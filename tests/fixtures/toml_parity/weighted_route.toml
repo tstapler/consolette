@@ -1,0 +1,19 @@
+[[upstreams]]
+name = "a"
+kind = "anthropic"
+
+[[upstreams]]
+name = "b"
+kind = "anthropic"
+
+[[routes]]
+name = "split"
+strategy = "weighted"
+
+[[routes.upstreams]]
+name = "a"
+weight = 0.7
+
+[[routes.upstreams]]
+name = "b"
+weight = 0.3

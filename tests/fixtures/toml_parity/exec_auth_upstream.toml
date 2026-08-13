@@ -1,0 +1,15 @@
+[[upstreams]]
+name = "internal"
+kind = "anthropic"
+
+[upstreams.auth]
+type = "exec"
+command = "consolette-internal-auth-helper"
+args = ["--project", "abc"]
+
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "internal"

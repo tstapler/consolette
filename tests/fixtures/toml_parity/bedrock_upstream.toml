@@ -1,0 +1,6 @@
+[[upstreams]]
+name = "bedrock"
+kind = "bedrock"
+aws_region = "us-east-1"
+aws_profile = "default"
+max_retries = 3

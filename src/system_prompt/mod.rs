@@ -4,6 +4,7 @@
 //! cache markers and bust the Anthropic KV cache on every request.
 
 pub mod cache_aligner;
+pub mod quantum_lock;
 pub mod verbosity;
 
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tracing::debug;
 
 use crate::config::schema::Config;
 use cache_aligner::should_add_cache_control;
+use quantum_lock::stabilize_dynamic_fragments;
 use verbosity::{is_continuation_turn, verbosity_suffix};
 
 pub struct SystemPromptPipeline {
@@ -92,28 +94,45 @@ fn extract_text_from_blocks(arr: &[Value]) -> String {
         .join("\n")
 }
 
-/// Build the 1- or 2-block output array.
+/// Build the 1- to 3-block output array.
 ///
-/// Block 0: original content + optional `cache_control` (if `cache_aligner` on and content stable).
-/// Block 1: verbosity suffix (if non-empty), no `cache_control`.
+/// Block 0: original content, with dynamic fragments (UUIDs, timestamps,
+/// tokens) rewritten to stable placeholders when `cache_aligner` is on
+/// (QuantumLock/CachePrefixManager), plus optional `cache_control` if the
+/// resulting text is stable enough. Middle block (if any dynamic fragments
+/// were found): the real values, so the model still sees them, but as a
+/// block that never gets `cache_control` and so doesn't need to stay
+/// byte-identical across requests. Last block: verbosity suffix (if
+/// non-empty), no `cache_control`.
 fn build_output_blocks(original_text: &str, suffix: &str, cache_aligner: bool) -> Vec<Value> {
-    let mut block0 = json!({"type": "text", "text": original_text});
+    let (stable_text, dynamic_trailer) = if cache_aligner {
+        stabilize_dynamic_fragments(original_text)
+    } else {
+        (original_text.to_string(), None)
+    };
 
-    if cache_aligner && should_add_cache_control(original_text) {
-        block0["cache_control"] = json!({"type": "ephemeral"});
+    let mut primary = json!({"type": "text", "text": stable_text});
+
+    if cache_aligner && should_add_cache_control(&stable_text) {
+        primary["cache_control"] = json!({"type": "ephemeral"});
     } else if cache_aligner {
         debug!(
-            text_len = original_text.len(),
+            text_len = stable_text.len(),
             "system_prompt: skipping cache_control (volatile or below threshold)"
         );
     }
 
-    if suffix.is_empty() {
-        vec![block0]
-    } else {
-        let block1 = json!({"type": "text", "text": suffix});
-        vec![block0, block1]
+    let mut output = vec![primary];
+
+    if let Some(trailer) = dynamic_trailer {
+        output.push(json!({"type": "text", "text": trailer}));
     }
+
+    if !suffix.is_empty() {
+        output.push(json!({"type": "text", "text": suffix}));
+    }
+
+    output
 }
 
 #[cfg(test)]
@@ -200,13 +219,21 @@ mod tests {
     }
 
     #[test]
-    fn volatile_text_skips_cache_control() {
+    fn volatile_text_gets_stabilized_and_cached() {
+        // QuantumLock/CachePrefixManager: rather than permanently skipping
+        // cache_control on any volatile content, the UUID is rewritten to a
+        // stable placeholder in block 0 (which can now be cached) and the
+        // real value moves to a separate, never-cached trailer block.
         let p = make_pipeline(true, 0);
         let volatile = "Session ID: 550e8400-e29b-41d4-a716-446655440000. ".repeat(5);
         let body = new_question_body(&json!(volatile));
         let out = p.apply(body);
         let system = out["system"].as_array().unwrap();
-        assert!(system[0].get("cache_control").is_none());
+        assert_eq!(system.len(), 2);
+        assert!(system[0].get("cache_control").is_some());
+        assert!(!system[0]["text"].as_str().unwrap().contains("550e8400"));
+        assert!(system[1].get("cache_control").is_none());
+        assert!(system[1]["text"].as_str().unwrap().contains("550e8400"));
     }
 
     #[test]

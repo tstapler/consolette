@@ -18,8 +18,9 @@ const MIN_MATCH_RATIO: f64 = 0.6;
 
 /// Matches a dotted-quad IPv4 address.
 #[allow(clippy::expect_used)]
-static IPV4: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").expect("IPV4 regex"));
+static IPV4: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").expect("IPV4 regex")
+});
 
 /// Matches a run of 3+ comma-separated `SCREAMING_SNAKE_CASE` tokens (an
 /// enum-style value list), e.g. `FEATURE, BUGFIX, HOTFIX, CHORE`.

@@ -15,8 +15,9 @@ use regex::Regex;
 const MIN_RUN: usize = 3;
 
 #[allow(clippy::expect_used)]
-static PY_IMPORT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*import\s+(\S+?)(?:\s+as\s+\S+)?\s*$").expect("PY_IMPORT regex"));
+static PY_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*import\s+(\S+?)(?:\s+as\s+\S+)?\s*$").expect("PY_IMPORT regex")
+});
 
 #[allow(clippy::expect_used)]
 static PY_FROM_IMPORT: LazyLock<Regex> =
@@ -34,11 +35,13 @@ static JS_REQUIRE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 #[allow(clippy::expect_used)]
-static JAVA_IMPORT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*import\s+(?:static\s+)?([\w.]+);\s*$").expect("JAVA_IMPORT regex"));
+static JAVA_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*import\s+(?:static\s+)?([\w.]+);\s*$").expect("JAVA_IMPORT regex")
+});
 
 #[allow(clippy::expect_used)]
-static TEMPLATE_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").expect("TEMPLATE_NUMBER regex"));
+static TEMPLATE_NUMBER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d+").expect("TEMPLATE_NUMBER regex"));
 
 #[allow(clippy::expect_used)]
 static TEMPLATE_SINGLE_QUOTED: LazyLock<Regex> =
@@ -190,7 +193,8 @@ mod tests {
 
     #[test]
     fn merges_java_import_block() {
-        let text = "import java.util.List;\nimport java.util.Map;\nimport java.io.File;\nclass Foo {}";
+        let text =
+            "import java.util.List;\nimport java.util.Map;\nimport java.io.File;\nclass Foo {}";
         let result = collapse_import_blocks(text);
         assert!(result.contains("[imports: List,Map,File]"));
     }

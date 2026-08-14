@@ -34,7 +34,8 @@ use consolette::compression::rewind::format_rewind_marker;
 use consolette::compression::{
     collapse_common_prefix, collapse_enum_lists, collapse_import_blocks, collapse_ip_prefixes,
     collapse_repeated_templates, collapse_semantic_duplicates, compact_diff,
-    compress_fenced_blocks, is_diff, truncate_lines, SmartCrusher, TextCompressor,
+    compress_fenced_blocks, fold_occurrence_counts, is_diff, relativize_timestamps, truncate_lines,
+    SmartCrusher, TextCompressor,
 };
 
 mod metrics_store;
@@ -218,6 +219,18 @@ fn compress_text(text: &str, max_lines: usize) -> (String, String) {
         if dedup_collapsed.len() < compressed.len() {
             compressed = dedup_collapsed;
             method = format!("{method}+semantic-dedup");
+        }
+
+        let log_folded = fold_occurrence_counts(&compressed);
+        if log_folded.len() < compressed.len() {
+            compressed = log_folded;
+            method = format!("{method}+log-crunch");
+        }
+
+        let ts_relativized = relativize_timestamps(&compressed);
+        if ts_relativized.len() < compressed.len() {
+            compressed = ts_relativized;
+            method = format!("{method}+ts-relative");
         }
     }
 

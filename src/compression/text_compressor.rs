@@ -293,8 +293,10 @@ fn collapse_package_noise(text: &str) -> String {
         return text.to_string();
     }
 
-    let templates: Vec<Option<&'static str>> =
-        lines.iter().map(|&line| package_noise_template(line)).collect();
+    let templates: Vec<Option<&'static str>> = lines
+        .iter()
+        .map(|&line| package_noise_template(line))
+        .collect();
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;

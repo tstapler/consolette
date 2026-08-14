@@ -19,10 +19,7 @@ fn shingles(text: &str) -> HashSet<String> {
     if words.len() < SHINGLE_WORDS {
         return HashSet::new();
     }
-    words
-        .windows(SHINGLE_WORDS)
-        .map(|w| w.join(" "))
-        .collect()
+    words.windows(SHINGLE_WORDS).map(|w| w.join(" ")).collect()
 }
 
 fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {

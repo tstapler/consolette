@@ -11,7 +11,9 @@ pub mod engine;
 pub mod line_truncate;
 pub mod path_collapse;
 pub mod rewind;
+pub mod semantic_dedup;
 pub mod smart_crusher;
+pub mod structural_collapse;
 pub mod text_compressor;
 
 // Re-exports for convenient use from other modules.
@@ -19,8 +21,10 @@ pub use code_compressor::{compress_fenced_blocks, CodeCompressor};
 pub use diff_compactor::{compact_diff, is_diff};
 pub use engine::{CompressionConfig, CompressionEngine, CompressionStats};
 pub use line_truncate::truncate_lines;
-pub use path_collapse::collapse_common_prefix;
+pub use path_collapse::{collapse_common_prefix, collapse_enum_lists, collapse_ip_prefixes};
 pub use rewind::RewindStore;
+pub use semantic_dedup::collapse_semantic_duplicates;
+pub use structural_collapse::{collapse_import_blocks, collapse_repeated_templates};
 pub use smart_crusher::SmartCrusher;
 pub use text_compressor::TextCompressor;
 

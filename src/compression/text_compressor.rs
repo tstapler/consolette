@@ -23,6 +23,60 @@ static ISO_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
         .expect("ISO_TIMESTAMP regex")
 });
 
+/// Matches an ANSI "cursor up N lines" sequence, the mechanism multi-line
+/// progress UIs (`docker pull`'s simultaneous per-layer redraw) use to
+/// repaint several lines in place — the multi-line analog of the `\r`
+/// single-line overwrite `collapse_carriage_returns` already handles.
+#[allow(clippy::expect_used)]
+static CURSOR_UP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[\d+[AF]").expect("CURSOR_UP regex"));
+
+/// Matches known package-manager download/progress noise lines: npm registry
+/// fetch logs, cargo Downloading/Compiling lines, and pip Downloading lines.
+/// The variable part (package name, version, URL, size) is captured so
+/// repeated lines that only differ in that part can be recognized as the
+/// same template and collapsed.
+#[allow(clippy::expect_used)]
+static PACKAGE_NOISE_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        ^(?:
+            npm\ http\ fetch\ .+
+            | npm\ WARN\ deprecated\ .+
+            |\ *Downloading\ [A-Za-z0-9_.\-]+\ v[0-9][A-Za-z0-9_.\-]*
+            |\ *Compiling\ [A-Za-z0-9_.\-]+\ v[0-9][A-Za-z0-9_.\-]*
+            |\ *Downloaded\ [A-Za-z0-9_.\-]+\ v[0-9][A-Za-z0-9_.\-]*
+            |Downloading\ https?://\S+\ \([0-9.]+\ ?[kKmMgG]?B\)
+        )$",
+    )
+    .expect("PACKAGE_NOISE_LINE regex")
+});
+
+/// Reduce a package-manager noise line to its template: strip the package
+/// name/version/URL/size so consecutive lines of the same *kind* (e.g. all
+/// `Compiling <crate> v<version>`) compare equal regardless of which crate.
+fn package_noise_template(line: &str) -> Option<&'static str> {
+    if !PACKAGE_NOISE_LINE.is_match(line) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    if line.starts_with("npm http fetch") {
+        Some("npm http fetch")
+    } else if line.starts_with("npm WARN deprecated") {
+        Some("npm WARN deprecated")
+    } else if trimmed.starts_with("Downloading ") && trimmed.contains(" v") {
+        Some("Downloading <crate>")
+    } else if trimmed.starts_with("Compiling ") {
+        Some("Compiling <crate>")
+    } else if trimmed.starts_with("Downloaded ") {
+        Some("Downloaded <crate>")
+    } else if trimmed.starts_with("Downloading http") {
+        Some("Downloading <url>")
+    } else {
+        None
+    }
+}
+
 /// Stateless text compressor.
 pub struct TextCompressor;
 
@@ -38,11 +92,13 @@ impl TextCompressor {
     /// unchanged.
     #[must_use]
     pub fn compress(&self, text: &str) -> String {
-        let s = collapse_carriage_returns(text);
+        let s = collapse_multiline_progress(text);
+        let s = collapse_carriage_returns(&s);
         let s = strip_ansi(&s);
         let s = dedup_consecutive_lines(&s);
         let s = normalize_blank_lines(&s);
         let s = dedup_log_timestamps(&s);
+        let s = collapse_package_noise(&s);
 
         // Safety net: never return something longer than the input.
         if s.len() < text.len() {
@@ -82,6 +138,23 @@ fn collapse_carriage_returns(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Collapse multi-line ANSI progress redraws (e.g. `docker pull`'s
+/// simultaneous per-layer status lines, repainted in place via a
+/// cursor-up-N-lines escape before each redraw) down to only the final
+/// frame. Everything before the first cursor-up sequence and everything
+/// from the last one onward survives unchanged; the intermediate,
+/// never-actually-final frames are discarded, mirroring how a terminal
+/// only ever shows the most recent redraw.
+fn collapse_multiline_progress(text: &str) -> String {
+    let matches: Vec<_> = CURSOR_UP.find_iter(text).collect();
+    if matches.len() < 2 {
+        return text.to_string();
+    }
+    let prefix = &text[..matches[0].start()];
+    let last_frame = &text[matches[matches.len() - 1].end()..];
+    format!("{prefix}{last_frame}")
 }
 
 /// Remove ANSI escape sequences.
@@ -209,6 +282,51 @@ fn dedup_log_timestamps(text: &str) -> String {
     out.join("\n")
 }
 
+/// Replace repeated package-manager download/progress lines (npm registry
+/// fetches, cargo Downloading/Compiling/Downloaded, pip Downloading) with a
+/// summary when 3 or more of the same kind appear consecutively — each such
+/// line's information content is "another package went by", which doesn't
+/// grow with the count.
+fn collapse_package_noise(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.is_empty() {
+        return text.to_string();
+    }
+
+    let templates: Vec<Option<&'static str>> =
+        lines.iter().map(|&line| package_noise_template(line)).collect();
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+
+    while i < lines.len() {
+        let Some(template) = templates[i] else {
+            out.push(lines[i].to_string());
+            i += 1;
+            continue;
+        };
+
+        let mut count = 1;
+        while i + count < lines.len() && templates[i + count] == Some(template) {
+            count += 1;
+        }
+
+        if count >= 3 {
+            out.push(lines[i].to_string());
+            let remaining = count - 1;
+            out.push(format!("[{remaining} more {template} lines]"));
+        } else {
+            for line in &lines[i..i + count] {
+                out.push((*line).to_string());
+            }
+        }
+
+        i += count;
+    }
+
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +402,59 @@ mod tests {
                      done";
         let result = dedup_log_timestamps(input);
         assert!(result.contains("[2 more identical log lines]"));
+    }
+
+    #[test]
+    fn collapses_multiline_progress_redraw() {
+        let input = "Pulling layer a\nPulling layer b\n\x1b[2A50%\n30%\n\x1b[2A100%\n100%\ndone";
+        let result = collapse_multiline_progress(input);
+        assert_eq!(result, "Pulling layer a\nPulling layer b\n100%\n100%\ndone");
+    }
+
+    #[test]
+    fn leaves_single_cursor_up_untouched() {
+        let input = "line one\n\x1b[1Aline two";
+        assert_eq!(collapse_multiline_progress(input), input);
+    }
+
+    #[test]
+    fn collapses_cargo_compiling_noise() {
+        let input = "Compiling foo v0.1.0\nCompiling bar v0.2.0\nCompiling baz v0.3.0\nFinished";
+        let result = collapse_package_noise(input);
+        assert!(result.contains("[2 more Compiling <crate> lines]"));
+        assert!(result.contains("Compiling foo v0.1.0"));
+        assert!(result.contains("Finished"));
+    }
+
+    #[test]
+    fn collapses_npm_fetch_noise() {
+        let input = "npm http fetch GET 200 https://registry.npmjs.org/a 50ms\n\
+                     npm http fetch GET 200 https://registry.npmjs.org/b 40ms\n\
+                     npm http fetch GET 200 https://registry.npmjs.org/c 60ms\n\
+                     done";
+        let result = collapse_package_noise(input);
+        assert!(result.contains("[2 more npm http fetch lines]"));
+    }
+
+    #[test]
+    fn two_package_noise_lines_not_collapsed() {
+        let input = "Compiling foo v0.1.0\nCompiling bar v0.2.0\nFinished";
+        assert_eq!(collapse_package_noise(input), input);
+    }
+
+    #[test]
+    fn full_pipeline_collapses_docker_pull_style_output() {
+        let mut input = String::from("Pulling from library/alpine\n");
+        for pct in (0..=100).step_by(10) {
+            use std::fmt::Write as _;
+            let _ = write!(input, "\x1b[2Alayer1: {pct}%\nlayer2: {pct}%\n");
+        }
+        input.push_str("Pull complete\n");
+        let c = TextCompressor::new();
+        let result = c.compress(&input);
+        assert!(result.len() < input.len());
+        assert!(result.contains("layer1: 100%"));
+        assert!(!result.contains("layer1: 0%"));
     }
 
     #[test]

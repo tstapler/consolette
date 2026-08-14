@@ -32,8 +32,9 @@ use sha2::{Digest, Sha256};
 
 use consolette::compression::rewind::format_rewind_marker;
 use consolette::compression::{
-    collapse_common_prefix, compact_diff, compress_fenced_blocks, is_diff, truncate_lines,
-    SmartCrusher, TextCompressor,
+    collapse_common_prefix, collapse_enum_lists, collapse_import_blocks, collapse_ip_prefixes,
+    collapse_repeated_templates, collapse_semantic_duplicates, compact_diff,
+    compress_fenced_blocks, is_diff, truncate_lines, SmartCrusher, TextCompressor,
 };
 
 mod metrics_store;
@@ -187,6 +188,36 @@ fn compress_text(text: &str, max_lines: usize) -> (String, String) {
         if collapsed.len() < compressed.len() {
             compressed = collapsed;
             method = "path-collapse".to_string();
+        }
+
+        let ip_collapsed = collapse_ip_prefixes(&compressed);
+        if ip_collapsed.len() < compressed.len() {
+            compressed = ip_collapsed;
+            method = format!("{method}+ip-collapse");
+        }
+
+        let enum_collapsed = collapse_enum_lists(&compressed);
+        if enum_collapsed.len() < compressed.len() {
+            compressed = enum_collapsed;
+            method = format!("{method}+enum-collapse");
+        }
+
+        let imports_collapsed = collapse_import_blocks(&compressed);
+        if imports_collapsed.len() < compressed.len() {
+            compressed = imports_collapsed;
+            method = format!("{method}+import-collapse");
+        }
+
+        let templates_collapsed = collapse_repeated_templates(&compressed);
+        if templates_collapsed.len() < compressed.len() {
+            compressed = templates_collapsed;
+            method = format!("{method}+template-collapse");
+        }
+
+        let dedup_collapsed = collapse_semantic_duplicates(&compressed);
+        if dedup_collapsed.len() < compressed.len() {
+            compressed = dedup_collapsed;
+            method = format!("{method}+semantic-dedup");
         }
     }
 

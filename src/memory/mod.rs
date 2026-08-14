@@ -176,9 +176,7 @@ pub async fn handler_memory_get(
 }
 
 /// `GET /memory` — list all keys with metadata.
-pub async fn handler_memory_list(
-    State(state): State<Arc<MemoryAppState>>,
-) -> impl IntoResponse {
+pub async fn handler_memory_list(State(state): State<Arc<MemoryAppState>>) -> impl IntoResponse {
     let all = state.store.list_all().await;
     let now = Utc::now();
 

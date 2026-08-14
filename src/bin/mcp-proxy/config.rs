@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing::warn;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -131,10 +131,10 @@ fn default_slot_ttl_turns() -> usize {
 
 impl McpProxyConfig {
     pub fn load(path: &PathBuf) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let config: McpProxyConfig = toml::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let config: McpProxyConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         Ok(config)
     }
 
@@ -189,7 +189,10 @@ impl McpProxyConfig {
 
 pub fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("mcp-proxy").join("mcp-proxy.toml")
+    PathBuf::from(home)
+        .join(".config")
+        .join("mcp-proxy")
+        .join("mcp-proxy.toml")
 }
 
 #[cfg(test)]
@@ -258,14 +261,19 @@ enabled = true
     #[test]
     fn validate_missing_upstream_fails() {
         let mut config: McpProxyConfig = toml::from_str("[global]\nenabled = true").unwrap();
-        config.servers.insert("test".into(), ServerConfig {
-            allow: vec![],
-            upstream_url: None,
-            upstream_command: None,
-            ..Default::default()
-        });
+        config.servers.insert(
+            "test".into(),
+            ServerConfig {
+                allow: vec![],
+                upstream_url: None,
+                upstream_command: None,
+                ..Default::default()
+            },
+        );
         let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("no upstream_url or upstream_command"));
+        assert!(err
+            .to_string()
+            .contains("no upstream_url or upstream_command"));
     }
 
     #[test]

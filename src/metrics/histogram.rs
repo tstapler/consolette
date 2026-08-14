@@ -38,7 +38,10 @@ impl DurationHistogram {
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
         // A poisoned mutex only happens if another lock holder panicked; recovering
         // the inner data is safe since it is left in a structurally valid state.
-        let mut samples = self.samples.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         samples.push_back((now, duration_ms));
         // Trim expired samples from the front.
         while samples.front().is_some_and(|(t, _)| *t < cutoff) {
@@ -57,11 +60,18 @@ impl DurationHistogram {
     #[must_use]
     // `n` (a sample count bounded by the 15-minute window) and the percentile
     // fraction are both far too small to lose precision as `f64`.
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     pub fn percentiles(&self) -> (u64, u64, u64) {
         let now = Instant::now();
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
-        let samples = self.samples.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut values: Vec<u64> = samples
             .iter()
@@ -87,7 +97,10 @@ impl DurationHistogram {
     pub fn requests_per_minute(&self) -> f64 {
         let now = Instant::now();
         let one_min_ago = now.checked_sub(Duration::from_mins(1)).unwrap_or(now);
-        let samples = self.samples.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = samples.iter().filter(|(t, _)| *t >= one_min_ago).count();
         count as f64
     }
@@ -110,7 +123,10 @@ impl DurationHistogram {
     )]
     pub fn rpm_chart_data(&self, minutes: u32) -> Vec<serde_json::Value> {
         let now = Instant::now();
-        let samples = self.samples.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut buckets = vec![0u64; minutes as usize];
         let total_secs = u64::from(minutes) * 60;

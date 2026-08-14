@@ -119,7 +119,9 @@ mod tests {
             {"id": 3, "type": "widget", "status": "ok"},
             {"id": 4, "type": "widget", "status": "ok"},
         ]);
-        let result = SmartCrusher::new().compress(&value).expect("should compress");
+        let result = SmartCrusher::new()
+            .compress(&value)
+            .expect("should compress");
         assert_eq!(result["_elided_constant_fields"]["type"], "widget");
         assert_eq!(result["_elided_constant_fields"]["status"], "ok");
         let items = result["items"].as_array().unwrap();

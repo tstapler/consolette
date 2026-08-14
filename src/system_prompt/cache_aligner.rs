@@ -12,9 +12,8 @@ static RE_UUID: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 #[allow(clippy::unwrap_used)]
-static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}").unwrap()
-});
+static RE_TIMESTAMP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}").unwrap());
 
 /// Returns `true` if `cache_control` should be added to a system block with this text.
 ///

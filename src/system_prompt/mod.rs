@@ -44,7 +44,11 @@ impl SystemPromptPipeline {
             .and_then(Value::as_array)
             .is_some_and(|msgs| is_continuation_turn(msgs));
 
-        let suffix = if is_continuation { verbosity_suffix(verbosity) } else { "" };
+        let suffix = if is_continuation {
+            verbosity_suffix(verbosity)
+        } else {
+            ""
+        };
 
         let system = body.get("system").cloned();
 
@@ -119,7 +123,11 @@ mod tests {
     use serde_json::json;
 
     fn make_pipeline(cache_aligner: bool, verbosity_level: u8) -> SystemPromptPipeline {
-        let cfg = Config { cache_aligner, verbosity_level, ..Config::default() };
+        let cfg = Config {
+            cache_aligner,
+            verbosity_level,
+            ..Config::default()
+        };
         SystemPromptPipeline::new(Arc::new(cfg))
     }
 

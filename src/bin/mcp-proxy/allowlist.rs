@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use rmcp::model::Tool;
+use std::collections::HashSet;
 use tracing::warn;
 
 #[derive(Debug, Clone)]
@@ -9,7 +9,10 @@ pub struct AllowList {
 }
 
 impl AllowList {
-    pub fn new(server_name: impl Into<String>, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn new(
+        server_name: impl Into<String>,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
             server_name: server_name.into(),
             tools: tools.into_iter().map(Into::into).collect(),
@@ -47,11 +50,15 @@ impl AllowList {
             }
             return tools;
         }
-        tools.into_iter().filter(|t| self.tools.contains(t.name.as_ref())).collect()
+        tools
+            .into_iter()
+            .filter(|t| self.tools.contains(t.name.as_ref()))
+            .collect()
     }
 
     pub fn detect_drift(&self, upstream_tools: &[Tool]) {
-        let upstream_names: HashSet<&str> = upstream_tools.iter().map(|t| t.name.as_ref()).collect();
+        let upstream_names: HashSet<&str> =
+            upstream_tools.iter().map(|t| t.name.as_ref()).collect();
         for allowed in &self.tools {
             if !upstream_names.contains(allowed.as_str()) {
                 warn!(
@@ -79,7 +86,8 @@ impl ToolNotAllowedError {
             message: format!(
                 "tool not found: {} (tool exists but is not in allowlist)",
                 self.tool
-            ).into(),
+            )
+            .into(),
             data: Some(serde_json::json!({
                 "tool": self.tool,
                 "server": self.server,
@@ -118,7 +126,10 @@ mod tests {
     #[test]
     fn dry_run_passes_all() {
         let allow = AllowList::new("slack", ["slack_send_message"]);
-        let tools = vec![make_tool("slack_send_message"), make_tool("slack_create_canvas")];
+        let tools = vec![
+            make_tool("slack_send_message"),
+            make_tool("slack_create_canvas"),
+        ];
         let filtered = allow.filter_catalog(tools, true);
         assert_eq!(filtered.len(), 2);
     }

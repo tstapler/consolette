@@ -9,12 +9,12 @@ mod server;
 mod slots;
 mod upstream;
 
-use std::path::Path;
 use clap::Parser;
+use std::path::Path;
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
-use config::{McpProxyConfig, default_config_path};
+use config::{default_config_path, McpProxyConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,7 +58,7 @@ async fn run_serve(
     config_path: &Path,
     config: McpProxyConfig,
 ) -> anyhow::Result<()> {
-    use rmcp::{ServiceExt, transport::io::stdio};
+    use rmcp::{transport::io::stdio, ServiceExt};
     use server::ProxyServer;
     use upstream::UpstreamClient;
 
@@ -67,7 +67,12 @@ async fn run_serve(
             "server '{}' not found in {} — available: {}",
             server_name,
             config_path.display(),
-            config.servers.keys().cloned().collect::<Vec<_>>().join(", ")
+            config
+                .servers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     })?;
 
@@ -88,8 +93,8 @@ async fn run_serve(
 }
 
 fn init_tracing_stderr() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("mcp_proxy=info,warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mcp_proxy=info,warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -97,9 +102,7 @@ fn init_tracing_stderr() {
 }
 
 fn init_tracing_stdout() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("mcp_proxy=info,warn"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mcp_proxy=info,warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }

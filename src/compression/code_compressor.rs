@@ -192,7 +192,9 @@ mod tests {
     #[test]
     fn strips_rust_line_and_block_comments() {
         let code = "// header comment\nfn main() {\n    /* block */\n    let x = 1; // trailing\n    println!(\"{x}\");\n}\n";
-        let result = CodeCompressor::new().compress(code, "rust").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "rust")
+            .expect("should compress");
         assert!(!result.contains("header comment"));
         assert!(!result.contains("block"));
         assert!(!result.contains("trailing"));
@@ -203,7 +205,9 @@ mod tests {
     #[test]
     fn strips_python_comments() {
         let code = "# module comment\ndef f():\n    x = 1  # inline\n    return x\n";
-        let result = CodeCompressor::new().compress(code, "python").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "python")
+            .expect("should compress");
         assert!(!result.contains("module comment"));
         assert!(!result.contains("inline"));
         assert!(result.contains("def f()"));
@@ -213,7 +217,9 @@ mod tests {
     #[test]
     fn strips_javascript_comments() {
         let code = "// top\nfunction f() {\n  /* mid */\n  return 1; // end\n}\n";
-        let result = CodeCompressor::new().compress(code, "javascript").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "javascript")
+            .expect("should compress");
         assert!(!result.contains("top"));
         assert!(!result.contains("mid"));
         assert!(!result.contains("end"));
@@ -223,7 +229,9 @@ mod tests {
     #[test]
     fn strips_typescript_comments() {
         let code = "// note\ninterface Foo {\n  x: number; // field\n}\n";
-        let result = CodeCompressor::new().compress(code, "typescript").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "typescript")
+            .expect("should compress");
         assert!(!result.contains("note"));
         assert!(!result.contains("field"));
         assert!(result.contains("interface Foo"));
@@ -232,7 +240,9 @@ mod tests {
     #[test]
     fn strips_go_comments() {
         let code = "// Package doc\npackage main\n\nfunc main() {\n\t// inline\n\tprintln(1)\n}\n";
-        let result = CodeCompressor::new().compress(code, "go").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "go")
+            .expect("should compress");
         assert!(!result.contains("Package doc"));
         assert!(!result.contains("inline"));
         assert!(result.contains("package main"));
@@ -241,7 +251,9 @@ mod tests {
     #[test]
     fn strips_bash_comments() {
         let code = "#!/bin/bash\n# a comment\necho hi # trailing\n";
-        let result = CodeCompressor::new().compress(code, "bash").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "bash")
+            .expect("should compress");
         assert!(!result.contains("# a comment"));
         assert!(!result.contains("trailing"));
         assert!(result.contains("echo hi"));
@@ -250,7 +262,9 @@ mod tests {
     #[test]
     fn strips_java_comments() {
         let code = "// header\nclass Foo {\n  /* body */\n  int x = 1; // field\n}\n";
-        let result = CodeCompressor::new().compress(code, "java").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "java")
+            .expect("should compress");
         assert!(!result.contains("header"));
         assert!(!result.contains("body"));
         assert!(!result.contains("field"));
@@ -260,7 +274,9 @@ mod tests {
     #[test]
     fn strips_c_comments() {
         let code = "// header\nint main() {\n  /* body */\n  return 0; // ret\n}\n";
-        let result = CodeCompressor::new().compress(code, "c").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "c")
+            .expect("should compress");
         assert!(!result.contains("header"));
         assert!(!result.contains("body"));
         assert!(result.contains("int main()"));
@@ -269,7 +285,9 @@ mod tests {
     #[test]
     fn strips_cpp_comments() {
         let code = "// header\nclass Foo {\npublic:\n  // ctor\n  Foo() {}\n};\n";
-        let result = CodeCompressor::new().compress(code, "cpp").expect("should compress");
+        let result = CodeCompressor::new()
+            .compress(code, "cpp")
+            .expect("should compress");
         assert!(!result.contains("header"));
         assert!(!result.contains("ctor"));
         assert!(result.contains("class Foo"));

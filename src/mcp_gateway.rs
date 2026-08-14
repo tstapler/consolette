@@ -53,7 +53,11 @@ struct GatewayGlobal {
 
 impl Default for GatewayGlobal {
     fn default() -> Self {
-        Self { enabled: true, dry_run: false, cache_ttl_secs: default_ttl() }
+        Self {
+            enabled: true,
+            dry_run: false,
+            cache_ttl_secs: default_ttl(),
+        }
     }
 }
 
@@ -68,9 +72,15 @@ struct GatewayServer {
     upstream_timeout_ms: u64,
 }
 
-fn bool_true() -> bool { true }
-fn default_ttl() -> u64 { 300 }
-fn default_timeout_ms() -> u64 { 5000 }
+fn bool_true() -> bool {
+    true
+}
+fn default_ttl() -> u64 {
+    300
+}
+fn default_timeout_ms() -> u64 {
+    5000
+}
 
 fn resolve_api_key(cfg: &GatewayServer) -> Option<String> {
     if let Some(var) = &cfg.api_key_env {
@@ -85,7 +95,10 @@ fn resolve_api_key(cfg: &GatewayServer) -> Option<String> {
 
 fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("mcp-proxy").join("mcp-proxy.toml")
+    PathBuf::from(home)
+        .join(".config")
+        .join("mcp-proxy")
+        .join("mcp-proxy.toml")
 }
 
 // ─── Tool schema cache ────────────────────────────────────────────────────────
@@ -101,13 +114,20 @@ struct ToolCache {
 
 impl ToolCache {
     fn new(ttl_secs: u64) -> Self {
-        Self { inner: Arc::new(RwLock::new(None)), ttl: Duration::from_secs(ttl_secs) }
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            ttl: Duration::from_secs(ttl_secs),
+        }
     }
 
     async fn get(&self) -> Option<Vec<Tool>> {
         let g = self.inner.read().await;
         g.as_ref().and_then(|(tools, ts)| {
-            if ts.elapsed() < self.ttl { Some(tools.clone()) } else { None }
+            if ts.elapsed() < self.ttl {
+                Some(tools.clone())
+            } else {
+                None
+            }
         })
     }
 
@@ -135,7 +155,11 @@ impl UpstreamConn {
             .await
             .with_context(|| format!("connecting to upstream {url}"))?;
         let peer = service.peer().clone();
-        Ok(Self { peer, _service: service, timeout: Duration::from_millis(timeout_ms) })
+        Ok(Self {
+            peer,
+            _service: service,
+            timeout: Duration::from_millis(timeout_ms),
+        })
     }
 
     async fn list_tools(&self) -> anyhow::Result<Vec<Tool>> {
@@ -169,11 +193,9 @@ struct GatewayHandler {
 
 impl ServerHandler for GatewayHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "mcp-context-filter",
-                env!("CARGO_PKG_VERSION"),
-            ))
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("mcp-context-filter", env!("CARGO_PKG_VERSION")),
+        )
     }
 
     async fn list_tools(
@@ -182,7 +204,10 @@ impl ServerHandler for GatewayHandler {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         if let Some(cached) = self.cache.get().await {
-            return Ok(ListToolsResult { tools: cached, ..Default::default() });
+            return Ok(ListToolsResult {
+                tools: cached,
+                ..Default::default()
+            });
         }
         let raw = self.upstream.list_tools().await.map_err(|e| {
             warn!(server = %self.server_name, error = %e, "upstream list_tools failed");
@@ -197,7 +222,10 @@ impl ServerHandler for GatewayHandler {
         };
         info!(server = %self.server_name, tools = filtered.len(), "tools/list");
         self.cache.set(filtered.clone()).await;
-        Ok(ListToolsResult { tools: filtered, ..Default::default() })
+        Ok(ListToolsResult {
+            tools: filtered,
+            ..Default::default()
+        })
     }
 
     async fn call_tool(
@@ -238,8 +266,8 @@ impl ServerHandler for GatewayHandler {
 /// Returns `None` if the config file is absent or no servers could be connected.
 /// Errors are logged as warnings; the main server continues without MCP routes.
 pub async fn build_mcp_router() -> Option<Router> {
-    let config_path = std::env::var("MCP_PROXY_CONFIG")
-        .map_or_else(|_| default_config_path(), PathBuf::from);
+    let config_path =
+        std::env::var("MCP_PROXY_CONFIG").map_or_else(|_| default_config_path(), PathBuf::from);
 
     if !config_path.exists() {
         info!(
@@ -250,11 +278,15 @@ pub async fn build_mcp_router() -> Option<Router> {
     }
 
     let text = std::fs::read_to_string(&config_path)
-        .inspect_err(|e| warn!(path = %config_path.display(), error = %e, "failed to read mcp-proxy.toml"))
+        .inspect_err(
+            |e| warn!(path = %config_path.display(), error = %e, "failed to read mcp-proxy.toml"),
+        )
         .ok()?;
 
     let config: GatewayConfig = toml::from_str(&text)
-        .inspect_err(|e| warn!(path = %config_path.display(), error = %e, "failed to parse mcp-proxy.toml"))
+        .inspect_err(
+            |e| warn!(path = %config_path.display(), error = %e, "failed to parse mcp-proxy.toml"),
+        )
         .ok()?;
 
     if !config.global.enabled {
@@ -272,19 +304,20 @@ pub async fn build_mcp_router() -> Option<Router> {
         };
 
         let api_key = resolve_api_key(server_cfg);
-        let Ok(upstream) =
-            UpstreamConn::connect(&url, api_key.as_deref(), server_cfg.upstream_timeout_ms)
-                .await
-                .inspect_err(
-                    |e| warn!(server = %server_name, error = %e, "upstream connect failed; skipping"),
-                )
-        else {
+        let Ok(upstream) = UpstreamConn::connect(
+            &url,
+            api_key.as_deref(),
+            server_cfg.upstream_timeout_ms,
+        )
+        .await
+        .inspect_err(
+            |e| warn!(server = %server_name, error = %e, "upstream connect failed; skipping"),
+        ) else {
             continue;
         };
         let upstream = Arc::new(upstream);
 
-        let allow: Arc<HashSet<String>> =
-            Arc::new(server_cfg.allow.iter().cloned().collect());
+        let allow: Arc<HashSet<String>> = Arc::new(server_cfg.allow.iter().cloned().collect());
         let cache = ToolCache::new(config.global.cache_ttl_secs);
         let dry_run = config.global.dry_run;
         let handler = GatewayHandler {

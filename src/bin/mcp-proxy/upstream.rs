@@ -1,10 +1,12 @@
-use std::time::Duration;
 use anyhow::Context;
-use rmcp::model::{Tool, CallToolRequestParams, CallToolResult, ContentBlock};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, Tool};
 use rmcp::serve_client;
 use rmcp::service::RunningService;
-use rmcp::transport::streamable_http_client::{StreamableHttpClientTransport, StreamableHttpClientTransportConfig};
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
 use rmcp::{Peer, RoleClient};
+use std::time::Duration;
 
 use crate::config::{ServerConfig, UpstreamTransportKind};
 
@@ -22,8 +24,14 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    pub async fn connect(server_name: &str, config: &ServerConfig, api_key: Option<&str>) -> anyhow::Result<Self> {
-        let url = config.upstream_url.as_deref()
+    pub async fn connect(
+        server_name: &str,
+        config: &ServerConfig,
+        api_key: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let url = config
+            .upstream_url
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no upstream_url"))?;
 
         match &config.transport {

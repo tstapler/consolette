@@ -227,6 +227,7 @@ fn unknown_ratelimit_upstream_reference_fails_validation() {
 /// closure per var keeps failures attributable to a single legacy name
 /// instead of one combined assertion block.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn legacy_env_var_matrix() {
     #[allow(clippy::type_complexity)]
     let cases: &[(&str, &str, &dyn Fn(&Config))] = &[
@@ -234,7 +235,10 @@ fn legacy_env_var_matrix() {
             assert_eq!(c.port, 9999, "PROXY_PORT -> port");
         }),
         ("COOLDOWN_SECONDS", "42", &|c: &Config| {
-            assert_eq!(c.cooldown_seconds, 42, "COOLDOWN_SECONDS -> cooldown_seconds");
+            assert_eq!(
+                c.cooldown_seconds, 42,
+                "COOLDOWN_SECONDS -> cooldown_seconds"
+            );
         }),
         ("REQUEST_TIMEOUT", "17", &|c: &Config| {
             assert_eq!(c.request_timeout, 17, "REQUEST_TIMEOUT -> request_timeout");
@@ -243,7 +247,11 @@ fn legacy_env_var_matrix() {
             let bedrock = c.upstreams.iter().find(|u| u.name == "bedrock").unwrap();
             match &bedrock.kind {
                 UpstreamKind::Bedrock { max_retries, .. } => {
-                    assert_eq!(*max_retries, Some(5), "BEDROCK_MAX_RETRIES -> bedrock.max_retries");
+                    assert_eq!(
+                        *max_retries,
+                        Some(5),
+                        "BEDROCK_MAX_RETRIES -> bedrock.max_retries"
+                    );
                 }
                 other => panic!("expected Bedrock upstream, got {other:?}"),
             }
@@ -264,7 +272,10 @@ fn legacy_env_var_matrix() {
             assert_eq!(c.verbosity_level, 3, "VERBOSITY_LEVEL -> verbosity_level");
         }),
         ("MEMORY_MAX_ENTRIES", "50", &|c: &Config| {
-            assert_eq!(c.memory_max_entries, 50, "MEMORY_MAX_ENTRIES -> memory_max_entries");
+            assert_eq!(
+                c.memory_max_entries, 50,
+                "MEMORY_MAX_ENTRIES -> memory_max_entries"
+            );
         }),
         ("AWS_PROFILE", "test-profile", &|c: &Config| {
             let bedrock = c.upstreams.iter().find(|u| u.name == "bedrock").unwrap();
@@ -305,7 +316,11 @@ fn legacy_env_var_matrix() {
             );
         }),
     ];
-    assert_eq!(cases.len(), 12, "all 12 legacy vars from Task 1.5.2 must be covered");
+    assert_eq!(
+        cases.len(),
+        12,
+        "all 12 legacy vars from Task 1.5.2 must be covered"
+    );
 
     for (name, value, assert_field) in cases {
         let _guard = env_lock().lock().unwrap();

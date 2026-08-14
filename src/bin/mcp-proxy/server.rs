@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo,
 };
-use rmcp::{ErrorData, ServerHandler, service::RequestContext, service::RoleServer};
+use rmcp::{service::RequestContext, service::RoleServer, ErrorData, ServerHandler};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::allowlist::AllowList;
@@ -22,12 +22,12 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    pub fn new(
-        server_name: String,
-        upstream: UpstreamClient,
-        config: &McpProxyConfig,
-    ) -> Self {
-        let server_cfg = config.servers.get(&server_name).cloned().unwrap_or_default();
+    pub fn new(server_name: String, upstream: UpstreamClient, config: &McpProxyConfig) -> Self {
+        let server_cfg = config
+            .servers
+            .get(&server_name)
+            .cloned()
+            .unwrap_or_default();
         let cache_ttl = config.global.cache_ttl_secs;
         let dry_run = config.global.dry_run;
 
@@ -48,8 +48,9 @@ impl ProxyServer {
 
 impl ServerHandler for ProxyServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mcp-context-filter", env!("CARGO_PKG_VERSION")))
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("mcp-context-filter", env!("CARGO_PKG_VERSION")),
+        )
     }
 
     async fn list_tools(
@@ -63,7 +64,10 @@ impl ServerHandler for ProxyServer {
                 tools = cached.len(),
                 "serving tools/list from cache"
             );
-            return Ok(ListToolsResult { tools: cached, ..Default::default() });
+            return Ok(ListToolsResult {
+                tools: cached,
+                ..Default::default()
+            });
         }
 
         let raw_tools = self.upstream.list_tools().await.map_err(|e| {
@@ -106,7 +110,10 @@ impl ServerHandler for ProxyServer {
 
         self.cache.set(compressed.clone()).await;
 
-        Ok(ListToolsResult { tools: compressed, ..Default::default() })
+        Ok(ListToolsResult {
+            tools: compressed,
+            ..Default::default()
+        })
     }
 
     async fn call_tool(
@@ -135,7 +142,10 @@ impl ServerHandler for ProxyServer {
                     error = %e,
                     "upstream call_tool failed"
                 );
-                Ok(crate::upstream::upstream_transport_error(&self.server_name, &e))
+                Ok(crate::upstream::upstream_transport_error(
+                    &self.server_name,
+                    &e,
+                ))
             }
         }
     }

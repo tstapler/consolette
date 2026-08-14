@@ -89,14 +89,20 @@ impl AnthropicProvider {
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(timeout)
             .build()
-            .map_err(|e| ProviderError::Upstream { status: 0, body: e.to_string() })?;
+            .map_err(|e| ProviderError::Upstream {
+                status: 0,
+                body: e.to_string(),
+            })?;
 
         // ADR-004: separate client with pool_max_idle_per_host(0) for SSE
         let stream_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(0)
             .build()
-            .map_err(|e| ProviderError::Upstream { status: 0, body: e.to_string() })?;
+            .map_err(|e| ProviderError::Upstream {
+                status: 0,
+                body: e.to_string(),
+            })?;
 
         Ok(Self {
             client,
@@ -143,11 +149,10 @@ impl AnthropicProvider {
     /// going through the real ADR-002 resolver/cache rather than
     /// reimplementing secret resolution or exec dispatch.
     async fn apply_auth(&self, out: &mut HeaderMap, url: &str) -> Result<(), ProviderError> {
-        let method = self
-            .upstream
-            .auth
-            .as_ref()
-            .ok_or_else(|| ProviderError::Auth("no auth configured for upstream".to_string()))?;
+        let method =
+            self.upstream.auth.as_ref().ok_or_else(|| {
+                ProviderError::Auth("no auth configured for upstream".to_string())
+            })?;
 
         let result: Result<(), AuthError> = match method {
             AuthMethod::Bearer { token } => {
@@ -256,8 +261,10 @@ impl AnthropicProvider {
 
         let url = format!("{}/v1/messages", self.base_url);
         let headers = self.build_headers(incoming_headers, &url).await?;
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| ProviderError::Upstream { status: 0, body: e.to_string() })?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Upstream {
+            status: 0,
+            body: e.to_string(),
+        })?;
 
         debug!("Anthropic non-stream POST {url}");
 
@@ -272,7 +279,10 @@ impl AnthropicProvider {
                 if e.is_timeout() {
                     ProviderError::Timeout
                 } else {
-                    ProviderError::Upstream { status: 0, body: e.to_string() }
+                    ProviderError::Upstream {
+                        status: 0,
+                        body: e.to_string(),
+                    }
                 }
             })?;
 
@@ -308,8 +318,10 @@ impl AnthropicProvider {
 
         let url = format!("{}/v1/messages", self.base_url);
         let headers = self.build_headers(incoming_headers, &url).await?;
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| ProviderError::Upstream { status: 0, body: e.to_string() })?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Upstream {
+            status: 0,
+            body: e.to_string(),
+        })?;
 
         debug!("Anthropic stream POST {url}");
 
@@ -324,7 +336,10 @@ impl AnthropicProvider {
                 if e.is_timeout() {
                     ProviderError::Timeout
                 } else {
-                    ProviderError::Upstream { status: 0, body: e.to_string() }
+                    ProviderError::Upstream {
+                        status: 0,
+                        body: e.to_string(),
+                    }
                 }
             })?;
 
@@ -350,7 +365,10 @@ impl AnthropicProvider {
         if !status.is_success() {
             let status_u16 = status.as_u16();
             let body_str = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Upstream { status: status_u16, body: body_str });
+            return Err(ProviderError::Upstream {
+                status: status_u16,
+                body: body_str,
+            });
         }
 
         Ok(response)
@@ -409,8 +427,7 @@ pub fn clean_request_body(body: &mut Value) {
             if let Some(content) = message.get_mut("content").and_then(|v| v.as_array_mut()) {
                 for item in content.iter_mut() {
                     if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                        if let Some(inner) =
-                            item.get_mut("content").and_then(|v| v.as_array_mut())
+                        if let Some(inner) = item.get_mut("content").and_then(|v| v.as_array_mut())
                         {
                             let before = inner.len();
                             inner.retain(|c| {
@@ -442,7 +459,10 @@ pub fn clean_request_body(body: &mut Value) {
     // 3. Clean system[*].cache_control.ephemeral.scope
     if let Some(system) = body.get_mut("system").and_then(|v| v.as_array_mut()) {
         for item in system.iter_mut() {
-            if let Some(cc) = item.get_mut("cache_control").and_then(|v| v.as_object_mut()) {
+            if let Some(cc) = item
+                .get_mut("cache_control")
+                .and_then(|v| v.as_object_mut())
+            {
                 if let Some(ephemeral) = cc.get_mut("ephemeral").and_then(|v| v.as_object_mut()) {
                     if ephemeral.remove("scope").is_some() {
                         debug!("Removed 'scope' from system[].cache_control.ephemeral");
@@ -492,13 +512,16 @@ async fn map_error_status(
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let body_str = response.text().await.unwrap_or_default();
-        return Err(ProviderError::Upstream { status: status_u16, body: body_str });
+        return Err(ProviderError::Upstream {
+            status: status_u16,
+            body: body_str,
+        });
     }
 
-    let resp_value: Value = response
-        .json()
-        .await
-        .map_err(|e| ProviderError::Upstream { status: status.as_u16(), body: e.to_string() })?;
+    let resp_value: Value = response.json().await.map_err(|e| ProviderError::Upstream {
+        status: status.as_u16(),
+        body: e.to_string(),
+    })?;
 
     Ok((resp_value, status))
 }
@@ -521,7 +544,9 @@ impl Provider for AnthropicProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         if stream {
             let response = self.send_streaming_request(body, &headers).await?;
-            let byte_stream = response.bytes_stream().map(|r| r.map_err(anyhow::Error::from));
+            let byte_stream = response
+                .bytes_stream()
+                .map(|r| r.map_err(anyhow::Error::from));
             Ok(ProviderResponse::Stream(Box::pin(byte_stream)))
         } else {
             let (value, _status) = self.send_request(body, &headers).await?;
@@ -539,9 +564,7 @@ mod tests {
     #[test]
     fn normalize_model_name_strips_bedrock_prefix_and_suffix() {
         assert_eq!(
-            AnthropicProvider::normalize_model_name(
-                "us.anthropic.claude-3-5-sonnet-20241022-v1:0"
-            ),
+            AnthropicProvider::normalize_model_name("us.anthropic.claude-3-5-sonnet-20241022-v1:0"),
             "claude-3-5-sonnet-20241022"
         );
     }
@@ -592,7 +615,9 @@ mod tests {
             }]
         });
         clean_request_body(&mut body);
-        let inner = body["messages"][0]["content"][0]["content"].as_array().unwrap();
+        let inner = body["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
         assert_eq!(inner.len(), 1);
         assert_eq!(inner[0]["type"], "text");
     }

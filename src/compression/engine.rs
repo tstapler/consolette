@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, warn};
 
-use crate::compression::{compress_fenced_blocks, RewindStore, SmartCrusher, TextCompressor};
 use crate::compression::rewind::{format_rewind_marker, REWIND_MARKER_PATTERN};
+use crate::compression::{compress_fenced_blocks, RewindStore, SmartCrusher, TextCompressor};
 
 // ---------------------------------------------------------------------------
 // Compiled regexes
@@ -141,10 +141,7 @@ impl CompressionEngine {
         // ----------------------------------------------------------------
         // 3. Extract messages array (we'll work on a clone).
         // ----------------------------------------------------------------
-        let Some(original_messages) = request
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
+        let Some(original_messages) = request.get("messages").and_then(Value::as_array).cloned()
         else {
             return (
                 request,
@@ -215,7 +212,10 @@ impl CompressionEngine {
                     continue;
                 }
 
-                let Some(text) = block.get("text").and_then(Value::as_str).map(str::to_string)
+                let Some(text) = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
                 else {
                     continue;
                 };
@@ -413,17 +413,15 @@ fn validate_tool_pairs(messages: &[Value]) -> (bool, Vec<String>) {
         }
 
         let prev_content = prev.get("content").and_then(Value::as_array);
-        let tool_use_ids: std::collections::HashSet<String> = prev_content.map_or_else(
-            std::collections::HashSet::new,
-            |blocks| {
+        let tool_use_ids: std::collections::HashSet<String> =
+            prev_content.map_or_else(std::collections::HashSet::new, |blocks| {
                 blocks
                     .iter()
                     .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
                     .filter_map(|b| b.get("id").and_then(Value::as_str))
                     .map(str::to_string)
                     .collect()
-            },
-        );
+            });
 
         for id in tool_result_ids {
             if !tool_use_ids.contains(&id) {
@@ -449,7 +447,9 @@ fn try_smart_crush_tool_result(block: &mut Value, crusher: &SmartCrusher) -> boo
 
     match block.get("content") {
         Some(Value::String(s)) => {
-            let Some(new_str) = crush_str(s) else { return false };
+            let Some(new_str) = crush_str(s) else {
+                return false;
+            };
             block["content"] = Value::String(new_str);
             true
         }
@@ -460,7 +460,9 @@ fn try_smart_crush_tool_result(block: &mut Value, crusher: &SmartCrusher) -> boo
                     if b.get("type").and_then(Value::as_str) != Some("text") {
                         continue;
                     }
-                    let Some(text) = b.get("text").and_then(Value::as_str) else { continue };
+                    let Some(text) = b.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
                     if let Some(new_str) = crush_str(text) {
                         b["text"] = Value::String(new_str);
                         changed = true;
@@ -508,9 +510,7 @@ fn inject_rewind_marker(msg: &mut Value, marker: &str, _msg_index: usize) {
 /// Inject the `rewind_retrieve` tool into `request["tools"]`, creating the
 /// array if absent.  Idempotent: no-op if already present.
 fn inject_rewind_tool(request: &mut Value) {
-    let tools = request
-        .get_mut("tools")
-        .and_then(Value::as_array_mut);
+    let tools = request.get_mut("tools").and_then(Value::as_array_mut);
 
     match tools {
         Some(arr) => {
@@ -617,7 +617,10 @@ mod tests {
         });
 
         let (compressed, stats) = engine.compress_request(request.clone()).await;
-        assert!(stats.compressed, "expected compression to trigger above the floor");
+        assert!(
+            stats.compressed,
+            "expected compression to trigger above the floor"
+        );
         assert!(stats.bytes_after < stats.bytes_before);
 
         // Tool pairing must survive: same tool_use_id, still present.
@@ -626,16 +629,12 @@ mod tests {
 
         // A Rewind marker must be discoverable even though the message had
         // no pre-existing text block (pure tool_result compression).
-        let has_marker = user_content
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|b| {
-                b.get("type").and_then(Value::as_str) == Some("text")
-                    && b.get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|t| REWIND_MARKER_RE.is_match(t))
-            });
+        let has_marker = user_content.as_array().unwrap().iter().any(|b| {
+            b.get("type").and_then(Value::as_str) == Some("text")
+                && b.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| REWIND_MARKER_RE.is_match(t))
+        });
         assert!(has_marker, "expected a Rewind marker block to be injected");
 
         // Rewind tool must be injected so the marker is actionable.

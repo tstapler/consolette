@@ -107,10 +107,7 @@ pub fn find_corrections(entries: &[TranscriptEntry]) -> Vec<CorrectionPattern> {
         }
 
         if TIER1.is_match(&entry.content) {
-            let rule = format!(
-                "- ALWAYS/NEVER: {}",
-                extract_instruction(&entry.content)
-            );
+            let rule = format!("- ALWAYS/NEVER: {}", extract_instruction(&entry.content));
             results.push(CorrectionPattern {
                 tier: 1,
                 context: entry.content.clone(),
@@ -121,9 +118,7 @@ pub fn find_corrections(entries: &[TranscriptEntry]) -> Vec<CorrectionPattern> {
             results.push(CorrectionPattern {
                 tier: 2,
                 context: entry.content.clone(),
-                suggested_rule: format!(
-                    "- Note: User indicated dissatisfaction with: {truncated}"
-                ),
+                suggested_rule: format!("- Note: User indicated dissatisfaction with: {truncated}"),
             });
         }
     }
@@ -248,9 +243,7 @@ fn find_error_recovery_loops(entries: &[TranscriptEntry]) -> Vec<CorrectionPatte
             patterns.push(CorrectionPattern {
                 tier: 3,
                 context: entry.content.clone(),
-                suggested_rule: format!(
-                    "- Pattern: Error recovery loop detected — {truncated}"
-                ),
+                suggested_rule: format!("- Pattern: Error recovery loop detected — {truncated}"),
             });
             flagged_uuids.insert(entry.uuid.as_str());
 
@@ -261,11 +254,13 @@ fn find_error_recovery_loops(entries: &[TranscriptEntry]) -> Vec<CorrectionPatte
             // Simpler structural check: look forward for assistant → same user
             // correction pattern within 4 entries (handles sequential files
             // where parentUuid chains may not be fully resolved).
-            let next_assistant = entries[i + 1..].iter().take(3).find(|e| e.role == "assistant");
+            let next_assistant = entries[i + 1..]
+                .iter()
+                .take(3)
+                .find(|e| e.role == "assistant");
             let next_user = next_assistant.and_then(|_| {
                 entries[i + 2..].iter().take(3).find(|e| {
-                    e.role == "user"
-                        && (TIER1.is_match(&e.content) || TIER2.is_match(&e.content))
+                    e.role == "user" && (TIER1.is_match(&e.content) || TIER2.is_match(&e.content))
                 })
             });
 
@@ -382,7 +377,9 @@ mod tests {
     fn test_tier2_suggested_rule_format() {
         let entries = vec![make_entry("u1", None, "user", "wrong, do it differently")];
         let patterns = find_corrections(&entries);
-        assert!(patterns[0].suggested_rule.starts_with("- Note: User indicated dissatisfaction with:"));
+        assert!(patterns[0]
+            .suggested_rule
+            .starts_with("- Note: User indicated dissatisfaction with:"));
     }
 
     #[test]

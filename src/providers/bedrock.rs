@@ -66,7 +66,12 @@ fn build_beta_compat() -> HashMap<&'static str, Vec<&'static str>> {
     m.insert("computer-use-2025-01-24", vec!["claude-3-7-sonnet"]);
     m.insert(
         "token-efficient-tools-2025-02-19",
-        vec!["claude-3-7-sonnet", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4"],
+        vec![
+            "claude-3-7-sonnet",
+            "claude-sonnet-4",
+            "claude-opus-4",
+            "claude-haiku-4",
+        ],
     );
     m.insert(
         "Interleaved-thinking-2025-05-14",
@@ -99,12 +104,30 @@ fn build_model_mapping() -> HashMap<&'static str, &'static str> {
     let mut m = HashMap::new();
     m.insert("claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-6");
     m.insert("claude-opus-4-6", "us.anthropic.claude-opus-4-6-v1");
-    m.insert("claude-sonnet-4-5-20250929", "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
-    m.insert("claude-opus-4-5-20251101", "us.anthropic.claude-opus-4-5-20251101-v1:0");
-    m.insert("claude-haiku-4-5-20251001", "us.anthropic.claude-haiku-4-5-20251001-v1:0");
-    m.insert("claude-3-7-sonnet-20250219", "us.anthropic.claude-3-7-sonnet-20250219-v1:0");
-    m.insert("claude-3-5-haiku-20241022", "us.anthropic.claude-3-5-haiku-20241022-v1:0");
-    m.insert("claude-3-haiku-20240307", "us.anthropic.claude-3-haiku-20240307-v1:0");
+    m.insert(
+        "claude-sonnet-4-5-20250929",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    );
+    m.insert(
+        "claude-opus-4-5-20251101",
+        "us.anthropic.claude-opus-4-5-20251101-v1:0",
+    );
+    m.insert(
+        "claude-haiku-4-5-20251001",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    m.insert(
+        "claude-3-7-sonnet-20250219",
+        "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    );
+    m.insert(
+        "claude-3-5-haiku-20241022",
+        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    );
+    m.insert(
+        "claude-3-haiku-20240307",
+        "us.anthropic.claude-3-haiku-20240307-v1:0",
+    );
     m
 }
 
@@ -133,7 +156,9 @@ impl CredCache {
             return false;
         }
         self.refreshed_at.lock().is_ok_and(|guard| {
-            guard.as_ref().is_some_and(|t| t.elapsed() < Duration::from_secs(30))
+            guard
+                .as_ref()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
         })
     }
 
@@ -180,7 +205,11 @@ impl BedrockProvider {
     /// when its flat config didn't override them.
     pub async fn new(upstream: Arc<Upstream>) -> Self {
         let (aws_region, aws_profile, max_retries) = match &upstream.kind {
-            UpstreamKind::Bedrock { aws_region, aws_profile, max_retries } => (
+            UpstreamKind::Bedrock {
+                aws_region,
+                aws_profile,
+                max_retries,
+            } => (
                 aws_region.clone(),
                 aws_profile.clone(),
                 max_retries.unwrap_or(3),
@@ -307,7 +336,9 @@ impl BedrockProvider {
         let budget = body["thinking"]["budget_tokens"].as_u64();
         let max = body["max_tokens"].as_u64();
 
-        let (Some(budget), Some(max)) = (budget, max) else { return };
+        let (Some(budget), Some(max)) = (budget, max) else {
+            return;
+        };
 
         if budget > max {
             if max < 1024 {
@@ -403,7 +434,10 @@ impl BedrockProvider {
                 std::collections::HashSet::new()
             };
 
-            if let Some(content) = messages[i].get_mut("content").and_then(|c| c.as_array_mut()) {
+            if let Some(content) = messages[i]
+                .get_mut("content")
+                .and_then(|c| c.as_array_mut())
+            {
                 content.retain(|item| {
                     if item.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                         match item.get("tool_use_id").and_then(|id| id.as_str()) {
@@ -486,11 +520,16 @@ impl BedrockProvider {
             return Ok(());
         }
 
-        warn!("AWS SSO credentials expiring in {}s, attempting refresh", remaining_secs.max(0));
+        warn!(
+            "AWS SSO credentials expiring in {}s, attempting refresh",
+            remaining_secs.max(0)
+        );
         self.do_sso_login().await
     }
 
-    async fn read_sso_expiry(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>, anyhow::Error> {
+    async fn read_sso_expiry(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, anyhow::Error> {
         let cache_dir = home_relative(".aws/sso/cache");
         let Ok(mut dir) = tokio::fs::read_dir(&cache_dir).await else {
             return Ok(None);
@@ -503,10 +542,18 @@ impl BedrockProvider {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(contents) = tokio::fs::read_to_string(&path).await else { continue };
-            let Ok(parsed): Result<Value, _> = serde_json::from_str(&contents) else { continue };
-            let Some(s) = parsed.get("expiresAt").and_then(|v| v.as_str()) else { continue };
-            let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) else { continue };
+            let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            let Ok(parsed): Result<Value, _> = serde_json::from_str(&contents) else {
+                continue;
+            };
+            let Some(s) = parsed.get("expiresAt").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) else {
+                continue;
+            };
             let utc = dt.with_timezone(&chrono::Utc);
             if soonest.is_none_or(|prev| utc < prev) {
                 soonest = Some(utc);
@@ -570,13 +617,19 @@ impl BedrockProvider {
                 E::ValidationException(v) => ProviderError::Validation(v.to_string(), 400),
                 E::AccessDeniedException(a) => ProviderError::Auth(a.to_string()),
                 E::ModelTimeoutException(_) => ProviderError::Timeout,
-                _ => ProviderError::Upstream { status: 500, body: e.to_string() },
+                _ => ProviderError::Upstream {
+                    status: 500,
+                    body: e.to_string(),
+                },
             };
         }
         if matches!(e, SdkError::TimeoutError(_)) {
             return ProviderError::Timeout;
         }
-        ProviderError::Upstream { status: 500, body: e.to_string() }
+        ProviderError::Upstream {
+            status: 500,
+            body: e.to_string(),
+        }
     }
 
     fn classify_invoke_error(
@@ -592,13 +645,19 @@ impl BedrockProvider {
                 E::ValidationException(v) => ProviderError::Validation(v.to_string(), 400),
                 E::AccessDeniedException(a) => ProviderError::Auth(a.to_string()),
                 E::ModelTimeoutException(_) => ProviderError::Timeout,
-                _ => ProviderError::Upstream { status: 500, body: e.to_string() },
+                _ => ProviderError::Upstream {
+                    status: 500,
+                    body: e.to_string(),
+                },
             };
         }
         if matches!(e, SdkError::TimeoutError(_)) {
             return ProviderError::Timeout;
         }
-        ProviderError::Upstream { status: 500, body: e.to_string() }
+        ProviderError::Upstream {
+            status: 500,
+            body: e.to_string(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -681,7 +740,10 @@ impl BedrockProvider {
                                 "AWS SSO session expired. Run: aws sso login".to_string(),
                             )
                         } else {
-                            ProviderError::Upstream { status: 500, body: msg }
+                            ProviderError::Upstream {
+                                status: 500,
+                                body: msg,
+                            }
                         };
                         let _ = tx.send(Err(err)).await;
                         break;
@@ -738,12 +800,11 @@ impl BedrockProvider {
             match result {
                 Ok(output) => {
                     let bytes = output.body.into_inner();
-                    let parsed: Value = serde_json::from_slice(&bytes).map_err(|e| {
-                        ProviderError::Upstream {
+                    let parsed: Value =
+                        serde_json::from_slice(&bytes).map_err(|e| ProviderError::Upstream {
                             status: 500,
                             body: format!("Failed to parse Bedrock response: {e}"),
-                        }
-                    })?;
+                        })?;
                     return Ok(parsed);
                 }
                 Err(e) => {
@@ -766,8 +827,10 @@ impl BedrockProvider {
 // ---------------------------------------------------------------------------
 
 fn home_relative(relative: &str) -> std::path::PathBuf {
-    let home = std::env::var("HOME")
-        .map_or_else(|_| std::path::PathBuf::from("/root"), std::path::PathBuf::from);
+    let home = std::env::var("HOME").map_or_else(
+        |_| std::path::PathBuf::from("/root"),
+        std::path::PathBuf::from,
+    );
     home.join(relative)
 }
 
@@ -793,9 +856,7 @@ impl Provider for BedrockProvider {
             .map(str::to_string);
 
         if stream {
-            let mut rx = self
-                .stream_message(&body, beta_header.as_deref())
-                .await?;
+            let mut rx = self.stream_message(&body, beta_header.as_deref()).await?;
 
             // Convert the mpsc Receiver into a futures Stream of Bytes. The
             // new `ProviderResponse::Stream` item type is `anyhow::Error`
@@ -892,7 +953,10 @@ mod tests {
         );
         assert_eq!(
             filtered,
-            vec!["computer-use-2025-01-24".to_string(), "output-128k-2025-02-19".to_string()]
+            vec![
+                "computer-use-2025-01-24".to_string(),
+                "output-128k-2025-02-19".to_string()
+            ]
         );
     }
 
@@ -940,7 +1004,9 @@ mod tests {
         });
         BedrockProvider::clean_body(&mut body);
         assert!(body["tools"][0].get("defer_loading").is_none());
-        let inner = body["messages"][0]["content"][0]["content"].as_array().unwrap();
+        let inner = body["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
         assert_eq!(inner.len(), 1);
         assert_eq!(inner[0]["type"], "text");
     }

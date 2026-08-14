@@ -27,8 +27,9 @@ fn conf_d_fixtures_are_tomllib_portable() {
     for path in fixtures {
         let contents = fs::read_to_string(&path).unwrap();
 
-        toml::from_str::<toml::Value>(&contents)
-            .unwrap_or_else(|e| panic!("{}: rejected by the Rust `toml` crate: {e}", path.display()));
+        toml::from_str::<toml::Value>(&contents).unwrap_or_else(|e| {
+            panic!("{}: rejected by the Rust `toml` crate: {e}", path.display())
+        });
 
         let output = Command::new("python3")
             .arg("-c")

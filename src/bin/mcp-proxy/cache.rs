@@ -1,6 +1,6 @@
+use rmcp::model::Tool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use rmcp::model::Tool;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
@@ -36,7 +36,10 @@ impl SchemaCache {
 
     pub async fn set(&self, tools: Vec<Tool>) {
         let mut guard = self.inner.write().await;
-        *guard = Some(CachedEntry { tools, fetched_at: Instant::now() });
+        *guard = Some(CachedEntry {
+            tools,
+            fetched_at: Instant::now(),
+        });
     }
 
     /// Preserved from the legacy cache API; not yet called by `server.rs`'s

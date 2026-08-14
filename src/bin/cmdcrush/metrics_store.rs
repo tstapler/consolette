@@ -71,7 +71,10 @@ impl SqliteMetricsExporter {
     fn attrs_to_json(attrs: &[KeyValue]) -> String {
         let mut map = serde_json::Map::new();
         for kv in attrs {
-            map.insert(kv.key.as_str().to_string(), serde_json::Value::String(kv.value.to_string()));
+            map.insert(
+                kv.key.as_str().to_string(),
+                serde_json::Value::String(kv.value.to_string()),
+            );
         }
         serde_json::Value::Object(map).to_string()
     }
@@ -153,7 +156,9 @@ impl PushMetricExporter for SqliteMetricsExporter {
                         _ => Ok(()),
                     },
                 };
-                result.map_err(|e| OTelSdkError::InternalFailure(format!("stats db insert failed: {e}")))?;
+                result.map_err(|e| {
+                    OTelSdkError::InternalFailure(format!("stats db insert failed: {e}"))
+                })?;
             }
         }
         Ok(())

@@ -363,7 +363,11 @@ fn run_history_stats(dir: &Path, max_lines: usize, top_n: usize) {
     };
     let tokens_saved = (total_before.saturating_sub(total_after)) as f64 / 4.0;
 
-    println!("cmdcrush history-stats — scanned {} transcript(s) under {}", paths.len(), dir.display());
+    println!(
+        "cmdcrush history-stats — scanned {} transcript(s) under {}",
+        paths.len(),
+        dir.display()
+    );
     println!("tool-output blobs examined: {blob_count}");
     println!(
         "bytes: {total_before} -> {total_after} ({pct:.1}% saved, ~{tokens_saved:.0} tokens at 4 bytes/token)"
@@ -452,7 +456,9 @@ fn run_model_stats(dir: &Path, since_hours: i64, model_filter: Option<&str>, lim
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let Ok(line) = line else { continue };
-            let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if value.get("type").and_then(Value::as_str) != Some("assistant") {
                 continue;
             }
@@ -475,16 +481,27 @@ fn run_model_stats(dir: &Path, since_hours: i64, model_filter: Option<&str>, lim
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| path.to_str().unwrap_or("unknown"))
                 .to_string();
-            let cwd = value.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
+            let cwd = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let usage = value.pointer("/message/usage");
-            let get_u64 = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64).unwrap_or(0);
+            let get_u64 = |key: &str| {
+                usage
+                    .and_then(|u| u.get(key))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            };
 
-            let session = sessions.entry(session_id.clone()).or_insert_with(|| SessionUsage {
-                session_id,
-                cwd: cwd.clone(),
-                last_ts: ts,
-                per_model: HashMap::new(),
-            });
+            let session = sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| SessionUsage {
+                    session_id,
+                    cwd: cwd.clone(),
+                    last_ts: ts,
+                    per_model: HashMap::new(),
+                });
             if ts > session.last_ts {
                 session.last_ts = ts;
                 session.cwd = cwd;
@@ -503,7 +520,10 @@ fn run_model_stats(dir: &Path, since_hours: i64, model_filter: Option<&str>, lim
         .values()
         .filter(|s| s.last_ts >= cutoff)
         .filter(|s| match model_filter {
-            Some(f) => s.per_model.keys().any(|m| m.to_lowercase().contains(&f.to_lowercase())),
+            Some(f) => s
+                .per_model
+                .keys()
+                .any(|m| m.to_lowercase().contains(&f.to_lowercase())),
             None => true,
         })
         .collect();
@@ -532,7 +552,11 @@ fn run_model_stats(dir: &Path, since_hours: i64, model_filter: Option<&str>, lim
             s.cwd
         );
         for (model, usage) in models {
-            let pct = if total == 0 { 0.0 } else { 100.0 * usage.total() as f64 / total as f64 };
+            let pct = if total == 0 {
+                0.0
+            } else {
+                100.0 * usage.total() as f64 / total as f64
+            };
             println!(
                 "    {model:<24} {:>12} tokens ({pct:>5.1}%)  [{} msgs, in={} out={} cache_w={} cache_r={}]",
                 usage.total(),
@@ -580,7 +604,10 @@ fn init_metrics() -> Option<Metrics> {
     let exporter = match SqliteMetricsExporter::open(&db_path) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("cmdcrush: failed to open stats db at {}: {e}", db_path.display());
+            eprintln!(
+                "cmdcrush: failed to open stats db at {}: {e}",
+                db_path.display()
+            );
             return None;
         }
     };
@@ -658,7 +685,12 @@ fn main() {
         return;
     }
     if cli.model_stats {
-        run_model_stats(&default_history_dir(), cli.since_hours, cli.model_filter.as_deref(), cli.sessions);
+        run_model_stats(
+            &default_history_dir(),
+            cli.since_hours,
+            cli.model_filter.as_deref(),
+            cli.sessions,
+        );
         return;
     }
 
@@ -674,7 +706,10 @@ fn main() {
                 return;
             }
             Err(e) => {
-                eprintln!("cmdcrush: failed to retrieve archive {}: {e}", path.display());
+                eprintln!(
+                    "cmdcrush: failed to retrieve archive {}: {e}",
+                    path.display()
+                );
                 std::process::exit(1);
             }
         }
@@ -785,7 +820,15 @@ fn main() {
             }
         }
         let (compressed, method) = compress_text(&merged, cli.max_lines);
-        print_result(cli.stats, metrics.as_ref(), &cmd_label, "merged", merged.len(), compressed.len(), &method);
+        print_result(
+            cli.stats,
+            metrics.as_ref(),
+            &cmd_label,
+            "merged",
+            merged.len(),
+            compressed.len(),
+            &method,
+        );
         let original_for_archive = merged.into_bytes();
         let mut final_output = compressed;
 
@@ -820,8 +863,24 @@ fn main() {
             (String::new(), "n/a".to_string())
         };
 
-        print_result(cli.stats, metrics.as_ref(), &cmd_label, "stdout", stdout_text.len(), compressed_stdout.len(), &out_method);
-        print_result(cli.stats, metrics.as_ref(), &cmd_label, "stderr", stderr_text.len(), compressed_stderr.len(), &err_method);
+        print_result(
+            cli.stats,
+            metrics.as_ref(),
+            &cmd_label,
+            "stdout",
+            stdout_text.len(),
+            compressed_stdout.len(),
+            &out_method,
+        );
+        print_result(
+            cli.stats,
+            metrics.as_ref(),
+            &cmd_label,
+            "stderr",
+            stderr_text.len(),
+            compressed_stderr.len(),
+            &err_method,
+        );
 
         if !cli.no_archive && !below_floor {
             if compressed_stdout.len() < stdout_text.len() {

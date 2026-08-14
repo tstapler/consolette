@@ -139,7 +139,8 @@ impl ProxyMetrics {
                 self.requests_anthropic.fetch_add(1, Ordering::Relaxed);
                 self.anthropic_duration_sum_ms
                     .fetch_add(duration_ms, Ordering::Relaxed);
-                self.anthropic_duration_count.fetch_add(1, Ordering::Relaxed);
+                self.anthropic_duration_count
+                    .fetch_add(1, Ordering::Relaxed);
                 if first_byte_ms > 0 {
                     self.anthropic_first_byte_sum_ms
                         .fetch_add(first_byte_ms, Ordering::Relaxed);

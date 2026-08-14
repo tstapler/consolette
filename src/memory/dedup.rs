@@ -159,8 +159,7 @@ pub async fn find_duplicate(
         // We then restrict to our candidate set from the SimHash pre-filter.
         let hits = idx.near_duplicates(&text_clone, 0.95);
 
-        let candidate_set: std::collections::HashSet<&String> =
-            candidates_clone.iter().collect();
+        let candidate_set: std::collections::HashSet<&String> = candidates_clone.iter().collect();
         hits.into_iter()
             .find(|h| candidate_set.contains(&h.id))
             .map(|h| h.id)

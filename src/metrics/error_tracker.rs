@@ -33,17 +33,15 @@ static RE_UUID: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 #[allow(clippy::unwrap_used)]
-static RE_ARN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"arn:aws:[a-z0-9-]+:[a-z0-9-]*:\d+:[a-zA-Z0-9/._-]+").unwrap()
-});
+static RE_ARN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"arn:aws:[a-z0-9-]+:[a-z0-9-]*:\d+:[a-zA-Z0-9/._-]+").unwrap());
 
 #[allow(clippy::unwrap_used)]
 static RE_LONG_NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{11,}\b").unwrap());
 
 #[allow(clippy::unwrap_used)]
-static RE_REQUEST_ID: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\brequest[_\s]?id[:\s]+[a-zA-Z0-9-]+").unwrap()
-});
+static RE_REQUEST_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\brequest[_\s]?id[:\s]+[a-zA-Z0-9-]+").unwrap());
 
 // `regex` doesn't support look-around; `\b` word boundaries give the same
 // "not embedded in a larger word" behavior since `\w` covers every character
@@ -250,12 +248,7 @@ impl ErrorTracker {
     /// Returns `(fingerprint, is_new)` where `is_new` is true on the first
     /// occurrence of this error type.
     #[must_use]
-    pub fn push(
-        &self,
-        error_message: &str,
-        provider: &str,
-        model: &str,
-    ) -> (String, bool) {
+    pub fn push(&self, error_message: &str, provider: &str, model: &str) -> (String, bool) {
         let sig = extract_signature(error_message, Some(provider));
         let fp = compute_fingerprint(&sig);
         let now = Utc::now();

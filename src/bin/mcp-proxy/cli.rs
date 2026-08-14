@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -111,13 +111,14 @@ pub async fn run_sync(
         };
 
         let api_key = crate::config::McpProxyConfig::effective_api_key(server_cfg);
-        let client = match UpstreamClient::connect(server_name, server_cfg, api_key.as_deref()).await {
-            Ok(c) => c,
-            Err(e) => {
-                println!("  {server_name}: UNREACHABLE — {e}");
-                continue;
-            }
-        };
+        let client =
+            match UpstreamClient::connect(server_name, server_cfg, api_key.as_deref()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("  {server_name}: UNREACHABLE — {e}");
+                    continue;
+                }
+            };
 
         let upstream_tools = match client.list_tools().await {
             Ok(t) => t,
@@ -127,16 +128,25 @@ pub async fn run_sync(
             }
         };
 
-        let upstream_names: std::collections::HashSet<&str> = upstream_tools.iter().map(|t| t.name.as_ref()).collect();
-        let missing: Vec<&str> = server_cfg.allow.iter()
+        let upstream_names: std::collections::HashSet<&str> =
+            upstream_tools.iter().map(|t| t.name.as_ref()).collect();
+        let missing: Vec<&str> = server_cfg
+            .allow
+            .iter()
             .filter(|t| !upstream_names.contains(t.as_str()))
             .map(String::as_str)
             .collect();
 
         if missing.is_empty() {
-            println!("  {server_name}: OK — all {} allowed tools present upstream", server_cfg.allow.len());
+            println!(
+                "  {server_name}: OK — all {} allowed tools present upstream",
+                server_cfg.allow.len()
+            );
         } else {
-            println!("  {server_name}: DRIFT — {} tools missing from upstream:", missing.len());
+            println!(
+                "  {server_name}: DRIFT — {} tools missing from upstream:",
+                missing.len()
+            );
             for t in &missing {
                 println!("    - {t}");
             }

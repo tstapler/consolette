@@ -57,8 +57,7 @@ impl SchemaCompressor {
             .map(|s| std::borrow::Cow::Owned(s.to_string()));
 
         // Extract $defs for $ref resolution, then rebuild a flat schema
-        let schema = Arc::try_unwrap(tool.input_schema)
-            .unwrap_or_else(|arc| (*arc).clone());
+        let schema = Arc::try_unwrap(tool.input_schema).unwrap_or_else(|arc| (*arc).clone());
         tool.input_schema = Arc::new(compress_schema_aggressive(schema));
         tool
     }
@@ -127,11 +126,7 @@ fn extract_defs(schema: &Map<String, Value>) -> HashMap<String, Value> {
 /// Recursively walk an object, inlining `$ref` pointers and stripping noise.
 ///
 /// `depth` guards against cyclic schemas (max 3 levels of inlining).
-fn inline_and_strip(
-    obj: &mut Map<String, Value>,
-    defs: &HashMap<String, Value>,
-    depth: usize,
-) {
+fn inline_and_strip(obj: &mut Map<String, Value>, defs: &HashMap<String, Value>, depth: usize) {
     const MAX_DEPTH: usize = 3;
 
     // Inline $ref if present (replaces the whole object's contents)
@@ -323,11 +318,7 @@ mod tests {
     #[test]
     fn off_leaves_everything_unchanged() {
         let desc = "Full description. More sentences.";
-        let tool = make_tool(
-            "noop",
-            desc,
-            json!({"type": "object", "properties": {}}),
-        );
+        let tool = make_tool("noop", desc, json!({"type": "object", "properties": {}}));
         let c = SchemaCompressor::new(CompressionLevel::Off);
         let [result] = c.compress(vec![tool]).try_into().unwrap();
         assert_eq!(result.description.as_deref(), Some(desc));
@@ -449,6 +440,9 @@ mod tests {
         let [compressed] = c.compress(vec![tool]).try_into().unwrap();
         let schema = serde_json::to_value(&*compressed.input_schema).unwrap();
         assert_eq!(schema["required"], json!(["type", "content"]));
-        assert_eq!(schema["properties"]["type"]["enum"], json!(["text", "image"]));
+        assert_eq!(
+            schema["properties"]["type"]["enum"],
+            json!(["text", "image"])
+        );
     }
 }

@@ -45,7 +45,10 @@ impl MemoryStore {
             .max_capacity(max_entries as u64)
             .time_to_live(Duration::from_hours(24))
             .build();
-        Self { entries, max_entries }
+        Self {
+            entries,
+            max_entries,
+        }
     }
 
     /// Insert (or overwrite) a key. The caller is responsible for compressing the value.

@@ -9,7 +9,8 @@ const CONTEXT_COLLAPSE_THRESHOLD: usize = 8;
 /// Heuristic: does `text` look like unified-diff output?
 #[must_use]
 pub fn is_diff(text: &str) -> bool {
-    text.lines().any(|l| l.starts_with("diff --git ") || l.starts_with("@@ "))
+    text.lines()
+        .any(|l| l.starts_with("diff --git ") || l.starts_with("@@ "))
         && (text.contains("\n--- ") || text.starts_with("--- ") || text.contains("\n+++ "))
 }
 

@@ -133,7 +133,11 @@ pub fn write_staging_file(staging_path: &Path, patterns: &[CorrectionPattern]) -
     let date = Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
 
     let mut file = std::fs::File::create(staging_path).map_err(|e| {
-        anyhow::anyhow!("cannot create staging file {}: {}", staging_path.display(), e)
+        anyhow::anyhow!(
+            "cannot create staging file {}: {}",
+            staging_path.display(),
+            e
+        )
     })?;
 
     writeln!(file, "# consolette learn — Staging (generated {date})")?;
@@ -205,7 +209,11 @@ mod tests {
         let f = NamedTempFile::new().unwrap();
         let patterns = vec![
             make_pattern(1, "don't use cat", "- ALWAYS/NEVER: don't use cat"),
-            make_pattern(2, "wrong!", "- Note: User indicated dissatisfaction with: wrong!"),
+            make_pattern(
+                2,
+                "wrong!",
+                "- Note: User indicated dissatisfaction with: wrong!",
+            ),
             make_pattern(
                 3,
                 "error again",

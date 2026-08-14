@@ -6,7 +6,7 @@ fallback+weighted routing behind one trait, per-upstream rate limiting, an inter
 Model Gateway upstream, and an idempotent ndotfiles/ansible install.
 
 **Date:** 2026-07-17
-**Status:** Phase 3 (Planning) — revised after adversarial + architecture review (rev 2); ready for re-review
+**Status:** Phase 5 (Implementation) — commit `c84491e` landed Epics 1/3/4 and the Epic 2 auth-header layer (config schema, `AuthMethodExt::apply`, `RoutingStrategy`/`HealthRegistry`/`Router::dispatch`, `governor`-based `AdmissionControl`), all unit-tested. Not yet built: Epic 2 Stories 2.2/2.3 (concrete `Provider` impls — `providers/mod.rs` only has the trait/error contract so far), the axum HTTP server / `AppState` referenced by Task 6.1.4, and the Story 6.2 feature-module port below. Epic 5 (Model Gateway upstream) is blocked on the concrete-provider work. Epics 6 (Story 6.1/6.3 rename+plist) and 7 (ndotfiles/ansible) are reported done in a prior pass and are out of scope for the current work item.
 **Source spec:** `project_plans/consolette/requirements.md` (CD-1..CD-5 fixed)
 **Research:** `project_plans/consolette/research/{model-gateway-auth,config-layering,weighted-router,rate-limiting}.md`
 
@@ -542,13 +542,23 @@ off `com.claude-proxy-rs` without dropping daily usage, preserve all features.
   - **Task 6.1.2** Update crate-level doc comment, `handle_root` `"service"` string, and `"claude-proxy-rs starting"` log to `consolette`. Files: `src/main.rs`.
   - **Task 6.1.3** Rename log paths `/tmp/claude-proxy-rs.*` → `/tmp/consolette.*` in `init_logging`; keep the mcp metrics cache path or migrate `~/.cache/claude-proxy` → `~/.cache/consolette` (note both in migration doc). Files: `src/main.rs`.
 
-### Story 6.2 — Config dir, log paths, Makefile targets
-- **As** Tyler **I want** paths/targets renamed **so that** ops commands match the new name (FR-6.3).
-- **Acceptance:** default config dir `~/.config/consolette/conf.d`; `make {build,start,stop,restart,migrate,logs}` reference `consolette`/`com.consolette`; feature set (compression/cache-aligner/verbosity/memory/metrics/dashboard/mcp-gateway) unchanged (FR-6.4).
-- **Files:** `Makefile`, `src/config/load.rs`
+### Story 6.2 — Feature-module port onto the new config/auth/routing/ratelimit abstractions
+- **As** Tyler **I want** the legacy feature modules ported into consolette's `src/` tree, wired through the new `Upstream`/`AuthMethod`/`Provider`/`Router`/`AdmissionControl` abstractions **so that** the rename is a genuine rename + extension rather than a scaffold that dropped functionality (FR-6.4).
+- **Context (superseding the original framing):** the original acceptance text ("confirm all feature modules compile+run unchanged post-rename") assumed a git-mv-style rename of the legacy crate. What actually happened in `c84491e` is a from-scratch scaffold of the ADR-001..004/007 abstractions with none of the legacy request-handling code carried over — there is nothing to "confirm unchanged" because it was never ported. This story is the real port, plus the two prerequisite layers the legacy code had that the scaffold doesn't yet:
+  1. Concrete `Provider` impls (`AnthropicProvider`, `BedrockProvider`, new `OpenAiProvider`) satisfying `providers::Provider`, built from `Upstream`/`AuthMethod` config and calling `AuthMethodExt::apply` for headers — reconciling legacy `providers/anthropic.rs` + `providers/bedrock.rs` request/response translation against the new trait (Epic 2 Stories 2.2/2.3, previously unscheduled against this story).
+  2. An axum HTTP server (`AppState`, route handlers) that constructs `Upstream`s/providers from `Config`, builds a `Router` (ADR-003) with a `RoutingStrategy` + `HealthRegistry` + `AdmissionControl`, and dispatches inbound requests through `Router::dispatch` — legacy `main.rs`/`fallback.rs` is the behavioral reference, not a file to keep, since `fallback.rs`'s ad hoc failover is superseded by the new `Router`.
+  3. The feature modules themselves: `compression/`, `system_prompt/` (cache-aligner + verbosity), `memory/`, `metrics/`, `learn/`, `dashboard.rs`, `mcp_gateway.rs` — ported with minimal adaptation (legacy `crate::config::Config` reads become the equivalent new `schema::Config` fields, which already exist: `compress`, `compress_floor_bytes`, `cache_aligner`, `verbosity_level`, `memory_max_entries`).
+  4. The `cmdcrush` and `mcp-proxy` standalone binaries (FR-6.1), including resolving the `rmcp` version gap (current `Cargo.toml` pins `0.1` for an unimplemented stub; legacy `mcp-proxy`/`mcp_gateway.rs` need `2.1`'s `server,client,transport-io,transport-streamable-http-client-reqwest,transport-streamable-http-server` feature set).
+- **Acceptance:** `cargo build --release` produces both `consolette` and `mcp-proxy` binaries; `cargo clippy --deny warnings` clean (NFR-5); ported unit/integration tests pass; feature set (compression/cache-aligner/verbosity/memory/metrics/dashboard/mcp-gateway) present and exercised through the new `Router`/`Provider` path, not the legacy ad hoc one.
+- **Files:** `Cargo.toml`, `src/main.rs`, `src/providers/{anthropic,bedrock,openai}.rs`, `src/compression/`, `src/system_prompt/`, `src/memory/`, `src/metrics/`, `src/learn/`, `src/dashboard.rs`, `src/mcp_gateway.rs`, `src/bin/cmdcrush/`, `src/bin/mcp-proxy/`
 
-  - **Task 6.2.1** Update `Makefile` targets, binary install path, and launchctl label. Files: `Makefile`.
-  - **Task 6.2.2** Confirm all feature modules compile+run unchanged post-rename (smoke checklist). Files: `Makefile` (a `make smoke` target optional).
+  - **Task 6.2.1** Update `Makefile` targets, binary install path, and launchctl label (already done in a prior pass per Epic 6 status note above — verify, don't redo). Files: `Makefile`.
+  - **Task 6.2.2** Concrete providers: `AnthropicProvider`/`BedrockProvider`/`OpenAiProvider` implementing `providers::Provider`, constructed per-`Upstream` from `UpstreamKind` + `AuthMethod`, porting legacy request/response translation and compression/cache-aligner hooks. Files: `src/providers/anthropic.rs`, `src/providers/bedrock.rs`, `src/providers/openai.rs`, `Cargo.toml` (reqwest, aws-sdk-bedrockruntime, aws-config).
+  - **Task 6.2.3** axum HTTP server: `AppState`, route handlers (`/v1/messages` etc.), `Router`/`RoutingStrategy`/`HealthRegistry`/`AdmissionControl` construction from `Config` at startup, replacing `run()`'s current one-line summary. Files: `src/main.rs` (or split per Task 6.1.4 into `src/cli.rs`/`src/server.rs`), `Cargo.toml` (axum, tower, tower-http).
+  - **Task 6.2.4** Port `compression/`, `system_prompt/`, `memory/`, `metrics/`, `learn/` as their own modules, adapted to read the new `schema::Config` feature-toggle fields instead of the legacy `Config`. Files: `src/compression/*.rs`, `src/system_prompt/*.rs`, `src/memory/*.rs`, `src/metrics/*.rs`, `src/learn/*.rs`, `Cargo.toml` (regex, once_cell, sha2, hex, tiktoken-rs, simhash, lshdedup-core, tree-sitter + grammars, chrono, uuid).
+  - **Task 6.2.5** Port `dashboard.rs` and `mcp_gateway.rs` against the new `AppState`. Files: `src/dashboard.rs`, `src/mcp_gateway.rs`, `Cargo.toml` (rmcp bump to `2.1`).
+  - **Task 6.2.6** Port `cmdcrush` and `mcp-proxy` binaries; add matching `[[bin]]` entries. Files: `src/bin/cmdcrush/*.rs`, `src/bin/mcp-proxy/*.rs`, `Cargo.toml`.
+  - **Task 6.2.7** Port applicable tests (compression regression, handshake, e2e where not environment-dependent) and run `cargo build --release && cargo clippy --deny warnings && cargo test` as the acceptance gate.
 
 ### Story 6.3 — com.consolette plist + launchd migration
 - **As** Tyler **I want** a clean cutover **so that** daily Claude Code usage never drops (FR-6.2).

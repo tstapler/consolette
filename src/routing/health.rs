@@ -38,6 +38,7 @@ pub struct HealthRegistry {
 }
 
 impl HealthRegistry {
+    #[must_use]
     pub fn new(cooldown_secs: u64) -> Self {
         Self {
             state: DashMap::new(),
@@ -66,6 +67,7 @@ impl HealthRegistry {
 
     /// Remaining cooldown in seconds (0 if not in cooldown) — used by
     /// metrics reporting per-upstream cooldown state.
+    #[must_use]
     pub fn remaining_secs(&self, idx: usize) -> u64 {
         match self.state.get(&idx).map(|s| *s) {
             Some(ProviderState::Cooldown { until }) => {

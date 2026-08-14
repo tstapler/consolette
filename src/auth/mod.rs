@@ -36,6 +36,10 @@ pub enum AuthError {
 /// function) so tests can substitute a fake resolver instead of touching the
 /// real environment or Keychain.
 pub trait SecretResolver {
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the secret can't be resolved (missing env
+    /// var, Keychain lookup failure, etc).
     fn resolve(&self, secret: &SecretRef) -> Result<String, AuthError>;
 }
 

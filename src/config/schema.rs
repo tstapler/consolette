@@ -221,6 +221,7 @@ pub struct RateLimitConfig {
 impl RateLimitConfig {
     /// Resolves the effective `on_breach`/`max_delay_ms` for `upstream`:
     /// per-upstream override, else `defaults`.
+    #[must_use]
     pub fn resolved_breach(&self, upstream: &str) -> (OnBreach, u64) {
         let limit = self.upstreams.get(upstream);
         let on_breach = limit

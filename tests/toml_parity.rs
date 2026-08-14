@@ -8,6 +8,9 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+#[allow(clippy::unwrap_used)] // fixture directory listing / reads — a missing or unreadable
+                              // fixture is a test setup bug, and the panic message from
+                              // `unwrap_or_else` above already gives the real diagnostic
 fn conf_d_fixtures_are_tomllib_portable() {
     let fixtures_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toml_parity");
     let mut fixtures: Vec<_> = fs::read_dir(fixtures_dir)

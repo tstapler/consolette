@@ -35,6 +35,7 @@ pub struct RateLimiters {
 }
 
 impl RateLimiters {
+    #[must_use]
     pub fn new(config: &RateLimitConfig) -> Self {
         let limiters = DashMap::new();
         for (name, limit) in &config.upstreams {

@@ -32,6 +32,7 @@ pub struct Router {
 }
 
 impl Router {
+    #[must_use]
     pub fn new(
         candidates: Vec<UpstreamRef>,
         providers: Vec<Arc<dyn Provider>>,
@@ -53,6 +54,11 @@ impl Router {
     /// the caller's estimate of this request's token cost, used for the
     /// chosen upstream's TPM dimension (ADR-004); upstreams with no TPM
     /// limiter ignore it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`ProviderError`] encountered once every candidate
+    /// upstream has been tried (or none were available/admitted).
     pub async fn dispatch(
         &self,
         body: serde_json::Value,

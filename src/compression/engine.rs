@@ -1,0 +1,676 @@
+//! Compression pipeline engine.
+//!
+//! Applies native text compression to message content, injects Rewind markers
+//! for reversibility, and guards against double-compression and tool-pair
+//! breakage (port of Python `compactor.py`).
+
+use bytes::Bytes;
+use regex::Regex;
+use serde_json::{json, Value};
+use std::sync::{Arc, LazyLock};
+use tracing::{debug, warn};
+
+use crate::compression::{compress_fenced_blocks, RewindStore, SmartCrusher, TextCompressor};
+use crate::compression::rewind::{format_rewind_marker, REWIND_MARKER_PATTERN};
+
+// ---------------------------------------------------------------------------
+// Compiled regexes
+// ---------------------------------------------------------------------------
+
+// `REWIND_MARKER_PATTERN` is a fixed string constant, so this can only fail
+// if the pattern itself is malformed — a programmer error worth panicking on.
+#[allow(clippy::expect_used)]
+static REWIND_MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(REWIND_MARKER_PATTERN).expect("REWIND_MARKER_RE regex"));
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Engine configuration, typically loaded from environment variables.
+pub struct CompressionConfig {
+    /// Minimum total byte size of the messages array before compression runs.
+    pub compress_floor_bytes: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        CompressionConfig {
+            compress_floor_bytes: 1000,
+        }
+    }
+}
+
+/// Per-request compression statistics returned alongside the (possibly)
+/// modified request.
+pub struct CompressionStats {
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+    pub compressed: bool,
+}
+
+/// The compression engine holds shared state (config + stores) and is cloned
+/// cheaply via `Arc` wrapping from the caller.
+pub struct CompressionEngine {
+    pub config: CompressionConfig,
+    pub rewind_store: Arc<RewindStore>,
+    text_compressor: TextCompressor,
+    smart_crusher: SmartCrusher,
+}
+
+// ---------------------------------------------------------------------------
+// The `rewind_retrieve` tool definition injected into `tools[]`.
+// ---------------------------------------------------------------------------
+
+fn rewind_tool_def() -> Value {
+    json!({
+        "name": "rewind_retrieve",
+        "description": "Retrieve the original uncompressed content for a compressed message. Use when you need to see the full original content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hash_id": {
+                    "type": "string",
+                    "description": "The hash ID from the compression marker"
+                }
+            },
+            "required": ["hash_id"]
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Implementation
+// ---------------------------------------------------------------------------
+
+impl CompressionEngine {
+    // Kept `async fn` for API consistency with the rest of the engine's
+    // lifecycle methods, even though construction itself never awaits.
+    #[allow(clippy::unused_async)]
+    pub async fn new(config: CompressionConfig, rewind_store: Arc<RewindStore>) -> Self {
+        CompressionEngine {
+            config,
+            rewind_store,
+            text_compressor: TextCompressor::new(),
+            smart_crusher: SmartCrusher::new(),
+        }
+    }
+
+    /// Main entry point: compress `request["messages"]` in place.
+    ///
+    /// Returns the (possibly modified) request and compression stats.
+    // The full pipeline (floor check, guard checks, per-block compression,
+    // tool-pair validation, and Rewind marker injection) is one cohesive unit
+    // of sequential logic; splitting it would scatter closely related state.
+    #[allow(clippy::too_many_lines)]
+    pub async fn compress_request(&self, mut request: Value) -> (Value, CompressionStats) {
+        // ----------------------------------------------------------------
+        // 1. Measure size of the messages array before compression.
+        // ----------------------------------------------------------------
+        let messages_json = if let Some(m) = request.get("messages") {
+            serde_json::to_string(m).unwrap_or_default()
+        } else {
+            let stats = CompressionStats {
+                bytes_before: 0,
+                bytes_after: 0,
+                compressed: false,
+            };
+            return (request, stats);
+        };
+        let bytes_before = messages_json.len();
+
+        // ----------------------------------------------------------------
+        // 2. Floor check: skip if total size is below threshold.
+        // ----------------------------------------------------------------
+        if bytes_before < self.config.compress_floor_bytes {
+            debug!(
+                bytes_before,
+                floor = self.config.compress_floor_bytes,
+                "compression skipped: below floor"
+            );
+            return (
+                request,
+                CompressionStats {
+                    bytes_before,
+                    bytes_after: bytes_before,
+                    compressed: false,
+                },
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // 3. Extract messages array (we'll work on a clone).
+        // ----------------------------------------------------------------
+        let Some(original_messages) = request
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+        else {
+            return (
+                request,
+                CompressionStats {
+                    bytes_before,
+                    bytes_after: bytes_before,
+                    compressed: false,
+                },
+            );
+        };
+
+        // ----------------------------------------------------------------
+        // 4. Double-compression guard: skip if any Rewind marker already
+        //    present in message content.
+        // ----------------------------------------------------------------
+        if has_rewind_markers(&original_messages) {
+            debug!("compression skipped: Rewind markers already present");
+            return (
+                request,
+                CompressionStats {
+                    bytes_before,
+                    bytes_after: bytes_before,
+                    compressed: false,
+                },
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // 5. Compress each eligible message.
+        //    - assistant messages: always compress text blocks
+        //    - user messages: compress text blocks that are log-like
+        //      (>20 lines OR contain ANSI escape codes)
+        //    - tool_result blocks: run SmartCrusher on JSON-array content
+        //      (statistical field elision); pass through if not JSON or
+        //      not worth restructuring
+        //    - tool_use blocks: pass through untouched
+        // ----------------------------------------------------------------
+        let mut compressed_messages = original_messages.clone();
+        let mut any_compressed = false;
+
+        for msg in &mut compressed_messages {
+            let role = msg
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) else {
+                continue; // string content — skip
+            };
+
+            for block in content.iter_mut() {
+                let block_type = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+
+                if block_type == "tool_result" {
+                    if try_smart_crush_tool_result(block, &self.smart_crusher) {
+                        any_compressed = true;
+                    }
+                    continue;
+                }
+
+                // Only compress text blocks; pass tool_use through untouched.
+                if block_type != "text" {
+                    continue;
+                }
+
+                let Some(text) = block.get("text").and_then(Value::as_str).map(str::to_string)
+                else {
+                    continue;
+                };
+
+                let should_compress = match role.as_str() {
+                    "assistant" => true,
+                    "user" => is_log_like(&text),
+                    _ => false,
+                };
+
+                if !should_compress {
+                    continue;
+                }
+
+                let code_compressed = compress_fenced_blocks(&text).unwrap_or(text.clone());
+                let compressed_text = self.text_compressor.compress(&code_compressed);
+                if compressed_text.len() < text.len() {
+                    if let Some(t) = block.get_mut("text") {
+                        *t = Value::String(compressed_text);
+                        any_compressed = true;
+                    }
+                }
+            }
+        }
+
+        if !any_compressed {
+            return (
+                request,
+                CompressionStats {
+                    bytes_before,
+                    bytes_after: bytes_before,
+                    compressed: false,
+                },
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // 6. Tool-pair guard: verify tool_use/tool_result pairing is intact.
+        //    If any orphaned pair → revert and return original messages.
+        // ----------------------------------------------------------------
+        let (valid, orphaned) = validate_tool_pairs(&compressed_messages);
+        if !valid {
+            warn!(
+                orphaned_count = orphaned.len(),
+                "compression broke tool_use/tool_result pairs — reverting"
+            );
+            return (
+                request,
+                CompressionStats {
+                    bytes_before,
+                    bytes_after: bytes_before,
+                    compressed: false,
+                },
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // 7. Store originals in RewindStore, inject Rewind markers and tool.
+        // ----------------------------------------------------------------
+        // For each message that was modified, store the original serialized
+        // bytes and embed a Rewind marker in the first text block.
+        for (i, (orig_msg, comp_msg)) in original_messages
+            .iter()
+            .zip(compressed_messages.iter_mut())
+            .enumerate()
+        {
+            let orig_serialized = serde_json::to_string(orig_msg).unwrap_or_default();
+            let comp_serialized = serde_json::to_string(comp_msg).unwrap_or_default();
+
+            if orig_serialized == comp_serialized {
+                // This message was not modified — skip.
+                continue;
+            }
+
+            // Store original bytes.
+            let orig_bytes = Bytes::from(orig_serialized.into_bytes());
+            let hash_id = self.rewind_store.insert(&orig_bytes).await;
+
+            // Count content blocks before/after for the marker.
+            let items_before = orig_msg
+                .get("content")
+                .and_then(Value::as_array)
+                .map_or(1, Vec::len);
+            let items_after = comp_msg
+                .get("content")
+                .and_then(Value::as_array)
+                .map_or(1, Vec::len);
+
+            let marker = format_rewind_marker(items_before, items_after, &hash_id);
+
+            // Inject marker into the first text block of the compressed message.
+            inject_rewind_marker(comp_msg, &marker, i);
+        }
+
+        // Inject rewind_retrieve tool into tools[] (idempotent).
+        inject_rewind_tool(&mut request);
+
+        // Replace messages in request.
+        if let Some(msgs) = request.get_mut("messages") {
+            *msgs = Value::Array(compressed_messages);
+        }
+
+        let bytes_after = request.get("messages").map_or(bytes_before, |m| {
+            serde_json::to_string(m).unwrap_or_default().len()
+        });
+
+        (
+            request,
+            CompressionStats {
+                bytes_before,
+                bytes_after,
+                compressed: true,
+            },
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Return `true` if any message content contains a Rewind marker.
+///
+/// Port of `_has_rewind_markers` from `compactor.py` (lines 107-132).
+fn has_rewind_markers(messages: &[Value]) -> bool {
+    for msg in messages {
+        let content = msg.get("content");
+        match content {
+            Some(Value::String(s)) => {
+                if REWIND_MARKER_RE.is_match(s) {
+                    return true;
+                }
+            }
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    let text = block
+                        .get("text")
+                        .or_else(|| block.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if REWIND_MARKER_RE.is_match(text) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Validate that every `tool_result.tool_use_id` in user messages has a
+/// corresponding `tool_use.id` in the preceding assistant message.
+///
+/// Port of `_validate_tool_pairs` from `compactor.py` (lines 167-214).
+///
+/// Returns `(is_valid, orphaned_ids)`.
+fn validate_tool_pairs(messages: &[Value]) -> (bool, Vec<String>) {
+    let mut orphaned: Vec<String> = Vec::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+
+        let Some(content) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+
+        // Collect tool_use_ids referenced by tool_result blocks in this user msg.
+        let mut tool_result_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                if let Some(uid) = block.get("tool_use_id").and_then(Value::as_str) {
+                    tool_result_ids.insert(uid.to_string());
+                }
+            }
+        }
+
+        if tool_result_ids.is_empty() {
+            continue;
+        }
+
+        // Verify the preceding message is an assistant turn with matching tool_use blocks.
+        if i == 0 {
+            orphaned.extend(tool_result_ids);
+            continue;
+        }
+
+        let prev = &messages[i - 1];
+        if prev.get("role").and_then(Value::as_str) != Some("assistant") {
+            orphaned.extend(tool_result_ids);
+            continue;
+        }
+
+        let prev_content = prev.get("content").and_then(Value::as_array);
+        let tool_use_ids: std::collections::HashSet<String> = prev_content.map_or_else(
+            std::collections::HashSet::new,
+            |blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .filter_map(|b| b.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            },
+        );
+
+        for id in tool_result_ids {
+            if !tool_use_ids.contains(&id) {
+                orphaned.push(id);
+            }
+        }
+    }
+
+    (orphaned.is_empty(), orphaned)
+}
+
+/// Attempt `SmartCrusher` field-elision compression on a `tool_result` block's
+/// `content`, which is either a raw JSON string or an array of `text` blocks
+/// (each potentially holding JSON text). Mutates `block` in place and returns
+/// `true` if anything was compressed.
+fn try_smart_crush_tool_result(block: &mut Value, crusher: &SmartCrusher) -> bool {
+    let crush_str = |s: &str| -> Option<String> {
+        let parsed: Value = serde_json::from_str(s).ok()?;
+        let crushed_value = crusher.compress(&parsed)?;
+        let new_str = serde_json::to_string(&crushed_value).ok()?;
+        (new_str.len() < s.len()).then_some(new_str)
+    };
+
+    match block.get("content") {
+        Some(Value::String(s)) => {
+            let Some(new_str) = crush_str(s) else { return false };
+            block["content"] = Value::String(new_str);
+            true
+        }
+        Some(Value::Array(_)) => {
+            let mut changed = false;
+            if let Some(blocks) = block.get_mut("content").and_then(Value::as_array_mut) {
+                for b in blocks.iter_mut() {
+                    if b.get("type").and_then(Value::as_str) != Some("text") {
+                        continue;
+                    }
+                    let Some(text) = b.get("text").and_then(Value::as_str) else { continue };
+                    if let Some(new_str) = crush_str(text) {
+                        b["text"] = Value::String(new_str);
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Return `true` if `text` looks like log output (>20 lines or contains ANSI).
+fn is_log_like(text: &str) -> bool {
+    // The pattern is a fixed string constant, so this can only fail if the
+    // pattern itself is malformed — a programmer error worth panicking on.
+    #[allow(clippy::expect_used)]
+    static ANSI_CHECK: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\x1b\[").expect("ANSI_CHECK regex"));
+
+    let line_count = text.lines().count();
+    line_count > 20 || ANSI_CHECK.is_match(text)
+}
+
+/// Inject `marker` as a suffix into the first text block of `msg`.
+fn inject_rewind_marker(msg: &mut Value, marker: &str, _msg_index: usize) {
+    if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
+        for block in content.iter_mut() {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text_val) = block.get_mut("text") {
+                    if let Some(text_str) = text_val.as_str() {
+                        let new_text = format!("{text_str}\n{marker}");
+                        *text_val = Value::String(new_text);
+                        return;
+                    }
+                }
+            }
+        }
+        // No existing text block (e.g. a tool_result-only compression) —
+        // append one so the marker stays discoverable/recoverable.
+        content.push(json!({"type": "text", "text": marker}));
+    }
+}
+
+/// Inject the `rewind_retrieve` tool into `request["tools"]`, creating the
+/// array if absent.  Idempotent: no-op if already present.
+fn inject_rewind_tool(request: &mut Value) {
+    let tools = request
+        .get_mut("tools")
+        .and_then(Value::as_array_mut);
+
+    match tools {
+        Some(arr) => {
+            let already_present = arr
+                .iter()
+                .any(|t| t.get("name").and_then(Value::as_str) == Some("rewind_retrieve"));
+            if !already_present {
+                arr.push(rewind_tool_def());
+            }
+        }
+        None => {
+            request["tools"] = Value::Array(vec![rewind_tool_def()]);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn ci_checks_json(n: usize) -> String {
+        let items: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "name": "CI",
+                    "event": "push",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": "18dd9e02c111210f107fa54f2588b27d32ce07e1",
+                    "url": format!("https://github.com/example/example/actions/runs/{}", i),
+                })
+            })
+            .collect();
+        serde_json::to_string(&Value::Array(items)).unwrap()
+    }
+
+    #[test]
+    fn smart_crush_string_content_elides_constant_fields() {
+        let mut block = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": ci_checks_json(6),
+        });
+        let crusher = SmartCrusher::new();
+        assert!(try_smart_crush_tool_result(&mut block, &crusher));
+        let new_content = block["content"].as_str().unwrap();
+        assert!(new_content.len() < ci_checks_json(6).len());
+        let parsed: Value = serde_json::from_str(new_content).unwrap();
+        assert_eq!(parsed["_elided_constant_fields"]["name"], "CI");
+    }
+
+    #[test]
+    fn smart_crush_array_content_elides_constant_fields() {
+        let mut block = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [{"type": "text", "text": ci_checks_json(6)}],
+        });
+        let crusher = SmartCrusher::new();
+        assert!(try_smart_crush_tool_result(&mut block, &crusher));
+        let text = block["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["_elided_constant_fields"]["status"], "completed");
+    }
+
+    #[test]
+    fn smart_crush_no_op_on_plain_text_content() {
+        let mut block = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "(Bash completed with no output)",
+        });
+        let crusher = SmartCrusher::new();
+        assert!(!try_smart_crush_tool_result(&mut block, &crusher));
+        assert_eq!(block["content"], "(Bash completed with no output)");
+    }
+
+    #[tokio::test]
+    async fn compress_request_crushes_large_tool_result_json() {
+        let rewind_store = Arc::new(RewindStore::new().await);
+        let engine = CompressionEngine::new(CompressionConfig::default(), rewind_store).await;
+
+        let request = json!({
+            "model": "claude-test",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "gh_checks", "input": {}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": ci_checks_json(30),
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let (compressed, stats) = engine.compress_request(request.clone()).await;
+        assert!(stats.compressed, "expected compression to trigger above the floor");
+        assert!(stats.bytes_after < stats.bytes_before);
+
+        // Tool pairing must survive: same tool_use_id, still present.
+        let user_content = &compressed["messages"][1]["content"];
+        assert_eq!(user_content[0]["tool_use_id"], "toolu_1");
+
+        // A Rewind marker must be discoverable even though the message had
+        // no pre-existing text block (pure tool_result compression).
+        let has_marker = user_content
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| {
+                b.get("type").and_then(Value::as_str) == Some("text")
+                    && b.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| REWIND_MARKER_RE.is_match(t))
+            });
+        assert!(has_marker, "expected a Rewind marker block to be injected");
+
+        // Rewind tool must be injected so the marker is actionable.
+        let tools = compressed["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "rewind_retrieve"));
+    }
+
+    #[tokio::test]
+    async fn compress_request_leaves_small_non_json_tool_result_untouched() {
+        let rewind_store = Arc::new(RewindStore::new().await);
+        let engine = CompressionEngine::new(CompressionConfig::default(), rewind_store).await;
+
+        // Pad with an assistant text block so the request clears the floor,
+        // and keep tool_use/tool_result pairing valid; the tool_result
+        // itself is plain (non-JSON) text and must pass through untouched.
+        let request = json!({
+            "model": "claude-test",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "noop", "input": {}},
+                        {"type": "text", "text": "x".repeat(1500)}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                    ]
+                }
+            ]
+        });
+
+        let (compressed, _stats) = engine.compress_request(request).await;
+        assert_eq!(compressed["messages"][1]["content"][0]["content"], "ok");
+    }
+}

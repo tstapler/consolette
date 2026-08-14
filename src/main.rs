@@ -2,11 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-mod auth;
-mod config;
-mod providers;
-mod ratelimit;
-mod routing;
+use consolette::config;
 
 /// consolette — CLI / MCP tool.
 #[derive(Parser)]

@@ -18,6 +18,11 @@ const ENV_ALLOWLIST: &[&str] = &["port", "log", "request_timeout", "cooldown_sec
 /// Load config from `<config_dir>/conf.d/*.toml`, sorted lexically, deep-merged
 /// over built-in defaults, with `CONSOLETTE_`-prefixed env vars as the
 /// highest-precedence overlay (FR-1.1, FR-1.2).
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] if a conf.d file can't be read/parsed or if
+/// reference validation (upstream/route cross-references) fails.
 pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
     let conf_d = config_dir.join("conf.d");
     let pattern = conf_d.join("*.toml");

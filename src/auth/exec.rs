@@ -54,6 +54,7 @@ pub struct ExecCredentialCache {
 }
 
 impl ExecCredentialCache {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -75,6 +76,12 @@ impl ExecCredentialCache {
     ///
     /// One parameter per piece of ADR-007 §2 request/cache context — splitting
     /// them into a struct would just move the same 7 fields somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the helper command can't be resolved or
+    /// executed, its output can't be parsed, or it doesn't return within
+    /// `timeout`.
     #[allow(clippy::too_many_arguments)]
     pub async fn get_or_run(
         &self,

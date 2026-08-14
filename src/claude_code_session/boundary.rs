@@ -7,8 +7,8 @@
 //! these markers lets [`create_plan`] make recompaction idempotent: turns
 //! already folded into a prior summary are never re-summarized.
 
-use crate::claude_code_session::transcript::{TranscriptRow, Turn};
-use serde_json::Value;
+use crate::claude_code_session::transcript::{RowFields, TranscriptRow, Turn};
+use serde_json::{json, Map, Value};
 
 /// The result of planning a compaction: which turns are already-summarized
 /// prefix, which turns should be summarized now, and which most-recent
@@ -81,6 +81,55 @@ pub fn create_plan(turns: Vec<Turn>, preserve_last_n_turns: usize) -> Compaction
         turns_to_summarize: remaining,
         preserved_turns,
     }
+}
+
+/// Build a compact-boundary row for the destination transcript.
+///
+/// Matches Claude Code's own native `compact_boundary` shape
+/// (`type: "system"`, `subtype: "compact_boundary"`, `parentUuid: null`,
+/// `logicalParentUuid` pointing at the last pre-boundary row) — see
+/// `project_plans/compaction-hook/decisions/ADR-011-compact-boundary-row-format.md`'s
+/// Empirical Verification section for the real-transcript evidence this is
+/// based on. `compactMetadata`/`level` are deliberately not reproduced —
+/// they describe Claude Code's own auto-compaction internals, which this
+/// compactor has no equivalent for.
+///
+/// A `consoletteCompact` marker is embedded alongside the native fields so
+/// [`is_boundary_or_summary_row`] recognizes this row on a later,
+/// idempotent recompaction pass, without needing to special-case `type`/
+/// `subtype`.
+#[must_use]
+pub fn build_boundary_row(
+    source_session_id: &str,
+    pruned_count: usize,
+    logical_parent_uuid: Option<&str>,
+    timestamp: &str,
+) -> TranscriptRow {
+    let mut extra = Map::new();
+    extra.insert("type".to_string(), json!("system"));
+    extra.insert("subtype".to_string(), json!("compact_boundary"));
+    extra.insert("content".to_string(), json!("Conversation compacted"));
+    extra.insert("timestamp".to_string(), json!(timestamp));
+    if let Some(parent) = logical_parent_uuid {
+        extra.insert("logicalParentUuid".to_string(), json!(parent));
+    }
+    extra.insert(
+        "consoletteCompact".to_string(),
+        json!({
+            "boundary": true,
+            "sourceSessionId": source_session_id,
+            "prunedCount": pruned_count,
+        }),
+    );
+
+    TranscriptRow::System(RowFields {
+        uuid: uuid::Uuid::new_v4().to_string(),
+        parent_uuid: None,
+        is_sidechain: false,
+        is_meta: false,
+        message: None,
+        extra,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -213,5 +262,29 @@ mod tests {
         assert_eq!(summarize_uuids, vec!["u4", "u5", "u6"]);
 
         assert!(plan.preserved_turns.is_empty());
+    }
+
+    #[test]
+    fn build_boundary_row_should_carry_native_shape_and_consolette_marker() {
+        let row = build_boundary_row(
+            "source-session",
+            3,
+            Some("last-pre-boundary-uuid"),
+            "2026-08-14T00:00:00Z",
+        );
+
+        assert!(matches!(row, TranscriptRow::System(_)));
+        assert_eq!(row.parent_uuid(), None);
+        let extra = &row.fields().extra;
+        assert_eq!(extra.get("type").and_then(Value::as_str), Some("system"));
+        assert_eq!(
+            extra.get("subtype").and_then(Value::as_str),
+            Some("compact_boundary")
+        );
+        assert_eq!(
+            extra.get("logicalParentUuid").and_then(Value::as_str),
+            Some("last-pre-boundary-uuid")
+        );
+        assert!(is_boundary_or_summary_row(&row));
     }
 }

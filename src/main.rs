@@ -1,7 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+use consolette::claude_code_session::mcp_server::CompactionMcpServer;
+use consolette::claude_code_session::omission_cache::OmissionCache;
+use consolette::claude_code_session::summarize::ClaudeCliSummarizer;
 use consolette::config;
 
 /// consolette — CLI / MCP tool.
@@ -18,6 +23,15 @@ enum Command {
     Run,
     /// Serve as an MCP server over stdio.
     Mcp,
+    /// Compact a Claude Code session transcript, writing a new resumable
+    /// session file alongside the source.
+    CompactSession {
+        /// Path to the source session's `.jsonl` transcript.
+        session: PathBuf,
+        /// Number of most-recent turns to keep verbatim, never summarized.
+        #[arg(long)]
+        preserve_last_n_turns: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -28,7 +42,11 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Run => run(),
-        Command::Mcp => mcp(),
+        Command::Mcp => mcp().await,
+        Command::CompactSession {
+            session,
+            preserve_last_n_turns,
+        } => compact_session_command(&session, preserve_last_n_turns.unwrap_or(0)).await,
     }
 }
 
@@ -50,8 +68,46 @@ fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("consolette")
 }
 
-fn mcp() -> anyhow::Result<()> {
-    // Wire up an rmcp server over stdio here — see
-    // https://github.com/modelcontextprotocol/rust-sdk for the current API.
-    anyhow::bail!("MCP server not yet implemented");
+async fn mcp() -> anyhow::Result<()> {
+    use rmcp::{transport::io::stdio, ServiceExt};
+
+    let cache = OmissionCache::open(&OmissionCache::default_cache_path())
+        .context("failed to open omission cache")?;
+    let server = CompactionMcpServer::new(Arc::new(cache));
+
+    let transport = stdio();
+    let service = server.serve(transport).await?;
+    service.waiting().await?;
+
+    Ok(())
+}
+
+/// Handler for `consolette compact-session`: parses, plans, prunes,
+/// summarizes (via the real `claude` CLI subprocess), and writes a new
+/// resumable destination transcript alongside the source.
+async fn compact_session_command(
+    session: &std::path::Path,
+    preserve_last_n_turns: usize,
+) -> anyhow::Result<()> {
+    let cache = OmissionCache::open(&OmissionCache::default_cache_path())
+        .context("failed to open omission cache")?;
+    let summarizer = ClaudeCliSummarizer::new(None);
+
+    let parent_dir = session
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let out_path = parent_dir.join(format!("{}.jsonl", uuid::Uuid::new_v4()));
+
+    let new_session_id = consolette::claude_code_session::compact_session(
+        session,
+        &out_path,
+        &cache,
+        &summarizer,
+        preserve_last_n_turns,
+    )
+    .await
+    .with_context(|| format!("failed to compact session {}", session.display()))?;
+
+    println!("Resume with: claude --resume {new_session_id}");
+    Ok(())
 }

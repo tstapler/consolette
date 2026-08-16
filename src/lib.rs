@@ -18,4 +18,5 @@ pub mod metrics;
 pub mod providers;
 pub mod ratelimit;
 pub mod routing;
+pub mod session_compaction;
 pub mod system_prompt;

@@ -1,0 +1,416 @@
+//! `consolette serve-cost` — Epic 2.3 (ADR-012, Amendment).
+//!
+//! The single live process that constructs `SessionCompactionPipeline` with
+//! `CostTrackingHook` registered, owns the one `Arc<CostTracker>`, and hosts
+//! the one HTTP route (`GET /v1/cost/{session_key}`) reading from it. Per
+//! the plan's repair iteration 1: the CLI (`cost-report`, Epic 3.1) is a
+//! `reqwest` client of this route rather than an independent constructor of
+//! equivalent state, so "the CLI and HTTP surfaces agree" is a structural
+//! property of there being exactly one process/tracker, not two
+//! independent implementations sharing a type definition.
+//!
+//! Out of scope for this epic (see plan.md's explicit scope boundary): no
+//! `providers`/`routing` wiring drives `pipeline.apply()` from a live
+//! request here. This process proves the pipeline+tracker+route can be
+//! constructed sharing one `Arc<CostTracker>`; a later epic is responsible
+//! for feeding it real compaction traffic.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
+use tokio::net::TcpListener;
+
+use crate::cost_metrics::estimator::TiktokenEstimator;
+use crate::cost_metrics::hook::CostTrackingHook;
+use crate::cost_metrics::pricing::PricingTable;
+use crate::cost_metrics::report::CostReportError;
+use crate::cost_metrics::tracker::CostTracker;
+use crate::session_compaction::{SessionCompactionPipeline, SessionKey, TierThresholds};
+
+/// Default loopback bind port (Story 2.3.1's resolved bind-address
+/// blocker): operator-only/internal, so loopback-only with no public bind
+/// option in this epic.
+pub const DEFAULT_PORT: u16 = 8787;
+
+/// Model tag `CostTrackingHook`'s `TiktokenEstimator` estimates against.
+/// `serve-cost` doesn't front any real provider traffic yet (out of scope
+/// for this epic), so there is no real per-request model to thread through;
+/// this is a fixed placeholder used only if/when something drives
+/// `apply()` through this process's pipeline.
+const BOOTSTRAP_MODEL: &str = "claude-sonnet-5";
+
+/// The one live pipeline + tracker this process owns. The pipeline and the
+/// `/v1/cost` route below share the identical `Arc<CostTracker>` —
+/// constructing them separately (as the pre-repair-iteration-1 draft did)
+/// is exactly the bug this type exists to make structurally impossible.
+pub struct CostServerState {
+    pub tracker: Arc<CostTracker>,
+    pub pipeline: SessionCompactionPipeline,
+}
+
+impl CostServerState {
+    /// Constructs the shared tracker, a `TiktokenEstimator`-backed
+    /// `CostTrackingHook`, and the `SessionCompactionPipeline` with that
+    /// hook registered.
+    pub async fn build() -> Self {
+        let tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
+        let hook = Arc::new(CostTrackingHook::new(
+            Arc::clone(&tracker),
+            Arc::new(TiktokenEstimator::new()),
+            BOOTSTRAP_MODEL,
+        ));
+        let mut pipeline = SessionCompactionPipeline::new(TierThresholds::default()).await;
+        pipeline.register_hook(hook);
+        CostServerState { tracker, pipeline }
+    }
+}
+
+/// Builds the `/v1/cost/{session_key}` route group, `State`-sharing
+/// `tracker` with whatever else in this process holds it.
+#[must_use = "dropping the router without serving it drops the route registration"]
+pub fn cost_router(tracker: Arc<CostTracker>) -> Router {
+    Router::new()
+        .route("/v1/cost/{session_key}", get(handler_cost_report))
+        .with_state(tracker)
+}
+
+/// `GET /v1/cost/{session_key}`: `200` + the session's `CostReport` as JSON,
+/// or `404` + `{"error":"session_not_found","session_key":...}` (ux.md's
+/// error-states table) when the session was never seen or was evicted.
+async fn handler_cost_report(
+    State(tracker): State<Arc<CostTracker>>,
+    Path(session_key): Path<String>,
+) -> impl IntoResponse {
+    let key = SessionKey::new(session_key.clone());
+    match tracker.report_for_session(&key).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(CostReportError::SessionNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "session_not_found",
+                "session_key": session_key,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `consolette serve-cost` entry point (Tasks 2.3.1b/c): builds the shared
+/// state, binds `127.0.0.1:{port}`, and serves the route forever.
+///
+/// # Errors
+///
+/// Returns an error if the port can't be bound or the server fails while
+/// serving.
+pub async fn serve_cost(port: u16) -> anyhow::Result<()> {
+    let state = CostServerState::build().await;
+    let router = cost_router(Arc::clone(&state.tracker));
+
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "consolette serve-cost listening");
+    axum::serve(listener, router).await?;
+
+    // Keep `state.pipeline` alive for the server's whole lifetime even
+    // though nothing calls `apply()` on it yet in this epic — dropping it
+    // early would be a pointless footgun for whatever wires real traffic
+    // through it next.
+    drop(state);
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::cost_metrics::types::TokenCount;
+
+    async fn tracker() -> Arc<CostTracker> {
+        Arc::new(CostTracker::new(PricingTable::new()).await)
+    }
+
+    fn tc(value: u64) -> TokenCount {
+        TokenCount {
+            value,
+            source: crate::cost_metrics::types::TokenSource::Exact,
+        }
+    }
+
+    /// Task 2.3.1d: real bind, `reqwest` GET against an OS-assigned port.
+    #[tokio::test]
+    async fn serve_cost_should_respond_404_when_unknown_session_queried() {
+        let tracker = tracker().await;
+        let router = cost_router(tracker);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let url = format!("http://{addr}/v1/cost/nonexistent");
+        let response = reqwest::get(&url).await.expect("request should succeed");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = response.json().await.expect("body should be JSON");
+        assert_eq!(
+            body,
+            json!({"error": "session_not_found", "session_key": "nonexistent"})
+        );
+    }
+
+    /// Task 2.3.1e: direct regression guard for Blocker 1 — construct the
+    /// process's pipeline+tracker+route exactly as `serve_cost` does, drive
+    /// one `apply()` call through the pipeline, reconcile it, and assert
+    /// the HTTP route (via axum's `oneshot`, no real bind) returns it.
+    #[tokio::test]
+    async fn serve_cost_should_expose_apply_result_via_http_route_when_pipeline_and_route_share_same_tracker(
+    ) {
+        let state = CostServerState::build().await;
+        let router = cost_router(Arc::clone(&state.tracker));
+
+        let key = SessionKey::new("serve-cost-e2e");
+        let messages = json!([{"role": "user", "content": "hello world, this is a test message"}]);
+        let (_out, report) = state.pipeline.apply(&key, &messages, 0.95).await;
+        let request_id = report.request_id;
+
+        // Synthetic reconciliation: real usage arrives. This may race the
+        // hook's spawned counterfactual estimation (either order is valid
+        // per `record_actual_usage`'s doc comment) — the fold only
+        // completes once both sides have landed, which the poll below
+        // waits out.
+        state
+            .tracker
+            .record_actual_usage(&key, request_id, tc(5))
+            .await
+            .expect("session is known to the tracker");
+
+        // Let the hook's spawned counterfactual estimation land and fold.
+        let mut attempts = 0;
+        while state
+            .tracker
+            .report_for_session(&key)
+            .await
+            .expect("session should exist")
+            .tokens_saved
+            .is_none()
+            && attempts < 50
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+
+        let request = axum::http::Request::builder()
+            .uri("/v1/cost/serve-cost-e2e")
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        let response = router.oneshot(request).await.expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(body["session_key"], "serve-cost-e2e");
+        assert!(
+            body["tokens_saved"].is_number(),
+            "expected a reconciled, non-null tokens_saved, got {body:?}"
+        );
+    }
+
+    /// Task 2.3.1e's unit-level sibling (`handler_cost_report` happy path):
+    /// axum `oneshot`, no full bind.
+    #[tokio::test]
+    async fn handler_cost_report_should_return_200_with_report_json_when_session_reconciled() {
+        let tracker = tracker().await;
+        let key = SessionKey::new("s1");
+        let request_id = crate::cost_metrics::types::RequestId::new();
+
+        tracker
+            .record_pending(
+                &key,
+                request_id,
+                crate::session_compaction::CompactionTier::Full,
+            )
+            .await;
+        tracker
+            .record_counterfactual(&key, request_id, tc(12000), tc(4000))
+            .await
+            .expect("session is known");
+        tracker
+            .record_actual_usage(&key, request_id, tc(4000))
+            .await
+            .expect("session is known");
+
+        let router = cost_router(tracker);
+        let request = axum::http::Request::builder()
+            .uri("/v1/cost/s1")
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        let response = router.oneshot(request).await.expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(body["session_key"], "s1");
+        assert_eq!(body["tokens_saved"], 8000);
+    }
+
+    #[tokio::test]
+    async fn handler_cost_report_should_return_404_with_session_key_echoed_when_session_unknown() {
+        let tracker = tracker().await;
+        let router = cost_router(tracker);
+
+        let request = axum::http::Request::builder()
+            .uri("/v1/cost/ghost")
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        let response = router.oneshot(request).await.expect("route should respond");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(
+            body,
+            json!({"error": "session_not_found", "session_key": "ghost"})
+        );
+    }
+
+    /// ux.md AC: unknown/pending numeric fields serialize as JSON `null`,
+    /// never `0` — a session with only a `Pending` row (no reconciliation
+    /// yet) must show `tokens_saved: null`, not `Some(0)`.
+    #[tokio::test]
+    async fn handler_cost_report_should_serialize_null_not_zero_when_tokens_saved_unknown() {
+        let tracker = tracker().await;
+        let key = SessionKey::new("pending-only");
+        let request_id = crate::cost_metrics::types::RequestId::new();
+        tracker
+            .record_pending(
+                &key,
+                request_id,
+                crate::session_compaction::CompactionTier::Full,
+            )
+            .await;
+
+        let router = cost_router(tracker);
+        let request = axum::http::Request::builder()
+            .uri("/v1/cost/pending-only")
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        let response = router.oneshot(request).await.expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert!(body["tokens_saved"].is_null());
+        assert!(body["actual_tokens"].is_null());
+        assert!(body["counterfactual_source"].is_null());
+    }
+
+    /// ux.md AC10: `pricing_source` is always an explicit tagged value
+    /// (`"Static"`/`"Live"`), not inferred/omitted.
+    #[tokio::test]
+    async fn handler_cost_report_should_include_explicit_pricing_source_tag_when_response_rendered()
+    {
+        let tracker = tracker().await;
+        let key = SessionKey::new("s1");
+        let request_id = crate::cost_metrics::types::RequestId::new();
+        tracker
+            .record_pending(
+                &key,
+                request_id,
+                crate::session_compaction::CompactionTier::Full,
+            )
+            .await;
+
+        let router = cost_router(tracker);
+        let request = axum::http::Request::builder()
+            .uri("/v1/cost/s1")
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        let response = router.oneshot(request).await.expect("route should respond");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(body["pricing_source"], "Static");
+    }
+
+    /// Task 3.2.1d / repair iteration 1: with the CLI now a `reqwest` client
+    /// of this route rather than an independent `report_for_session`
+    /// caller, "the two surfaces agree" is a structural property, not
+    /// something worth proving by comparing two separately-computed values.
+    /// This guards against a *future* regression reintroducing an
+    /// independent CLI-side computation: bind the real server, call
+    /// `fetch_cost_report` (Epic 3.1) against it, and separately issue a raw
+    /// `reqwest::get`, and assert both deserialize to identical
+    /// `CostReport` values.
+    #[tokio::test]
+    async fn cost_report_client_and_raw_http_get_should_return_identical_json_when_hitting_same_server(
+    ) {
+        let tracker = tracker().await;
+        let key = SessionKey::new("s1");
+        let request_id = crate::cost_metrics::types::RequestId::new();
+
+        tracker
+            .record_pending(
+                &key,
+                request_id,
+                crate::session_compaction::CompactionTier::Full,
+            )
+            .await;
+        tracker
+            .record_counterfactual(&key, request_id, tc(12000), tc(4000))
+            .await
+            .expect("session is known");
+        tracker
+            .record_actual_usage(&key, request_id, tc(4000))
+            .await
+            .expect("session is known");
+
+        let router = cost_router(tracker);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let server = format!("http://{addr}");
+
+        let via_client = crate::cost_metrics::client::fetch_cost_report(&server, "s1")
+            .await
+            .expect("client fetch should succeed");
+
+        let via_raw_get = reqwest::get(format!("{server}/v1/cost/s1"))
+            .await
+            .expect("raw request should succeed")
+            .json::<crate::cost_metrics::report::CostReport>()
+            .await
+            .expect("raw response should deserialize as CostReport");
+
+        assert_eq!(
+            via_client, via_raw_get,
+            "fetch_cost_report must not transform the response beyond deserialization"
+        );
+    }
+}

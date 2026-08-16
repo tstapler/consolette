@@ -149,51 +149,14 @@ impl AnthropicProvider {
     /// going through the real ADR-002 resolver/cache rather than
     /// reimplementing secret resolution or exec dispatch.
     async fn apply_auth(&self, out: &mut HeaderMap, url: &str) -> Result<(), ProviderError> {
-        let method =
-            self.upstream.auth.as_ref().ok_or_else(|| {
-                ProviderError::Auth("no auth configured for upstream".to_string())
-            })?;
-
-        let result: Result<(), AuthError> = match method {
-            AuthMethod::Bearer { token } => {
-                let value = self.resolver.resolve(token)?;
-                insert_header(out, "authorization", &format!("Bearer {value}"))
-            }
-            AuthMethod::Apikey { key, header } => {
-                let value = self.resolver.resolve(key)?;
-                insert_header(out, header, &value)
-            }
-            AuthMethod::Exec {
-                command,
-                args,
-                cache_ttl_secs,
-                timeout_secs,
-            } => {
-                match self
-                    .exec_cache
-                    .get_or_run(
-                        &self.upstream.name,
-                        command,
-                        args,
-                        Duration::from_secs(*cache_ttl_secs),
-                        Duration::from_secs(*timeout_secs),
-                        "POST",
-                        url,
-                    )
-                    .await
-                {
-                    Ok(helper_headers) => {
-                        for (name, value) in &helper_headers {
-                            out.insert(name.clone(), value.clone());
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        };
-
-        result.map_err(|e| ProviderError::Auth(e.to_string()))
+        apply_auth_headers(
+            &self.upstream,
+            self.resolver.as_ref(),
+            &self.exec_cache,
+            out,
+            url,
+        )
+        .await
     }
 
     /// Build the outgoing request headers.
@@ -373,6 +336,74 @@ impl AnthropicProvider {
 
         Ok(response)
     }
+}
+
+/// Apply `upstream`'s configured [`AuthMethod`] to `out`.
+///
+/// Extracted from [`AnthropicProvider::apply_auth`] as a free function (see
+/// `project_plans/compaction-cost-metrics/implementation/plan.md` Task
+/// 1.2.2a) so `cost_metrics::estimator::AnthropicCountTokensEstimator` can
+/// reuse the exact same secret-resolution path — `x-api-key`/`Bearer`
+/// header selection driven by config, `exec` helper dispatch through the
+/// shared [`ExecCredentialCache`] — without duplicating it or requiring a
+/// full [`AnthropicProvider`] instance.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Auth`] if no `AuthMethod` is configured, the
+/// secret fails to resolve, or the resolved value isn't a valid header
+/// value.
+pub async fn apply_auth_headers(
+    upstream: &Upstream,
+    resolver: &(dyn SecretResolver + Send + Sync),
+    exec_cache: &ExecCredentialCache,
+    out: &mut HeaderMap,
+    url: &str,
+) -> Result<(), ProviderError> {
+    let method = upstream
+        .auth
+        .as_ref()
+        .ok_or_else(|| ProviderError::Auth("no auth configured for upstream".to_string()))?;
+
+    let result: Result<(), AuthError> = match method {
+        AuthMethod::Bearer { token } => {
+            let value = resolver.resolve(token)?;
+            insert_header(out, "authorization", &format!("Bearer {value}"))
+        }
+        AuthMethod::Apikey { key, header } => {
+            let value = resolver.resolve(key)?;
+            insert_header(out, header, &value)
+        }
+        AuthMethod::Exec {
+            command,
+            args,
+            cache_ttl_secs,
+            timeout_secs,
+        } => {
+            match exec_cache
+                .get_or_run(
+                    &upstream.name,
+                    command,
+                    args,
+                    Duration::from_secs(*cache_ttl_secs),
+                    Duration::from_secs(*timeout_secs),
+                    "POST",
+                    url,
+                )
+                .await
+            {
+                Ok(helper_headers) => {
+                    for (name, value) in &helper_headers {
+                        out.insert(name.clone(), value.clone());
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    result.map_err(|e| ProviderError::Auth(e.to_string()))
 }
 
 /// Insert a header, converting name/value validation failures into

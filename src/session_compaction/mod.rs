@@ -90,6 +90,7 @@ impl SessionCompactionPipeline {
         messages: &Value,
         pressure_pct: f32,
     ) -> (Value, CompactionReport) {
+        let request_id = crate::cost_metrics::types::RequestId::new();
         let tier = tier_for_pressure(pressure_pct, &self.thresholds);
         let session_lock = self.store.get_or_default(session_key).await;
 
@@ -99,6 +100,7 @@ impl SessionCompactionPipeline {
         }
 
         let mut report = CompactionReport {
+            request_id,
             tier: Some(tier),
             ..CompactionReport::default()
         };
@@ -147,9 +149,16 @@ impl SessionCompactionPipeline {
             }
         }
 
+        report.compacted_messages = out.clone();
         {
             let state = session_lock.read().await;
-            self.hooks.run_post_compact(&state, &report);
+            let ctx = hooks::PostCompactContext {
+                session_key,
+                session: &state,
+                pre_compaction_messages: messages,
+                report: &report,
+            };
+            self.hooks.run_post_compact(&ctx).await;
         }
 
         (out, report)
@@ -223,17 +232,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_should_generate_fresh_request_id_when_invoked() {
+        let pipeline = SessionCompactionPipeline::new(TierThresholds::default()).await;
+        let key = SessionKey::new("s5");
+        let messages = json!([]);
+
+        let (_out, report_a) = pipeline.apply(&key, &messages, 0.10).await;
+        let (_out, report_b) = pipeline.apply(&key, &messages, 0.10).await;
+
+        assert_ne!(
+            report_a.request_id,
+            crate::cost_metrics::types::RequestId::default()
+        );
+        assert_ne!(
+            report_b.request_id,
+            crate::cost_metrics::types::RequestId::default()
+        );
+        assert_ne!(report_a.request_id, report_b.request_id);
+    }
+
+    #[tokio::test]
     async fn hooks_fire_around_apply() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
         #[derive(Default)]
         struct CountingHook(AtomicUsize, AtomicUsize);
+        #[async_trait::async_trait]
         impl CompactHooks for CountingHook {
             fn pre_compact(&self, _session: &SessionState) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
-            fn post_compact(&self, _session: &SessionState, _report: &CompactionReport) {
+            async fn post_compact(&self, _ctx: &hooks::PostCompactContext<'_>) {
                 self.1.fetch_add(1, Ordering::SeqCst);
             }
         }

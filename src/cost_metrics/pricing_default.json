@@ -1,0 +1,18 @@
+{
+  "_source": "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json",
+  "_note": "Filtered snapshot of Anthropic + OpenAI entries, hand-vendored 2026-08-16 for consolette's Epic 1.4 (project_plans/compaction-cost-metrics/implementation/plan.md Task 1.4.1a). Rates are per-token USD (LiteLLM's own unit -- do not multiply/divide by 1e6). Model keys cover every distinct model-name string src/providers/*.rs can emit: src/providers/bedrock.rs's MODEL_MAPPING short-name keys, src/providers/anthropic.rs's normalize_model_name output ('claude-3-5-sonnet-20241022', per its own unit test), and src/providers/mod.rs's default fallback ('claude-3-haiku-20240307'), plus the plan.md AC's example models (claude-sonnet-5, claude-opus-4-5, gpt-4o). Re-sync by re-fetching the upstream JSON and re-filtering.",
+  "models": {
+    "claude-sonnet-5": { "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015 },
+    "claude-opus-4-5": { "input_cost_per_token": 0.000005, "output_cost_per_token": 0.000025 },
+    "claude-sonnet-4-6": { "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015 },
+    "claude-opus-4-6": { "input_cost_per_token": 0.000005, "output_cost_per_token": 0.000025 },
+    "claude-sonnet-4-5-20250929": { "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015 },
+    "claude-opus-4-5-20251101": { "input_cost_per_token": 0.000005, "output_cost_per_token": 0.000025 },
+    "claude-haiku-4-5-20251001": { "input_cost_per_token": 0.000001, "output_cost_per_token": 0.000005 },
+    "claude-3-7-sonnet-20250219": { "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015 },
+    "claude-3-5-haiku-20241022": { "input_cost_per_token": 0.0000008, "output_cost_per_token": 0.000004 },
+    "claude-3-haiku-20240307": { "input_cost_per_token": 0.00000025, "output_cost_per_token": 0.00000125 },
+    "claude-3-5-sonnet-20241022": { "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015 },
+    "gpt-4o": { "input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001 }
+  }
+}

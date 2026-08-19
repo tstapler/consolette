@@ -17,6 +17,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -24,13 +25,19 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use crate::cost_metrics::estimator::TiktokenEstimator;
 use crate::cost_metrics::hook::CostTrackingHook;
-use crate::cost_metrics::pricing::PricingTable;
+use crate::cost_metrics::pricing::{spawn_pricing_refresh_task, PricingTable, LITELLM_PRICING_URL};
 use crate::cost_metrics::report::CostReportError;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::session_compaction::{SessionCompactionPipeline, SessionKey, TierThresholds};
+
+/// How often the background task re-fetches `LITELLM_PRICING_URL` (Story
+/// 1.4.2). Pricing drifts on the order of days/weeks, not minutes, so this
+/// favors a low, predictable request rate over freshness.
+const PRICING_REFRESH_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Default loopback bind port (Story 2.3.1's resolved bind-address
 /// blocker): operator-only/internal, so loopback-only with no public bind
@@ -51,14 +58,29 @@ const BOOTSTRAP_MODEL: &str = "claude-sonnet-5";
 pub struct CostServerState {
     pub tracker: Arc<CostTracker>,
     pub pipeline: SessionCompactionPipeline,
+    /// Story 1.4.2's background refresh task. Held only to keep it alive for
+    /// `CostServerState`'s lifetime (`tokio::spawn` already detaches it, so
+    /// nothing ever `.await`s this) — dropped, and thus aborted, when the
+    /// server shuts down.
+    _pricing_refresh: tokio::task::JoinHandle<()>,
 }
 
 impl CostServerState {
     /// Constructs the shared tracker, a `TiktokenEstimator`-backed
-    /// `CostTrackingHook`, and the `SessionCompactionPipeline` with that
-    /// hook registered.
+    /// `CostTrackingHook`, the `SessionCompactionPipeline` with that hook
+    /// registered, and Story 1.4.2's background pricing-refresh task —
+    /// wired so a successful fetch flips `report_for_session`'s
+    /// `pricing_source` to `PricingSource::Live` without any read-path
+    /// change.
     pub async fn build() -> Self {
-        let tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
+        let (pricing_tx, pricing_rx) = watch::channel(Arc::new(PricingTable::load_default()));
+        let pricing_refresh = spawn_pricing_refresh_task(
+            pricing_tx,
+            reqwest::Client::new(),
+            LITELLM_PRICING_URL.to_string(),
+            PRICING_REFRESH_INTERVAL,
+        );
+        let tracker = Arc::new(CostTracker::new_with_pricing_receiver(pricing_rx).await);
         let hook = Arc::new(CostTrackingHook::new(
             Arc::clone(&tracker),
             Arc::new(TiktokenEstimator::new()),
@@ -66,7 +88,11 @@ impl CostServerState {
         ));
         let mut pipeline = SessionCompactionPipeline::new(TierThresholds::default()).await;
         pipeline.register_hook(hook);
-        CostServerState { tracker, pipeline }
+        CostServerState {
+            tracker,
+            pipeline,
+            _pricing_refresh: pricing_refresh,
+        }
     }
 }
 

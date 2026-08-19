@@ -527,6 +527,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tiktoken_estimator_should_count_tool_result_text_payload_not_json_structure() {
+        let messages = json!([{
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_01",
+                    "content": "search returned three matches",
+                },
+            ]
+        }]);
+        let estimator = TiktokenEstimator::new();
+
+        let (tokens, meta) = estimator.estimate("gpt-4o", &messages).await.unwrap();
+
+        assert!(!meta.truncated_content);
+        let expected = {
+            let bpe = tiktoken_rs::o200k_base_singleton();
+            let bpe = bpe.lock();
+            bpe.encode_with_special_tokens("search returned three matches")
+                .len() as u64
+        };
+        assert_eq!(tokens.value, expected);
+    }
+
+    #[tokio::test]
     async fn anthropic_count_tokens_estimator_should_return_estimated_source_when_mock_returns_200()
     {
         let mock = MockServer::start(vec![MockResponse::ok(json!({"input_tokens": 512}))]).await;

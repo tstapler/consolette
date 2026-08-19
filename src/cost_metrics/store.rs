@@ -167,7 +167,10 @@ impl SessionCostStore {
     #[cfg(test)]
     #[allow(clippy::unused_async)]
     pub async fn new_with_ttl(ttl: Duration) -> Self {
-        let cache = Cache::builder().max_capacity(1000).time_to_live(ttl).build();
+        let cache = Cache::builder()
+            .max_capacity(1000)
+            .time_to_live(ttl)
+            .build();
         SessionCostStore { cache }
     }
 

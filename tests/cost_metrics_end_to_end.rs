@@ -12,11 +12,7 @@
 //! surfaces use). Only the provider's `usage.*` response is faked, since a
 //! real Anthropic round trip is out of scope for this test.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::cast_precision_loss
-)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss)]
 
 use std::sync::Arc;
 use std::time::Duration;

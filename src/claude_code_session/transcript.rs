@@ -387,6 +387,79 @@ fn push_row_into_turns(row: TranscriptRow, turns: &mut Vec<Turn>, current_turn: 
 }
 
 // ---------------------------------------------------------------------------
+// ChainCoverage
+// ---------------------------------------------------------------------------
+
+/// How much of a transcript's genuine user/assistant message history
+/// `build_turns` actually reconstructed onto the active chain.
+///
+/// A transcript with multiple disconnected conversation roots (e.g. from
+/// repeated `--resume`/`--clear` cycles in a long-lived project directory)
+/// has real message history before the first broken `parent_uuid` link that
+/// `build_turns` never reaches — see its doc comment's "dangling parent is
+/// tolerated" step. Low coverage means callers reasoning about "the whole
+/// transcript" from `turns` alone (e.g. `compare_compaction_cost`) are
+/// actually only seeing its most recent thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainCoverage {
+    pub chain_messages: usize,
+    pub total_messages: usize,
+}
+
+impl ChainCoverage {
+    /// Fraction of `total_messages` present in `chain_messages`, in `[0,
+    /// 1]`. `1.0` when there are no messages at all (nothing was excluded).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn ratio(&self) -> f64 {
+        if self.total_messages == 0 {
+            1.0
+        } else {
+            self.chain_messages as f64 / self.total_messages as f64
+        }
+    }
+}
+
+/// Computes [`ChainCoverage`] for a `(rows, turns)` pair produced by
+/// [`parse_session_file`] and [`build_turns`] respectively.
+///
+/// Counts "genuine" user/assistant messages only — matching `build_turns`'s
+/// own turn-boundary rule, tool-result-carrier rows and non-message
+/// (system/unknown) rows are excluded from both sides of the ratio.
+#[must_use]
+pub fn chain_coverage(rows: &[TranscriptRow], turns: &[Turn]) -> ChainCoverage {
+    let is_genuine_message = |row: &TranscriptRow| {
+        matches!(row, TranscriptRow::User(_) | TranscriptRow::Assistant(_))
+            && !is_tool_result_carrier(row)
+    };
+
+    let total_messages = rows
+        .iter()
+        .filter(|row| !row.is_sidechain() && is_genuine_message(row))
+        .count();
+
+    // Each turn's `user_row` is always genuine by construction
+    // (`push_row_into_turns` only opens a turn on a genuine user row); only
+    // `assistant_rows` needs filtering, since it can also hold
+    // system/unknown rows riding along on the same chain.
+    let chain_messages: usize = turns
+        .iter()
+        .map(|turn| {
+            1 + turn
+                .assistant_rows
+                .iter()
+                .filter(|row| is_genuine_message(row))
+                .count()
+        })
+        .sum();
+
+    ChainCoverage {
+        chain_messages,
+        total_messages,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -561,5 +634,43 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user_row.uuid(), "a1");
         assert_eq!(turns[0].assistant_rows[0].uuid(), "b1");
+    }
+
+    // -- chain_coverage --
+
+    #[test]
+    fn chain_coverage_should_be_full_when_transcript_has_a_single_connected_chain() {
+        let f = write_temp_jsonl(&[
+            &user_row("u1", None, "hello"),
+            &assistant_row("a1", Some("u1"), "hi"),
+        ]);
+        let rows = parse_session_file(f.path()).unwrap();
+        let turns = build_turns(&rows).unwrap();
+
+        let coverage = chain_coverage(&rows, &turns);
+        assert_eq!(coverage.chain_messages, 2);
+        assert_eq!(coverage.total_messages, 2);
+        assert!((coverage.ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn chain_coverage_should_exclude_earlier_disconnected_conversation_root() {
+        // Two entirely separate conversations in one file (e.g. from a
+        // `--resume`/`--clear` cycle): u1/a1 shares no parent link with
+        // u2/a2, so build_turns's active-chain walk starting from the last
+        // row (a2) never reaches u1/a1.
+        let f = write_temp_jsonl(&[
+            &user_row("u1", None, "first conversation"),
+            &assistant_row("a1", Some("u1"), "first reply"),
+            &user_row("u2", None, "second conversation"),
+            &assistant_row("a2", Some("u2"), "second reply"),
+        ]);
+        let rows = parse_session_file(f.path()).unwrap();
+        let turns = build_turns(&rows).unwrap();
+
+        let coverage = chain_coverage(&rows, &turns);
+        assert_eq!(coverage.total_messages, 4);
+        assert_eq!(coverage.chain_messages, 2);
+        assert!((coverage.ratio() - 0.5).abs() < f64::EPSILON);
     }
 }

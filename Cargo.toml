@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "consolette — CLI / MCP tool"
+repository = "https://github.com/tstapler/consolette"
 
 # Rust 1.74+ lints — set once here instead of per-module boilerplate.
 [lints.clippy]

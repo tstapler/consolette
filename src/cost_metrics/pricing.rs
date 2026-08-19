@@ -18,11 +18,18 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::watch;
 
+use crate::cost_metrics::types::PricingSource;
+
 /// The vendored `LiteLLM` snapshot, filtered to models `src/providers/*.rs`
 /// actually routes to (Task 1.4.1a). Re-sync by re-fetching
 /// `model_prices_and_context_window.json` from
 /// `github.com/BerriAI/litellm` and re-filtering.
 const PRICING_DEFAULT_JSON: &str = include_str!("pricing_default.json");
+
+/// Upstream source for [`spawn_pricing_refresh_task`]'s live refresh — the
+/// same `LiteLLM` file `pricing_default.json` was vendored from.
+pub const LITELLM_PRICING_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
 /// On-disk shape of `pricing_default.json`: a documented source/note plus
 /// the actual per-model rates, so the fixture can carry its own provenance
@@ -49,12 +56,21 @@ pub struct ModelPrice {
 #[derive(Debug, Clone, Default)]
 pub struct PricingTable {
     prices: HashMap<String, ModelPrice>,
+    source: PricingSource,
 }
 
 impl PricingTable {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether this table's rates came from the static vendored snapshot or
+    /// a successful live refresh (Story 1.4.2's `report_for_session`
+    /// `pricing_source` tag).
+    #[must_use]
+    pub fn source(&self) -> PricingSource {
+        self.source
     }
 
     /// Parse the vendored `pricing_default.json` fixture. No network
@@ -71,6 +87,7 @@ impl PricingTable {
             .expect("pricing_default.json must parse as the documented PricingSnapshot shape");
         PricingTable {
             prices: snapshot.models,
+            source: PricingSource::Static,
         }
     }
 
@@ -179,7 +196,10 @@ pub async fn refresh_once(
 ) -> Result<(), PricingRefreshError> {
     match fetch_live_pricing(client, url).await {
         Ok(prices) => {
-            tx.send_replace(Arc::new(PricingTable { prices }));
+            tx.send_replace(Arc::new(PricingTable {
+                prices,
+                source: PricingSource::Live,
+            }));
             Ok(())
         }
         Err(err) => {

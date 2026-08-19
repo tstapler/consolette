@@ -22,7 +22,10 @@
 //! "was arch B5.2/adv B5") compile and pass; that stub has been replaced
 //! with the real type imported from `pricing.rs` below.
 
+use std::sync::Arc;
+
 use chrono::Utc;
+use tokio::sync::watch;
 
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::report::{CostReport, CostReportError, TierBreakdown};
@@ -30,7 +33,7 @@ use crate::cost_metrics::store::{
     tier_index, CostRecord, SessionCostState, SessionCostStore, TierTotals, ALL_TIERS,
 };
 use crate::cost_metrics::types::{
-    cost_for_tokens, CostAmountUsd, PricingSource, ReconciliationStatus, RequestId, TokenCount,
+    cost_for_tokens, CostAmountUsd, ReconciliationStatus, RequestId, TokenCount,
 };
 use crate::session_compaction::session_state::SessionKey;
 use crate::session_compaction::tiered::CompactionTier;
@@ -50,7 +53,8 @@ pub const PENDING_MAX_AGE: chrono::Duration = chrono::Duration::minutes(10);
 /// aged-out row was never `Reconciled`, so there is nothing to unfold.
 fn sweep_stale_pending(state: &mut SessionCostState, now: chrono::DateTime<Utc>) {
     for record in &mut state.records {
-        if record.status == ReconciliationStatus::Pending && now - record.recorded_at > PENDING_MAX_AGE
+        if record.status == ReconciliationStatus::Pending
+            && now - record.recorded_at > PENDING_MAX_AGE
         {
             record.status = ReconciliationStatus::Abandoned;
         }
@@ -72,13 +76,35 @@ pub enum CostTrackerError {
 }
 
 /// `CostTracker` — session-scoped cost-accounting state plus pricing.
+///
+/// `pricing` is a `watch::Receiver` rather than an owned `PricingTable` so a
+/// production `CostTracker` (via [`CostTracker::new_with_pricing_receiver`])
+/// can observe Story 1.4.2's background live-refresh swaps without any
+/// write-path call site needing to change: every read still goes through
+/// `self.pricing.borrow().clone()`, an `Arc<PricingTable>` clone.
 pub struct CostTracker {
     store: SessionCostStore,
-    pricing: PricingTable,
+    pricing: watch::Receiver<Arc<PricingTable>>,
 }
 
 impl CostTracker {
+    /// Build a tracker over a fixed, never-refreshed pricing table — the
+    /// common case for tests and for a deployment with no live-refresh
+    /// configured. Internally wraps `pricing` in a throwaway `watch`
+    /// channel; dropping the sender is harmless since nothing ever calls
+    /// `send`/`send_replace` on it.
     pub async fn new(pricing: PricingTable) -> Self {
+        let (_tx, rx) = watch::channel(Arc::new(pricing));
+        CostTracker {
+            store: SessionCostStore::new().await,
+            pricing: rx,
+        }
+    }
+
+    /// Build a tracker over an externally-owned, potentially live-refreshing
+    /// pricing receiver (Story 1.4.2) — the sender side is held by
+    /// [`crate::cost_metrics::pricing::spawn_pricing_refresh_task`].
+    pub async fn new_with_pricing_receiver(pricing: watch::Receiver<Arc<PricingTable>>) -> Self {
         CostTracker {
             store: SessionCostStore::new().await,
             pricing,
@@ -97,7 +123,8 @@ impl CostTracker {
     /// growing a TTL parameter it has no other use for.
     #[cfg(test)]
     fn new_with_store(store: SessionCostStore, pricing: PricingTable) -> Self {
-        CostTracker { store, pricing }
+        let (_tx, rx) = watch::channel(Arc::new(pricing));
+        CostTracker { store, pricing: rx }
     }
 
     /// Insert a `Pending` row synchronously — no network call, no `.await`
@@ -157,7 +184,8 @@ impl CostTracker {
             })?;
         record.counterfactual_est = Some(counterfactual_est);
         record.compacted_est = Some(compacted_est);
-        try_fold_if_ready(&mut state, request_id, &self.pricing);
+        let pricing = self.pricing.borrow().clone();
+        try_fold_if_ready(&mut state, request_id, &pricing);
         Ok(())
     }
 
@@ -192,6 +220,7 @@ impl CostTracker {
             return Err(CostTrackerError::SessionNotFound);
         };
         let mut state_guard = state.write().await;
+        let pricing = self.pricing.borrow().clone();
 
         let already_reconciled_tier = state_guard.find_mut(request_id).and_then(|record| {
             (record.status == ReconciliationStatus::Reconciled)
@@ -219,17 +248,17 @@ impl CostTracker {
             // that was actually folded in — before overwriting it with the
             // replacement, so a decreasing retry can't corrupt totals via
             // `saturating_sub` against the wrong operand.
-            unfold(&mut state_guard, tier, request_id, &self.pricing);
+            unfold(&mut state_guard, tier, request_id, &pricing);
             if let Some(record) = state_guard.find_mut(request_id) {
                 record.actual_tokens = Some(actual);
                 record.status = ReconciliationStatus::Pending;
             }
-            try_fold_if_ready(&mut state_guard, request_id, &self.pricing);
+            try_fold_if_ready(&mut state_guard, request_id, &pricing);
         } else {
             if let Some(record) = state_guard.find_mut(request_id) {
                 record.actual_tokens = Some(actual);
             }
-            try_fold_if_ready(&mut state_guard, request_id, &self.pricing);
+            try_fold_if_ready(&mut state_guard, request_id, &pricing);
         }
 
         Ok(())
@@ -341,7 +370,7 @@ impl CostTracker {
                 .then_some(total_counterfactual.saturating_sub(total_compacted)),
             estimated_cost_saved_usd: cost_counterfactual_sum.map(|c| c.0),
             actual_cost_usd: cost_actual_sum.map(|c| c.0),
-            pricing_source: PricingSource::Static,
+            pricing_source: self.pricing.borrow().source(),
             pending_count,
             abandoned_count,
             by_tier,
@@ -866,8 +895,7 @@ mod tests {
     // -- Epic 4.2: concurrency and reconciliation edge cases --
 
     #[tokio::test]
-    async fn report_for_session_should_return_session_not_found_when_cache_entry_ttl_expired(
-    ) {
+    async fn report_for_session_should_return_session_not_found_when_cache_entry_ttl_expired() {
         use std::time::Duration;
 
         let store = SessionCostStore::new_with_ttl(Duration::from_millis(50)).await;
@@ -908,7 +936,10 @@ mod tests {
             .unwrap();
 
         let report = tracker.report_for_session(&key).await;
-        assert!(report.is_ok(), "zero savings must not be reported as an error");
+        assert!(
+            report.is_ok(),
+            "zero savings must not be reported as an error"
+        );
         let report = report.unwrap();
         assert_eq!(report.tokens_saved, Some(0));
     }

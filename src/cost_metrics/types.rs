@@ -97,8 +97,9 @@ pub enum ReconciliationStatus {
 }
 
 /// Where a `PricingTable` entry's numbers came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PricingSource {
+    #[default]
     Static,
     Live,
 }

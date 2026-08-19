@@ -5,6 +5,9 @@ use anyhow::Result;
 use crate::claude_code_session::boundary::{
     extract_compaction_metrics, is_compacted, CompactionMetrics,
 };
+use crate::claude_code_session::native_compaction::{
+    extract_native_compaction_events, is_native_compacted, NativeCompactionEvent,
+};
 use crate::claude_code_session::transcript::{
     build_turns, chain_coverage, parse_session_file, ChainCoverage,
 };
@@ -32,6 +35,17 @@ pub struct CompactionComparison {
     /// fit within `preserve_last_n_turns`) still stamps a boundary marker
     /// but has no per-summary metrics to report.
     pub is_compacted: bool,
+    /// Whether Claude Code's own native auto-compaction (a `compact_boundary`
+    /// row, independent of any consolette marker) ever ran against this
+    /// transcript. Orthogonal to `is_compacted` — a transcript can carry
+    /// either, both, or neither kind of marker.
+    pub is_native_compacted: bool,
+    /// Every native compaction event found in the transcript, in row order.
+    /// Empty when `is_native_compacted` is `false`, but can also be empty
+    /// even when `is_native_compacted` is `true` (a `compact_boundary` row
+    /// with no parseable `compactMetadata` — see
+    /// [`crate::claude_code_session::native_compaction`]'s doc comment).
+    pub native_events: Vec<NativeCompactionEvent>,
     pub compaction_metrics: Vec<CompactionMetrics>,
     /// How much of the transcript's message history `no_compaction`
     /// actually accounts for. `build_turns` only reconstructs the active
@@ -81,6 +95,12 @@ pub async fn compare_compaction_cost(
         Vec::new()
     };
 
+    // Computed unconditionally: independent of consolette's own
+    // `compacted` flag, since a transcript can carry either marker without
+    // the other.
+    let native_compacted = is_native_compacted(&rows);
+    let native_events = extract_native_compaction_events(&rows);
+
     Ok(CompactionComparison {
         no_compaction: NoCompactionEstimate {
             total_tokens,
@@ -88,6 +108,8 @@ pub async fn compare_compaction_cost(
             pricing_model: pricing_model.to_string(),
         },
         is_compacted: compacted,
+        is_native_compacted: native_compacted,
+        native_events,
         compaction_metrics,
         chain_coverage: coverage,
     })
@@ -183,6 +205,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(comparison.compaction_metrics, vec![metrics]);
+    }
+
+    /// Task 1.2.2b: a transcript carrying both a native `compact_boundary`
+    /// row and a consolette `consoletteCompact` marker reports both flags as
+    /// `true` — the two are orthogonal, not mutually exclusive.
+    #[tokio::test]
+    async fn compare_compaction_cost_should_report_both_native_and_consolette_compaction() {
+        let native_boundary = r#"{"uuid":"n1","parentUuid":null,"type":"system","subtype":"compact_boundary","timestamp":"2024-01-01T00:00:00Z","message":null,"compactMetadata":{"trigger":"auto","preTokens":9000,"postTokens":1200}}"#.to_string();
+        let consolette_user_marker = r#"{"uuid":"u1","parentUuid":"n1","type":"user","timestamp":"2024-01-01T00:00:01Z","message":{"role":"user","content":"[consolette: compacted turns summary]"},"consoletteCompact":{"summary":true,"coversTurnUuids":["orig-u1"]}}"#.to_string();
+        let consolette_assistant_marker = r#"{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2024-01-01T00:00:02Z","message":{"role":"assistant","content":"summary text"},"consoletteCompact":{"summary":true,"coversTurnUuids":["orig-u1"]}}"#.to_string();
+        let file = write_fixture(&[
+            native_boundary,
+            consolette_user_marker,
+            consolette_assistant_marker,
+        ]);
+
+        let comparison = compare_compaction_cost(file.path(), "claude-sonnet-5")
+            .await
+            .unwrap();
+
+        assert!(comparison.is_compacted);
+        assert!(comparison.is_native_compacted);
+        assert_eq!(comparison.native_events.len(), 1);
+        assert_eq!(comparison.native_events[0].tokens_saved(), Some(7800));
     }
 
     #[tokio::test]

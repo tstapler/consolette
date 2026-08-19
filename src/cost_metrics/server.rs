@@ -21,18 +21,28 @@ use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+use crate::claude_code_session::session_bi::{
+    build_session_bi_snapshot, spawn_session_bi_refresh_task, SessionBiSnapshot,
+    SESSION_BI_PER_FILE_TIMEOUT, SESSION_BI_REFRESH_INTERVAL, SESSION_BI_SCAN_CONCURRENCY,
+};
 use crate::cost_metrics::estimator::TiktokenEstimator;
 use crate::cost_metrics::hook::CostTrackingHook;
 use crate::cost_metrics::pricing::{spawn_pricing_refresh_task, PricingTable, LITELLM_PRICING_URL};
 use crate::cost_metrics::report::CostReportError;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::session_compaction::{SessionCompactionPipeline, SessionKey, TierThresholds};
+
+/// Vanilla HTML/JS/CSS dashboard shell, compiled into the binary (see
+/// `pricing.rs`'s `pricing_default.json` for the precedent). No build step,
+/// no CDN dependency (ADR-015) — the file fetches `/v1/dashboard/sessions`
+/// client-side and does its own sort/filter/render.
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
 /// How often the background task re-fetches `LITELLM_PRICING_URL` (Story
 /// 1.4.2). Pricing drifts on the order of days/weeks, not minutes, so this
@@ -63,16 +73,29 @@ pub struct CostServerState {
     /// nothing ever `.await`s this) — dropped, and thus aborted, when the
     /// server shuts down.
     _pricing_refresh: tokio::task::JoinHandle<()>,
+    /// Latest session BI snapshot, read by `handler_dashboard_sessions`.
+    /// `watch::Receiver` is `Clone`, so each request handler gets its own
+    /// cheap clone rather than contending on a shared lock.
+    pub session_bi_rx: watch::Receiver<Arc<SessionBiSnapshot>>,
+    /// Mirrors `_pricing_refresh`: held only to keep the background scan
+    /// task alive for this state's lifetime.
+    _session_bi_refresh: tokio::task::JoinHandle<()>,
 }
 
 impl CostServerState {
-    /// Constructs the shared tracker, a `TiktokenEstimator`-backed
-    /// `CostTrackingHook`, the `SessionCompactionPipeline` with that hook
-    /// registered, and Story 1.4.2's background pricing-refresh task —
-    /// wired so a successful fetch flips `report_for_session`'s
-    /// `pricing_source` to `PricingSource::Live` without any read-path
-    /// change.
-    pub async fn build() -> Self {
+    /// Real constructor (Task 3.1.2a/b): builds the shared tracker, a
+    /// `TiktokenEstimator`-backed `CostTrackingHook`, the
+    /// `SessionCompactionPipeline` with that hook registered, Story 1.4.2's
+    /// background pricing-refresh task, and an eager initial session-BI
+    /// snapshot scanned from `session_glob` before spawning the periodic
+    /// refresh task — so the very first `/dashboard` request after startup
+    /// doesn't race an empty snapshot.
+    ///
+    /// Takes the glob directly (never resolves `$HOME` itself) so tests can
+    /// point it at a fixture directory instead of a real
+    /// `~/.claude/projects` tree — see [`Self::build`] for the thin
+    /// `$HOME`-resolving wrapper real callers use.
+    pub async fn build_with_session_glob(session_glob: &str) -> Self {
         let (pricing_tx, pricing_rx) = watch::channel(Arc::new(PricingTable::load_default()));
         let pricing_refresh = spawn_pricing_refresh_task(
             pricing_tx,
@@ -88,11 +111,51 @@ impl CostServerState {
         ));
         let mut pipeline = SessionCompactionPipeline::new(TierThresholds::default()).await;
         pipeline.register_hook(hook);
+
+        let initial_snapshot = build_session_bi_snapshot(
+            session_glob,
+            BOOTSTRAP_MODEL,
+            SESSION_BI_SCAN_CONCURRENCY,
+            SESSION_BI_PER_FILE_TIMEOUT,
+        )
+        .await;
+        let (session_bi_tx, session_bi_rx) = watch::channel(Arc::new(initial_snapshot));
+        let session_bi_refresh = spawn_session_bi_refresh_task(
+            session_bi_tx,
+            session_glob.to_string(),
+            BOOTSTRAP_MODEL.to_string(),
+            SESSION_BI_REFRESH_INTERVAL,
+            SESSION_BI_SCAN_CONCURRENCY,
+            SESSION_BI_PER_FILE_TIMEOUT,
+        );
+
         CostServerState {
             tracker,
             pipeline,
             _pricing_refresh: pricing_refresh,
+            session_bi_rx,
+            _session_bi_refresh: session_bi_refresh,
         }
+    }
+
+    /// Thin wrapper (Task 3.1.2b): resolves `$HOME` once into the default
+    /// `~/.claude/projects/**/*.jsonl` glob and delegates to
+    /// [`Self::build_with_session_glob`]. Keeping this signature unchanged
+    /// (`async fn build() -> Self`, no `Result`) matters: it's the
+    /// constructor the pre-existing
+    /// `serve_cost_should_expose_apply_result_via_http_route_when_pipeline_and_route_share_same_tracker`
+    /// test and real `serve_cost` both call directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `HOME` environment variable is not set — matching
+    /// `discover_sessions`'s own behavior for the same condition, just
+    /// surfaced at process-startup time instead of at first scan.
+    #[allow(clippy::expect_used)]
+    pub async fn build() -> Self {
+        let home = std::env::var("HOME").expect("HOME environment variable not set");
+        let session_glob = format!("{home}/.claude/projects/**/*.jsonl");
+        Self::build_with_session_glob(&session_glob).await
     }
 }
 
@@ -126,6 +189,28 @@ async fn handler_cost_report(
     }
 }
 
+/// Builds the `/dashboard` and `/v1/dashboard/sessions` route group,
+/// `State`-sharing the session-BI watch receiver.
+#[must_use = "dropping the router without serving it drops the route registration"]
+pub fn dashboard_router(session_bi_rx: watch::Receiver<Arc<SessionBiSnapshot>>) -> Router {
+    Router::new()
+        .route("/dashboard", get(|| async { Html(DASHBOARD_HTML) }))
+        .route("/v1/dashboard/sessions", get(handler_dashboard_sessions))
+        .with_state(session_bi_rx)
+}
+
+/// `GET /v1/dashboard/sessions`: `200` + the latest [`SessionBiSnapshot`] as
+/// JSON. Always succeeds — an empty/never-yet-scanned corpus is a valid
+/// snapshot (empty `rows`), not an error state; `dashboard.html`'s
+/// `#status-banner` distinguishes "loading"/"empty" from "fetch failed" on
+/// the client side.
+async fn handler_dashboard_sessions(
+    State(session_bi_rx): State<watch::Receiver<Arc<SessionBiSnapshot>>>,
+) -> impl IntoResponse {
+    let snapshot = session_bi_rx.borrow().clone();
+    (StatusCode::OK, Json(snapshot)).into_response()
+}
+
 /// `consolette serve-cost` entry point (Tasks 2.3.1b/c): builds the shared
 /// state, binds `127.0.0.1:{port}`, and serves the route forever.
 ///
@@ -135,7 +220,8 @@ async fn handler_cost_report(
 /// serving.
 pub async fn serve_cost(port: u16) -> anyhow::Result<()> {
     let state = CostServerState::build().await;
-    let router = cost_router(Arc::clone(&state.tracker));
+    let router = cost_router(Arc::clone(&state.tracker))
+        .merge(dashboard_router(state.session_bi_rx.clone()));
 
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let listener = TcpListener::bind(addr).await?;
@@ -438,5 +524,74 @@ mod tests {
             via_client, via_raw_get,
             "fetch_cost_report must not transform the response beyond deserialization"
         );
+    }
+
+    fn user_row(uuid: &str, text: &str) -> String {
+        format!(
+            r#"{{"uuid":"{uuid}","parentUuid":null,"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    fn assistant_row(uuid: &str, parent: &str, text: &str) -> String {
+        format!(
+            r#"{{"uuid":"{uuid}","parentUuid":"{parent}","type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{{"role":"assistant","content":"{text}"}}}}"#
+        )
+    }
+
+    /// Task 3.3.1c: end-to-end dashboard route test using
+    /// `build_with_session_glob` against a fixture directory — must never
+    /// use `build()` (which scans real `$HOME/.claude/projects`) for this or
+    /// any other filesystem-touching test.
+    #[tokio::test]
+    async fn dashboard_sessions_route_should_return_fixture_rows_via_build_with_session_glob() {
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let session_path = dir.path().join("fixture-session.jsonl");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&session_path).expect("fixture file should create");
+            writeln!(f, "{}", user_row("u1", "hello")).expect("write should succeed");
+            writeln!(f, "{}", assistant_row("a1", "u1", "hi")).expect("write should succeed");
+        }
+        let pattern = format!("{}/*.jsonl", dir.path().display());
+
+        let state = CostServerState::build_with_session_glob(&pattern).await;
+        let router = dashboard_router(state.session_bi_rx.clone());
+
+        let request = axum::http::Request::builder()
+            .uri("/v1/dashboard/sessions")
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        let response = router.oneshot(request).await.expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let snapshot: crate::claude_code_session::session_bi::SessionBiSnapshot =
+            serde_json::from_slice(&body).expect("body should deserialize as SessionBiSnapshot");
+        assert_eq!(snapshot.rows.len(), 1);
+        assert!(snapshot.parse_failures.is_empty());
+    }
+
+    /// Task 3.2.1c: `GET /dashboard` returns the compiled-in HTML shell.
+    #[tokio::test]
+    async fn dashboard_route_should_return_html_shell() {
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let pattern = format!("{}/*.jsonl", dir.path().display());
+        let state = CostServerState::build_with_session_glob(&pattern).await;
+        let router = dashboard_router(state.session_bi_rx.clone());
+
+        let request = axum::http::Request::builder()
+            .uri("/dashboard")
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        let response = router.oneshot(request).await.expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body.contains("<html") || body.contains("<!DOCTYPE") || body.contains("<!doctype"));
     }
 }

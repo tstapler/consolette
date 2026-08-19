@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>consolette session dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1a1a1a;
+    --bg: #ffffff;
+    --border: #d0d0d0;
+    --muted: #666666;
+    --banner-info-bg: #eef4ff;
+    --banner-info-fg: #1a3d7c;
+    --banner-error-bg: #fdecec;
+    --banner-error-fg: #7c1a1a;
+    --banner-empty-bg: #f5f5f5;
+    --banner-empty-fg: #444444;
+    --row-hover: #f2f6ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6e6e6;
+      --bg: #121212;
+      --border: #3a3a3a;
+      --muted: #a0a0a0;
+      --banner-info-bg: #1a2a4a;
+      --banner-info-fg: #cfe0ff;
+      --banner-error-bg: #4a1a1a;
+      --banner-error-fg: #ffd0d0;
+      --banner-empty-bg: #1e1e1e;
+      --banner-empty-fg: #cccccc;
+      --row-hover: #1c2433;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 1.5rem;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  #filter-row {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+  #filter-row label { font-size: 0.85rem; color: var(--muted); }
+  #filter-text, #filter-status {
+    font-size: 0.9rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  #status-banner {
+    padding: 0.6rem 0.9rem;
+    border-radius: 6px;
+    margin-bottom: 0.75rem;
+    font-size: 0.9rem;
+  }
+  #status-banner.hidden { display: none; }
+  #status-banner.state-loading,
+  #status-banner.state-empty-corpus,
+  #status-banner.state-empty-after-filter {
+    background: var(--banner-empty-bg);
+    color: var(--banner-empty-fg);
+  }
+  #status-banner.state-fetch-error {
+    background: var(--banner-error-bg);
+    color: var(--banner-error-fg);
+  }
+  #row-count {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.85rem;
+  }
+  th, td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    white-space: nowrap;
+  }
+  th button {
+    all: unset;
+    cursor: pointer;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  th button:focus-visible {
+    outline: 2px solid #4a90e2;
+    outline-offset: 2px;
+  }
+  th button .arrow { font-size: 0.75em; opacity: 0.7; }
+  tbody tr:hover { background: var(--row-hover); }
+  #table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+  <h1>Session compaction comparison</h1>
+
+  <div id="filter-row">
+    <label for="filter-text">Filter</label>
+    <input id="filter-text" type="text" placeholder="path or project substring" aria-label="Filter sessions by path or project substring">
+
+    <label for="filter-status">Status</label>
+    <select id="filter-status" aria-label="Filter sessions by compaction status">
+      <option value="">All</option>
+      <option value="native_only">Native only</option>
+      <option value="consolette_only">Consolette only</option>
+      <option value="both">Both</option>
+      <option value="neither">Neither</option>
+    </select>
+  </div>
+
+  <div id="status-banner" class="hidden" role="status" aria-live="polite"></div>
+  <div id="row-count"></div>
+
+  <div id="table-wrap">
+    <table>
+      <thead>
+        <tr id="header-row"></tr>
+      </thead>
+      <tbody id="table-body"></tbody>
+    </table>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // Column definitions: key must match SessionComparisonRow's JSON field
+  // names exactly (server.rs / session_bi.rs).
+  var COLUMNS = [
+    { key: "session_id", label: "Session" },
+    { key: "project", label: "Project" },
+    { key: "status", label: "Status" },
+    { key: "native_event_count", label: "Native events" },
+    { key: "native_tokens_saved", label: "Native saved" },
+    { key: "consolette_tokens_saved", label: "Consolette saved" },
+    { key: "net_advantage_tokens", label: "Net advantage" },
+    { key: "no_compaction_total_tokens", label: "No-compaction tokens" },
+    { key: "no_compaction_estimated_cost_usd", label: "No-compaction cost (USD)" },
+    { key: "chain_coverage_ratio", label: "Chain coverage" },
+    { key: "size_bytes", label: "Size (bytes)" },
+    { key: "modified_unix_secs", label: "Modified" }
+  ];
+
+  var state = {
+    rows: [],
+    parseFailureCount: 0,
+    sortKey: "modified_unix_secs",
+    sortDir: "desc", // "asc" | "desc"
+    filterText: "",
+    filterStatus: ""
+  };
+
+  var bannerEl = document.getElementById("status-banner");
+  var rowCountEl = document.getElementById("row-count");
+  var headerRowEl = document.getElementById("header-row");
+  var tableBodyEl = document.getElementById("table-body");
+  var filterTextEl = document.getElementById("filter-text");
+  var filterStatusEl = document.getElementById("filter-status");
+
+  /**
+   * Single state machine for #status-banner. Every visible/hidden banner
+   * state goes through here rather than ad hoc textContent assignments
+   * scattered through the code, so the states stay mutually exclusive and
+   * easy to audit.
+   *
+   * States: "loading", "fetch-error", "empty-corpus", "empty-after-filter",
+   * "hidden" (normal — rows are showing, nothing to say).
+   */
+  function setBannerState(bannerState, extra) {
+    bannerEl.className = "";
+    switch (bannerState) {
+      case "loading":
+        bannerEl.classList.add("state-loading");
+        bannerEl.textContent = "Loading session data...";
+        setControlsDisabled(true);
+        break;
+      case "fetch-error":
+        bannerEl.classList.add("state-fetch-error");
+        bannerEl.textContent = "Failed to load session data" + (extra ? ": " + extra : "") + ".";
+        setControlsDisabled(true);
+        break;
+      case "empty-corpus":
+        bannerEl.classList.add("state-empty-corpus");
+        bannerEl.textContent = "No session transcripts were found.";
+        setControlsDisabled(false);
+        break;
+      case "empty-after-filter":
+        bannerEl.classList.add("state-empty-after-filter");
+        bannerEl.textContent = "No sessions match the current filter.";
+        setControlsDisabled(false);
+        break;
+      case "hidden":
+        bannerEl.classList.add("hidden");
+        bannerEl.textContent = "";
+        setControlsDisabled(false);
+        break;
+      default:
+        bannerEl.classList.add("hidden");
+        bannerEl.textContent = "";
+        setControlsDisabled(false);
+    }
+  }
+
+  function setControlsDisabled(disabled) {
+    filterTextEl.disabled = disabled;
+    filterStatusEl.disabled = disabled;
+  }
+
+  function renderHeader() {
+    while (headerRowEl.firstChild) {
+      headerRowEl.removeChild(headerRowEl.firstChild);
+    }
+    COLUMNS.forEach(function (col) {
+      var th = document.createElement("th");
+      var isSorted = state.sortKey === col.key;
+      if (isSorted) {
+        th.setAttribute("aria-sort", state.sortDir === "asc" ? "ascending" : "descending");
+      } else {
+        th.setAttribute("aria-sort", "none");
+      }
+
+      var button = document.createElement("button");
+      button.type = "button";
+      var labelSpan = document.createElement("span");
+      labelSpan.textContent = col.label;
+      button.appendChild(labelSpan);
+
+      if (isSorted) {
+        var arrowSpan = document.createElement("span");
+        arrowSpan.className = "arrow";
+        arrowSpan.textContent = state.sortDir === "asc" ? "▲" : "▼";
+        button.appendChild(arrowSpan);
+      }
+
+      button.addEventListener("click", function () {
+        if (state.sortKey === col.key) {
+          state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+        } else {
+          state.sortKey = col.key;
+          state.sortDir = "asc";
+        }
+        renderHeader();
+        applyFiltersAndSort();
+      });
+
+      th.appendChild(button);
+      headerRowEl.appendChild(th);
+    });
+  }
+
+  function cellText(row, key) {
+    var value = row[key];
+    if (value === null || value === undefined) {
+      return "—"; // em dash for null/unknown
+    }
+    if (key === "chain_coverage_ratio" && typeof value === "number") {
+      return (value * 100).toFixed(1) + "%";
+    }
+    if (key === "no_compaction_estimated_cost_usd" && typeof value === "number") {
+      return "$" + value.toFixed(4);
+    }
+    if (key === "modified_unix_secs" && typeof value === "number") {
+      return new Date(value * 1000).toISOString();
+    }
+    return String(value);
+  }
+
+  function renderRows(rows) {
+    while (tableBodyEl.firstChild) {
+      tableBodyEl.removeChild(tableBodyEl.firstChild);
+    }
+    rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      COLUMNS.forEach(function (col) {
+        var td = document.createElement("td");
+        td.textContent = cellText(row, col.key); // never innerHTML: values are transcript-derived
+        tr.appendChild(td);
+      });
+      tableBodyEl.appendChild(tr);
+    });
+  }
+
+  function matchesFilters(row) {
+    if (state.filterStatus && row.status !== state.filterStatus) {
+      return false;
+    }
+    if (state.filterText) {
+      var needle = state.filterText.toLowerCase();
+      var haystack = (String(row.session_path || "") + " " + String(row.project || "")).toLowerCase();
+      if (haystack.indexOf(needle) === -1) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function compareRows(a, b) {
+    var key = state.sortKey;
+    var av = a[key];
+    var bv = b[key];
+    var dir = state.sortDir === "asc" ? 1 : -1;
+
+    // Nulls sort last regardless of direction, so an "unknown" value never
+    // masquerades as the smallest/largest real value.
+    var aNull = av === null || av === undefined;
+    var bNull = bv === null || bv === undefined;
+    if (aNull && bNull) return 0;
+    if (aNull) return 1;
+    if (bNull) return -1;
+
+    if (typeof av === "number" && typeof bv === "number") {
+      return (av - bv) * dir;
+    }
+    var as = String(av);
+    var bs = String(bv);
+    if (as < bs) return -1 * dir;
+    if (as > bs) return 1 * dir;
+    return 0;
+  }
+
+  /**
+   * Combined AND filter + sort, re-run on every filter/sort input change.
+   * Also drives the row-count readout and the empty-state banner logic.
+   */
+  function applyFiltersAndSort() {
+    var filtered = state.rows.filter(matchesFilters);
+    filtered.sort(compareRows);
+    renderRows(filtered);
+    updateRowCountReadout(filtered.length, state.rows.length);
+
+    if (state.rows.length === 0) {
+      setBannerState("empty-corpus");
+    } else if (filtered.length === 0) {
+      setBannerState("empty-after-filter");
+    } else {
+      setBannerState("hidden");
+    }
+  }
+
+  function updateRowCountReadout(shown, total) {
+    var text = "Showing " + shown + " of " + total;
+    if (state.parseFailureCount > 0) {
+      text += " (" + state.parseFailureCount + " session" +
+        (state.parseFailureCount === 1 ? "" : "s") + " failed to parse and " +
+        "are not shown)";
+    }
+    rowCountEl.textContent = text;
+  }
+
+  function loadData() {
+    setBannerState("loading");
+    fetch("/v1/dashboard/sessions")
+      .then(function (response) {
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+        return response.json();
+      })
+      .then(function (snapshot) {
+        state.rows = Array.isArray(snapshot.rows) ? snapshot.rows : [];
+        state.parseFailureCount = Array.isArray(snapshot.parse_failures)
+          ? snapshot.parse_failures.length
+          : 0;
+        renderHeader();
+        applyFiltersAndSort();
+      })
+      .catch(function (err) {
+        setBannerState("fetch-error", err && err.message ? err.message : String(err));
+        rowCountEl.textContent = "";
+      });
+  }
+
+  filterTextEl.addEventListener("input", function () {
+    state.filterText = filterTextEl.value;
+    applyFiltersAndSort();
+  });
+  filterStatusEl.addEventListener("change", function () {
+    state.filterStatus = filterStatusEl.value;
+    applyFiltersAndSort();
+  });
+
+  renderHeader();
+  loadData();
+})();
+</script>
+</body>
+</html>

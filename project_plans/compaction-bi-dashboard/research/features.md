@@ -1,0 +1,81 @@
+# Feature Landscape Research: compaction-bi-dashboard
+
+## 1. Existing single-session comparison logic to extend
+
+**`src/claude_code_session/boundary.rs`** (consolette-only today):
+- `is_compacted(rows: &[TranscriptRow]) -> bool` — any row's `extra["consoletteCompact"]` has `boundary` or `summary` truthy. Requirement explicitly forbids changing this function's semantics; native detection must be a sibling, e.g. `is_natively_compacted()` / `extract_native_compaction_events()`.
+- `CompactionMetrics { tokens_before, tokens_after, tokens_saved: i64, estimated_cost_usd: Option<f64>, real_cost_usd: Option<f64> }` (`#[derive(Serialize, Deserialize)]`, `real_cost_usd` is `#[serde(default)]` for backward compat with pre-field transcripts) — this is the shape/convention a `NativeCompactionMetrics` struct should mirror: signed `tokens_saved`, `Option<f64>` cost fields, never panics on missing data.
+- `extract_compaction_metrics()` returns `Vec<CompactionMetrics>` in row order, documenting that multiple summary groups from one run produce *duplicate* entries — callers must dedupe. A native-events extractor should document its own per-event-not-per-run semantics explicitly (native events are inherently one-per-boundary-row, no duplication concern, which is actually simpler than the consolette case).
+- `build_boundary_row()`'s doc comment already states consolette's synthetic boundary rows *deliberately* don't reproduce `compactMetadata`/`level` — confirms `compactMetadata` is exclusively a native-CC field, never something consolette itself writes, so a native parser never needs to worry about consolette rows colliding with it.
+
+**`src/claude_code_session/cost_compare.rs`**:
+- `CompactionComparison { no_compaction: NoCompactionEstimate, is_compacted: bool, compaction_metrics: Vec<CompactionMetrics>, chain_coverage: ChainCoverage }` and `compare_compaction_cost(session_path, pricing_model) -> Result<CompactionComparison>` is the exact single-session function the requirements' "extending cost_compare.rs" scope item targets. Natural extension point: add `native_compaction: NativeCompactionComparison` (or similar) as a sibling field, not a replacement — matches the "additive, not a behavior change" constraint. The existing struct already threads `chain_coverage: ChainCoverage` through for exactly the multi-root-transcript caveat the requirements flag.
+- `NoCompactionEstimate { total_tokens, estimated_cost_usd: Option<f64>, pricing_model: String }` — the reusable pattern for reporting a cost figure with the pricing model it was computed against, useful for a native-compaction cost struct too (native tokens priced via the *current* pricing model, which won't match whatever model was live when the CLI actually ran auto-compaction — worth labeling, see estimator note below).
+- Pricing/estimation reuse path is already established: `TiktokenEstimator::new()` + `PricingTable::load_default().price_for(pricing_model)` — `price.input_usd_per_token` for input-side costs. A native-event cost estimate should follow the identical two-call pattern rather than inventing a new pricing lookup.
+
+**`src/claude_code_session/discovery.rs`**:
+- `discover_sessions(sort_by: SortBy) -> Result<Vec<SessionFile>>` globs `~/.claude/projects/**/*.jsonl` (via `discover_sessions_glob` for test/fixture injection) and returns `SessionFile { path, modified, size_bytes }` — no parsing, just filesystem stat+sort. This is already the "whole tree, not just consolette-touched files" superset the requirements ask for (Rabbit Holes: "must not implicitly filter to consolette-known sessions"). The aggregation module should call `discover_sessions`/`discover_sessions_glob` directly rather than re-globbing.
+- `SortBy` enum (`RecentFirst`/`OldestFirst`/`LargestFirst`/`SmallestFirst`) is a CLI-flag-driven sort — the dashboard's client-side sortable-columns feature is a different, richer sort (any column, not just these four), so this enum is not directly reusable for the *dashboard's* sort UX, only for whatever initial default ordering the JSON endpoint picks before the client re-sorts.
+
+**`src/claude_code_session/transcript.rs`**:
+- `ChainCoverage { chain_messages: usize, total_messages: usize }` + `.ratio() -> f64` (returns `1.0` when `total_messages == 0`, i.e. no messages is treated as "fully covered," not as an error state) and `chain_coverage(rows, turns) -> ChainCoverage`. `compare_compaction_cost` already calls this per-session; the aggregation module should carry `chain_coverage`/`ratio()` per row into the table so partial-chain sessions are visually flagged (per Rabbit Holes: "must surface coverage rather than silently presenting partial-chain numbers as if complete").
+
+## 2. Real native `compactMetadata` shape (confirmed against the operator's own `~/.claude/projects/` tree)
+
+Sampled 1,237 real `compactMetadata` events across a subset of session files (`~/.claude/projects/**/*.jsonl`, Claude Code CLI `2.1.232` observed in the `version` field). One representative event:
+
+```json
+{
+  "type": "system", "subtype": "compact_boundary",
+  "parentUuid": null, "logicalParentUuid": "<uuid>",
+  "level": "info",
+  "compactMetadata": {
+    "trigger": "auto",
+    "preTokens": 109760,
+    "postTokens": 19686,
+    "durationMs": 132057,
+    "cumulativeDroppedTokens": 90074,
+    "preCompactDiscoveredTools": ["Monitor"],
+    "preservedSegment": {"headUuid": "...", "anchorUuid": "...", "tailUuid": "..."},
+    "preservedMessages": {"anchorUuid": "...", "uuids": [...], "allUuids": [...]}
+  }
+}
+```
+
+Findings from the sample:
+- `trigger` was `"auto"` in every sampled event (no `"manual"`/`/compact`-triggered events observed in this sample — the parser must not assume `"auto"` is the only value; treat `trigger` as an open string or a `#[serde(other)]`-style enum, never an exhaustive match that fails on an unrecognized value).
+- `preTokens`, `postTokens`, `durationMs`, `cumulativeDroppedTokens`, `preservedSegment`, `preservedMessages` were present on **100%** of sampled events — safe as non-optional-but-still-`#[serde(default)]`-guarded fields (belt-and-suspenders against the Rabbit Holes' version-drift concern, since "always present in this sample" is not a stability guarantee across future CLI versions).
+- `preCompactDiscoveredTools` was **missing on 728 of 1,237 events (59%)** — must be `Option<Vec<String>>` with `#[serde(default)]`, confirmed genuinely optional in the wild, not just theoretically.
+- No malformed/partial `compactMetadata` was observed in this sample, but the requirements' "skip-and-log, never panic" mandate should still hold for any future-version field addition/removal — recommend `#[serde(default)]` on every field of a `NativeCompactMetadata` struct plus a top-level `Option<NativeCompactMetadata>` per row (deserialize failure on the object itself → log + treat as "native compaction detected but metadata unparseable," not a hard error for the whole session).
+
+## 3. Edge cases the native parser / aggregator must handle
+
+- **Four compaction states per session**: native-only, consolette-only, both, neither — `CompactionComparison`'s existing `is_compacted: bool` + a new `is_natively_compacted: bool` sibling field naturally produce all four combinations without new enum machinery; the dashboard's filter (native only / consolette only / both / neither, per requirements) is a client-side derived filter over those two booleans, not a new server-side status enum.
+- **Multiple native compaction events per session**: same duplication concern `extract_compaction_metrics`'s doc comment already flags for consolette, but simpler for native — each `compact_boundary` row is a genuinely distinct event (one per auto-compaction trigger), so a `Vec<NativeCompactionEvent>` with no dedup logic needed is correct; sum `tokens_saved`/cost across the vec for a per-session total.
+- **Multi-root/disconnected chains** (`ChainCoverage`): a native `compact_boundary` row could in principle sit on a *different* root than the one `build_turns` reconstructs as "the active chain" (e.g. an old `--resume` branch that was itself compacted before being abandoned) — the aggregator should extract native events from **raw rows**, not from `turns`, exactly as `is_compacted`/`extract_compaction_metrics` already operate on `rows: &[TranscriptRow]` rather than `Vec<Turn>`, so native-event detection is chain-coverage-independent by construction. Only the *cost estimate* (which needs `TiktokenEstimator` on live conversation content) is chain-coverage-sensitive; the boundary-row metadata itself (`preTokens`/`postTokens`) is Claude Code's own self-reported accounting and needs no reconstruction.
+- **Version drift**: mitigate via `#[serde(default)]` per-field + treating the whole `compactMetadata` object's deserialization failure as skip-and-log (see above), matching the Rabbit Holes mandate verbatim.
+- **1,135+ files at scan time**: `discover_sessions_glob` already just stats files (cheap); the expensive part is `parse_session_file` + row-scan per file for `compactMetadata`/`consoletteCompact` markers. Native-event extraction doesn't need `build_turns` at all (just a linear scan of `rows` for `subtype == "compact_boundary"`), so it's strictly cheaper than the full `compare_compaction_cost` per-turn tokenization loop — the aggregator's per-session cost should probably skip the expensive `estimate_turn_tokens` no-compaction-counterfactual loop for the *aggregate table* view (which cares about compaction tokens/costs, not full-transcript-cost-with-no-compaction-at-all) and only run the heavier `compare_compaction_cost`-style estimate on a per-session drill-down, to keep the 1,135-file scan fast (Phase 2 should time both variants against the real tree — informal sampling above suggests a plain grep-for-marker style scan over ~1,200+ compaction events across the tree completed in well under the tool's 120s timeout even via naive `grep -rl`+Python re-parse).
+
+## 4. Unstated needs beyond the explicit requirements
+
+- **Aggregate totals/summary row**: operator's actual question ("is consolette's compaction worth it") is answered better by a totals row (sum of native tokens saved vs. sum of consolette tokens saved, sum of estimated dollars each) than by scanning 1,135 individual rows — the per-row table answers "which sessions," a totals row answers "overall, which system wins." Not in the explicit success metrics but directly serves the stated Problem Statement.
+- **Distinguish "never triggered" from "data missing/unparseable"**: a session with `is_natively_compacted == false` because it's short enough to have never hit Claude Code's auto-compact threshold looks identical, in a naive boolean, to a session where `compactMetadata` failed to parse. Given the Rabbit Holes' skip-and-log mandate, the per-session row should carry a tri-state (e.g. `NoNativeCompaction`, `NativeCompactionPresent(Vec<NativeCompactionEvent>)`, `NativeCompactionUnparseable`) rather than collapsing to a bool, so the "skip-and-log" cases are visible in the UI, not just in a server log the operator won't be watching.
+- **Per-session drill-down link**: the table gives aggregate numbers; the operator will want to jump into a *specific* session's detail (reusing `compare_compaction_cost`'s existing full-detail output) when a row looks surprising (e.g. native saved way more than consolette). Since `cost_compare.rs`'s single-session function already exists and is reusable, the cheapest way to satisfy this is a link from each dashboard row to a session-detail JSON (or even just showing the file path so the operator can run existing CLI tooling against it) rather than building a second, richer detail UI.
+- **Visual "which system won" indicator**: since the entire point is "is consolette worth it over what CC already gives for free," a sortable column alone still requires manual eyeballing across two token-saved columns per row; a derived `net_advantage` (consolette_tokens_saved - native_tokens_saved, or per-dollar equivalent) sortable column, with a simple color/glyph indicator, directly answers the stated Problem Statement rather than just exposing raw numbers side by side.
+- **Explicit "estimated vs. exact" labeling per the `CostReport` convention**: `src/cost_metrics/types.rs`'s `TokenCount { value, source: TokenSource }` where `TokenSource` is `Exact` (real provider `usage.*`) or `Estimated { via: EstimatorKind }`, plus `PricingSource::{Static, Live}`, is the established repo-wide pattern for "is this number authoritative or inferred." Native `preTokens`/`postTokens` are Claude Code's own self-reported, presumably-exact counts (its own tokenizer, not ours) — labeling them `TokenSource::Exact`-equivalent (or a parallel `NativeReported` variant, since it's not literally provider `usage.*` either) versus consolette's `TokenSource::Estimated` figures directly satisfies the Feasibility Risks section's explicit ask ("clearly label which numbers are native-reported vs. consolette-estimated... mirroring the existing CostReport exact/estimated pattern") and should reuse this enum family rather than inventing new ad hoc booleans.
+- **Empty/loading states**: a fresh dashboard load against 1,135+ files needs an explicit "scanning..." state if the request takes any perceptible time (per the Constraints section's "synchronous per-request scan vs. cache" open question) — even a simple client-side "Loading N sessions..." placeholder avoids the appearance of a hung page, which is exactly the failure mode the Success Metrics warn against.
+
+## 5. Comparable "two systems on one dataset" UX/data-model patterns (conceptual, no new deps)
+
+- **Side-by-side reconciliation pattern already in this codebase**: `src/cost_metrics/types.rs`'s `ReconciliationStatus { Pending, Reconciled, Abandoned }` is exactly the "was there enough data from both sides to compare" state machine this feature needs at the per-session level — reusing this enum's *shape* (even if not the literal type) for "native data present / consolette data present / neither / both" avoids inventing a new but structurally identical status enum.
+- **A vs. B diff-table pattern (conceptual)**: standard practice for "compare tool A and tool B over the same corpus" tables (e.g. benchmark leaderboards, A/B cost-comparison dashboards) is one row per corpus item with paired columns (`a_metric`, `b_metric`, `delta`, `winner`) plus a footer aggregate row and a "confidence"/"data quality" column — matches the "net_advantage" and "estimated vs. exact" recommendations above. No specific named framework is needed; this is a generic client-side-sortable-`<table>` + a plain JS array of row objects, consistent with the vanilla-JS, no-new-dependency constraint.
+- **Server-rendered static HTML + fetch-one-JSON-endpoint** is already the exact shape of `serve-cost`'s existing single-session route (`GET /v1/cost/{session_key}` returning `CostReport` as `Json`) — the dashboard page is a natural sibling route (e.g. `GET /v1/dashboard/sessions` returning `Vec<SessionComparisonRow>`, `GET /` or `GET /dashboard` serving the static HTML/JS), following `cost_router()`'s existing `Router::new().route(...).with_state(...)` composition pattern in `src/cost_metrics/server.rs`.
+
+## Sources
+- `src/claude_code_session/boundary.rs` (`CompactionMetrics`, `is_compacted`, `extract_compaction_metrics`, `build_boundary_row`)
+- `src/claude_code_session/cost_compare.rs` (`CompactionComparison`, `NoCompactionEstimate`, `compare_compaction_cost`)
+- `src/claude_code_session/discovery.rs` (`discover_sessions`, `discover_sessions_glob`, `SessionFile`, `SortBy`)
+- `src/claude_code_session/transcript.rs:390-459` (`ChainCoverage`, `chain_coverage`)
+- `src/cost_metrics/types.rs` (`TokenCount`, `TokenSource`, `EstimatorKind`, `PricingSource`, `ReconciliationStatus`)
+- `src/cost_metrics/server.rs` (`CostServerState`, `cost_router`, `serve_cost`, `DEFAULT_PORT = 8787`)
+- Direct inspection of real `~/.claude/projects/**/*.jsonl` files: 1,237 sampled `compactMetadata` events across a subset of session files, `version: "2.1.232"`, confirming field presence/absence rates (`preCompactDiscoveredTools` missing on 59% of sampled events; all other fields present in 100% of the sample; `trigger` only observed as `"auto"`).

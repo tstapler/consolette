@@ -7,7 +7,7 @@
 //! `preserved_turns` verbatim. See
 //! `project_plans/compaction-hook/implementation/plan.md` Epic 4.1.
 
-use crate::claude_code_session::boundary::{build_boundary_row, CompactionPlan};
+use crate::claude_code_session::boundary::{build_boundary_row, CompactionMetrics, CompactionPlan};
 use crate::claude_code_session::summarize::TurnSummary;
 use crate::claude_code_session::transcript::{RowFields, TranscriptRow, Turn};
 use anyhow::{anyhow, Context, Result};
@@ -43,21 +43,25 @@ fn turn_rows(turn: &Turn) -> Vec<&TranscriptRow> {
 /// [`crate::claude_code_session::boundary::create_plan`]'s marker scan on
 /// a later, idempotent recompaction pass actually sees the
 /// `consoletteCompact.summary` marker instead of silently missing it.
+#[allow(clippy::expect_used)] // CompactionMetrics is plain numeric/Option<f64> fields — serialization cannot fail.
 fn build_summary_turn_rows(
     summary: &TurnSummary,
     parent_uuid: Option<&str>,
     timestamp: &str,
+    metrics: Option<&CompactionMetrics>,
 ) -> (TranscriptRow, TranscriptRow) {
+    let mut user_marker = json!({
+        "summary": true,
+        "coversTurnUuids": summary.covers_turn_uuids,
+    });
+    if let Some(metrics) = metrics {
+        user_marker["metrics"] =
+            serde_json::to_value(metrics).expect("CompactionMetrics serializes");
+    }
     let mut user_extra = serde_json::Map::new();
     user_extra.insert("type".to_string(), json!("user"));
     user_extra.insert("timestamp".to_string(), json!(timestamp));
-    user_extra.insert(
-        "consoletteCompact".to_string(),
-        json!({
-            "summary": true,
-            "coversTurnUuids": summary.covers_turn_uuids,
-        }),
-    );
+    user_extra.insert("consoletteCompact".to_string(), user_marker);
     let user_uuid = uuid::Uuid::new_v4().to_string();
     let user_row = TranscriptRow::User(RowFields {
         uuid: user_uuid.clone(),
@@ -71,16 +75,18 @@ fn build_summary_turn_rows(
         extra: user_extra,
     });
 
+    let mut assistant_marker = json!({
+        "summary": true,
+        "coversTurnUuids": summary.covers_turn_uuids,
+    });
+    if let Some(metrics) = metrics {
+        assistant_marker["metrics"] =
+            serde_json::to_value(metrics).expect("CompactionMetrics serializes");
+    }
     let mut assistant_extra = serde_json::Map::new();
     assistant_extra.insert("type".to_string(), json!("assistant"));
     assistant_extra.insert("timestamp".to_string(), json!(timestamp));
-    assistant_extra.insert(
-        "consoletteCompact".to_string(),
-        json!({
-            "summary": true,
-            "coversTurnUuids": summary.covers_turn_uuids,
-        }),
-    );
+    assistant_extra.insert("consoletteCompact".to_string(), assistant_marker);
     let assistant_row = TranscriptRow::Assistant(RowFields {
         uuid: uuid::Uuid::new_v4().to_string(),
         parent_uuid: Some(user_uuid),
@@ -165,6 +171,7 @@ pub fn write_destination_transcript(
     source_session_id: &str,
     pruned_count: usize,
     out_path: &Path,
+    metrics: Option<&CompactionMetrics>,
 ) -> Result<String> {
     let new_session_id = out_path
         .file_stem()
@@ -233,7 +240,7 @@ pub fn write_destination_transcript(
 
     for summary in summaries {
         let (user_row, assistant_row) =
-            build_summary_turn_rows(summary, last_uuid.as_deref(), &timestamp);
+            build_summary_turn_rows(summary, last_uuid.as_deref(), &timestamp, metrics);
         last_uuid = Some(assistant_row.uuid().to_string());
         out_rows.push(user_row);
         out_rows.push(assistant_row);
@@ -348,7 +355,7 @@ mod tests {
         let out_path = out_dir.path().join(format!("{new_session_id}.jsonl"));
 
         let returned_id =
-            write_destination_transcript(&plan, &summaries, "source-session", 0, &out_path)
+            write_destination_transcript(&plan, &summaries, "source-session", 0, &out_path, None)
                 .unwrap();
         assert_eq!(returned_id, new_session_id);
 
@@ -401,5 +408,79 @@ mod tests {
         assert!(replan.turns_to_summarize.is_empty());
         assert_eq!(replan.prefix_turns.len(), 1);
         assert_eq!(replan.preserved_turns.len(), 1);
+    }
+
+    #[test]
+    fn write_destination_transcript_should_stamp_metrics_onto_summary_marker_when_provided() {
+        use crate::claude_code_session::boundary::CompactionMetrics;
+
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        let mut lines = Vec::new();
+        let mut prev: Option<String> = None;
+        for i in 1..=2 {
+            let u = format!("u{i}");
+            let a = format!("a{i}");
+            lines.push(user_row(&u, prev.as_deref(), "source-session"));
+            lines.push(assistant_row(&a, Some(&u), "source-session"));
+            prev = Some(a);
+        }
+        {
+            let mut f = fs::File::create(&source_path).unwrap();
+            for line in &lines {
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+
+        let rows = parse_session_file(&source_path).unwrap();
+        let turns = build_turns(&rows).unwrap();
+        let plan = create_plan(turns, 0);
+
+        let summaries = vec![TurnSummary {
+            covers_turn_uuids: vec!["u1".to_string(), "u2".to_string()],
+            summary_text: "summary of turns 1-2".to_string(),
+        }];
+
+        let metrics = CompactionMetrics {
+            tokens_before: 100,
+            tokens_after: 20,
+            tokens_saved: 80,
+            estimated_cost_usd: Some(0.0042),
+            real_cost_usd: Some(0.0039),
+        };
+
+        let out_dir = TempDir::new().unwrap();
+        let new_session_id = uuid::Uuid::new_v4().to_string();
+        let out_path = out_dir.path().join(format!("{new_session_id}.jsonl"));
+
+        write_destination_transcript(
+            &plan,
+            &summaries,
+            "source-session",
+            0,
+            &out_path,
+            Some(&metrics),
+        )
+        .unwrap();
+
+        let written_rows = parse_session_file(&out_path).unwrap();
+        let summary_assistant_row = &written_rows[2];
+        assert_eq!(
+            summary_assistant_row
+                .fields()
+                .extra
+                .get("consoletteCompact"),
+            Some(&json!({
+                "summary": true,
+                "coversTurnUuids": ["u1", "u2"],
+                "metrics": {
+                    "tokens_before": 100,
+                    "tokens_after": 20,
+                    "tokens_saved": 80,
+                    "estimated_cost_usd": 0.0042,
+                    "real_cost_usd": 0.0039,
+                },
+            }))
+        );
     }
 }

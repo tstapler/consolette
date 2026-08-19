@@ -266,6 +266,19 @@ pub struct Config {
     pub routes: Vec<Route>,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
+    #[serde(default)]
+    pub cost_metrics: CostMetricsConfig,
+}
+
+/// `serve-cost`'s config-file surface (Epic 2.3, Story 2.3.1): the
+/// dedicated `--port` flag falls back to `[cost_metrics].port` here, then to
+/// `crate::cost_metrics::server::DEFAULT_PORT`, so there's one config-aware
+/// port path rather than a second, config-blind flag-only one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CostMetricsConfig {
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 fn default_port() -> u16 {
@@ -345,6 +358,7 @@ impl Default for Config {
                 ],
             }],
             ratelimit: RateLimitConfig::default(),
+            cost_metrics: CostMetricsConfig::default(),
         }
     }
 }

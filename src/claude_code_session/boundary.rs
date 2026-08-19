@@ -8,6 +8,7 @@
 //! already folded into a prior summary are never re-summarized.
 
 use crate::claude_code_session::transcript::{RowFields, TranscriptRow, Turn};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 /// The result of planning a compaction: which turns are already-summarized
@@ -45,6 +46,76 @@ fn is_turn_marked(turn: &Turn) -> bool {
     is_boundary_or_summary_row(&turn.user_row)
         || turn.assistant_rows.iter().any(is_boundary_or_summary_row)
         || turn.tool_rows.iter().any(is_boundary_or_summary_row)
+}
+
+/// `true` when `rows` contains at least one boundary or summary marker —
+/// i.e. this transcript has already been through
+/// [`crate::claude_code_session::compact_session`] at least once.
+#[must_use]
+pub fn is_compacted(rows: &[TranscriptRow]) -> bool {
+    rows.iter().any(is_boundary_or_summary_row)
+}
+
+/// Token/cost accounting for one `compact_session` run, stamped onto every
+/// summary-turn row that run writes (see
+/// `crate::claude_code_session::mod::compaction_metrics_for`). One value is
+/// computed per run, not per summary group — a run that folds multiple
+/// summary groups shares the same aggregate figures across all of them.
+///
+/// `estimated_cost_usd` is always an estimate derived from
+/// [`crate::cost_metrics::estimator::TiktokenEstimator`] +
+/// [`crate::cost_metrics::pricing::PricingTable`], never a live-CLI-measured
+/// dollar figure — `None` when the pricing model used has no entry in the
+/// pricing table. `real_cost_usd`, when present, is the actual
+/// `total_cost_usd` reported by the `claude` CLI for the summarization call
+/// that produced this run's summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CompactionMetrics {
+    /// Estimated tokens across all `turns_to_summarize` content fed to the
+    /// summarizer.
+    pub tokens_before: u64,
+    /// Estimated tokens across the summary text(s) the summarizer produced.
+    pub tokens_after: u64,
+    /// `tokens_before - tokens_after`. Signed because a pathological
+    /// summary longer than its source is possible in principle.
+    pub tokens_saved: i64,
+    /// Estimated USD cost of the summarization call itself (input =
+    /// `tokens_before`, output = `tokens_after`, priced via the pricing
+    /// model used for the run). `None` when that model has no pricing
+    /// table entry.
+    pub estimated_cost_usd: Option<f64>,
+    /// Real, live-measured USD cost of the summarization call, as reported
+    /// by `claude -p --output-format json`'s `total_cost_usd` field. `None`
+    /// when the summarizer that produced this run's summaries can't report
+    /// a real cost (e.g. `FakeSummarizer`, or a transcript compacted before
+    /// this field existed).
+    #[serde(default)]
+    pub real_cost_usd: Option<f64>,
+}
+
+/// Extract every [`CompactionMetrics`] stamped into `rows`' summary-row
+/// markers, in row order. A transcript compacted more than once (i.e.
+/// recompacted after new turns accrued) can carry more than one distinct
+/// value; a transcript compacted exactly once but whose run produced N
+/// summary groups yields N *duplicate* entries (documented run-level
+/// aggregate, see [`CompactionMetrics`]'s doc comment) — callers that want
+/// one figure per run should dedupe.
+#[must_use]
+pub fn extract_compaction_metrics(rows: &[TranscriptRow]) -> Vec<CompactionMetrics> {
+    rows.iter()
+        .filter_map(|row| {
+            let marker = row.fields().extra.get("consoletteCompact")?.as_object()?;
+            if !marker
+                .get("summary")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let metrics = marker.get("metrics")?;
+            serde_json::from_value(metrics.clone()).ok()
+        })
+        .collect()
 }
 
 /// Build a [`CompactionPlan`] from reconstructed turns.
@@ -286,5 +357,96 @@ mod tests {
             Some("last-pre-boundary-uuid")
         );
         assert!(is_boundary_or_summary_row(&row));
+    }
+
+    fn marked_assistant_row_with_metrics(
+        uuid: &str,
+        parent: Option<&str>,
+        text: &str,
+        metrics: &CompactionMetrics,
+    ) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","parentUuid":{},"isSidechain":false,"isMeta":false,"consoletteCompact":{{"summary":true,"metrics":{}}},"message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#,
+            parent_uuid_json(parent),
+            serde_json::to_string(metrics).unwrap(),
+        )
+    }
+
+    #[test]
+    fn is_compacted_should_return_false_for_transcript_with_no_markers() {
+        let turns = [make_turn("u1", "a1", false), make_turn("u2", "a2", false)];
+        let rows: Vec<TranscriptRow> = turns
+            .iter()
+            .flat_map(|t| {
+                std::iter::once(t.user_row.clone()).chain(t.assistant_rows.iter().cloned())
+            })
+            .collect();
+
+        assert!(!is_compacted(&rows));
+    }
+
+    #[test]
+    fn is_compacted_should_return_true_when_any_row_carries_boundary_or_summary_marker() {
+        let turns = [make_turn("u1", "a1", true), make_turn("u2", "a2", false)];
+        let rows: Vec<TranscriptRow> = turns
+            .iter()
+            .flat_map(|t| {
+                std::iter::once(t.user_row.clone()).chain(t.assistant_rows.iter().cloned())
+            })
+            .collect();
+
+        assert!(is_compacted(&rows));
+    }
+
+    #[test]
+    fn extract_compaction_metrics_should_return_empty_when_no_summary_row_carries_metrics() {
+        let turns = [make_turn("u1", "a1", true), make_turn("u2", "a2", false)];
+        let rows: Vec<TranscriptRow> = turns
+            .iter()
+            .flat_map(|t| {
+                std::iter::once(t.user_row.clone()).chain(t.assistant_rows.iter().cloned())
+            })
+            .collect();
+
+        assert!(extract_compaction_metrics(&rows).is_empty());
+    }
+
+    #[test]
+    fn extract_compaction_metrics_should_deserialize_metrics_stamped_on_summary_rows() {
+        let metrics = CompactionMetrics {
+            tokens_before: 500,
+            tokens_after: 50,
+            tokens_saved: 450,
+            estimated_cost_usd: Some(0.001_23),
+            real_cost_usd: None,
+        };
+        let user_line = user_row("u1", None, "[consolette: compacted turns summary]");
+        let assistant_line =
+            marked_assistant_row_with_metrics("a1", Some("u1"), "summary text", &metrics);
+
+        let rows: Vec<TranscriptRow> = vec![
+            serde_json::from_str(&user_line).unwrap(),
+            serde_json::from_str(&assistant_line).unwrap(),
+        ];
+
+        let extracted = extract_compaction_metrics(&rows);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], metrics);
+    }
+
+    #[test]
+    fn extract_compaction_metrics_should_default_real_cost_to_none_for_pre_field_transcripts() {
+        let user_line = user_row("u1", None, "[consolette: compacted turns summary]");
+        let assistant_line = r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":false,"isMeta":false,"consoletteCompact":{"summary":true,"metrics":{"tokens_before":500,"tokens_after":50,"tokens_saved":450,"estimated_cost_usd":0.00123}},"message":{"role":"assistant","content":[{"type":"text","text":"summary text"}]}}"#
+            .to_string();
+
+        let rows: Vec<TranscriptRow> = vec![
+            serde_json::from_str(&user_line).unwrap(),
+            serde_json::from_str(&assistant_line).unwrap(),
+        ];
+
+        let extracted = extract_compaction_metrics(&rows);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].real_cost_usd, None);
     }
 }

@@ -5,9 +5,13 @@
 //! under `crate::compression`.
 
 pub mod boundary;
+pub mod cost_compare;
+pub mod discovery;
 pub mod mcp_server;
+pub mod native_compaction;
 pub mod omission_cache;
 pub mod prune;
+pub mod session_bi;
 pub mod summarize;
 pub mod transcript;
 pub mod writer;
@@ -15,13 +19,130 @@ pub mod writer;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde_json::{json, Value};
 
-use crate::claude_code_session::boundary::create_plan;
+use crate::claude_code_session::boundary::{create_plan, CompactionMetrics};
 use crate::claude_code_session::omission_cache::OmissionCache;
 use crate::claude_code_session::prune::{prune_tool_row, PrunedRow};
-use crate::claude_code_session::summarize::Summarizer;
+use crate::claude_code_session::summarize::{SummarizeOutcome, Summarizer, TurnSummary};
 use crate::claude_code_session::transcript::{build_turns, parse_session_file, Turn};
 use crate::claude_code_session::writer::write_destination_transcript;
+use crate::cost_metrics::estimator::{TiktokenEstimator, TokenEstimator};
+use crate::cost_metrics::pricing::PricingTable;
+
+/// Pricing model used to estimate compaction cost when no other model is
+/// specified — chosen because it has a confirmed entry in the vendored
+/// `pricing_default.json` snapshot, not because it's necessarily the model
+/// that actually ran the real summarization call. `CompactionMetrics`'s
+/// `estimated_cost_usd` is always priced against this constant regardless of
+/// which model `claude -p` actually invoked; `real_cost_usd`, when the
+/// summarizer reports one, is the true figure and isn't affected by this
+/// choice (see `compaction_metrics_for`'s doc comment).
+pub const DEFAULT_PRICING_MODEL: &str = "claude-sonnet-5";
+
+/// Estimate the token count of one [`Turn`]'s combined message content,
+/// via `estimator`. Returns `Ok(0)` for a turn with no estimable text
+/// rather than erroring — an empty turn is a legitimate (if unusual)
+/// input, not a failure.
+async fn estimate_turn_tokens(
+    estimator: &TiktokenEstimator,
+    model: &str,
+    turn: &Turn,
+) -> Result<u64> {
+    let messages: Vec<Value> = std::iter::once(&turn.user_row)
+        .chain(turn.assistant_rows.iter())
+        .chain(turn.tool_rows.iter())
+        .filter_map(|row| row.fields().message.clone())
+        .collect();
+    let (count, _meta) = estimator
+        .estimate(model, &Value::Array(messages))
+        .await
+        .map_err(|e| anyhow::anyhow!("token estimation failed for turn: {e}"))?;
+    Ok(count.value)
+}
+
+/// Compute [`CompactionMetrics`] for one `compact_session` run: how many
+/// tokens the summarized turns cost before vs. after summarization, the
+/// estimated USD cost of the summarization call, and (when the summarizer
+/// reported one) the real, live-measured cost.
+///
+/// `tokens_before`/`tokens_after`/`tokens_saved`/`estimated_cost_usd` are
+/// always [`TiktokenEstimator`]-derived estimates — `pricing_model` need not
+/// be the model that actually produced `summaries`.
+/// [`crate::claude_code_session::summarize::ClaudeCliSummarizer`] shells out
+/// to `claude -p --output-format json`, whose own `total_cost_usd` is passed
+/// through as `real_cost_usd` instead of being independently estimated.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
+async fn compaction_metrics_for(
+    turns_to_summarize: &[Turn],
+    summaries: &[TurnSummary],
+    pricing_model: &str,
+    real_cost_usd: Option<f64>,
+) -> Result<CompactionMetrics> {
+    let estimator = TiktokenEstimator::new();
+
+    let mut tokens_before = 0u64;
+    for turn in turns_to_summarize {
+        tokens_before += estimate_turn_tokens(&estimator, pricing_model, turn).await?;
+    }
+
+    let mut tokens_after = 0u64;
+    for summary in summaries {
+        let messages = json!([{ "role": "assistant", "content": summary.summary_text }]);
+        let (count, _meta) = estimator
+            .estimate(pricing_model, &messages)
+            .await
+            .map_err(|e| anyhow::anyhow!("token estimation failed for summary text: {e}"))?;
+        tokens_after += count.value;
+    }
+
+    let tokens_saved = tokens_before as i64 - tokens_after as i64;
+    let estimated_cost_usd = PricingTable::load_default()
+        .price_for(pricing_model)
+        .map(|price| {
+            tokens_before as f64 * price.input_usd_per_token
+                + tokens_after as f64 * price.output_usd_per_token
+        });
+
+    Ok(CompactionMetrics {
+        tokens_before,
+        tokens_after,
+        tokens_saved,
+        estimated_cost_usd,
+        real_cost_usd,
+    })
+}
+
+/// Prunes oversized tool output out of every row in a turn, caching the
+/// omitted content under `destination_session_id` so a later
+/// `read_omitted_content` MCP call (scoped to the post-compaction session
+/// id) can still retrieve it.
+fn prune_turn(turn: &Turn, cache: &OmissionCache, destination_session_id: &str) -> Result<Turn> {
+    let prune_row =
+        |row: &crate::claude_code_session::transcript::TranscriptRow| match prune_tool_row(
+            row,
+            cache,
+            destination_session_id,
+        )
+        .context("failed to prune tool row into omission cache")?
+        {
+            PrunedRow::Unchanged(row) | PrunedRow::Pruned { row, .. } => Ok(row),
+        };
+
+    Ok(Turn {
+        user_row: prune_row(&turn.user_row)?,
+        assistant_rows: turn
+            .assistant_rows
+            .iter()
+            .map(prune_row)
+            .collect::<Result<Vec<_>>>()?,
+        tool_rows: turn
+            .tool_rows
+            .iter()
+            .map(prune_row)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
 
 /// End-to-end compaction pipeline for one source session transcript (Epic
 /// 5.2): parse -> reconstruct turns -> plan -> prune oversized tool output
@@ -91,49 +212,22 @@ pub async fn compact_session<S: Summarizer>(
     // verbatim) still benefits from pruning, and a turn about to be
     // summarized is pruned first so the summarizer never sees (or has to
     // pay token cost for) content that's about to be discarded anyway.
-    let prune_turn = |turn: &Turn| -> Result<Turn> {
-        let prune_row =
-            |row: &crate::claude_code_session::transcript::TranscriptRow| match prune_tool_row(
-                row,
-                cache,
-                &destination_session_id,
-            )
-            .context("failed to prune tool row into omission cache")?
-            {
-                PrunedRow::Unchanged(row) | PrunedRow::Pruned { row, .. } => Ok(row),
-            };
-
-        Ok(Turn {
-            user_row: prune_row(&turn.user_row)?,
-            assistant_rows: turn
-                .assistant_rows
-                .iter()
-                .map(prune_row)
-                .collect::<Result<Vec<_>>>()?,
-            tool_rows: turn
-                .tool_rows
-                .iter()
-                .map(prune_row)
-                .collect::<Result<Vec<_>>>()?,
-        })
-    };
-
     let prefix_turns = plan
         .prefix_turns
         .iter()
-        .map(prune_turn)
+        .map(|turn| prune_turn(turn, cache, &destination_session_id))
         .collect::<Result<Vec<_>>>()
         .context("failed to prune prefix turns")?;
     let turns_to_summarize = plan
         .turns_to_summarize
         .iter()
-        .map(prune_turn)
+        .map(|turn| prune_turn(turn, cache, &destination_session_id))
         .collect::<Result<Vec<_>>>()
         .context("failed to prune turns scheduled for summarization")?;
     let preserved_turns = plan
         .preserved_turns
         .iter()
-        .map(prune_turn)
+        .map(|turn| prune_turn(turn, cache, &destination_session_id))
         .collect::<Result<Vec<_>>>()
         .context("failed to prune preserved turns")?;
     let pruned_count = turns_to_summarize.len();
@@ -145,13 +239,37 @@ pub async fn compact_session<S: Summarizer>(
     // preserved tail), and invoking a real ClaudeCliSummarizer here would
     // needlessly shell out to `claude -p --resume` on every no-op
     // recompaction pass.
-    let summaries = if turns_to_summarize.is_empty() {
-        Vec::new()
+    let SummarizeOutcome {
+        summaries,
+        real_cost_usd,
+    } = if turns_to_summarize.is_empty() {
+        SummarizeOutcome {
+            summaries: Vec::new(),
+            real_cost_usd: None,
+        }
     } else {
         summarizer
             .summarize(&source_session_id, &turns_to_summarize)
             .await
             .context("summarizer failed")?
+    };
+
+    // Skipped (None) when there's nothing to summarize, matching the
+    // summarizer skip above — no summary rows are written in that case, so
+    // there is nothing for metrics to attach to.
+    let metrics = if turns_to_summarize.is_empty() {
+        None
+    } else {
+        Some(
+            compaction_metrics_for(
+                &turns_to_summarize,
+                &summaries,
+                DEFAULT_PRICING_MODEL,
+                real_cost_usd,
+            )
+            .await
+            .context("failed to compute compaction metrics")?,
+        )
     };
 
     let pruned_plan = crate::claude_code_session::boundary::CompactionPlan {
@@ -166,6 +284,7 @@ pub async fn compact_session<S: Summarizer>(
         &source_session_id,
         pruned_count,
         out_path,
+        metrics.as_ref(),
     )
     .with_context(|| {
         format!(

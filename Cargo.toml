@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "consolette — CLI / MCP tool"
+repository = "https://github.com/tstapler/consolette"
 
 # Rust 1.74+ lints — set once here instead of per-module boilerplate.
 [lints.clippy]
@@ -80,7 +81,7 @@ aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
 moka = { version = "0.12", features = ["future"] }
 tokio-retry = "0.3"
 backoff = { version = "0.4", features = ["tokio"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 nix = { version = "0.29", features = ["fs", "term"] }
 simhash = "0.3"
 # gaoya has no 0.2 release on crates.io; lshdedup-core is purpose-built for dedup.

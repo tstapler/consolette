@@ -360,7 +360,7 @@ mod tests {
     use crate::claude_code_session::transcript::{RowFields, TranscriptRow};
     use serde_json::Map;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempPath};
 
     fn make_turn(user_uuid: &str) -> Turn {
         let fields = RowFields {
@@ -451,13 +451,15 @@ mod tests {
     /// with — standing in for a `claude` binary that hangs, to trigger
     /// `SummarizeError::Timeout` deterministically without depending on the
     /// real CLI.
-    fn write_slow_fake_claude() -> NamedTempFile {
+    fn write_slow_fake_claude() -> TempPath {
         let mut script = NamedTempFile::new().unwrap();
         writeln!(script, "#!/bin/sh\nsleep 5\n").unwrap();
         let mut perms = std::fs::metadata(script.path()).unwrap().permissions();
         perms.set_mode(0o700);
         std::fs::set_permissions(script.path(), perms).unwrap();
-        script
+        // Close the write handle before it's spawned — on Linux, exec-ing a
+        // file that's still open for writing fails with ETXTBSY.
+        script.into_temp_path()
     }
 
     /// Writes an executable shell script standing in for `claude -p
@@ -465,7 +467,7 @@ mod tests {
     /// envelope to stdout, letting us exercise
     /// [`ClaudeCliSummarizer::summarize`]'s envelope-parsing path without
     /// depending on the real CLI.
-    fn write_fake_claude_json(result: &str, total_cost_usd: f64) -> NamedTempFile {
+    fn write_fake_claude_json(result: &str, total_cost_usd: f64) -> TempPath {
         let envelope = serde_json::json!({ "result": result, "total_cost_usd": total_cost_usd });
         let mut script = NamedTempFile::new().unwrap();
         writeln!(
@@ -477,13 +479,15 @@ mod tests {
         let mut perms = std::fs::metadata(script.path()).unwrap().permissions();
         perms.set_mode(0o700);
         std::fs::set_permissions(script.path(), perms).unwrap();
-        script
+        // Close the write handle before it's spawned — on Linux, exec-ing a
+        // file that's still open for writing fails with ETXTBSY.
+        script.into_temp_path()
     }
 
     #[tokio::test]
     async fn claude_cli_summarizer_should_return_real_cost_and_summaries_from_json_envelope() {
         let script = write_fake_claude_json("<summary>fake summary</summary>", 0.0123);
-        let summarizer = ClaudeCliSummarizer::new(Some(script.path().to_path_buf()));
+        let summarizer = ClaudeCliSummarizer::new(Some(script.to_path_buf()));
         let turns = vec![make_turn("u1")];
 
         let outcome = summarizer.summarize("fake-session", &turns).await.unwrap();
@@ -500,7 +504,8 @@ mod tests {
         let mut perms = std::fs::metadata(script.path()).unwrap().permissions();
         perms.set_mode(0o700);
         std::fs::set_permissions(script.path(), perms).unwrap();
-        let summarizer = ClaudeCliSummarizer::new(Some(script.path().to_path_buf()));
+        let script = script.into_temp_path();
+        let summarizer = ClaudeCliSummarizer::new(Some(script.to_path_buf()));
 
         let result = summarizer.summarize("fake-session", &[]).await;
 
@@ -517,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn claude_cli_summarizer_should_return_timeout_error_when_subprocess_exceeds_timeout() {
         let script = write_slow_fake_claude();
-        let summarizer = ClaudeCliSummarizer::new(Some(script.path().to_path_buf()))
+        let summarizer = ClaudeCliSummarizer::new(Some(script.to_path_buf()))
             .with_timeout(Duration::from_millis(50));
 
         let result = summarizer.summarize("fake-session", &[]).await;

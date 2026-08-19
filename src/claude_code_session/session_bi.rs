@@ -139,16 +139,18 @@ pub async fn build_session_comparison_row(
             reason: e.to_string(),
         })?;
 
+    // `None` (unknown), not `Some(0)`, when any event's `tokens_saved()` is
+    // unknown (missing preTokens/postTokens) — `filter_map` would otherwise
+    // silently treat "unknown" as "contributed nothing" and understate the
+    // sum instead of reporting it as unavailable.
     let native_tokens_saved = if comparison.native_events.is_empty() {
         None
     } else {
-        Some(
-            comparison
-                .native_events
-                .iter()
-                .filter_map(super::native_compaction::NativeCompactionEvent::tokens_saved)
-                .sum::<i64>(),
-        )
+        comparison
+            .native_events
+            .iter()
+            .map(super::native_compaction::NativeCompactionEvent::tokens_saved)
+            .sum::<Option<i64>>()
     };
 
     let consolette_tokens_saved = if comparison.compaction_metrics.is_empty() {
@@ -435,6 +437,40 @@ mod tests {
         assert_eq!(row.consolette_tokens_saved, None);
         assert_eq!(row.net_advantage_tokens, None);
         assert!(row.no_compaction_total_tokens > 0);
+    }
+
+    /// Regression test for a real bug: a native event with `tokens_saved()
+    /// == None` (missing `preTokens`/`postTokens`) was previously counted as
+    /// contributing `0` to the sum (via `filter_map`), so a session with one
+    /// such event reported `native_tokens_saved: Some(0)` — indistinguishable
+    /// from "confirmed zero tokens saved" — instead of `None` ("unknown").
+    /// This also corrupted `net_advantage_tokens`, which is derived from it.
+    #[tokio::test]
+    async fn build_session_comparison_row_should_report_native_tokens_saved_as_unknown_when_any_event_is_missing_token_counts(
+    ) {
+        let dir = TempDir::new().unwrap();
+        // One native event with full token counts, one with none — the
+        // aggregate must be `None`, not `Some(<partial sum>)`.
+        let lines = vec![
+            r#"{"uuid":"n1","parentUuid":null,"type":"system","subtype":"compact_boundary","timestamp":"2024-01-01T00:00:00Z","message":null,"compactMetadata":{"trigger":"auto","preTokens":9000,"postTokens":1200}}"#.to_string(),
+            user_row("u1", Some("n1"), "hello"),
+            r#"{"uuid":"n2","parentUuid":"u1","type":"system","subtype":"compact_boundary","timestamp":"2024-01-01T00:00:02Z","message":null,"compactMetadata":{"trigger":"manual"}}"#.to_string(),
+        ];
+        let path = write_fixture(&dir, "session.jsonl", &lines);
+        let metadata = fs::metadata(&path).unwrap();
+        let file = SessionFile {
+            path,
+            modified: metadata.modified().unwrap(),
+            size_bytes: metadata.len(),
+        };
+
+        let row = build_session_comparison_row(&file, "claude-sonnet-5")
+            .await
+            .unwrap();
+
+        assert_eq!(row.native_event_count, 2);
+        assert_eq!(row.native_tokens_saved, None);
+        assert_eq!(row.net_advantage_tokens, None);
     }
 
     /// Task 2.1.2b: a nonexistent path — not a garbage-JSON-content file —

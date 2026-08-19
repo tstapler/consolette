@@ -33,10 +33,6 @@ pub struct NativeCompactionEvent {
     pub duration_ms: Option<u64>,
     #[serde(rename = "cumulativeDroppedTokens")]
     pub cumulative_dropped_tokens: Option<u64>,
-    #[serde(rename = "preservedSegment")]
-    pub preserved_segment_tokens: Option<u64>,
-    #[serde(rename = "preservedMessages")]
-    pub preserved_messages: Option<u64>,
     #[serde(rename = "preCompactDiscoveredTools")]
     pub discovered_tools: Option<Vec<String>>,
 }
@@ -143,12 +139,44 @@ mod tests {
                 post_tokens: Some(1200),
                 duration_ms: Some(842),
                 cumulative_dropped_tokens: Some(7800),
-                preserved_segment_tokens: None,
-                preserved_messages: None,
                 discovered_tools: None,
             }]
         );
         assert_eq!(events[0].tokens_saved(), Some(7800));
+    }
+
+    /// Regression test for a real bug: `preservedSegment`/`preservedMessages`
+    /// are JSON *objects* in real Claude Code transcripts, not numbers (see
+    /// ADR-011's empirically captured sample), and this crate previously
+    /// modeled them as `Option<u64>`. Because the whole `compactMetadata`
+    /// object is deserialized in one shot, that type mismatch on a *present*
+    /// field failed the entire deserialize and `.ok()` silently dropped the
+    /// whole event on every real-world transcript. This test uses ADR-011's
+    /// exact captured shape (field values redacted) to guard against that
+    /// regressing.
+    #[test]
+    fn native_compaction_should_extract_event_when_metadata_has_real_object_shaped_preserved_fields(
+    ) {
+        let row = compact_boundary_row_with_metadata(
+            r#"{"trigger":"auto","preTokens":108562,"postTokens":17027,"cumulativeDroppedTokens":91535,"durationMs":189663,"preservedSegment":{"headUuid":"h1","anchorUuid":"a1","tailUuid":"t1"},"preservedMessages":{"anchorUuid":"a1","uuids":["u1"],"allUuids":["u1","u2"]}}"#,
+        );
+        let rows = vec![row];
+
+        assert!(is_native_compacted(&rows));
+
+        let events = extract_native_compaction_events(&rows);
+        assert_eq!(
+            events,
+            vec![NativeCompactionEvent {
+                trigger: Some("auto".to_string()),
+                pre_tokens: Some(108_562),
+                post_tokens: Some(17027),
+                duration_ms: Some(189_663),
+                cumulative_dropped_tokens: Some(91535),
+                discovered_tools: None,
+            }]
+        );
+        assert_eq!(events[0].tokens_saved(), Some(91535));
     }
 
     /// Task 1.1.2a: a `compact_boundary` row with no `compactMetadata` at
@@ -194,8 +222,6 @@ mod tests {
             post_tokens: None,
             duration_ms: None,
             cumulative_dropped_tokens: None,
-            preserved_segment_tokens: None,
-            preserved_messages: None,
             discovered_tools: None,
         };
         assert_eq!(event.tokens_saved(), None);

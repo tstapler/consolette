@@ -136,11 +136,10 @@ fn list_sessions_command(sort: &str, limit: Option<usize>) -> anyhow::Result<()>
     }
 
     for session in &sessions {
-        let age = session
-            .modified
-            .elapsed()
-            .map(|d| format!("{}s ago", d.as_secs()))
-            .unwrap_or_else(|_| "unknown age".to_string());
+        let age = session.modified.elapsed().map_or_else(
+            |_| "unknown age".to_string(),
+            |d| format!("{}s ago", d.as_secs()),
+        );
         println!(
             "{}\t{:>10} bytes\t{}",
             session.path.display(),

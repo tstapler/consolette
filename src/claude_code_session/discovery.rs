@@ -33,6 +33,10 @@ pub enum SortBy {
 impl SortBy {
     /// Parses the `--sort` CLI flag's value (`recent`, `oldest`, `largest`,
     /// `smallest`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `value` is not one of the recognized sort names.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "recent" => Ok(Self::RecentFirst),
@@ -93,14 +97,15 @@ pub fn discover_sessions_glob(pattern: &str, sort_by: SortBy) -> Result<Vec<Sess
 
 fn sort_sessions(sessions: &mut [SessionFile], sort_by: SortBy) {
     match sort_by {
-        SortBy::RecentFirst => sessions.sort_by(|a, b| b.modified.cmp(&a.modified)),
-        SortBy::OldestFirst => sessions.sort_by(|a, b| a.modified.cmp(&b.modified)),
-        SortBy::LargestFirst => sessions.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes)),
-        SortBy::SmallestFirst => sessions.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes)),
+        SortBy::RecentFirst => sessions.sort_by_key(|s| std::cmp::Reverse(s.modified)),
+        SortBy::OldestFirst => sessions.sort_by_key(|s| s.modified),
+        SortBy::LargestFirst => sessions.sort_by_key(|s| std::cmp::Reverse(s.size_bytes)),
+        SortBy::SmallestFirst => sessions.sort_by_key(|s| s.size_bytes),
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs::File;

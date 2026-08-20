@@ -4,9 +4,9 @@
 //! header map back on stdout — cached per `(upstream, command, args)` so a
 //! subprocess isn't spawned on every request.
 //!
-//! Plugin discovery (`plugins.d/*/`, `plugin.toml`, `bin/` resolution ahead
-//! of `PATH`) is a separate, not-yet-implemented ADR-007 story — `command`
-//! here only resolves via an explicit path or `PATH`.
+//! Plugin `bin/` directories (from `config::plugin_bin_dirs`, ADR-007 §1) are
+//! searched ahead of `PATH` when resolving `command` — see
+//! [`ExecCredentialCache::with_bin_dirs`].
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -51,12 +51,28 @@ struct CacheEntry {
 #[derive(Default)]
 pub struct ExecCredentialCache {
     entries: DashMap<u64, CacheEntry>,
+    bin_dirs: Vec<PathBuf>,
 }
 
 impl ExecCredentialCache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A cache that also searches `bin_dirs` (a plugin's `bin/` directory —
+    /// ADR-007 §2: "resolves against the owning plugin's `bin/` first, then
+    /// `PATH`") ahead of `PATH` when resolving a bare command name. v1
+    /// simplification: searched for every helper regardless of which plugin
+    /// contributed the `conf.d` fragment that named it — the flat config-merge
+    /// design has no such provenance, and a helper name is expected to be
+    /// unique across installed plugins.
+    #[must_use]
+    pub fn with_bin_dirs(bin_dirs: Vec<PathBuf>) -> Self {
+        Self {
+            bin_dirs,
+            ..Self::default()
+        }
     }
 
     pub fn clear(&self) {
@@ -101,7 +117,7 @@ impl ExecCredentialCache {
         }
 
         let (headers, ttl_override) =
-            run_helper(upstream, command, args, timeout, method, url).await?;
+            run_helper(upstream, command, args, timeout, method, url, &self.bin_dirs).await?;
         let ttl = ttl_override.map_or(default_ttl, Duration::from_secs);
         self.entries.insert(
             key,
@@ -114,18 +130,23 @@ impl ExecCredentialCache {
     }
 }
 
-/// Resolves `command` to a path: as given if it contains a `/`, else the
-/// first `PATH` entry that has it. No plugin-`bin/` lookup yet — see the
-/// module doc comment.
-fn resolve_command(command: &str) -> Result<PathBuf, AuthError> {
+/// Resolves `command` to a path: as given if it contains a `/`; else the
+/// first `bin_dirs` entry that has it (ADR-007 §2: plugin `bin/` ahead of
+/// `PATH`); else the first `PATH` entry that has it.
+fn resolve_command(command: &str, bin_dirs: &[PathBuf]) -> Result<PathBuf, AuthError> {
     if command.contains('/') {
         return Ok(PathBuf::from(command));
     }
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(command))
-                .find(|p| p.is_file())
+    bin_dirs
+        .iter()
+        .map(|dir| dir.join(command))
+        .find(|p| p.is_file())
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(command))
+                    .find(|p| p.is_file())
+            })
         })
         .ok_or_else(|| AuthError::Exec(format!("command {command:?} not found on PATH")))
 }
@@ -162,6 +183,7 @@ fn check_permissions(path: &Path) -> Result<(), AuthError> {
 /// path, so the caller doesn't need to distinguish them further. Helper
 /// stdout/stderr content is never included in error text or logs (ADR-007
 /// §6): only the fact and shape of a failure is reported.
+#[allow(clippy::too_many_arguments)]
 async fn run_helper(
     upstream: &str,
     command: &str,
@@ -169,8 +191,9 @@ async fn run_helper(
     timeout: Duration,
     method: &str,
     url: &str,
+    bin_dirs: &[PathBuf],
 ) -> Result<(HeaderMap, Option<u64>), AuthError> {
-    let resolved = resolve_command(command)?;
+    let resolved = resolve_command(command, bin_dirs)?;
     check_permissions(&resolved)?;
 
     let mut line = serde_json::to_string(&RequestContext {

@@ -1,12 +1,13 @@
-//! Layered loader: `defaults < conf.d/*.toml (sorted) < env allowlist`
-//! (ADR-001), followed by the legacy env back-compat shim and reference
-//! validation.
+//! Layered loader: `defaults < conf.d/*.toml (sorted) < plugins.d/*/conf.d
+//! (plugin-name lexical, ADR-007 §1) < env allowlist` (ADR-001), followed by
+//! the legacy env back-compat shim and reference validation.
 
 use std::path::{Path, PathBuf};
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 
+use super::plugins;
 use super::schema::{Config, Upstream, UpstreamKind};
 use super::validate::validate_references;
 use super::ConfigError;
@@ -35,8 +36,11 @@ pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
         .collect();
     files.sort();
 
+    let discovered_plugins = plugins::discover(config_dir);
+    let plugin_files = plugins::conf_d_files(&discovered_plugins);
+
     let mut figment = Figment::new().merge(Serialized::defaults(Config::default()));
-    for file in &files {
+    for file in files.iter().chain(plugin_files.iter()) {
         figment = figment.merge(Toml::file(file));
     }
     figment = figment.merge(Env::prefixed("CONSOLETTE_").split("__").only(ENV_ALLOWLIST));
@@ -45,6 +49,15 @@ pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
     apply_legacy_env_shim(&mut config);
     validate_references(&config)?;
     Ok(config)
+}
+
+/// `bin/` directories of every plugin discovered under `<config_dir>/plugins.d/`
+/// (plus `CONSOLETTE_PLUGIN_PATH`), for credential-helper command resolution
+/// ahead of `PATH` (ADR-007 §2). Separate from [`load`] since callers that
+/// only need config don't need to re-walk `plugins.d/`.
+#[must_use]
+pub fn plugin_bin_dirs(config_dir: &Path) -> Vec<PathBuf> {
+    plugins::bin_dirs(&plugins::discover(config_dir))
 }
 
 /// Reads one legacy (unprefixed) env var, emitting a one-time deprecation

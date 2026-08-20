@@ -38,6 +38,7 @@ echo '{"headers":{"X-Test":"value1"}}'
         Duration::from_secs(5),
         METHOD,
         URL,
+        &[],
     )
     .await
     .unwrap();
@@ -65,6 +66,7 @@ echo '{"headers":{"X-Test":"value1"},"cache_ttl_secs":42}'
         Duration::from_secs(5),
         METHOD,
         URL,
+        &[],
     )
     .await
     .unwrap();
@@ -92,6 +94,7 @@ exit 1
         Duration::from_secs(5),
         METHOD,
         URL,
+        &[],
     )
     .await;
 
@@ -119,6 +122,7 @@ echo 'not json'
         Duration::from_secs(5),
         METHOD,
         URL,
+        &[],
     )
     .await;
 
@@ -145,6 +149,7 @@ echo '{"headers":{}}'
         Duration::from_millis(50),
         METHOD,
         URL,
+        &[],
     )
     .await;
 
@@ -171,6 +176,7 @@ echo '{"headers":{}}'
         Duration::from_secs(5),
         METHOD,
         URL,
+        &[],
     )
     .await;
 
@@ -186,6 +192,7 @@ async fn missing_command_is_exec_error() {
         Duration::from_secs(5),
         METHOD,
         URL,
+        &[],
     )
     .await;
 
@@ -300,18 +307,35 @@ echo '{{"headers":{{"X-Count":"'"$n"'"}}}}'
 
 #[test]
 fn resolve_command_finds_absolute_path() {
-    let path = resolve_command("/bin/sh").unwrap();
+    let path = resolve_command("/bin/sh", &[]).unwrap();
     assert_eq!(path, PathBuf::from("/bin/sh"));
 }
 
 #[test]
 fn resolve_command_searches_path_for_bare_name() {
-    let path = resolve_command("sh").unwrap();
+    let path = resolve_command("sh", &[]).unwrap();
     assert!(path.is_file());
 }
 
 #[test]
 fn resolve_command_errors_when_not_found() {
-    let result = resolve_command("consolette-definitely-not-a-real-command");
+    let result = resolve_command("consolette-definitely-not-a-real-command", &[]);
     assert!(matches!(result, Err(AuthError::Exec(_))));
+}
+
+#[test]
+fn resolve_command_prefers_bin_dirs_over_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = write_helper(&dir, "sh", "#!/bin/sh\necho fake\n");
+
+    let path = resolve_command("sh", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(path, helper);
+}
+
+#[test]
+fn resolve_command_falls_back_to_path_when_not_in_bin_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let path = resolve_command("sh", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(path, PathBuf::from("/bin/sh"));
 }

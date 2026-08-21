@@ -6,11 +6,6 @@
 //! merging the JSON header map it returns on stdout. Plugin discovery
 //! (`plugins.d/*/`, `plugin.toml`) is a separate, not-yet-implemented
 //! ADR-007 story — `command` only resolves via an explicit path or `PATH`.
-//!
-//! Nothing outside tests calls this yet — request dispatch lands with
-//! ADR-003's router, which will call `AuthMethodExt::apply` per upstream
-//! request. `allow(dead_code)` is temporary until that wiring exists.
-#![allow(dead_code)]
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 

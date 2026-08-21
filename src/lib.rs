@@ -12,6 +12,7 @@ pub mod compression;
 pub mod config;
 pub mod cost_metrics;
 pub mod dashboard;
+pub mod entrypoint;
 pub mod learn;
 pub mod mcp_gateway;
 pub mod memory;

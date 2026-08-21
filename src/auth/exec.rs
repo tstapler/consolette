@@ -116,8 +116,16 @@ impl ExecCredentialCache {
             }
         }
 
-        let (headers, ttl_override) =
-            run_helper(upstream, command, args, timeout, method, url, &self.bin_dirs).await?;
+        let (headers, ttl_override) = run_helper(
+            upstream,
+            command,
+            args,
+            timeout,
+            method,
+            url,
+            &self.bin_dirs,
+        )
+        .await?;
         let ttl = ttl_override.map_or(default_ttl, Duration::from_secs);
         self.entries.insert(
             key,

@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Run => run(),
+        Command::Run => run().await,
         Command::ListSessions { sort, limit } => list_sessions_command(&sort, limit),
         Command::Mcp => mcp().await,
         Command::CompactSession {
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let config = config::load(&config_dir())?;
     println!(
         "consolette: loaded config (port {}, {} upstream(s), {} route(s))",
@@ -120,7 +120,8 @@ fn run() -> anyhow::Result<()> {
         config.upstreams.len(),
         config.routes.len()
     );
-    Ok(())
+    let state = consolette::entrypoint::EntrypointState::build(&config).await?;
+    consolette::entrypoint::serve_entrypoint(config.port, state).await
 }
 
 fn list_sessions_command(sort: &str, limit: Option<usize>) -> anyhow::Result<()> {

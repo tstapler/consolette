@@ -44,6 +44,13 @@ pub enum ProviderError {
     ModelUnsupported(String),
     #[error("upstream error: {status} {body}")]
     Upstream { status: u16, body: String },
+    /// Returned by `Router::dispatch` when every candidate upstream was
+    /// tried (or none were available/admitted) — distinct from a genuine
+    /// upstream-returned `Upstream{status: 503, ..}`, which means one
+    /// specific upstream itself reported a 503, not that the whole
+    /// candidate pool was exhausted.
+    #[error("all upstream candidates exhausted")]
+    Exhausted,
 }
 
 impl From<crate::auth::AuthError> for ProviderError {

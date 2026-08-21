@@ -14,11 +14,16 @@ use std::time::Duration;
 
 use http::HeaderMap;
 
+use crate::auth::exec::ExecCredentialCache;
+use crate::auth::{SecretResolver, SystemSecretResolver};
+use crate::config::schema::{Config, Strategy, UpstreamKind};
+use crate::providers::anthropic::AnthropicProvider;
+use crate::providers::bedrock::BedrockProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
-use crate::ratelimit::{AdmissionControl, Admit};
+use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
 
 use super::health::{Availability, HealthRegistry};
-use super::strategy::{RoutingStrategy, UpstreamRef};
+use super::strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef, WeightedStrategy};
 
 /// Owns the dispatch loop for one route: a fixed candidate list, a selection
 /// strategy, and the shared health registry. `providers` is indexed by the
@@ -47,6 +52,103 @@ impl Router {
             health,
             admission,
         }
+    }
+
+    /// Assembles a fully dispatch-ready `Router` from a loaded [`Config`]:
+    /// builds a live [`Provider`] per configured upstream, resolves the
+    /// first `Route`'s candidate list/strategy, and wires the health
+    /// registry and admission control.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any upstream fails to construct its `Provider`
+    /// (e.g. `UpstreamKind::Openai`, which has no `Provider` implementation
+    /// yet), if `config.routes` is empty, or if a route references an
+    /// upstream name not present in `config.upstreams`.
+    pub async fn from_config(config: &Config) -> anyhow::Result<Router> {
+        let resolver: Arc<dyn SecretResolver + Send + Sync> = Arc::new(SystemSecretResolver);
+        let exec_cache = Arc::new(ExecCredentialCache::new());
+
+        let mut providers: Vec<Arc<dyn Provider>> = Vec::with_capacity(config.upstreams.len());
+        let mut bedrock_indices: Vec<usize> = Vec::new();
+        for (idx, upstream) in config.upstreams.iter().enumerate() {
+            match &upstream.kind {
+                UpstreamKind::Anthropic => {
+                    let provider = AnthropicProvider::new(
+                        Arc::new(upstream.clone()),
+                        Arc::clone(&resolver),
+                        Arc::clone(&exec_cache),
+                        config.request_timeout,
+                    )?;
+                    providers.push(Arc::new(provider) as Arc<dyn Provider>);
+                }
+                UpstreamKind::Bedrock { .. } => {
+                    let provider = BedrockProvider::new(Arc::new(upstream.clone())).await;
+                    bedrock_indices.push(idx);
+                    providers.push(Arc::new(provider) as Arc<dyn Provider>);
+                }
+                UpstreamKind::Openai { .. } => {
+                    anyhow::bail!(
+                        "upstream \"{}\": UpstreamKind::Openai has no Provider implementation yet",
+                        upstream.name
+                    );
+                }
+            }
+        }
+
+        let health = Arc::new(HealthRegistry::new(config.cooldown_seconds));
+        for idx in bedrock_indices {
+            health.set_can_cooldown(idx, false);
+        }
+
+        let route = config
+            .routes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no routes configured"))?;
+        if config.routes.len() > 1 {
+            tracing::warn!(
+                ignored = ?config.routes[1..].iter().map(|r| &r.name).collect::<Vec<_>>(),
+                "multiple routes configured; using the first"
+            );
+        }
+
+        let mut candidates: Vec<UpstreamRef> = Vec::with_capacity(route.upstreams.len());
+        for route_upstream in &route.upstreams {
+            let index = config
+                .upstreams
+                .iter()
+                .position(|u| u.name == route_upstream.name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "route \"{}\" references unknown upstream \"{}\"",
+                        route.name,
+                        route_upstream.name
+                    )
+                })?;
+            candidates.push(UpstreamRef {
+                index,
+                name: route_upstream.name.clone(),
+                weight: route_upstream.weight.unwrap_or(1.0),
+            });
+        }
+
+        let strategy: Arc<dyn RoutingStrategy> = match route.strategy {
+            Strategy::Fallback => Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
+            Strategy::Weighted => Arc::new(WeightedStrategy) as Arc<dyn RoutingStrategy>,
+        };
+
+        let admission = Arc::new(RateLimiters::new(&config.ratelimit)) as Arc<dyn AdmissionControl>;
+
+        tracing::info!(
+            route = %route.name,
+            strategy = ?route.strategy,
+            candidates = candidates.len(),
+            "router assembled from config"
+        );
+
+        Ok(Router::new(
+            candidates, providers, strategy, health, admission,
+        ))
     }
 
     /// Dispatches a request, re-selecting a different upstream on rate-limit
@@ -110,10 +212,7 @@ impl Router {
             }
         }
 
-        Err(last_error.unwrap_or(ProviderError::Upstream {
-            status: 503,
-            body: "no healthy upstreams available".to_string(),
-        }))
+        Err(last_error.unwrap_or(ProviderError::Exhausted))
     }
 }
 
@@ -351,10 +450,7 @@ mod tests {
             .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
             .await;
 
-        assert!(matches!(
-            res,
-            Err(ProviderError::Upstream { status: 503, .. })
-        ));
+        assert!(matches!(res, Err(ProviderError::Exhausted)));
     }
 
     struct ShedFor {
@@ -499,5 +595,93 @@ mod tests {
             "cooled upstream must never be selected"
         );
         assert_eq!(b_calls.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn from_config_default_config_produces_two_candidates_in_order() {
+        // `AnthropicProvider::new` doesn't resolve the bearer-token secret
+        // at construction time (only at send-time), so no env var needs to
+        // be set for this to succeed.
+        let config = Config::default();
+        #[allow(clippy::expect_used)]
+        let router = Router::from_config(&config)
+            .await
+            .expect("Config::default() must build a Router");
+        assert_eq!(router.candidates.len(), 2);
+        assert_eq!(router.candidates[0].index, 0);
+        assert_eq!(router.candidates[0].name, "anthropic");
+        assert_eq!(router.candidates[1].index, 1);
+        assert_eq!(router.candidates[1].name, "bedrock");
+        assert_eq!(router.providers[0].name(), "anthropic");
+        assert_eq!(router.providers[1].name(), "bedrock");
+    }
+
+    #[tokio::test]
+    async fn from_config_openai_kind_bails_with_expected_message() {
+        use crate::config::schema::{Route, RouteUpstreamRef, Upstream, UpstreamKind};
+
+        let config = Config {
+            upstreams: vec![Upstream {
+                name: "my-openai-upstream".to_string(),
+                kind: UpstreamKind::Openai {
+                    base_url: "https://example.invalid".to_string(),
+                },
+                auth: None,
+            }],
+            routes: vec![Route {
+                name: "default".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "my-openai-upstream".to_string(),
+                    weight: None,
+                }],
+            }],
+            ..Config::default()
+        };
+
+        let Err(err) = Router::from_config(&config).await else {
+            panic!("Openai-kind upstream must fail to build a Provider")
+        };
+        assert_eq!(
+            err.to_string(),
+            "upstream \"my-openai-upstream\": UpstreamKind::Openai has no Provider implementation yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_empty_routes_bails() {
+        let config = Config {
+            routes: vec![],
+            ..Config::default()
+        };
+        let Err(err) = Router::from_config(&config).await else {
+            panic!("empty routes must fail")
+        };
+        assert!(err.to_string().contains("no routes configured"));
+    }
+
+    #[tokio::test]
+    async fn from_config_multi_route_uses_first() {
+        use crate::config::schema::{Route, RouteUpstreamRef};
+
+        let mut config = Config::default();
+        let route_a = config.routes[0].clone();
+        let route_b = Route {
+            name: "secondary".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "bedrock".to_string(),
+                weight: None,
+            }],
+        };
+        config.routes = vec![route_a, route_b];
+
+        #[allow(clippy::expect_used)]
+        let router = Router::from_config(&config)
+            .await
+            .expect("multi-route config must still build");
+        assert_eq!(router.candidates.len(), 2);
+        assert_eq!(router.candidates[0].name, "anthropic");
+        assert_eq!(router.candidates[1].name, "bedrock");
     }
 }

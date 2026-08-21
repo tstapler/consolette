@@ -386,11 +386,20 @@ fn sum_opt(acc: Option<CostAmountUsd>, next: Option<CostAmountUsd>) -> Option<Co
     }
 }
 
-/// Fold a record into `totals_by_tier` exactly once, the moment all three of
-/// `counterfactual_est`/`compacted_est`/`actual_tokens` are present and the
-/// row isn't already `Reconciled`. Shared by `record_counterfactual` and
-/// `record_actual_usage` so there is exactly one place that appends to
-/// `totals_by_tier`.
+/// Fold a record into `totals_by_tier` exactly once, the moment it has
+/// enough data to reconcile and the row isn't already `Reconciled`. Shared by
+/// `record_counterfactual` and `record_actual_usage` so there is exactly one
+/// place that appends to `totals_by_tier`.
+///
+/// Two shapes are considered "ready":
+/// - The session-compaction shape: all three of `counterfactual_est`,
+///   `compacted_est`, and `actual_tokens` are present (there was a real
+///   compaction decision to compare against).
+/// - The live HTTP-proxy shape (`tier == CompactionTier::Off`, entrypoint's
+///   `begin_cost_tracking`/`CostTrackingStream`, ADR-016): a proxied request
+///   has no counterfactual to compare against by construction, so `actual_tokens`
+///   alone is enough — the record folds with a zero counterfactual/compacted
+///   baseline, meaning "no savings computation applies," not "zero tokens saved."
 fn try_fold_if_ready(state: &mut SessionCostState, request_id: RequestId, pricing: &PricingTable) {
     let Some(record) = state.find_mut(request_id) else {
         return;
@@ -398,15 +407,22 @@ fn try_fold_if_ready(state: &mut SessionCostState, request_id: RequestId, pricin
     if record.status == ReconciliationStatus::Reconciled {
         return;
     }
-    let (Some(counterfactual), Some(compacted), Some(actual)) = (
-        record.counterfactual_est,
-        record.compacted_est,
-        record.actual_tokens,
-    ) else {
+    let Some(actual) = record.actual_tokens else {
         return;
     };
-
     let tier = record.tier.unwrap_or(CompactionTier::Off);
+    let (counterfactual, compacted) = match (record.counterfactual_est, record.compacted_est) {
+        (Some(c), Some(k)) => (c, k),
+        (None, None) if tier == CompactionTier::Off => {
+            let zero = TokenCount {
+                value: 0,
+                source: actual.source,
+            };
+            (zero, zero)
+        }
+        _ => return,
+    };
+
     let price = record.model.as_deref().and_then(|m| pricing.price_for(m));
     let cost_counterfactual =
         price.map(|p| cost_for_tokens(&counterfactual, p.input_usd_per_token));
@@ -436,12 +452,19 @@ fn unfold(
     let Some(record) = state.find_mut(request_id) else {
         return;
     };
-    let (Some(counterfactual), Some(compacted), Some(actual)) = (
-        record.counterfactual_est,
-        record.compacted_est,
-        record.actual_tokens,
-    ) else {
+    let Some(actual) = record.actual_tokens else {
         return;
+    };
+    let (counterfactual, compacted) = match (record.counterfactual_est, record.compacted_est) {
+        (Some(c), Some(k)) => (c, k),
+        (None, None) if tier == CompactionTier::Off => {
+            let zero = TokenCount {
+                value: 0,
+                source: actual.source,
+            };
+            (zero, zero)
+        }
+        _ => return,
     };
     let price = record.model.as_deref().and_then(|m| pricing.price_for(m));
     let cost_counterfactual =
@@ -971,5 +994,75 @@ mod tests {
         let state = tracker.store.get(&key).await.unwrap();
         let state = state.read().await;
         assert_eq!(state.records[0].status, ReconciliationStatus::Abandoned);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Entrypoint (HTTP-proxy) shape: record_pending + record_actual_usage
+    // only, never record_counterfactual (ADR-016; plan.md Stories 2.1.2/
+    // 2.2.1). A live proxied request has nothing to compare against, so
+    // report_for_session must still surface actual usage.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn report_for_session_should_reflect_actual_usage_when_no_counterfactual_was_ever_recorded(
+    ) {
+        let tracker = CostTracker::new(PricingTable::new()).await;
+        let key = SessionKey::new("s1");
+        let request_id = RequestId::new();
+
+        tracker
+            .record_pending(&key, request_id, CompactionTier::Off)
+            .await;
+        tracker
+            .record_actual_usage(&key, request_id, tc(42))
+            .await
+            .unwrap();
+
+        let report = tracker.report_for_session(&key).await.unwrap();
+        assert_eq!(
+            report.actual_tokens,
+            Some(42),
+            "actual usage from a no-counterfactual (HTTP-proxy) record must be reported"
+        );
+
+        let state = tracker.store.get(&key).await.unwrap();
+        let state = state.read().await;
+        assert_eq!(state.records[0].status, ReconciliationStatus::Reconciled);
+        let totals = state.totals_by_tier[tier_index(CompactionTier::Off)];
+        assert_eq!(totals.actual_tokens, 42);
+        assert_eq!(totals.counterfactual_tokens, 0);
+        assert_eq!(totals.compacted_tokens, 0);
+        assert_eq!(totals.reconciled_count, 1);
+    }
+
+    #[tokio::test]
+    async fn record_actual_usage_retry_should_not_corrupt_totals_for_no_counterfactual_record() {
+        let tracker = CostTracker::new(PricingTable::new()).await;
+        let key = SessionKey::new("s1");
+        let request_id = RequestId::new();
+
+        tracker
+            .record_pending(&key, request_id, CompactionTier::Off)
+            .await;
+        tracker
+            .record_actual_usage(&key, request_id, tc(42))
+            .await
+            .unwrap();
+        // Retry with a corrected value, mirroring a mid-stream-cut estimate
+        // later replaced by an exact count (unfold must reverse the first
+        // fold before try_fold_if_ready re-applies the new one).
+        tracker
+            .record_actual_usage(&key, request_id, tc(50))
+            .await
+            .unwrap();
+
+        let report = tracker.report_for_session(&key).await.unwrap();
+        assert_eq!(report.actual_tokens, Some(50));
+
+        let state = tracker.store.get(&key).await.unwrap();
+        let state = state.read().await;
+        let totals = state.totals_by_tier[tier_index(CompactionTier::Off)];
+        assert_eq!(totals.actual_tokens, 50);
+        assert_eq!(totals.reconciled_count, 1);
     }
 }

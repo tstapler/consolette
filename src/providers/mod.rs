@@ -8,6 +8,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod openai;
 
 use std::pin::Pin;
 

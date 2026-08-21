@@ -19,6 +19,7 @@ use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Strategy, UpstreamKind};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
+use crate::providers::openai::OpenaiProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
 
@@ -61,10 +62,9 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if any upstream fails to construct its `Provider`
-    /// (e.g. `UpstreamKind::Openai`, which has no `Provider` implementation
-    /// yet), if `config.routes` is empty, or if a route references an
-    /// upstream name not present in `config.upstreams`.
+    /// Returns `Err` if any upstream fails to construct its `Provider`,
+    /// if `config.routes` is empty, or if a route references an upstream
+    /// name not present in `config.upstreams`.
     pub async fn from_config(config: &Config) -> anyhow::Result<Router> {
         let resolver: Arc<dyn SecretResolver + Send + Sync> = Arc::new(SystemSecretResolver);
         let exec_cache = Arc::new(ExecCredentialCache::new());
@@ -87,11 +87,15 @@ impl Router {
                     bedrock_indices.push(idx);
                     providers.push(Arc::new(provider) as Arc<dyn Provider>);
                 }
-                UpstreamKind::Openai { .. } => {
-                    anyhow::bail!(
-                        "upstream \"{}\": UpstreamKind::Openai has no Provider implementation yet",
-                        upstream.name
-                    );
+                UpstreamKind::Openai { base_url } => {
+                    let provider = OpenaiProvider::new(
+                        Arc::new(upstream.clone()),
+                        base_url.clone(),
+                        Arc::clone(&resolver),
+                        Arc::clone(&exec_cache),
+                        config.request_timeout,
+                    )?;
+                    providers.push(Arc::new(provider) as Arc<dyn Provider>);
                 }
             }
         }
@@ -617,7 +621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_config_openai_kind_bails_with_expected_message() {
+    async fn from_config_openai_kind_builds_successfully() {
         use crate::config::schema::{Route, RouteUpstreamRef, Upstream, UpstreamKind};
 
         let config = Config {
@@ -639,13 +643,11 @@ mod tests {
             ..Config::default()
         };
 
-        let Err(err) = Router::from_config(&config).await else {
-            panic!("Openai-kind upstream must fail to build a Provider")
-        };
-        assert_eq!(
-            err.to_string(),
-            "upstream \"my-openai-upstream\": UpstreamKind::Openai has no Provider implementation yet"
-        );
+        let router = Router::from_config(&config)
+            .await
+            .expect("Openai-kind upstream must build a Provider");
+        assert_eq!(router.candidates[0].name, "my-openai-upstream");
+        assert_eq!(router.providers[0].name(), "openai");
     }
 
     #[tokio::test]

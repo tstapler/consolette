@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use std::fs;
 use std::sync::{Mutex, OnceLock};
 
@@ -47,7 +49,12 @@ fn missing_plugins_d_yields_no_plugins() {
 fn discovers_plugin_with_valid_manifest() {
     let _guard = env_lock().lock().unwrap();
     let root = tempdir().unwrap();
-    write_plugin(root.path(), "acme-vendor", &[("50-model-gateway.toml", "")], true);
+    write_plugin(
+        root.path(),
+        "acme-vendor",
+        &[("50-model-gateway.toml", "")],
+        true,
+    );
 
     let plugins = discover(root.path());
     assert_eq!(plugins.len(), 1);
@@ -138,15 +145,15 @@ fn consolette_plugin_path_env_var_contributes_additional_plugin_dirs() {
     write_plugin(extra.path(), "unused-name-not-derived-from-dir", &[], false);
     // The manifest's declared name is what's used, not the directory name.
     fs::rename(
-        extra.path().join("plugins.d").join("unused-name-not-derived-from-dir"),
+        extra
+            .path()
+            .join("plugins.d")
+            .join("unused-name-not-derived-from-dir"),
         extra.path().join("standalone"),
     )
     .unwrap();
 
-    std::env::set_var(
-        "CONSOLETTE_PLUGIN_PATH",
-        extra.path().join("standalone"),
-    );
+    std::env::set_var("CONSOLETTE_PLUGIN_PATH", extra.path().join("standalone"));
     let plugins = discover(root.path());
     std::env::remove_var("CONSOLETTE_PLUGIN_PATH");
 

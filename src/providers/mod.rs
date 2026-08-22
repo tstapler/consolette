@@ -295,6 +295,144 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Anthropic → OpenAI (the reverse direction from the pair above). Used by
+// `OpenaiProvider::send`, which receives an Anthropic-shaped request body at
+// the `Provider` trait boundary and must speak native OpenAI wire format to
+// an `UpstreamKind::Openai` endpoint, then translate the OpenAI response back
+// to Anthropic shape before returning it. Text-only, matching the scope of
+// `translate_openai_to_anthropic`/`translate_anthropic_to_openai` above (no
+// tool_use/image content yet).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Translate an Anthropic Messages request body to `OpenAI` Chat Completions format.
+///
+/// Mapping:
+/// - top-level `system` string → a leading `{"role":"system",...}` message
+/// - `messages[].content` (Anthropic content-block array or string) → flattened plain-text string
+/// - `model`, `max_tokens`, `temperature`, `stream` → forwarded as-is
+#[must_use]
+pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let model = anthropic
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("gpt-4o")
+        .to_string();
+
+    let max_tokens = anthropic.get("max_tokens").and_then(Value::as_u64);
+    let stream = anthropic
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let temperature = anthropic.get("temperature").cloned();
+
+    let mut messages: Vec<Value> = Vec::new();
+
+    if let Some(system) = anthropic.get("system").and_then(Value::as_str) {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+
+    if let Some(anthropic_messages) = anthropic.get("messages").and_then(Value::as_array) {
+        for msg in anthropic_messages {
+            let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+            let content = msg.get("content").cloned().unwrap_or(Value::Null);
+            let text = extract_text_from_content(&content);
+            messages.push(json!({"role": role, "content": text}));
+        }
+    }
+
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = Value::from(max_tokens);
+    }
+    if let Some(temp) = temperature {
+        body["temperature"] = temp;
+    }
+
+    body
+}
+
+/// Translate an `OpenAI` Chat Completions response body to Anthropic Messages format.
+///
+/// Mapping:
+/// - `choices[0].message.content` → `content: [{"type":"text","text":...}]`
+/// - `choices[0].finish_reason` → `stop_reason` (`"length"`→`"max_tokens"`,
+///   `"tool_calls"`→`"tool_use"`, everything else→`"end_turn"`)
+/// - `usage.{prompt,completion}_tokens` → `usage.{input,output}_tokens`
+#[must_use]
+pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let id = openai
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let model = openai
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let choice = openai
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first());
+
+    let content_text = choice
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let finish_reason = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str);
+    let stop_reason = map_openai_finish_reason(finish_reason);
+
+    let prompt_tokens = openai
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = openai
+        .get("usage")
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": content_text}],
+        "stop_reason": stop_reason,
+        "usage": {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens
+        }
+    })
+}
+
+/// Map an `OpenAI` `finish_reason` to an Anthropic `stop_reason`.
+#[must_use]
+pub(crate) fn map_openai_finish_reason(finish_reason: Option<&str>) -> &'static str {
+    match finish_reason {
+        Some("length") => "max_tokens",
+        Some("tool_calls") => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // cost_metrics Epic 2.2, Story 2.2.1: `usage.*` extraction and the
 // (currently uncalled) actual-usage reporting wrapper.
 //
@@ -587,6 +725,71 @@ mod tests {
         let report = tracker.report_for_session(&key).await.unwrap();
         // Not reconciled yet (no counterfactual side), so still pending.
         assert_eq!(report.pending_count, 2);
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_openai_flattens_system_and_content_blocks() {
+        let anthropic = json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 512,
+            "temperature": 0.5,
+            "system": "be terse",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+        });
+
+        let openai = translate_anthropic_request_to_openai(&anthropic);
+
+        assert_eq!(openai["model"], json!("claude-sonnet-5"));
+        assert_eq!(openai["max_tokens"], json!(512));
+        assert_eq!(openai["temperature"], json!(0.5));
+        assert_eq!(
+            openai["messages"],
+            json!([
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+            ])
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_openai_omits_absent_optional_fields() {
+        let anthropic = json!({"model": "claude-sonnet-5", "messages": []});
+        let openai = translate_anthropic_request_to_openai(&anthropic);
+
+        assert!(openai.get("max_tokens").is_none());
+        assert!(openai.get("temperature").is_none());
+        assert_eq!(openai["stream"], json!(false));
+    }
+
+    #[test]
+    fn translate_openai_response_to_anthropic_maps_content_and_usage() {
+        let openai = json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-4o",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4}
+        });
+
+        let anthropic = translate_openai_response_to_anthropic(&openai);
+
+        assert_eq!(anthropic["id"], json!("chatcmpl-1"));
+        assert_eq!(anthropic["content"], json!([{"type": "text", "text": "hello"}]));
+        assert_eq!(anthropic["stop_reason"], json!("end_turn"));
+        assert_eq!(anthropic["usage"]["input_tokens"], json!(10));
+        assert_eq!(anthropic["usage"]["output_tokens"], json!(4));
+    }
+
+    #[test]
+    fn map_openai_finish_reason_covers_known_and_fallback_cases() {
+        assert_eq!(map_openai_finish_reason(Some("length")), "max_tokens");
+        assert_eq!(map_openai_finish_reason(Some("tool_calls")), "tool_use");
+        assert_eq!(map_openai_finish_reason(Some("stop")), "end_turn");
+        assert_eq!(map_openai_finish_reason(None), "end_turn");
     }
 
     #[tokio::test]

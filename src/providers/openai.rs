@@ -12,12 +12,18 @@
 //! `bearer`/`apikey`/`exec`, identical across upstream kinds — no reason to
 //! duplicate it).
 
+use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
+use eventsource_stream::Eventsource;
+use futures_core::Stream;
 use http::HeaderMap;
 use reqwest::{Client, StatusCode};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::auth::exec::ExecCredentialCache;
@@ -25,7 +31,7 @@ use crate::auth::SecretResolver;
 use crate::config::schema::Upstream;
 
 use super::anthropic::apply_auth_headers;
-use super::{Provider, ProviderError, ProviderResponse};
+use super::{map_openai_finish_reason, Provider, ProviderError, ProviderResponse};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -270,15 +276,200 @@ impl Provider for OpenaiProvider {
         _headers: HeaderMap,
         stream: bool,
     ) -> Result<ProviderResponse, ProviderError> {
+        // `Provider::send` always receives/returns Anthropic-wire-format JSON
+        // at the trait boundary (see `BedrockProvider` for the same pattern)
+        // — translate to/from native OpenAI shape here, internal to this
+        // provider.
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let openai_body = super::translate_anthropic_request_to_openai(&body);
+
         if stream {
-            let response = self.send_streaming_request(body).await?;
+            let response = self.send_streaming_request(openai_body).await?;
             let byte_stream = response
                 .bytes_stream()
                 .map(|r| r.map_err(anyhow::Error::from));
-            Ok(ProviderResponse::Stream(Box::pin(byte_stream)))
+            let translated = OpenaiToAnthropicStream::new(byte_stream, model);
+            Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
-            let value = self.send_request(body).await?;
-            Ok(ProviderResponse::Full(value))
+            let value = self.send_request(openai_body).await?;
+            let anthropic_value = super::translate_openai_response_to_anthropic(&value);
+            Ok(ProviderResponse::Full(anthropic_value))
+        }
+    }
+}
+
+/// Translates an `OpenAI` `chat.completion.chunk` SSE byte stream into an
+/// Anthropic Messages SSE event stream — the reverse of
+/// `entrypoint::openai_stream::OpenAiStreamTranslator`. Anthropic's SSE
+/// protocol requires bracketing events (`message_start`,
+/// `content_block_start`, ... `content_block_stop`, `message_delta`,
+/// `message_stop`) that `OpenAI`'s flatter chunk stream has no equivalent
+/// for, so a single inbound chunk can produce more than one outbound frame;
+/// `pending` buffers those extras between polls.
+struct OpenaiToAnthropicStream<S> {
+    inner: eventsource_stream::EventStream<S>,
+    id: String,
+    model: String,
+    started: bool,
+    finished: bool,
+    done: bool,
+    pending: VecDeque<Bytes>,
+}
+
+impl<S> OpenaiToAnthropicStream<S>
+where
+    S: Stream<Item = Result<Bytes, anyhow::Error>>,
+{
+    fn new(inner: S, model: String) -> Self {
+        Self {
+            inner: inner.eventsource(),
+            id: format!("msg_{}", uuid::Uuid::new_v4()),
+            model,
+            started: false,
+            finished: false,
+            done: false,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn frame(event: &str, data: &Value) -> Bytes {
+        Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
+    }
+
+    /// Push the synthetic `message_start`/`content_block_start` pair, if not
+    /// already emitted, so every stream opens with a well-formed Anthropic
+    /// preamble even if the first `OpenAI` chunk carries no text.
+    fn ensure_started(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.pending.push_back(Self::frame(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.model,
+                    "stop_reason": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }),
+        ));
+        self.pending.push_back(Self::frame(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ));
+    }
+
+    fn push_delta(&mut self, text: &str) {
+        self.ensure_started();
+        self.pending.push_back(Self::frame(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        ));
+    }
+
+    /// Emit the closing `content_block_stop`/`message_delta`/`message_stop`
+    /// sequence and mark the stream finished. Idempotent.
+    fn close(&mut self, stop_reason: &str) {
+        if self.finished {
+            return;
+        }
+        self.ensure_started();
+        self.finished = true;
+        self.pending
+            .push_back(Self::frame("content_block_stop", &json!({"type": "content_block_stop", "index": 0})));
+        self.pending.push_back(Self::frame(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason},
+                "usage": {"output_tokens": 0}
+            }),
+        ));
+        self.pending
+            .push_back(Self::frame("message_stop", &json!({"type": "message_stop"})));
+    }
+}
+
+impl<S> Stream for OpenaiToAnthropicStream<S>
+where
+    S: Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
+{
+    type Item = Result<Bytes, anyhow::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            if let Some(frame) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            if this.finished {
+                this.done = true;
+                continue;
+            }
+
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    this.close("end_turn");
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    warn!(error = %e, "openai->anthropic stream translator: eventsource parse error");
+                    this.close("end_turn");
+                }
+                Poll::Ready(Some(Ok(event))) => {
+                    if event.data == "[DONE]" {
+                        this.close("end_turn");
+                        continue;
+                    }
+                    let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
+                        continue;
+                    };
+
+                    let choice = parsed
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first());
+
+                    if let Some(text) = choice
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("content"))
+                        .and_then(Value::as_str)
+                    {
+                        if !text.is_empty() {
+                            this.push_delta(text);
+                        }
+                    }
+
+                    if let Some(reason) = choice
+                        .and_then(|c| c.get("finish_reason"))
+                        .and_then(Value::as_str)
+                    {
+                        this.close(map_openai_finish_reason(Some(reason)));
+                    }
+                }
+            }
         }
     }
 }
@@ -325,5 +516,101 @@ mod tests {
             .build_headers("https://example.invalid/v1/chat/completions")
             .await;
         assert!(matches!(result, Err(ProviderError::Auth(_))));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // OpenaiToAnthropicStream
+    // ────────────────────────────────────────────────────────────────────
+
+    mod stream_translator {
+        use super::*;
+        use futures_util::stream;
+
+        async fn drain<S>(s: S) -> Vec<Bytes>
+        where
+            S: Stream<Item = Result<Bytes, anyhow::Error>>,
+        {
+            s.map(|item| item.unwrap()).collect().await
+        }
+
+        fn sse(data: &str) -> Bytes {
+            Bytes::from(format!("data: {data}\n\n"))
+        }
+
+        fn parse_event(frame: &Bytes) -> (String, Value) {
+            let text = String::from_utf8(frame.to_vec()).unwrap();
+            let mut event = String::new();
+            let mut data = String::new();
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("event: ") {
+                    event = rest.to_string();
+                } else if let Some(rest) = line.strip_prefix("data: ") {
+                    data = rest.to_string();
+                }
+            }
+            (event, serde_json::from_str(&data).unwrap())
+        }
+
+        #[tokio::test]
+        async fn content_delta_is_bracketed_by_start_and_stop_events() {
+            let inner = stream::iter(vec![
+                Ok(sse(r#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#)),
+                Ok(sse(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)),
+                Ok(sse("[DONE]")),
+            ]);
+            let translator = OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string());
+            let out = drain(translator).await;
+
+            let events: Vec<String> = out.iter().map(|f| parse_event(f).0).collect();
+            assert_eq!(
+                events,
+                vec![
+                    "message_start",
+                    "content_block_start",
+                    "content_block_delta",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop",
+                ]
+            );
+
+            let (_, delta_data) = parse_event(&out[2]);
+            assert_eq!(delta_data["delta"]["text"], "Hi");
+
+            let (_, message_delta_data) = parse_event(&out[4]);
+            assert_eq!(message_delta_data["delta"]["stop_reason"], "end_turn");
+        }
+
+        #[tokio::test]
+        async fn length_finish_reason_maps_to_max_tokens_stop_reason() {
+            let inner = stream::iter(vec![Ok(sse(
+                r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}"#,
+            ))]);
+            let translator = OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string());
+            let out = drain(translator).await;
+
+            let (_, message_delta_data) = parse_event(&out[4]);
+            assert_eq!(message_delta_data["delta"]["stop_reason"], "max_tokens");
+        }
+
+        #[tokio::test]
+        async fn empty_stream_still_produces_well_formed_bracketing_events() {
+            let inner: futures_util::stream::Iter<std::vec::IntoIter<Result<Bytes, anyhow::Error>>> =
+                stream::iter(vec![]);
+            let translator = OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string());
+            let out = drain(translator).await;
+
+            let events: Vec<String> = out.iter().map(|f| parse_event(f).0).collect();
+            assert_eq!(
+                events,
+                vec![
+                    "message_start",
+                    "content_block_start",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop",
+                ]
+            );
+        }
     }
 }

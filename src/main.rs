@@ -254,25 +254,27 @@ impl rmcp::ServerHandler for CombinedMcpServer {
         ))
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, rmcp::ErrorData>>
+    {
         let mut tools = consolette::claude_code_session::mcp_server::tool_defs();
         tools.extend(consolette::context_forensics::mcp_server::tool_defs());
-        Ok(rmcp::model::ListToolsResult {
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
             tools,
             ..Default::default()
-        })
+        }))
     }
 
-    async fn call_tool(
+    fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        Ok(self.dispatch(request))
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>>
+    {
+        std::future::ready(Ok(self.dispatch(request)))
     }
 }
 

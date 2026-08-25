@@ -11,12 +11,11 @@
 //! modules — extending neither").
 //!
 //! Built up epic-by-epic per
-//! `project_plans/context-analyzer/implementation/plan.md`; Epic 1.1
-//! introduces only [`usage::extract_call_usage`], which has no caller yet
-//! outside its own unit tests — later epics (1.2's store, 1.3's ingestion
-//! pipeline) wire it in. Matches `src/providers/mod.rs`'s same
-//! built-ahead-of-its-caller precedent.
-#![allow(dead_code)]
+//! `project_plans/context-analyzer/implementation/plan.md`; some pieces are
+//! built ahead of their caller (matches `src/providers/mod.rs`'s same
+//! precedent) — see each such item's own `#[allow(dead_code)]` for why,
+//! rather than a blanket module-level allow that could hide unrelated dead
+//! code.
 
 pub mod budget;
 pub mod composition;

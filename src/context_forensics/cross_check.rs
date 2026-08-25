@@ -10,6 +10,12 @@
 //! A session with no proxy-side data at all degrades to
 //! [`CrossCheckStatus::TranscriptOnly`] for every call — never an error,
 //! never a missing row.
+//!
+//! Nothing in this codebase yet captures per-call proxy usage keyed by
+//! message id, so this reconciliation path has no caller yet outside its
+//! own unit tests — a later epic wires it into the live proxy-capture path
+//! (mirrors `mod.rs`'s [`crate::context_forensics::usage::extract_call_usage`]
+//! precedent).
 
 use anyhow::Result;
 
@@ -23,8 +29,10 @@ use crate::providers::AnthropicUsage;
 /// diverging — accounts for the small provider-side rounding/timing noise
 /// `research/pitfalls.md` doesn't quantify. A starting guess, not a
 /// verified constant; revisit once real corroborated/diverged data exists.
+#[allow(dead_code)]
 const TOLERANCE_TOKENS: i64 = 5;
 
+#[allow(dead_code)]
 fn signed_variance(transcript: u64, proxy: u64) -> i64 {
     let transcript = i64::try_from(transcript).unwrap_or(i64::MAX);
     let proxy = i64::try_from(proxy).unwrap_or(i64::MAX);
@@ -34,6 +42,7 @@ fn signed_variance(transcript: u64, proxy: u64) -> i64 {
 /// Total signed variance (transcript minus proxy, summed across all four
 /// usage fields) between two readings of the same call.
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn usage_variance(transcript: AnthropicUsage, proxy: AnthropicUsage) -> i64 {
     signed_variance(transcript.input_tokens, proxy.input_tokens)
         + signed_variance(transcript.output_tokens, proxy.output_tokens)
@@ -51,6 +60,7 @@ pub(crate) fn usage_variance(transcript: AnthropicUsage, proxy: AnthropicUsage) 
 /// one for the same call. Returns the status to record plus the variance
 /// (`None` when there's no proxy-side reading to compare against).
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn reconcile(
     transcript: AnthropicUsage,
     proxy: Option<AnthropicUsage>,
@@ -66,6 +76,28 @@ pub(crate) fn reconcile(
     }
 }
 
+/// A session's aggregate cross-check status for dashboard display (Story
+/// 5.2.2): [`CrossCheckStatus::Diverged`] if any call diverged, else
+/// [`CrossCheckStatus::Corroborated`] if any call corroborated, else
+/// [`CrossCheckStatus::TranscriptOnly`] — the same worst-first precedence a
+/// reader would want ("tell me if anything's wrong first").
+#[must_use]
+pub(crate) fn worst_status(rows: &[ProxyCrossCheckRow]) -> CrossCheckStatus {
+    if rows
+        .iter()
+        .any(|row| row.status == CrossCheckStatus::Diverged)
+    {
+        CrossCheckStatus::Diverged
+    } else if rows
+        .iter()
+        .any(|row| row.status == CrossCheckStatus::Corroborated)
+    {
+        CrossCheckStatus::Corroborated
+    } else {
+        CrossCheckStatus::TranscriptOnly
+    }
+}
+
 /// Reconciles one call and persists the verdict as a `proxy_cross_check`
 /// row, replacing any prior reconciliation for the same call (idempotent
 /// re-run — e.g. from a rescan once a later proxy-captured reading
@@ -74,6 +106,7 @@ pub(crate) fn reconcile(
 /// # Errors
 ///
 /// Returns an error if the underlying store write fails.
+#[allow(dead_code)]
 pub(crate) fn record_reconciliation(
     store: &ContextForensicsStore,
     session_id: &str,
@@ -205,6 +238,37 @@ mod tests {
         let rows = store.proxy_cross_check_for_session("s1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, CrossCheckStatus::Corroborated);
+    }
+
+    fn cross_check_row(status: CrossCheckStatus) -> ProxyCrossCheckRow {
+        ProxyCrossCheckRow {
+            session_id: "s1".to_string(),
+            call_id: "s1:msg_abc".to_string(),
+            proxy_request_id: None,
+            status,
+            variance_tokens: None,
+        }
+    }
+
+    #[test]
+    fn worst_status_should_return_transcript_only_when_rows_empty() {
+        assert_eq!(worst_status(&[]), CrossCheckStatus::TranscriptOnly);
+    }
+
+    #[test]
+    fn worst_status_should_return_corroborated_when_one_corroborated_row() {
+        let rows = [cross_check_row(CrossCheckStatus::Corroborated)];
+        assert_eq!(worst_status(&rows), CrossCheckStatus::Corroborated);
+    }
+
+    #[test]
+    fn worst_status_should_return_diverged_when_any_row_diverged() {
+        let rows = [
+            cross_check_row(CrossCheckStatus::Corroborated),
+            cross_check_row(CrossCheckStatus::Diverged),
+            cross_check_row(CrossCheckStatus::Corroborated),
+        ];
+        assert_eq!(worst_status(&rows), CrossCheckStatus::Diverged);
     }
 
     #[test]

@@ -182,6 +182,12 @@ fn collect_turn_row(
             .and_then(Value::as_str)
             .map(String::from);
 
+        let message_json = row
+            .fields()
+            .message
+            .as_ref()
+            .and_then(|message| serde_json::to_string(message).ok());
+
         pending_calls.push(ApiCallRow {
             id: format!("{session_id}:{}", row.uuid()),
             session_id: session_id.to_string(),
@@ -197,6 +203,7 @@ fn collect_turn_row(
             conversation_tokens: breakdown.conversation_tokens,
             system_tokens: breakdown.system_tokens,
             usage_provenance: UsageProvenance::TranscriptExact,
+            message_json,
         });
         *call_index += 1;
     }
@@ -208,6 +215,19 @@ fn collect_turn_row(
     if pending_calls.is_empty() {
         return None;
     }
+    let user_row_json = turn
+        .user_row
+        .fields()
+        .message
+        .as_ref()
+        .and_then(|message| serde_json::to_string(message).ok());
+    let tool_row_messages: Vec<Value> = turn
+        .tool_rows
+        .iter()
+        .filter_map(|row| row.fields().message.clone())
+        .collect();
+    let tool_rows_json = serde_json::to_string(&Value::Array(tool_row_messages)).ok();
+
     Some((
         TurnRow {
             id: turn_id,
@@ -215,6 +235,8 @@ fn collect_turn_row(
             turn_index: turn_index_u64,
             user_row_uuid: turn.user_row.uuid().to_string(),
             cumulative_tokens: turn_context_size,
+            user_row_json,
+            tool_rows_json,
         },
         pending_calls,
     ))

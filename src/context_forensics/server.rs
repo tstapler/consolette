@@ -196,6 +196,83 @@ async fn handler_sessions_summary(State(state): State<SummaryState>) -> impl Int
     }
 }
 
+/// One [`ApiCallRow`]'s content for the turn-content response — just the
+/// `message_json` (deserialized), since every other `ApiCallRow` field is
+/// already available via the composition route and would be noise here.
+fn parsed_json(raw: Option<&String>) -> Option<serde_json::Value> {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+}
+
+/// `GET /v1/context/sessions/{id}/turns/{turn_index}`: the turn's
+/// `user_row`/`assistant_rows`/`tool_rows` content, from the `message_json`/
+/// `user_row_json`/`tool_rows_json` columns captured at ingest time (Story
+/// 2.2.1) — no re-parsing the transcript. `404` with a JSON error body when
+/// `id` isn't a known session or has no turn at `turn_index` (never a `500`
+/// for either).
+async fn handler_turn_content(
+    State(store): State<Arc<ContextForensicsStore>>,
+    Path((session_id, turn_index)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    match store.get_session(&session_id) {
+        Ok(None) => {
+            return session_not_found(&session_id);
+        }
+        Ok(Some(_)) => {}
+        Err(error) => {
+            tracing::error!(%error, session_id, "context-forensics: failed to look up session");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body("store_query_failed", &serde_json::json!({}))),
+            )
+                .into_response();
+        }
+    }
+
+    let content = match store.turn_content(&session_id, turn_index) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(error_body(
+                    "turn_not_found",
+                    &serde_json::json!({ "session_id": session_id, "turn_index": turn_index }),
+                )),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, session_id, turn_index, "context-forensics: failed to look up turn content");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body("store_query_failed", &serde_json::json!({}))),
+            )
+                .into_response();
+        }
+    };
+    let (turn, calls) = content;
+
+    let tool_rows: Vec<serde_json::Value> = turn
+        .tool_rows_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let assistant_rows: Vec<serde_json::Value> = calls
+        .iter()
+        .filter_map(|call| parsed_json(call.message_json.as_ref()))
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "user_row": parsed_json(turn.user_row_json.as_ref()),
+            "assistant_rows": assistant_rows,
+            "tool_rows": tool_rows,
+        })),
+    )
+        .into_response()
+}
+
 fn session_not_found(session_id: &str) -> axum::response::Response {
     (
         StatusCode::NOT_FOUND,
@@ -250,6 +327,10 @@ pub fn context_router(
             "/v1/context/sessions/{id}/growth",
             get(handler_session_growth),
         )
+        .route(
+            "/v1/context/sessions/{id}/turns/{turn_index}",
+            get(handler_turn_content),
+        )
         .with_state(store)
         .merge(summary_router)
 }
@@ -278,6 +359,10 @@ pub fn context_unavailable_router() -> Router {
         .route("/v1/context/sessions/summary", get(unavailable))
         .route("/v1/context/sessions/{id}/composition", get(unavailable))
         .route("/v1/context/sessions/{id}/growth", get(unavailable))
+        .route(
+            "/v1/context/sessions/{id}/turns/{turn_index}",
+            get(unavailable),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +459,56 @@ mod tests {
         let turns = json["turns"].as_array().unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0]["input_tokens"], 1000);
+    }
+
+    #[tokio::test]
+    async fn get_turn_content_route_should_return_verbatim_message_text_when_turn_exists() {
+        let (_dir, store, session_id) = seeded_store();
+        let router = context_router(store, fixture_pricing_rx());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/context/sessions/{session_id}/turns/0"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user_row"]["content"], "hi");
+        let assistant_rows = json["assistant_rows"].as_array().unwrap();
+        assert_eq!(assistant_rows.len(), 1);
+        assert_eq!(assistant_rows[0]["content"][0]["text"], "reply");
+        assert_eq!(json["tool_rows"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_turn_content_should_return_404_when_turn_index_out_of_range() {
+        let (_dir, store, session_id) = seeded_store();
+        let router = context_router(store, fixture_pricing_rx());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/context/sessions/{session_id}/turns/99"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "turn_not_found");
     }
 
     #[tokio::test]

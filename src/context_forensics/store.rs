@@ -107,6 +107,16 @@ pub struct SessionRow {
 }
 
 /// Persisted per-turn record.
+///
+/// `user_row_json`/`tool_rows_json` (Story 2.2.1, Task 2.2.1a) hold the raw
+/// content the message inspector renders: `user_row_json` is the turn's
+/// `user_row.message`, serialized; `tool_rows_json` is a JSON array of the
+/// turn's `tool_rows[].message` values, in order. Denormalized onto this row
+/// rather than a new per-row table — tool rows carry no token usage and the
+/// inspector only ever renders a whole turn at once, never queries
+/// individual tool rows. Both `None` for turns ingested before this column
+/// existed; a rescan backfills them (the store is a derived, rebuildable
+/// cache — see Migration Plan).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRow {
     pub id: String,
@@ -114,6 +124,8 @@ pub struct TurnRow {
     pub turn_index: u64,
     pub user_row_uuid: String,
     pub cumulative_tokens: u64,
+    pub user_row_json: Option<String>,
+    pub tool_rows_json: Option<String>,
 }
 
 /// Persisted per-API-call record. One assistant transcript row = one API
@@ -123,6 +135,10 @@ pub struct TurnRow {
 /// (nullable in the schema) from Phase 1 onward: Claude Code ingestion
 /// always writes `Some(_)` (including `Some(0)`), Codex ingestion (Phase 3)
 /// writes `None` for the field it has no equivalent for.
+///
+/// `message_json` (Story 2.2.1, Task 2.2.1a) is the row's serialized
+/// `message` — the assistant-row half of the message inspector's content
+/// (`user_row_json`/`tool_rows_json` on [`TurnRow`] hold the other half).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiCallRow {
     /// `"{session_id}:{row_uuid}"`.
@@ -140,6 +156,7 @@ pub struct ApiCallRow {
     pub conversation_tokens: u64,
     pub system_tokens: u64,
     pub usage_provenance: UsageProvenance,
+    pub message_json: Option<String>,
 }
 
 /// Persisted native-compaction event (Claude Code's own auto-compaction, as
@@ -246,18 +263,22 @@ fn exec_upsert_turn(conn: &Connection, row: &TurnRow) -> Result<()> {
     let turn_index = to_i64(row.turn_index);
     let cumulative_tokens = to_i64(row.cumulative_tokens);
     conn.execute(
-        "INSERT INTO turns (id, session_id, turn_index, user_row_uuid, cumulative_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO turns (id, session_id, turn_index, user_row_uuid, cumulative_tokens, user_row_json, tool_rows_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT (session_id, turn_index) DO UPDATE SET
             id = excluded.id,
             user_row_uuid = excluded.user_row_uuid,
-            cumulative_tokens = excluded.cumulative_tokens",
+            cumulative_tokens = excluded.cumulative_tokens,
+            user_row_json = excluded.user_row_json,
+            tool_rows_json = excluded.tool_rows_json",
         params![
             row.id,
             row.session_id,
             turn_index,
             row.user_row_uuid,
             cumulative_tokens,
+            row.user_row_json,
+            row.tool_rows_json,
         ],
     )?;
     Ok(())
@@ -276,8 +297,8 @@ fn exec_upsert_api_call(conn: &Connection, row: &ApiCallRow) -> Result<()> {
         "INSERT INTO api_calls (
             id, session_id, turn_id, row_uuid, call_index, model,
             input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-            tool_io_tokens, conversation_tokens, system_tokens, usage_provenance
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            tool_io_tokens, conversation_tokens, system_tokens, usage_provenance, message_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT (session_id, row_uuid) DO UPDATE SET
             id = excluded.id,
             turn_id = excluded.turn_id,
@@ -290,7 +311,8 @@ fn exec_upsert_api_call(conn: &Connection, row: &ApiCallRow) -> Result<()> {
             tool_io_tokens = excluded.tool_io_tokens,
             conversation_tokens = excluded.conversation_tokens,
             system_tokens = excluded.system_tokens,
-            usage_provenance = excluded.usage_provenance",
+            usage_provenance = excluded.usage_provenance,
+            message_json = excluded.message_json",
         params![
             row.id,
             row.session_id,
@@ -306,6 +328,7 @@ fn exec_upsert_api_call(conn: &Connection, row: &ApiCallRow) -> Result<()> {
             conversation_tokens,
             system_tokens,
             row.usage_provenance.as_db_str(),
+            row.message_json,
         ],
     )?;
     Ok(())
@@ -349,6 +372,8 @@ CREATE TABLE IF NOT EXISTS turns (
     turn_index        INTEGER NOT NULL,
     user_row_uuid     TEXT NOT NULL,
     cumulative_tokens INTEGER NOT NULL,
+    user_row_json     TEXT,
+    tool_rows_json    TEXT,
     UNIQUE (session_id, turn_index)
 );
 
@@ -367,6 +392,7 @@ CREATE TABLE IF NOT EXISTS api_calls (
     conversation_tokens           INTEGER NOT NULL,
     system_tokens                  INTEGER NOT NULL,
     usage_provenance              TEXT NOT NULL CHECK (usage_provenance IN ('transcript_exact','proxy_captured')),
+    message_json                  TEXT,
     UNIQUE (session_id, row_uuid)
 );
 
@@ -722,7 +748,7 @@ impl ContextForensicsStore {
     pub fn turns_for_session(&self, session_id: &str) -> Result<Vec<TurnRow>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, turn_index, user_row_uuid, cumulative_tokens
+            "SELECT id, session_id, turn_index, user_row_uuid, cumulative_tokens, user_row_json, tool_rows_json
              FROM turns WHERE session_id = ?1 ORDER BY turn_index ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -734,6 +760,8 @@ impl ContextForensicsStore {
                 turn_index: u64::try_from(turn_index).unwrap_or(0),
                 user_row_uuid: row.get(3)?,
                 cumulative_tokens: u64::try_from(cumulative_tokens).unwrap_or(0),
+                user_row_json: row.get(5)?,
+                tool_rows_json: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -751,7 +779,7 @@ impl ContextForensicsStore {
         let mut stmt = conn.prepare(
             "SELECT id, session_id, turn_id, row_uuid, call_index, model,
                     input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-                    tool_io_tokens, conversation_tokens, system_tokens, usage_provenance
+                    tool_io_tokens, conversation_tokens, system_tokens, usage_provenance, message_json
              FROM api_calls WHERE session_id = ?1 ORDER BY call_index ASC",
         )?;
         #[allow(clippy::type_complexity)]
@@ -780,6 +808,7 @@ impl ContextForensicsStore {
                 conversation_tokens,
                 system_tokens,
                 usage_provenance,
+                row.get::<_, Option<String>>(14)?,
             ))
         })?;
 
@@ -800,6 +829,7 @@ impl ContextForensicsStore {
                 conversation_tokens,
                 system_tokens,
                 usage_provenance,
+                message_json,
             ) = row?;
             result.push(ApiCallRow {
                 id,
@@ -818,9 +848,128 @@ impl ContextForensicsStore {
                 conversation_tokens: u64::try_from(conversation_tokens).unwrap_or(0),
                 system_tokens: u64::try_from(system_tokens).unwrap_or(0),
                 usage_provenance: UsageProvenance::from_db_str(&usage_provenance)?,
+                message_json,
             });
         }
         Ok(result)
+    }
+
+    /// One turn's [`TurnRow`] plus its [`ApiCallRow`]s, by `session_id` +
+    /// `turn_index` — the message inspector's data source (Story 2.2.1).
+    /// `None` if no turn at that index exists for that session (the route
+    /// handler maps this to `404`, never a `500`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned, the query
+    /// fails, or a stored `usage_provenance` value doesn't match a known
+    /// [`UsageProvenance`] variant.
+    pub fn turn_content(
+        &self,
+        session_id: &str,
+        turn_index: u64,
+    ) -> Result<Option<(TurnRow, Vec<ApiCallRow>)>> {
+        let conn = self.lock()?;
+        let turn_index_i64 = to_i64(turn_index);
+        let turn = conn
+            .query_row(
+                "SELECT id, session_id, turn_index, user_row_uuid, cumulative_tokens, user_row_json, tool_rows_json
+                 FROM turns WHERE session_id = ?1 AND turn_index = ?2",
+                params![session_id, turn_index_i64],
+                |row| {
+                    let cumulative_tokens: i64 = row.get(4)?;
+                    Ok(TurnRow {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        turn_index,
+                        user_row_uuid: row.get(3)?,
+                        cumulative_tokens: u64::try_from(cumulative_tokens).unwrap_or(0),
+                        user_row_json: row.get(5)?,
+                        tool_rows_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(turn) = turn else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_id, row_uuid, call_index, model,
+                    input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                    tool_io_tokens, conversation_tokens, system_tokens, usage_provenance, message_json
+             FROM api_calls WHERE turn_id = ?1 ORDER BY call_index ASC",
+        )?;
+        #[allow(clippy::type_complexity)]
+        let rows = stmt.query_map(params![turn.id], |row| {
+            let call_index: i64 = row.get(4)?;
+            let input_tokens: i64 = row.get(6)?;
+            let output_tokens: i64 = row.get(7)?;
+            let cache_creation_input_tokens: Option<i64> = row.get(8)?;
+            let cache_read_input_tokens: Option<i64> = row.get(9)?;
+            let tool_io_tokens: i64 = row.get(10)?;
+            let conversation_tokens: i64 = row.get(11)?;
+            let system_tokens: i64 = row.get(12)?;
+            let usage_provenance: String = row.get(13)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                call_index,
+                row.get::<_, Option<String>>(5)?,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                tool_io_tokens,
+                conversation_tokens,
+                system_tokens,
+                usage_provenance,
+                row.get::<_, Option<String>>(14)?,
+            ))
+        })?;
+
+        let mut calls = Vec::new();
+        for row in rows {
+            let (
+                id,
+                session_id,
+                turn_id,
+                row_uuid,
+                call_index,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                tool_io_tokens,
+                conversation_tokens,
+                system_tokens,
+                usage_provenance,
+                message_json,
+            ) = row?;
+            calls.push(ApiCallRow {
+                id,
+                session_id,
+                turn_id,
+                row_uuid,
+                call_index: u64::try_from(call_index).unwrap_or(0),
+                model,
+                input_tokens: u64::try_from(input_tokens).unwrap_or(0),
+                output_tokens: u64::try_from(output_tokens).unwrap_or(0),
+                cache_creation_input_tokens: cache_creation_input_tokens
+                    .map(|v| u64::try_from(v).unwrap_or(0)),
+                cache_read_input_tokens: cache_read_input_tokens
+                    .map(|v| u64::try_from(v).unwrap_or(0)),
+                tool_io_tokens: u64::try_from(tool_io_tokens).unwrap_or(0),
+                conversation_tokens: u64::try_from(conversation_tokens).unwrap_or(0),
+                system_tokens: u64::try_from(system_tokens).unwrap_or(0),
+                usage_provenance: UsageProvenance::from_db_str(&usage_provenance)?,
+                message_json,
+            });
+        }
+        Ok(Some((turn, calls)))
     }
 
     /// Every [`NativeCompactionEventRow`] for one session.
@@ -1052,6 +1201,7 @@ mod tests {
             conversation_tokens: input_tokens,
             system_tokens: 0,
             usage_provenance: UsageProvenance::TranscriptExact,
+            message_json: None,
         }
     }
 
@@ -1180,6 +1330,8 @@ mod tests {
                 turn_index: 0,
                 user_row_uuid: "u1".to_string(),
                 cumulative_tokens: 1000,
+                user_row_json: None,
+                tool_rows_json: None,
             })
             .unwrap();
         store
@@ -1189,6 +1341,8 @@ mod tests {
                 turn_index: 1,
                 user_row_uuid: "u2".to_string(),
                 cumulative_tokens: 850_000,
+                user_row_json: None,
+                tool_rows_json: None,
             })
             .unwrap();
 
@@ -1244,6 +1398,8 @@ mod tests {
                 turn_index: 0,
                 user_row_uuid: "u1".to_string(),
                 cumulative_tokens: 1200,
+                user_row_json: None,
+                tool_rows_json: None,
             })
             .unwrap();
         store
@@ -1266,6 +1422,8 @@ mod tests {
                 turn_index: 0,
                 user_row_uuid: "u1".to_string(),
                 cumulative_tokens: 1200,
+                user_row_json: None,
+                tool_rows_json: None,
             })
             .unwrap();
         store

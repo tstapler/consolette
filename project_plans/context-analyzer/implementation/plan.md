@@ -554,7 +554,7 @@ Phase 1: Foundations + MVP slice (composition + growth, Claude Code, no hooks)
 **Files**: `src/context_forensics/server.rs`, `src/context_forensics/store.rs`
 
 ##### Task 2.2.1a: Store the raw row content needed for inspection (~4 min)
-- Extend `ApiCallRow`/`TurnRow` upsert to also persist the row's serialized `message` JSON (a new nullable `TEXT` column on `api_calls`, `message_json`), since the store doesn't otherwise keep raw content after ingestion.
+- **Schema correction** (the AC needs `user_row`/`tool_rows` content, which nothing before this task stores — `TurnRow` only ever held a `user_row_uuid` reference): add nullable `TEXT` columns `message_json` on `api_calls` (the assistant row's serialized `message`, one per call — covers `assistant_rows`) AND `user_row_json` + `tool_rows_json` on `turns` (the turn's user row's serialized `message`, and a JSON array of its tool rows' `message` values in order). Denormalized onto `TurnRow` rather than a new per-row table: tool rows carry no token usage and the inspector only ever renders a whole turn at once, never queries individual tool rows, so a join-free blob is proportionate.
 - Files: `src/context_forensics/store.rs`
 
 ##### Task 2.2.1b: Route + test (~4 min)

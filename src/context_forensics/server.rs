@@ -67,9 +67,13 @@ async fn handler_list_sessions(
         }
     };
 
+    let peak_context_tokens_by_session = store.peak_context_tokens_by_session().unwrap_or_default();
     let mut entries = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let peak_context_tokens = store.peak_context_tokens(&session.id).unwrap_or(0);
+        let peak_context_tokens = peak_context_tokens_by_session
+            .get(&session.id)
+            .copied()
+            .unwrap_or(0);
         entries.push(SessionListEntry {
             id: session.id,
             source: session.source,

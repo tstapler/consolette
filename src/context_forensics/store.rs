@@ -563,6 +563,7 @@ CREATE TABLE IF NOT EXISTS api_calls (
     message_json                  TEXT,
     UNIQUE (session_id, row_uuid)
 );
+CREATE INDEX IF NOT EXISTS idx_api_calls_turn_id ON api_calls(turn_id);
 
 CREATE TABLE IF NOT EXISTS native_compaction_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -685,6 +686,13 @@ impl ContextForensicsStore {
         // comment).
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|error| anyhow!("failed to set synchronous=NORMAL: {error}"))?;
+
+        // `bundled` rusqlite happens to build vendored SQLite with
+        // `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, but that's a transitive
+        // dependency detail, not a guarantee — set it explicitly so the
+        // `REFERENCES` constraints in the schema above are actually enforced.
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|error| anyhow!("failed to enable foreign_keys: {error}"))?;
 
         if path.exists() {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
@@ -879,19 +887,7 @@ impl ContextForensicsStore {
     /// fails.
     pub fn cross_check_status_for_session(&self, session_id: &str) -> Result<CrossCheckStatus> {
         let rows = self.proxy_cross_check_for_session(session_id)?;
-        if rows
-            .iter()
-            .any(|row| row.status == CrossCheckStatus::Diverged)
-        {
-            Ok(CrossCheckStatus::Diverged)
-        } else if rows
-            .iter()
-            .any(|row| row.status == CrossCheckStatus::Corroborated)
-        {
-            Ok(CrossCheckStatus::Corroborated)
-        } else {
-            Ok(CrossCheckStatus::TranscriptOnly)
-        }
+        Ok(crate::context_forensics::cross_check::worst_status(&rows))
     }
 
     /// A one-line, human-readable discrepancy summary for a
@@ -1030,6 +1026,8 @@ impl ContextForensicsStore {
             }
         }
 
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
         let mut written = 0;
         for (key, start) in &starts {
             let Some(stop) = stops.get(key) else {
@@ -1048,9 +1046,10 @@ impl ContextForensicsStore {
                 started_at: Some(start.received_at.clone()),
                 ended_at: Some(stop.received_at.clone()),
             };
-            self.upsert_subagent(&row)?;
+            exec_upsert_subagent(&tx, &row)?;
             written += 1;
         }
+        tx.commit()?;
         Ok(written)
     }
 
@@ -1516,6 +1515,29 @@ impl ContextForensicsStore {
         Ok(peak.and_then(|v| u64::try_from(v).ok()).unwrap_or(0))
     }
 
+    /// Every session's peak `cumulative_tokens`, in one query — the
+    /// aggregate counterpart to [`Self::peak_context_tokens`] for callers
+    /// that need every session's peak (avoids an N+1 loop of per-session
+    /// `peak_context_tokens` calls, e.g. `handler_list_sessions` and
+    /// [`Self::summary_for_all_sessions`]). A session with no turns yet is
+    /// simply absent from the map (never a `0` entry) — callers already
+    /// treat "missing" and "zero" the same way via `unwrap_or(0)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the query
+    /// fails.
+    pub fn peak_context_tokens_by_session(&self) -> Result<HashMap<String, u64>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT session_id, MAX(cumulative_tokens) FROM turns GROUP BY session_id")?;
+        let rows = stmt.query_map([], |row| {
+            let tokens: i64 = row.get(1)?;
+            Ok((row.get::<_, String>(0)?, u64::try_from(tokens).unwrap_or(0)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Per-turn [`TurnComposition`] for one session — every [`ApiCallRow`]
     /// grouped by its `turn_id`, aggregated with the containing turn's
     /// `turn_index`. A call with a `turn_id` that doesn't resolve to any
@@ -1620,6 +1642,7 @@ impl ContextForensicsStore {
     /// underlying query fails.
     pub fn summary_for_all_sessions(&self, pricing: &PricingTable) -> Result<Vec<SessionSummary>> {
         let sessions = self.list_sessions()?;
+        let peak_context_tokens_by_session = self.peak_context_tokens_by_session()?;
         let mut summaries = Vec::with_capacity(sessions.len());
         for session in &sessions {
             let calls = self.api_calls_for_session(&session.id)?;
@@ -1631,7 +1654,10 @@ impl ContextForensicsStore {
             } else {
                 total_cost_usd / call_count as f64
             };
-            let peak_context_tokens = self.peak_context_tokens(&session.id)?;
+            let peak_context_tokens = peak_context_tokens_by_session
+                .get(&session.id)
+                .copied()
+                .unwrap_or(0);
             summaries.push(SessionSummary {
                 id: session.id.clone(),
                 source: session.source,
@@ -1878,6 +1904,62 @@ mod tests {
         store.upsert_session(&sample_session("s1")).unwrap();
 
         assert_eq!(store.peak_context_tokens("s1").unwrap(), 0);
+    }
+
+    #[test]
+    fn peak_context_tokens_by_session_should_return_max_per_session_when_multiple_sessions_stored()
+    {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+        store.upsert_session(&sample_session("s2")).unwrap();
+        for (id, session_id, turn_index, cumulative_tokens) in [
+            ("s1t1", "s1", 0, 1000),
+            ("s1t2", "s1", 1, 850_000),
+            ("s2t1", "s2", 0, 500),
+            ("s2t2", "s2", 1, 300),
+        ] {
+            store
+                .upsert_turn(&TurnRow {
+                    id: id.to_string(),
+                    session_id: session_id.to_string(),
+                    turn_index,
+                    user_row_uuid: format!("u-{id}"),
+                    cumulative_tokens,
+                    user_row_json: None,
+                    tool_rows_json: None,
+                })
+                .unwrap();
+        }
+
+        let peaks = store.peak_context_tokens_by_session().unwrap();
+
+        assert_eq!(peaks.get("s1").copied(), Some(850_000));
+        assert_eq!(peaks.get("s2").copied(), Some(500));
+    }
+
+    #[test]
+    fn upsert_subagent_should_fail_when_parent_session_does_not_exist() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+
+        let result = store.upsert_subagent(&SubagentRow {
+            id: "does-not-exist:agent-1".to_string(),
+            parent_session_id: "does-not-exist".to_string(),
+            parent_turn_id: None,
+            subagent_session_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            started_at: None,
+            ended_at: None,
+        });
+
+        assert!(
+            result.is_err(),
+            "expected a foreign_keys violation (no such parent session), got {result:?}"
+        );
     }
 
     #[test]

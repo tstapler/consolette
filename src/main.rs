@@ -220,6 +220,27 @@ struct CombinedMcpServer {
     context_forensics: consolette::context_forensics::mcp_server::ContextForensicsMcpServer,
 }
 
+impl CombinedMcpServer {
+    /// The actual `call_tool` routing logic, factored out of
+    /// [`rmcp::ServerHandler::call_tool`] so unit tests can exercise it
+    /// without constructing a live `RequestContext<RoleServer>` (mirrors
+    /// `CompactionMcpServer::dispatch` and
+    /// `ContextForensicsMcpServer::dispatch`'s own same split, for the same
+    /// reason).
+    fn dispatch(&self, request: rmcp::model::CallToolRequestParams) -> rmcp::model::CallToolResult {
+        if consolette::claude_code_session::mcp_server::owns_tool(&request.name) {
+            self.compaction.dispatch(request)
+        } else if consolette::context_forensics::mcp_server::owns_tool(&request.name) {
+            self.context_forensics.dispatch(&request)
+        } else {
+            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                "unknown tool: {}",
+                request.name
+            ))])
+        }
+    }
+}
+
 impl rmcp::ServerHandler for CombinedMcpServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(
@@ -251,15 +272,7 @@ impl rmcp::ServerHandler for CombinedMcpServer {
         request: rmcp::model::CallToolRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        if consolette::claude_code_session::mcp_server::owns_tool(&request.name) {
-            Ok(self.compaction.dispatch(request))
-        } else if consolette::context_forensics::mcp_server::owns_tool(&request.name) {
-            Ok(self.context_forensics.dispatch(&request))
-        } else {
-            Ok(rmcp::model::CallToolResult::error(vec![
-                rmcp::model::ContentBlock::text(format!("unknown tool: {}", request.name)),
-            ]))
-        }
+        Ok(self.dispatch(request))
     }
 }
 
@@ -476,4 +489,94 @@ async fn compare_cost_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use consolette::context_forensics::mcp_server::ContextForensicsMcpServer;
+    use consolette::context_forensics::store::ContextForensicsStore;
+    use consolette::cost_metrics::pricing::PricingTable;
+    use rmcp::model::CallToolRequestParams;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    fn combined_server(dir: &TempDir) -> CombinedMcpServer {
+        let cache = OmissionCache::open(&dir.path().join("omission-cache.sqlite")).unwrap();
+        let store = ContextForensicsStore::open(&dir.path().join("store.sqlite")).unwrap();
+        let pricing = PricingTable::load_default();
+        CombinedMcpServer {
+            compaction: CompactionMcpServer::new(Arc::new(cache)),
+            context_forensics: ContextForensicsMcpServer::new(Arc::new(store), Arc::new(pricing)),
+        }
+    }
+
+    fn call(tool_name: &str, args: &[(&str, serde_json::Value)]) -> CallToolRequestParams {
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        let mut map = serde_json::Map::new();
+        for (key, value) in args {
+            map.insert((*key).to_string(), value.clone());
+        }
+        params.arguments = Some(map);
+        params
+    }
+
+    #[test]
+    fn tool_defs_should_not_share_any_tool_name_between_sub_servers() {
+        let compaction_names: HashSet<String> =
+            consolette::claude_code_session::mcp_server::tool_defs()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect();
+        let context_forensics_names: HashSet<String> =
+            consolette::context_forensics::mcp_server::tool_defs()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect();
+
+        let overlap: Vec<_> = compaction_names
+            .intersection(&context_forensics_names)
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "expected no shared tool names between the two sub-servers, found {overlap:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_should_route_to_compaction_server_when_tool_owned_by_it() {
+        let dir = TempDir::new().unwrap();
+        let server = combined_server(&dir);
+
+        let result = server.dispatch(call(
+            "read_omitted_content",
+            &[
+                ("session_id", serde_json::json!("s1")),
+                ("content_id", serde_json::json!("omitted-001")),
+            ],
+        ));
+
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn dispatch_should_route_to_context_forensics_server_when_tool_owned_by_it() {
+        let dir = TempDir::new().unwrap();
+        let server = combined_server(&dir);
+
+        let result = server.dispatch(call("list_sessions_summary", &[]));
+
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn dispatch_should_return_error_when_tool_owned_by_neither_sub_server() {
+        let dir = TempDir::new().unwrap();
+        let server = combined_server(&dir);
+
+        let result = server.dispatch(call("not_a_real_tool", &[]));
+
+        assert_eq!(result.is_error, Some(true));
+    }
 }

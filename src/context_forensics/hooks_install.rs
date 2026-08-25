@@ -89,6 +89,14 @@ impl SettingsJsonGateway {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
+        // `rename()` replaces the destination inode wholesale, so a tmp file
+        // created with umask-default permissions would silently drop any
+        // tighter mode bits (e.g. a user-hardened 0600) the live file had —
+        // capture them up front and reapply after the rename. `None` when
+        // the file doesn't exist yet, in which case a fresh file just keeps
+        // its umask-default mode.
+        let original_permissions = fs::metadata(path).ok().map(|m| m.permissions());
+
         let tmp_path = path.with_extension("json.tmp");
         let mut tmp_file = fs::File::create(&tmp_path)
             .with_context(|| format!("failed to create {}", tmp_path.display()))?;
@@ -108,6 +116,16 @@ impl SettingsJsonGateway {
                 path.display()
             )
         })?;
+
+        if let Some(permissions) = original_permissions {
+            fs::set_permissions(path, permissions).with_context(|| {
+                format!(
+                    "failed to restore original permissions on {}",
+                    path.display()
+                )
+            })?;
+        }
+
         Ok(())
     }
 
@@ -263,6 +281,7 @@ pub fn down(path: &Path) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test assertions on well-formed fixtures
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn settings_path(dir: &TempDir) -> PathBuf {
@@ -456,6 +475,61 @@ mod tests {
 
         down(&path).unwrap();
 
+        assert_eq!(SettingsJsonGateway::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn write_should_preserve_original_permission_bits_when_file_is_hardened() {
+        let dir = TempDir::new().unwrap();
+        let path = settings_path(&dir);
+        SettingsJsonGateway::write(&path, &serde_json::json!({"existing": true})).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        SettingsJsonGateway::write(&path, &serde_json::json!({"updated": true})).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "write() must not silently loosen a hardened file's mode bits"
+        );
+    }
+
+    #[test]
+    fn up_should_reject_and_leave_file_unchanged_when_root_is_not_an_object() {
+        let dir = TempDir::new().unwrap();
+        let path = settings_path(&dir);
+        fs::write(&path, "\"just-a-string\"").unwrap();
+
+        let result = up(&path);
+
+        assert!(result.is_err());
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw, "\"just-a-string\"");
+    }
+
+    #[test]
+    fn up_should_reject_and_leave_file_unchanged_when_hooks_key_is_not_an_object() {
+        let dir = TempDir::new().unwrap();
+        let path = settings_path(&dir);
+        let original = serde_json::json!({"hooks": "not-an-object"});
+        SettingsJsonGateway::write(&path, &original).unwrap();
+
+        let result = up(&path);
+
+        assert!(result.is_err());
+        assert_eq!(SettingsJsonGateway::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn up_should_reject_and_leave_file_unchanged_when_hook_event_value_is_not_an_array() {
+        let dir = TempDir::new().unwrap();
+        let path = settings_path(&dir);
+        let original = serde_json::json!({"hooks": {"PostToolUse": "not-an-array"}});
+        SettingsJsonGateway::write(&path, &original).unwrap();
+
+        let result = up(&path);
+
+        assert!(result.is_err());
         assert_eq!(SettingsJsonGateway::read(&path).unwrap(), original);
     }
 }

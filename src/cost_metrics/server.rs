@@ -94,6 +94,12 @@ pub struct CostServerState {
     pub context_store: Option<Arc<ContextForensicsStore>>,
     /// Mirrors `_session_bi_refresh`; `None` alongside `context_store: None`.
     _context_refresh: Option<tokio::task::JoinHandle<()>>,
+    /// Cloned before the original is moved into
+    /// `CostTracker::new_with_pricing_receiver` — `context_router`'s
+    /// `/v1/context/sessions/summary` route (Story 2.1.1) needs its own
+    /// handle on the same live-refreshing pricing table so cross-session
+    /// cost figures use the same cache-aware rates `/v1/cost` does.
+    pub pricing_rx: watch::Receiver<Arc<PricingTable>>,
 }
 
 impl CostServerState {
@@ -139,6 +145,7 @@ impl CostServerState {
             LITELLM_PRICING_URL.to_string(),
             PRICING_REFRESH_INTERVAL,
         );
+        let context_pricing_rx = pricing_rx.clone();
         let tracker = Arc::new(CostTracker::new_with_pricing_receiver(pricing_rx).await);
         let hook = Arc::new(CostTrackingHook::new(
             Arc::clone(&tracker),
@@ -195,6 +202,7 @@ impl CostServerState {
             _session_bi_refresh: session_bi_refresh,
             context_store,
             _context_refresh: context_refresh,
+            pricing_rx: context_pricing_rx,
         }
     }
 
@@ -281,7 +289,7 @@ async fn handler_dashboard_sessions(
 pub async fn serve_cost(port: u16) -> anyhow::Result<()> {
     let state = CostServerState::build().await;
     let context_routes = match &state.context_store {
-        Some(store) => context_router(Arc::clone(store)),
+        Some(store) => context_router(Arc::clone(store), state.pricing_rx.clone()),
         None => context_unavailable_router(),
     };
     let router = cost_router(Arc::clone(&state.tracker))
@@ -703,6 +711,7 @@ mod tests {
 
         let router = dashboard_router(state.session_bi_rx.clone()).merge(context_router(
             Arc::clone(state.context_store.as_ref().expect("checked above")),
+            state.pricing_rx.clone(),
         ));
 
         let context_response = router

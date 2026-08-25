@@ -211,11 +211,47 @@
     border-radius: 4px;
     color: var(--muted);
   }
+  table.summary-table {
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    width: 100%;
+    margin-bottom: 1.5rem;
+  }
+  table.summary-table th, table.summary-table td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.4rem 0.6rem;
+    text-align: left;
+  }
+  table.summary-table th button {
+    font: inherit;
+    font-weight: 600;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  table.summary-table tbody tr {
+    cursor: pointer;
+  }
+  table.summary-table tbody tr:hover {
+    background: var(--banner-empty-bg);
+  }
+  #cost-scatter-wrap svg, #cost-trend-chart-wrap svg { width: 100%; height: auto; display: block; }
+  #cost-scatter-wrap circle { cursor: pointer; }
+  .trend-summary { font-size: 0.85rem; color: var(--muted); }
+  #cross-session-panel { display: none; }
 </style>
 </head>
 <body>
-  <nav><a href="/dashboard">&larr; Session compaction comparison</a></nav>
-  <h1>Context dashboard</h1>
+  <nav>
+    <a href="/dashboard">&larr; Session compaction comparison</a>
+    <span id="cross-session-nav-link"></span>
+  </nav>
+  <h1 id="page-title">Context dashboard</h1>
 
   <div id="picker-row">
     <label for="session-picker">Session</label>
@@ -252,6 +288,23 @@
     </details>
   </section>
 
+  <section class="panel" id="cross-session-panel">
+    <h2>Sessions</h2>
+    <table class="summary-table" id="summary-table">
+      <thead>
+        <tr id="summary-header-row"></tr>
+      </thead>
+      <tbody id="summary-table-body"></tbody>
+    </table>
+
+    <h2>Cost/call vs. peak context</h2>
+    <div id="cost-scatter-wrap"></div>
+
+    <h2>Cost/Call Over Time</h2>
+    <div id="cost-trend-chart-wrap"></div>
+    <p class="trend-summary" id="cost-trend-summary"></p>
+  </section>
+
 <script>
 (function () {
   "use strict";
@@ -263,6 +316,13 @@
     { label: "1M", value: 1000000 }
   ];
 
+  // Story 2.1.2: `/dashboard/context/sessions` is a client-side route
+  // within this same single-page dashboard (not a second HTML file) — the
+  // server (context_forensics/server.rs) serves the identical shell at
+  // both paths; this flag is the one place that decides which panel set
+  // renders.
+  var IS_CROSS_SESSION_VIEW = window.location.pathname.replace(/\/+$/, "").split("/").pop() === "sessions";
+
   var state = {
     sessions: [],
     sessionId: null,
@@ -270,7 +330,10 @@
     growth: [],       // per-turn {turn_index, cumulative_tokens}
     compactionEvents: [],
     selectedTurnIndex: 0,
-    activeThresholds: {} // value -> bool
+    activeThresholds: {}, // value -> bool
+    summary: [], // Story 2.1.1 SessionSummary rows, started_at-ascending
+    summarySortKey: "cost_per_call_usd",
+    summarySortDir: "desc" // "asc" | "desc"
   };
 
   var bannerEl = document.getElementById("status-banner");
@@ -285,6 +348,15 @@
   var textFallbackBodyEl = document.getElementById("growth-text-body");
   var compositionPanelEl = document.getElementById("composition-panel");
   var growthPanelEl = document.getElementById("growth-panel");
+  var pageTitleEl = document.getElementById("page-title");
+  var crossSessionNavLinkEl = document.getElementById("cross-session-nav-link");
+  var pickerRowEl = document.getElementById("picker-row");
+  var crossSessionPanelEl = document.getElementById("cross-session-panel");
+  var summaryHeaderRowEl = document.getElementById("summary-header-row");
+  var summaryTableBodyEl = document.getElementById("summary-table-body");
+  var scatterWrapEl = document.getElementById("cost-scatter-wrap");
+  var trendChartWrapEl = document.getElementById("cost-trend-chart-wrap");
+  var trendSummaryEl = document.getElementById("cost-trend-summary");
 
   /**
    * Single state machine for #status-banner, mirroring dashboard.html's own
@@ -783,7 +855,302 @@
     loadSessionData();
   });
 
-  loadSessions();
+  // -- Cross-session view (Story 2.1.1/2.1.2) --------------------------
+
+  var SUMMARY_COLUMNS = [
+    { key: "id", label: "Session" },
+    { key: "source", label: "Source" },
+    { key: "started_at", label: "Started" },
+    { key: "cost_per_call_usd", label: "Cost/Call" },
+    { key: "peak_context_tokens", label: "Peak Context" },
+    { key: "call_count", label: "Calls" },
+    { key: "chain_coverage_ratio", label: "Coverage" }
+  ];
+
+  function formatUsd(value) {
+    return "$" + Number(value).toFixed(4);
+  }
+
+  function sortedSummary() {
+    var key = state.summarySortKey;
+    var dir = state.summarySortDir === "asc" ? 1 : -1;
+    var rows = state.summary.slice();
+    rows.sort(function (a, b) {
+      var av = a[key];
+      var bv = b[key];
+      // Nulls (e.g. missing started_at/chain_coverage_ratio) sort last
+      // regardless of direction, mirroring cost_metrics/dashboard.html's
+      // own convention.
+      if (av === null || av === undefined) { return bv === null || bv === undefined ? 0 : 1; }
+      if (bv === null || bv === undefined) { return -1; }
+      if (av < bv) { return -1 * dir; }
+      if (av > bv) { return 1 * dir; }
+      return 0;
+    });
+    return rows;
+  }
+
+  function navigateToSession(sessionId) {
+    window.location.href = "/dashboard/context?session=" + encodeURIComponent(sessionId);
+  }
+
+  function renderSummaryHeader() {
+    while (summaryHeaderRowEl.firstChild) {
+      summaryHeaderRowEl.removeChild(summaryHeaderRowEl.firstChild);
+    }
+    SUMMARY_COLUMNS.forEach(function (col) {
+      var th = document.createElement("th");
+      var isSorted = state.summarySortKey === col.key;
+      th.setAttribute("aria-sort", isSorted ? (state.summarySortDir === "asc" ? "ascending" : "descending") : "none");
+
+      var button = document.createElement("button");
+      button.type = "button";
+      var labelSpan = document.createElement("span");
+      labelSpan.textContent = col.label;
+      button.appendChild(labelSpan);
+      if (isSorted) {
+        var arrowSpan = document.createElement("span");
+        arrowSpan.textContent = state.summarySortDir === "asc" ? "▲" : "▼";
+        button.appendChild(arrowSpan);
+      }
+      button.addEventListener("click", function () {
+        if (state.summarySortKey === col.key) {
+          state.summarySortDir = state.summarySortDir === "asc" ? "desc" : "asc";
+        } else {
+          state.summarySortKey = col.key;
+          state.summarySortDir = "asc";
+        }
+        renderSummaryHeader();
+        renderSummaryTable();
+      });
+      th.appendChild(button);
+      summaryHeaderRowEl.appendChild(th);
+    });
+  }
+
+  function renderSummaryTable() {
+    while (summaryTableBodyEl.firstChild) {
+      summaryTableBodyEl.removeChild(summaryTableBodyEl.firstChild);
+    }
+    sortedSummary().forEach(function (row) {
+      var tr = document.createElement("tr");
+      tr.tabIndex = 0;
+      tr.setAttribute("role", "button");
+      tr.setAttribute("aria-label", "View session " + row.id);
+      tr.addEventListener("click", function () { navigateToSession(row.id); });
+      tr.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); navigateToSession(row.id); }
+      });
+
+      [
+        row.id,
+        row.source,
+        row.started_at || "—",
+        formatUsd(row.cost_per_call_usd),
+        row.peak_context_tokens.toLocaleString(),
+        row.call_count.toLocaleString(),
+        row.chain_coverage_ratio === null || row.chain_coverage_ratio === undefined
+          ? "—"
+          : (row.chain_coverage_ratio * 100).toFixed(0) + "%"
+      ].forEach(function (value) {
+        var td = document.createElement("td");
+        td.textContent = value;
+        tr.appendChild(td);
+      });
+      summaryTableBodyEl.appendChild(tr);
+    });
+  }
+
+  function renderScatter() {
+    scatterWrapEl.innerHTML = "";
+    if (state.summary.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.textContent = "No sessions ingested yet.";
+      scatterWrapEl.appendChild(empty);
+      return;
+    }
+
+    var width = 720;
+    var height = 260;
+    var padding = { top: 16, right: 16, bottom: 28, left: 64 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+
+    var maxX = Math.max.apply(null, state.summary.map(function (s) { return s.peak_context_tokens; }).concat([1]));
+    var maxY = Math.max.apply(null, state.summary.map(function (s) { return s.cost_per_call_usd; }).concat([0.0001]));
+
+    function xFor(v) { return padding.left + (v / maxX) * innerW; }
+    function yFor(v) { return padding.top + innerH - (v / maxY) * innerH; }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Cost per call vs peak context tokens, one point per session");
+
+    var axisX = document.createElementNS(svgNS, "line");
+    axisX.setAttribute("x1", padding.left);
+    axisX.setAttribute("x2", padding.left + innerW);
+    axisX.setAttribute("y1", padding.top + innerH);
+    axisX.setAttribute("y2", padding.top + innerH);
+    axisX.setAttribute("stroke", "var(--chart-axis)");
+    svg.appendChild(axisX);
+
+    state.summary.forEach(function (row) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", xFor(row.peak_context_tokens));
+      circle.setAttribute("cy", yFor(row.cost_per_call_usd));
+      circle.setAttribute("r", "5");
+      circle.setAttribute("fill", "var(--chart-line)");
+      circle.setAttribute("tabindex", "0");
+      circle.setAttribute("role", "button");
+      circle.setAttribute("aria-label", "Session " + row.id + ": " + formatUsd(row.cost_per_call_usd) + " per call, " + row.peak_context_tokens.toLocaleString() + " peak context tokens");
+      var titleEl = document.createElementNS(svgNS, "title");
+      titleEl.textContent = row.id;
+      circle.appendChild(titleEl);
+      circle.addEventListener("click", function () { navigateToSession(row.id); });
+      circle.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); navigateToSession(row.id); }
+      });
+      svg.appendChild(circle);
+    });
+
+    var yLabel = document.createElementNS(svgNS, "text");
+    yLabel.setAttribute("x", 4);
+    yLabel.setAttribute("y", padding.top + 8);
+    yLabel.setAttribute("font-size", "10");
+    yLabel.setAttribute("fill", "var(--muted)");
+    yLabel.textContent = formatUsd(maxY);
+    svg.appendChild(yLabel);
+
+    var xLabel = document.createElementNS(svgNS, "text");
+    xLabel.setAttribute("x", padding.left + innerW - 4);
+    xLabel.setAttribute("y", padding.top + innerH + 20);
+    xLabel.setAttribute("font-size", "10");
+    xLabel.setAttribute("fill", "var(--muted)");
+    xLabel.setAttribute("text-anchor", "end");
+    xLabel.textContent = maxX.toLocaleString() + " tokens";
+    svg.appendChild(xLabel);
+
+    scatterWrapEl.appendChild(svg);
+  }
+
+  function renderTrendChart() {
+    trendChartWrapEl.innerHTML = "";
+    trendSummaryEl.textContent = "";
+
+    if (state.summary.length < 2) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.textContent = "Not enough sessions yet for a trend";
+      trendChartWrapEl.appendChild(empty);
+      return;
+    }
+
+    // `state.summary` is already `started_at`-ascending (the
+    // `/v1/context/sessions/summary` response's own ordering contract) —
+    // no client-side re-sort here, so this chart always reflects
+    // chronological order regardless of the table's current sort.
+    var width = 720;
+    var height = 200;
+    var padding = { top: 16, right: 16, bottom: 24, left: 64 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+
+    var maxY = Math.max.apply(null, state.summary.map(function (s) { return s.cost_per_call_usd; }).concat([0.0001]));
+
+    function xFor(i) { return padding.left + (i / (state.summary.length - 1)) * innerW; }
+    function yFor(v) { return padding.top + innerH - (v / maxY) * innerH; }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Cost per call over time across sessions, chronological order");
+
+    var points = state.summary.map(function (s, i) {
+      return xFor(i) + "," + yFor(s.cost_per_call_usd);
+    }).join(" ");
+    var polyline = document.createElementNS(svgNS, "polyline");
+    polyline.setAttribute("points", points);
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", "var(--chart-line)");
+    polyline.setAttribute("stroke-width", "2");
+    svg.appendChild(polyline);
+
+    state.summary.forEach(function (s, i) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", xFor(i));
+      circle.setAttribute("cy", yFor(s.cost_per_call_usd));
+      circle.setAttribute("r", "3");
+      circle.setAttribute("fill", "var(--chart-line)");
+      svg.appendChild(circle);
+    });
+
+    trendChartWrapEl.appendChild(svg);
+
+    // Never chart-only (ux.md acceptance criterion 25): a first-vs-last
+    // text summary renders alongside the trend line.
+    var first = state.summary[0];
+    var last = state.summary[state.summary.length - 1];
+    var summaryText;
+    if (first.cost_per_call_usd <= 0) {
+      summaryText = "Cost/call: " + formatUsd(first.cost_per_call_usd) + " → " + formatUsd(last.cost_per_call_usd) + " over " + state.summary.length + " sessions.";
+    } else {
+      var ratio = last.cost_per_call_usd / first.cost_per_call_usd;
+      var direction = ratio >= 1 ? "up" : "down";
+      var factor = ratio >= 1 ? ratio : (1 / ratio);
+      summaryText = "Cost/call " + direction + " " + factor.toFixed(1) + "x over " + state.summary.length + " sessions (" + formatUsd(first.cost_per_call_usd) + " → " + formatUsd(last.cost_per_call_usd) + ").";
+    }
+    trendSummaryEl.textContent = summaryText;
+  }
+
+  function loadCrossSessionSummary() {
+    setBannerState("loading");
+    fetch("/v1/context/sessions/summary")
+      .then(function (response) {
+        if (!response.ok) { throw new Error("HTTP " + response.status); }
+        return response.json();
+      })
+      .then(function (summary) {
+        state.summary = Array.isArray(summary) ? summary : [];
+        setBannerState(state.summary.length === 0 ? "empty-corpus" : "hidden");
+        renderSummaryHeader();
+        renderSummaryTable();
+        renderScatter();
+        renderTrendChart();
+      })
+      .catch(function (err) {
+        setBannerState("fetch-error", {
+          detail: err && err.message ? err.message : String(err),
+          onRetry: loadCrossSessionSummary
+        });
+      });
+  }
+
+  // -- View bootstrap ---------------------------------------------------
+
+  if (IS_CROSS_SESSION_VIEW) {
+    pageTitleEl.textContent = "Sessions";
+    pickerRowEl.style.display = "none";
+    compositionPanelEl.style.display = "none";
+    growthPanelEl.style.display = "none";
+    crossSessionPanelEl.style.display = "";
+    var backLink = document.createElement("a");
+    backLink.href = "/dashboard/context";
+    backLink.textContent = "← Session detail";
+    crossSessionNavLinkEl.appendChild(document.createTextNode(" · "));
+    crossSessionNavLinkEl.appendChild(backLink);
+    loadCrossSessionSummary();
+  } else {
+    var crossLink = document.createElement("a");
+    crossLink.href = "/dashboard/context/sessions";
+    crossLink.textContent = "Cross-session view →";
+    crossSessionNavLinkEl.appendChild(document.createTextNode(" · "));
+    crossSessionNavLinkEl.appendChild(crossLink);
+    loadSessions();
+  }
 })();
 </script>
 </body>

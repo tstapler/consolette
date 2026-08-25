@@ -15,8 +15,10 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use tokio::sync::watch;
 
 use crate::context_forensics::store::{ContextForensicsStore, Source};
+use crate::cost_metrics::pricing::PricingTable;
 
 /// Self-contained dashboard HTML/JS/CSS, compiled into the binary (matches
 /// `cost_metrics/dashboard.html`'s `include_str!` precedent — no build
@@ -164,6 +166,36 @@ async fn handler_session_growth(
         .into_response()
 }
 
+/// `State` for the `/v1/context/sessions/summary` route (Story 2.1.1) —
+/// needs both the store and a live-refreshing `PricingTable` (so
+/// `cost_per_call_usd` uses the same cache-aware rates `/v1/cost` does),
+/// unlike the other routes above which only need the store.
+#[derive(Clone)]
+struct SummaryState {
+    store: Arc<ContextForensicsStore>,
+    pricing_rx: watch::Receiver<Arc<PricingTable>>,
+}
+
+/// `GET /v1/context/sessions/summary`: cross-session cost/call, peak-context,
+/// and coverage summary (Story 2.1.1), ordered by `started_at` ascending —
+/// the same payload the cross-session table/scatter/trend chart (Story
+/// 2.1.2) all render from. Always `200` — an empty corpus is a valid
+/// (empty array) response, not an error.
+async fn handler_sessions_summary(State(state): State<SummaryState>) -> impl IntoResponse {
+    let pricing = state.pricing_rx.borrow().clone();
+    match state.store.summary_for_all_sessions(&pricing) {
+        Ok(summaries) => (StatusCode::OK, Json(summaries)).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "context-forensics: failed to compute cross-session summary");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body("store_query_failed", &serde_json::json!({}))),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn session_not_found(session_id: &str) -> axum::response::Response {
     (
         StatusCode::NOT_FOUND,
@@ -181,11 +213,34 @@ async fn handler_context_dashboard() -> impl IntoResponse {
 }
 
 /// Build the `/dashboard/context` + `/v1/context/*` route group,
-/// `State`-sharing `store`.
+/// `State`-sharing `store` (and, for the cross-session summary route,
+/// `pricing_rx`).
 #[must_use = "dropping the router without serving it drops the route registration"]
-pub fn context_router(store: Arc<ContextForensicsStore>) -> Router {
+pub fn context_router(
+    store: Arc<ContextForensicsStore>,
+    pricing_rx: watch::Receiver<Arc<PricingTable>>,
+) -> Router {
+    let summary_router = Router::new()
+        .route(
+            "/v1/context/sessions/summary",
+            get(handler_sessions_summary),
+        )
+        .with_state(SummaryState {
+            store: Arc::clone(&store),
+            pricing_rx,
+        });
+
     Router::new()
         .route("/dashboard/context", get(handler_context_dashboard))
+        // Story 2.1.2: the cross-session view is a client-side route within
+        // this same single-page dashboard, not a second HTML file — this
+        // route exists only so a direct navigation/bookmark/refresh at that
+        // URL still serves the SPA shell (which then reads
+        // `window.location.pathname` to decide which panel to render).
+        .route(
+            "/dashboard/context/sessions",
+            get(handler_context_dashboard),
+        )
         .route("/v1/context/sessions", get(handler_list_sessions))
         .route(
             "/v1/context/sessions/{id}/composition",
@@ -196,6 +251,7 @@ pub fn context_router(store: Arc<ContextForensicsStore>) -> Router {
             get(handler_session_growth),
         )
         .with_state(store)
+        .merge(summary_router)
 }
 
 /// Fallback route group mounted in place of [`context_router`] when
@@ -217,7 +273,9 @@ pub fn context_unavailable_router() -> Router {
 
     Router::new()
         .route("/dashboard/context", get(unavailable))
+        .route("/dashboard/context/sessions", get(unavailable))
         .route("/v1/context/sessions", get(unavailable))
+        .route("/v1/context/sessions/summary", get(unavailable))
         .route("/v1/context/sessions/{id}/composition", get(unavailable))
         .route("/v1/context/sessions/{id}/growth", get(unavailable))
 }
@@ -236,6 +294,10 @@ mod tests {
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
     use tower::ServiceExt;
+
+    fn fixture_pricing_rx() -> watch::Receiver<Arc<PricingTable>> {
+        watch::channel(Arc::new(PricingTable::load_default())).1
+    }
 
     fn seeded_store() -> (TempDir, Arc<ContextForensicsStore>, String) {
         let dir = TempDir::new().unwrap();
@@ -268,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn get_sessions_route_should_return_all_sessions_when_store_seeded() {
         let (_dir, store, _session_id) = seeded_store();
-        let router = context_router(store);
+        let router = context_router(store, fixture_pricing_rx());
 
         let response = router
             .oneshot(
@@ -292,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_composition_route_should_return_per_turn_breakdown_when_session_exists() {
         let (_dir, store, session_id) = seeded_store();
-        let router = context_router(store);
+        let router = context_router(store, fixture_pricing_rx());
 
         let response = router
             .oneshot(
@@ -317,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_growth_route_should_return_404_when_session_id_unknown() {
         let (_dir, store, _session_id) = seeded_store();
-        let router = context_router(store);
+        let router = context_router(store, fixture_pricing_rx());
 
         let response = router
             .oneshot(
@@ -340,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_composition_route_should_return_404_when_session_id_unknown() {
         let (_dir, store, _session_id) = seeded_store();
-        let router = context_router(store);
+        let router = context_router(store, fixture_pricing_rx());
 
         let response = router
             .oneshot(
@@ -387,7 +449,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let router = context_router(store);
+        let router = context_router(store, fixture_pricing_rx());
         let response = router
             .oneshot(
                 Request::builder()
@@ -410,14 +472,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_sessions_summary_route_should_return_all_sessions_when_multiple_sessions_stored() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(ContextForensicsStore::open(&dir.path().join("cf.sqlite")).unwrap());
+
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let mut fixture = NamedTempFile::with_suffix(".jsonl").unwrap();
+            writeln!(
+                fixture,
+                r#"{{"type":"user","uuid":"u{i}","parentUuid":null,"isSidechain":false,"isMeta":false,"message":{{"role":"user","content":"hi"}}}}"#
+            )
+            .unwrap();
+            writeln!(
+                fixture,
+                r#"{{"type":"assistant","uuid":"a{i}","parentUuid":"u{i}","isSidechain":false,"isMeta":false,"message":{{"role":"assistant","model":"claude-sonnet-5","content":[{{"type":"text","text":"reply"}}],"usage":{{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#
+            )
+            .unwrap();
+            ingest_claude_code_session(&store, fixture.path()).unwrap();
+            ids.push(
+                fixture
+                    .path()
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+
+        let router = context_router(store, fixture_pricing_rx());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/context/sessions/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json.as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        for id in &ids {
+            assert!(sessions.iter().any(|s| s["id"] == *id));
+        }
+        assert!(sessions[0]["call_count"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
     async fn get_context_dashboard_route_should_return_200() {
         let (_dir, store, _session_id) = seeded_store();
-        let router = context_router(store);
+        let router = context_router(store, fixture_pricing_rx());
 
         let response = router
             .oneshot(
                 Request::builder()
                     .uri("/dashboard/context")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_context_dashboard_sessions_route_should_return_200() {
+        let (_dir, store, _session_id) = seeded_store();
+        let router = context_router(store, fixture_pricing_rx());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/context/sessions")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -16,6 +16,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::cost_metrics::pricing::PricingTable;
+
 // ---------------------------------------------------------------------------
 // Domain sum types (Domain Glossary: `Source`, `UsageProvenance`)
 // ---------------------------------------------------------------------------
@@ -179,6 +181,21 @@ pub struct TurnComposition {
 pub struct GrowthPoint {
     pub turn_index: u64,
     pub cumulative_tokens: u64,
+}
+
+/// One row of `GET /v1/context/sessions/summary` —
+/// [`ContextForensicsStore::summary_for_all_sessions`]'s per-element shape
+/// (Story 2.1.1). Doubles as the "Cost/Call Over Time" trend series (Story
+/// 2.1.2) since the store method orders these by `started_at` ascending.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub source: Source,
+    pub started_at: Option<String>,
+    pub cost_per_call_usd: f64,
+    pub peak_context_tokens: u64,
+    pub call_count: u64,
+    pub chain_coverage_ratio: Option<f64>,
 }
 
 /// `rusqlite` has no `ToSql` impl for `u64` (sqlite's native integer type is
@@ -912,6 +929,84 @@ impl ContextForensicsStore {
             })
             .collect())
     }
+
+    /// Cross-session cost/call, peak-context, and coverage summary (Story
+    /// 2.1.1) — every stored session, `cost_per_call_usd` computed via
+    /// `pricing`'s cache-aware rates (Story 1.1.2), not input/output alone.
+    /// A call whose `model` is unset or absent from `pricing` contributes
+    /// `$0.0` to that session's total rather than failing the whole
+    /// response — `PricingTable::price_for` returning `None` is documented
+    /// as the normal "unpriced model" case, not an error.
+    ///
+    /// Ordered by `started_at` ascending (a `None` `started_at` sorts last,
+    /// tie-broken by `id` for determinism) so this same payload doubles as
+    /// the chronological "Cost/Call Over Time" trend series (Story 2.1.2)
+    /// without a second query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or any
+    /// underlying query fails.
+    pub fn summary_for_all_sessions(&self, pricing: &PricingTable) -> Result<Vec<SessionSummary>> {
+        let sessions = self.list_sessions()?;
+        let mut summaries = Vec::with_capacity(sessions.len());
+        for session in &sessions {
+            let calls = self.api_calls_for_session(&session.id)?;
+            let call_count = calls.len();
+            let total_cost_usd: f64 = calls.iter().map(|call| call_cost_usd(call, pricing)).sum();
+            #[allow(clippy::cast_precision_loss)]
+            let cost_per_call_usd = if call_count == 0 {
+                0.0
+            } else {
+                total_cost_usd / call_count as f64
+            };
+            let peak_context_tokens = self.peak_context_tokens(&session.id)?;
+            summaries.push(SessionSummary {
+                id: session.id.clone(),
+                source: session.source,
+                started_at: session.started_at.clone(),
+                cost_per_call_usd,
+                peak_context_tokens,
+                call_count: to_u64_saturating(call_count),
+                chain_coverage_ratio: session.chain_coverage_ratio,
+            });
+        }
+        summaries.sort_by(|a, b| match (&a.started_at, &b.started_at) {
+            (Some(x), Some(y)) => x.cmp(y).then_with(|| a.id.cmp(&b.id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.id.cmp(&b.id),
+        });
+        Ok(summaries)
+    }
+}
+
+/// One call's total USD cost across all four cache-aware rate tiers (Story
+/// 1.1.2/2.1.1). `0.0` when the call's `model` is unset or unpriced —
+/// `PricingTable::price_for` returning `None` is a documented, expected
+/// case (an unrecognized/new model), not an error this aggregation should
+/// fail on.
+#[allow(clippy::cast_precision_loss)]
+fn call_cost_usd(call: &ApiCallRow, pricing: &PricingTable) -> f64 {
+    let Some(model) = call.model.as_deref() else {
+        return 0.0;
+    };
+    let Some(price) = pricing.price_for(model) else {
+        return 0.0;
+    };
+    let cache_creation_input_tokens = call.cache_creation_input_tokens.unwrap_or(0);
+    let cache_read_input_tokens = call.cache_read_input_tokens.unwrap_or(0);
+    call.input_tokens as f64 * price.input_usd_per_token
+        + call.output_tokens as f64 * price.output_usd_per_token
+        + cache_creation_input_tokens as f64 * price.cache_creation_usd_per_token
+        + cache_read_input_tokens as f64 * price.cache_read_usd_per_token
+}
+
+/// `usize` (a row count within one process's memory, never near
+/// `u64::MAX`) into the `u64` [`SessionSummary::call_count`] uses for
+/// JSON-response consistency with this module's other token/count fields.
+fn to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,5 +1279,95 @@ mod tests {
         let calls = store.api_calls_for_session("s1").unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].input_tokens, 1200);
+    }
+
+    fn cache_aware_pricing_table() -> PricingTable {
+        let mut pricing = PricingTable::new();
+        pricing.insert(
+            "claude-sonnet-5",
+            crate::cost_metrics::pricing::ModelPrice {
+                input_usd_per_token: 0.000_003,
+                output_usd_per_token: 0.000_015,
+                cache_read_usd_per_token: 0.000_000_3,
+                cache_creation_usd_per_token: 0.000_003_75,
+            },
+        );
+        pricing
+    }
+
+    #[test]
+    fn summary_for_all_sessions_should_compute_cost_per_call_using_cache_aware_rates() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+
+        let mut call = sample_api_call("s1", "u1", 1_000);
+        call.output_tokens = 100;
+        call.cache_creation_input_tokens = Some(2_000);
+        call.cache_read_input_tokens = Some(10_000);
+        store.upsert_api_call(&call).unwrap();
+
+        let pricing = cache_aware_pricing_table();
+        let summaries = store.summary_for_all_sessions(&pricing).unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        // (1000 * 0.000003) + (100 * 0.000015) + (2000 * 0.00000375) + (10000 * 0.0000003)
+        // = 0.003 + 0.0015 + 0.0075 + 0.003 = 0.015, over 1 call.
+        let expected = 0.003 + 0.0015 + 0.0075 + 0.003;
+        assert!(
+            (summaries[0].cost_per_call_usd - expected).abs() < 1e-9,
+            "expected {expected}, got {}",
+            summaries[0].cost_per_call_usd
+        );
+        assert_eq!(summaries[0].call_count, 1);
+    }
+
+    #[test]
+    fn summary_for_all_sessions_should_return_zero_cost_per_call_when_session_has_zero_calls() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+
+        let pricing = cache_aware_pricing_table();
+        let summaries = store.summary_for_all_sessions(&pricing).unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        // The zero-calls short-circuit in `summary_for_all_sessions`
+        // returns the exact literal `0.0`, never an accumulated float, so
+        // an exact comparison is correct here (not the usual float_cmp
+        // footgun of comparing two independently-computed values).
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(summaries[0].cost_per_call_usd, 0.0);
+        }
+        assert_eq!(summaries[0].call_count, 0);
+    }
+
+    #[test]
+    fn summary_for_all_sessions_should_order_by_started_at_ascending_when_multiple_sessions_stored()
+    {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+
+        let mut later = sample_session("s-later");
+        later.started_at = Some("2026-08-03T00:00:00Z".to_string());
+        let mut earliest = sample_session("s-earliest");
+        earliest.started_at = Some("2026-08-01T00:00:00Z".to_string());
+        let mut middle = sample_session("s-middle");
+        middle.started_at = Some("2026-08-02T00:00:00Z".to_string());
+
+        // Upsert out of chronological order to prove the response is
+        // sorted by `started_at`, not insertion order.
+        store.upsert_session(&later).unwrap();
+        store.upsert_session(&earliest).unwrap();
+        store.upsert_session(&middle).unwrap();
+
+        let pricing = cache_aware_pricing_table();
+        let summaries = store.summary_for_all_sessions(&pricing).unwrap();
+
+        assert_eq!(
+            summaries.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["s-earliest", "s-middle", "s-later"]
+        );
     }
 }

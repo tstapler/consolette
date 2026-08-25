@@ -894,6 +894,44 @@ impl ContextForensicsStore {
         }
     }
 
+    /// A one-line, human-readable discrepancy summary for a
+    /// [`CrossCheckStatus::Diverged`] session (Story 5.2.2 AC2's "name the
+    /// specific discrepancy" tooltip content) — the call with the largest
+    /// absolute variance, and how many calls diverged in total. `None` for
+    /// any other `status`; there's nothing to name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the query
+    /// fails.
+    pub fn cross_check_detail_for_session(
+        &self,
+        session_id: &str,
+        status: CrossCheckStatus,
+    ) -> Result<Option<String>> {
+        if status != CrossCheckStatus::Diverged {
+            return Ok(None);
+        }
+        let rows = self.proxy_cross_check_for_session(session_id)?;
+        let diverged: Vec<_> = rows
+            .iter()
+            .filter(|row| row.status == CrossCheckStatus::Diverged)
+            .collect();
+        let Some(worst) = diverged
+            .iter()
+            .max_by_key(|row| row.variance_tokens.unwrap_or(0).abs())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(format!(
+            "{} of {} cross-checked calls diverged; largest variance is {} tokens on call {}",
+            diverged.len(),
+            rows.len(),
+            worst.variance_tokens.unwrap_or(0),
+            worst.call_id,
+        )))
+    }
+
     /// Look up one [`SubagentRow`] by `id`.
     ///
     /// # Errors
@@ -2139,5 +2177,66 @@ mod tests {
             summaries.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec!["s-earliest", "s-middle", "s-later"]
         );
+    }
+
+    #[test]
+    fn cross_check_detail_for_session_should_name_worst_call_when_status_diverged() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+        for row_uuid in ["msg_small", "msg_big", "msg_ok"] {
+            store
+                .upsert_api_call(&sample_api_call("s1", row_uuid, 100))
+                .unwrap();
+        }
+        store
+            .upsert_proxy_cross_check(&ProxyCrossCheckRow {
+                session_id: "s1".to_string(),
+                call_id: "s1:msg_small".to_string(),
+                proxy_request_id: None,
+                status: CrossCheckStatus::Diverged,
+                variance_tokens: Some(-50),
+            })
+            .unwrap();
+        store
+            .upsert_proxy_cross_check(&ProxyCrossCheckRow {
+                session_id: "s1".to_string(),
+                call_id: "s1:msg_big".to_string(),
+                proxy_request_id: None,
+                status: CrossCheckStatus::Diverged,
+                variance_tokens: Some(500),
+            })
+            .unwrap();
+        store
+            .upsert_proxy_cross_check(&ProxyCrossCheckRow {
+                session_id: "s1".to_string(),
+                call_id: "s1:msg_ok".to_string(),
+                proxy_request_id: None,
+                status: CrossCheckStatus::Corroborated,
+                variance_tokens: Some(0),
+            })
+            .unwrap();
+
+        let detail = store
+            .cross_check_detail_for_session("s1", CrossCheckStatus::Diverged)
+            .unwrap()
+            .unwrap();
+
+        assert!(detail.contains("2 of 3"));
+        assert!(detail.contains("500 tokens"));
+        assert!(detail.contains("s1:msg_big"));
+    }
+
+    #[test]
+    fn cross_check_detail_for_session_should_return_none_when_status_not_diverged() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+
+        let detail = store
+            .cross_check_detail_for_session("s1", CrossCheckStatus::Corroborated)
+            .unwrap();
+
+        assert_eq!(detail, None);
     }
 }

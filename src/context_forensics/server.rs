@@ -106,17 +106,33 @@ async fn handler_session_composition(
         }
     }
 
-    match store.composition_for_session(&session_id) {
-        Ok(turns) => (StatusCode::OK, Json(serde_json::json!({ "turns": turns }))).into_response(),
+    let turns = match store.composition_for_session(&session_id) {
+        Ok(turns) => turns,
         Err(error) => {
             tracing::error!(%error, session_id, "context-forensics: failed to compute composition");
-            (
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(error_body("store_query_failed", &serde_json::json!({}))),
             )
-                .into_response()
+                .into_response();
         }
-    }
+    };
+    let cross_check_status = store
+        .cross_check_status_for_session(&session_id)
+        .unwrap_or(crate::context_forensics::store::CrossCheckStatus::TranscriptOnly);
+    let cross_check_detail = store
+        .cross_check_detail_for_session(&session_id, cross_check_status)
+        .unwrap_or(None);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "turns": turns,
+            "cross_check_status": cross_check_status,
+            "cross_check_detail": cross_check_detail,
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /v1/context/sessions/{id}/growth`: `{turns, native_compaction_events}`

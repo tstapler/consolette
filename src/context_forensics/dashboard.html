@@ -211,6 +211,36 @@
     border-radius: 4px;
     color: var(--muted);
   }
+  #cross-check-badge-wrap { position: relative; }
+  .cross-check-badge {
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: none;
+    color: inherit;
+    cursor: pointer;
+  }
+  .cross-check-badge.hidden { display: none; }
+  .cross-check-badge[data-status="corroborated"] { border-color: var(--conversation); color: var(--conversation); }
+  .cross-check-badge[data-status="diverged"] { border-color: #d14343; color: #d14343; }
+  .cross-check-badge[data-status="transcript_only"] { border-color: var(--muted); color: var(--muted); }
+  .cross-check-tooltip {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: 5;
+    margin-top: 0.3rem;
+    max-width: 22rem;
+    font-size: 0.8rem;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  }
+  .cross-check-tooltip.hidden { display: none; }
   table.summary-table {
     border-collapse: collapse;
     font-size: 0.85rem;
@@ -260,7 +290,7 @@
     margin-top: 0.6rem;
   }
   #inspector-panel.hidden { display: none; }
-  #inspector-panel .panel-header {
+  .panel-header {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
@@ -327,7 +357,13 @@
   <div id="status-banner" class="hidden" role="status" aria-live="polite"></div>
 
   <section class="panel" id="composition-panel">
-    <h2>Composition breakdown</h2>
+    <div class="panel-header">
+      <h2>Composition breakdown</h2>
+      <span id="cross-check-badge-wrap">
+        <button type="button" id="cross-check-badge" class="cross-check-badge" aria-expanded="false"></button>
+        <div id="cross-check-tooltip" class="cross-check-tooltip hidden" role="tooltip"></div>
+      </span>
+    </div>
     <div id="scrubber-row">
       <input id="turn-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Select turn">
       <span id="turn-label">Turn 0</span>
@@ -417,7 +453,10 @@
     summary: [], // Story 2.1.1 SessionSummary rows, started_at-ascending
     summarySortKey: "cost_per_call_usd",
     summarySortDir: "desc", // "asc" | "desc"
-    inspectorOpen: false // Story 2.2.2
+    inspectorOpen: false, // Story 2.2.2
+    crossCheckStatus: "transcript_only", // Story 5.2.2
+    crossCheckDetail: null,
+    crossCheckTooltipOpen: false
   };
 
   var bannerEl = document.getElementById("status-banner");
@@ -431,6 +470,8 @@
   var legendEl = document.getElementById("growth-legend");
   var textFallbackBodyEl = document.getElementById("growth-text-body");
   var compositionPanelEl = document.getElementById("composition-panel");
+  var crossCheckBadgeEl = document.getElementById("cross-check-badge");
+  var crossCheckTooltipEl = document.getElementById("cross-check-tooltip");
   var growthPanelEl = document.getElementById("growth-panel");
   var churnPanelEl = document.getElementById("churn-panel");
   var pageTitleEl = document.getElementById("page-title");
@@ -546,7 +587,33 @@
     return state.composition[state.selectedTurnIndex] || null;
   }
 
+  var CROSS_CHECK_LABELS = {
+    corroborated: "Corroborated",
+    diverged: "Diverged",
+    transcript_only: "Transcript only"
+  };
+
+  function renderCrossCheckBadge() {
+    var status = state.crossCheckStatus;
+    var label = CROSS_CHECK_LABELS[status] || CROSS_CHECK_LABELS.transcript_only;
+    crossCheckBadgeEl.textContent = "[" + label + " ⓘ]";
+    crossCheckBadgeEl.setAttribute("data-status", status);
+    crossCheckBadgeEl.setAttribute("aria-expanded", state.crossCheckTooltipOpen ? "true" : "false");
+
+    var tooltipText = state.crossCheckDetail
+      || (status === "corroborated" ? "Every cross-checked call agreed with the live proxy capture."
+        : "No proxy-captured usage exists for this session yet; figures are transcript-derived only.");
+    crossCheckTooltipEl.textContent = tooltipText;
+    crossCheckTooltipEl.classList.toggle("hidden", !state.crossCheckTooltipOpen);
+  }
+
+  function toggleCrossCheckTooltip() {
+    state.crossCheckTooltipOpen = !state.crossCheckTooltipOpen;
+    renderCrossCheckBadge();
+  }
+
   function renderComposition() {
+    renderCrossCheckBadge();
     var turn = currentTurnComposition();
     turnLabelEl.textContent = "Turn " + state.selectedTurnIndex;
 
@@ -671,6 +738,7 @@
 
   viewFullTurnBtn.addEventListener("click", openInspector);
   inspectorCollapseBtn.addEventListener("click", closeInspector);
+  crossCheckBadgeEl.addEventListener("click", toggleCrossCheckTooltip);
 
   function renderDonut(segments, total) {
     var size = 160;
@@ -1046,6 +1114,9 @@
       var growthResp = results[1];
       var churnResp = results[2];
       state.composition = Array.isArray(compositionResp.turns) ? compositionResp.turns : [];
+      state.crossCheckStatus = compositionResp.cross_check_status || "transcript_only";
+      state.crossCheckDetail = compositionResp.cross_check_detail || null;
+      state.crossCheckTooltipOpen = false;
       state.growth = Array.isArray(growthResp.turns) ? growthResp.turns : [];
       state.churn = Array.isArray(churnResp) ? churnResp : [];
       state.compactionEvents = Array.isArray(growthResp.native_compaction_events) ? growthResp.native_compaction_events : [];

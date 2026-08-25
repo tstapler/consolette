@@ -64,10 +64,23 @@ impl ContextForensicsMcpServer {
         if let Some(result) = self.require_known_session(session_id) {
             return result;
         }
-        match self.store.composition_for_session(session_id) {
-            Ok(turns) => json_result(&json!({ "turns": turns })),
-            Err(error) => store_error_result(&error),
-        }
+        let turns = match self.store.composition_for_session(session_id) {
+            Ok(turns) => turns,
+            Err(error) => return store_error_result(&error),
+        };
+        let cross_check_status = self
+            .store
+            .cross_check_status_for_session(session_id)
+            .unwrap_or(crate::context_forensics::store::CrossCheckStatus::TranscriptOnly);
+        let cross_check_detail = self
+            .store
+            .cross_check_detail_for_session(session_id, cross_check_status)
+            .unwrap_or(None);
+        json_result(&json!({
+            "turns": turns,
+            "cross_check_status": cross_check_status,
+            "cross_check_detail": cross_check_detail,
+        }))
     }
 
     fn get_session_growth(&self, request: &CallToolRequestParams) -> CallToolResult {
@@ -384,7 +397,10 @@ mod tests {
         };
         let body: Value = serde_json::from_str(&text.text).unwrap();
         let expected = store.composition_for_session("s1").unwrap();
-        assert_eq!(body, json!({ "turns": expected }));
+        assert_eq!(
+            body,
+            json!({ "turns": expected, "cross_check_status": "transcript_only", "cross_check_detail": null })
+        );
     }
 
     #[test]

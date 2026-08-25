@@ -50,7 +50,7 @@ pub struct CostTrackingStream<S> {
     #[allow(dead_code)] // reserved for future model-aware cost recording
     model: String,
     buf: Vec<u8>,
-    last_usage: Option<(u64, u64)>,
+    last_usage: Option<crate::providers::AnthropicUsage>,
     /// Set once a terminal frame (`message_stop`, a mid-stream error frame,
     /// or an unattributed end-of-stream) has been handled — suppresses
     /// further polling of `inner` and further cost recording.
@@ -125,9 +125,9 @@ impl<S> CostTrackingStream<S> {
         let request_id = self.request_id;
         let last_usage = self.last_usage;
         tokio::spawn(async move {
-            if let Some((input, output)) = last_usage {
+            if let Some(usage) = last_usage {
                 let actual = TokenCount {
-                    value: input + output,
+                    value: usage.input_tokens + usage.output_tokens,
                     source: TokenSource::Exact,
                 };
                 let _ = tracker
@@ -157,9 +157,9 @@ impl<S> CostTrackingStream<S> {
         let request_id = self.request_id;
         let last_usage = self.last_usage;
         tokio::spawn(async move {
-            if let Some((input, output)) = last_usage {
+            if let Some(usage) = last_usage {
                 let actual = TokenCount {
-                    value: input + output,
+                    value: usage.input_tokens + usage.output_tokens,
                     source: TokenSource::Estimated {
                         via: EstimatorKind::AnthropicCountTokensApi,
                     },

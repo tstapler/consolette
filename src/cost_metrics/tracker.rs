@@ -826,6 +826,7 @@ mod tests {
             ModelPrice {
                 input_usd_per_token: 0.000_003,
                 output_usd_per_token: 0.000_015,
+                ..Default::default()
             },
         );
         pricing.insert(
@@ -833,6 +834,7 @@ mod tests {
             ModelPrice {
                 input_usd_per_token: 0.000_002_5,
                 output_usd_per_token: 0.000_01,
+                ..Default::default()
             },
         );
         let tracker = CostTracker::new(pricing).await;

@@ -42,12 +42,22 @@ struct PricingSnapshot {
 /// Per-token USD rates for one model. Matches `LiteLLM`'s
 /// `input_cost_per_token`/`output_cost_per_token` source data — never a
 /// per-million rate (repair iteration 1, was arch B5.2/adv B5).
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+///
+/// `cache_read_usd_per_token`/`cache_creation_usd_per_token` (context-
+/// analyzer plan.md Story 1.1.2) source from `LiteLLM`'s
+/// `cache_read_input_token_cost`/`cache_creation_input_token_cost` fields
+/// and default to `0.0` when a model entry omits them — an omission that
+/// must not fail parsing of the whole snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
 pub struct ModelPrice {
     #[serde(rename = "input_cost_per_token")]
     pub input_usd_per_token: f64,
     #[serde(rename = "output_cost_per_token")]
     pub output_usd_per_token: f64,
+    #[serde(rename = "cache_read_input_token_cost", default)]
+    pub cache_read_usd_per_token: f64,
+    #[serde(rename = "cache_creation_input_token_cost", default)]
+    pub cache_creation_usd_per_token: f64,
 }
 
 /// Static/config-overridable model → price lookup. `price_for` on a model
@@ -253,6 +263,7 @@ mod tests {
         ModelPrice {
             input_usd_per_token: input,
             output_usd_per_token: output,
+            ..Default::default()
         }
     }
 
@@ -264,6 +275,36 @@ mod tests {
             .expect("claude-sonnet-5 must be present in the vendored snapshot");
         assert_eq!(price.input_usd_per_token, 0.000_003);
         assert_eq!(price.output_usd_per_token, 0.000_015);
+    }
+
+    #[test]
+    fn model_price_should_populate_cache_rate_fields_when_snapshot_sets_them() {
+        let snapshot: PricingSnapshot = serde_json::from_str(
+            r#"{"models": {"cache-heavy-model": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015,
+                "cache_read_input_token_cost": 0.00000003,
+                "cache_creation_input_token_cost": 0.00000375
+            }}}"#,
+        )
+        .expect("fixture snapshot must parse");
+        let price = snapshot.models.get("cache-heavy-model").unwrap();
+        assert_eq!(price.cache_read_usd_per_token, 0.000_000_03);
+        assert_eq!(price.cache_creation_usd_per_token, 0.000_003_75);
+    }
+
+    #[test]
+    fn model_price_should_default_cache_rate_fields_to_zero_when_snapshot_omits_them() {
+        let snapshot: PricingSnapshot = serde_json::from_str(
+            r#"{"models": {"no-cache-fields-model": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015
+            }}}"#,
+        )
+        .expect("fixture snapshot missing cache fields must still parse");
+        let price = snapshot.models.get("no-cache-fields-model").unwrap();
+        assert_eq!(price.cache_read_usd_per_token, 0.0);
+        assert_eq!(price.cache_creation_usd_per_token, 0.0);
     }
 
     #[test]

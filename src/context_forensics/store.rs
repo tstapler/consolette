@@ -200,6 +200,18 @@ pub struct GrowthPoint {
     pub cumulative_tokens: u64,
 }
 
+/// One point on the cache-read churn chart —
+/// [`ContextForensicsStore::cache_churn_for_session`]'s per-element shape
+/// (Story 2.3.1). Field names are the literal Anthropic API `usage.*` keys
+/// (per `research/ux.md` §2), not an abstracted "churn score" — Tyler cross-
+/// checks these against raw API responses he already reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheChurnPoint {
+    pub turn_index: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
 /// One row of `GET /v1/context/sessions/summary` —
 /// [`ContextForensicsStore::summary_for_all_sessions`]'s per-element shape
 /// (Story 2.1.1). Doubles as the "Cost/Call Over Time" trend series (Story
@@ -1079,6 +1091,29 @@ impl ContextForensicsStore {
             .collect())
     }
 
+    /// Per-turn cache-read/cache-creation churn series for one session
+    /// (Story 2.3.1), ordered by `turn_index` — reuses
+    /// [`Self::composition_for_session`]'s already-aggregated
+    /// `TurnComposition` rows (which carry these same two fields) rather
+    /// than re-querying `api_calls`, since both routes need the identical
+    /// per-turn cache-token sums.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the
+    /// underlying query fails.
+    pub fn cache_churn_for_session(&self, session_id: &str) -> Result<Vec<CacheChurnPoint>> {
+        let turns = self.composition_for_session(session_id)?;
+        Ok(turns
+            .into_iter()
+            .map(|turn| CacheChurnPoint {
+                turn_index: turn.turn_index,
+                cache_read_input_tokens: turn.cache_read_input_tokens,
+                cache_creation_input_tokens: turn.cache_creation_input_tokens,
+            })
+            .collect())
+    }
+
     /// Cross-session cost/call, peak-context, and coverage summary (Story
     /// 2.1.1) — every stored session, `cost_per_call_usd` computed via
     /// `pricing`'s cache-aware rates (Story 1.1.2), not input/output alone.
@@ -1356,6 +1391,35 @@ mod tests {
         store.upsert_session(&sample_session("s1")).unwrap();
 
         assert_eq!(store.peak_context_tokens("s1").unwrap(), 0);
+    }
+
+    #[test]
+    fn cache_churn_for_session_should_return_per_turn_read_and_creation_tokens_when_calls_exist() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+        store
+            .upsert_turn(&TurnRow {
+                id: "t10".to_string(),
+                session_id: "s1".to_string(),
+                turn_index: 10,
+                user_row_uuid: "u10".to_string(),
+                cumulative_tokens: 20_000,
+                user_row_json: None,
+                tool_rows_json: None,
+            })
+            .unwrap();
+        let mut call = sample_api_call("s1", "a10", 1000);
+        call.turn_id = Some("t10".to_string());
+        call.cache_read_input_tokens = Some(18_000);
+        call.cache_creation_input_tokens = Some(200);
+        store.upsert_api_call(&call).unwrap();
+
+        let points = store.cache_churn_for_session("s1").unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].turn_index, 10);
+        assert_eq!(points[0].cache_read_input_tokens, 18_000);
+        assert_eq!(points[0].cache_creation_input_tokens, 200);
     }
 
     #[test]

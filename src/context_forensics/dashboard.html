@@ -240,6 +240,10 @@
   table.summary-table tbody tr:hover {
     background: var(--banner-empty-bg);
   }
+  #churn-chart-wrap svg { width: 100%; height: auto; display: block; }
+  .churn-legend { font-size: 0.8rem; color: var(--muted); margin-top: 0.4rem; }
+  .churn-legend .swatch.cache-read { background: var(--chart-line); }
+  .churn-legend .swatch.cache-creation { background: var(--autocompact-marker); }
   #cost-scatter-wrap svg, #cost-trend-chart-wrap svg { width: 100%; height: auto; display: block; }
   #cost-scatter-wrap circle { cursor: pointer; }
   .trend-summary { font-size: 0.85rem; color: var(--muted); }
@@ -360,6 +364,12 @@
     </details>
   </section>
 
+  <section class="panel" id="churn-panel">
+    <h2>Cache-read churn</h2>
+    <div id="churn-chart-wrap"></div>
+    <div class="churn-legend" id="churn-legend"></div>
+  </section>
+
   <section class="panel" id="cross-session-panel">
     <h2>Sessions</h2>
     <table class="summary-table" id="summary-table">
@@ -400,6 +410,7 @@
     sessionId: null,
     composition: [], // per-turn TurnComposition
     growth: [],       // per-turn {turn_index, cumulative_tokens}
+    churn: [],        // per-turn CacheChurnPoint
     compactionEvents: [],
     selectedTurnIndex: 0,
     activeThresholds: {}, // value -> bool
@@ -421,6 +432,7 @@
   var textFallbackBodyEl = document.getElementById("growth-text-body");
   var compositionPanelEl = document.getElementById("composition-panel");
   var growthPanelEl = document.getElementById("growth-panel");
+  var churnPanelEl = document.getElementById("churn-panel");
   var pageTitleEl = document.getElementById("page-title");
   var crossSessionNavLinkEl = document.getElementById("cross-session-nav-link");
   var pickerRowEl = document.getElementById("picker-row");
@@ -430,6 +442,8 @@
   var scatterWrapEl = document.getElementById("cost-scatter-wrap");
   var trendChartWrapEl = document.getElementById("cost-trend-chart-wrap");
   var trendSummaryEl = document.getElementById("cost-trend-summary");
+  var churnChartWrapEl = document.getElementById("churn-chart-wrap");
+  var churnLegendEl = document.getElementById("churn-legend");
   var viewFullTurnBtn = document.getElementById("view-full-turn-btn");
   var inspectorPanelEl = document.getElementById("inspector-panel");
   var inspectorTitleEl = document.getElementById("inspector-title");
@@ -489,6 +503,7 @@
   function setPanelsVisible(visible) {
     compositionPanelEl.style.display = visible ? "" : "none";
     growthPanelEl.style.display = visible ? "" : "none";
+    churnPanelEl.style.display = visible ? "" : "none";
     if (!visible) {
       closeInspector();
     }
@@ -901,6 +916,83 @@
     textFallbackBodyEl.appendChild(list);
   }
 
+  // -- Cache-read churn chart (Story 2.3.2) -------------------------------
+  //
+  // Legend/axis use the literal Anthropic API field names, not an
+  // abstracted "churn score" (ux.md/research/ux.md §2) -- Tyler cross-checks
+  // these numbers directly against raw API responses.
+
+  function renderChurnChart() {
+    churnChartWrapEl.innerHTML = "";
+    churnLegendEl.innerHTML = "";
+
+    if (state.churn.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.textContent = "No calls recorded for this session yet.";
+      churnChartWrapEl.appendChild(empty);
+      return;
+    }
+
+    var width = 720;
+    var height = 160;
+    var padding = { top: 12, right: 16, bottom: 24, left: 56 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+    var n = state.churn.length;
+    var barGroupW = innerW / n;
+    var barW = Math.max(1, barGroupW * 0.35);
+
+    var maxY = Math.max.apply(null, state.churn.map(function (p) {
+      return Math.max(p.cache_read_input_tokens, p.cache_creation_input_tokens);
+    }).concat([1]));
+
+    function yFor(v) { return padding.top + innerH - (v / maxY) * innerH; }
+    function barHeight(v) { return (v / maxY) * innerH; }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "cache_read_input_tokens and cache_creation_input_tokens per turn");
+
+    state.churn.forEach(function (p, i) {
+      var groupX = padding.left + i * barGroupW;
+
+      var readBar = document.createElementNS(svgNS, "rect");
+      readBar.setAttribute("x", groupX);
+      readBar.setAttribute("y", yFor(p.cache_read_input_tokens));
+      readBar.setAttribute("width", barW);
+      readBar.setAttribute("height", barHeight(p.cache_read_input_tokens));
+      readBar.setAttribute("fill", "var(--chart-line)");
+      svg.appendChild(readBar);
+
+      var creationBar = document.createElementNS(svgNS, "rect");
+      creationBar.setAttribute("x", groupX + barW + 1);
+      creationBar.setAttribute("y", yFor(p.cache_creation_input_tokens));
+      creationBar.setAttribute("width", barW);
+      creationBar.setAttribute("height", barHeight(p.cache_creation_input_tokens));
+      creationBar.setAttribute("fill", "var(--autocompact-marker)");
+      svg.appendChild(creationBar);
+    });
+
+    churnChartWrapEl.appendChild(svg);
+
+    var legendItems = [
+      { swatch: "cache-read", label: "cache_read_input_tokens" },
+      { swatch: "cache-creation", label: "cache_creation_input_tokens" }
+    ];
+    legendItems.forEach(function (item) {
+      var span = document.createElement("span");
+      var swatch = document.createElement("span");
+      swatch.className = "swatch " + item.swatch;
+      span.appendChild(swatch);
+      span.appendChild(document.createTextNode(item.label));
+      span.style.marginRight = "1rem";
+      churnLegendEl.appendChild(span);
+    });
+  }
+
   // -- Scrubber --------------------------------------------------
 
   function renderScrubber() {
@@ -947,12 +1039,15 @@
 
     Promise.all([
       fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/composition"),
-      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/growth")
+      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/growth"),
+      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/cache-churn")
     ]).then(function (results) {
       var compositionResp = results[0];
       var growthResp = results[1];
+      var churnResp = results[2];
       state.composition = Array.isArray(compositionResp.turns) ? compositionResp.turns : [];
       state.growth = Array.isArray(growthResp.turns) ? growthResp.turns : [];
+      state.churn = Array.isArray(churnResp) ? churnResp : [];
       state.compactionEvents = Array.isArray(growthResp.native_compaction_events) ? growthResp.native_compaction_events : [];
       state.selectedTurnIndex = topGrowthTurnIndex(state.growth);
 
@@ -962,6 +1057,7 @@
       renderComposition();
       renderThresholdToggles();
       renderGrowthChart();
+      renderChurnChart();
     }).catch(function (err) {
       if (err && err.notFound) {
         setPanelsVisible(false);

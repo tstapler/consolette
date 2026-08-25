@@ -166,6 +166,41 @@ async fn handler_session_growth(
         .into_response()
 }
 
+/// `GET /v1/context/sessions/{id}/cache-churn`: per-turn
+/// [`CacheChurnPoint`]s for `id` (Story 2.3.1). `404` with a JSON error
+/// body when `id` isn't a known session — never a `500` for an unknown id.
+async fn handler_cache_churn(
+    State(store): State<Arc<ContextForensicsStore>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match store.get_session(&session_id) {
+        Ok(None) => {
+            return session_not_found(&session_id);
+        }
+        Ok(Some(_)) => {}
+        Err(error) => {
+            tracing::error!(%error, session_id, "context-forensics: failed to look up session");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body("store_query_failed", &serde_json::json!({}))),
+            )
+                .into_response();
+        }
+    }
+
+    match store.cache_churn_for_session(&session_id) {
+        Ok(points) => (StatusCode::OK, Json(points)).into_response(),
+        Err(error) => {
+            tracing::error!(%error, session_id, "context-forensics: failed to compute cache churn");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body("store_query_failed", &serde_json::json!({}))),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `State` for the `/v1/context/sessions/summary` route (Story 2.1.1) —
 /// needs both the store and a live-refreshing `PricingTable` (so
 /// `cost_per_call_usd` uses the same cache-aware rates `/v1/cost` does),
@@ -331,6 +366,10 @@ pub fn context_router(
             "/v1/context/sessions/{id}/turns/{turn_index}",
             get(handler_turn_content),
         )
+        .route(
+            "/v1/context/sessions/{id}/cache-churn",
+            get(handler_cache_churn),
+        )
         .with_state(store)
         .merge(summary_router)
 }
@@ -363,6 +402,7 @@ pub fn context_unavailable_router() -> Router {
             "/v1/context/sessions/{id}/turns/{turn_index}",
             get(unavailable),
         )
+        .route("/v1/context/sessions/{id}/cache-churn", get(unavailable))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +549,72 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "turn_not_found");
+    }
+
+    #[tokio::test]
+    async fn get_cache_churn_route_should_return_exact_figures_when_turn_has_cache_usage() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(ContextForensicsStore::open(&dir.path().join("cf.sqlite")).unwrap());
+
+        let mut fixture = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(
+            fixture,
+            r#"{{"type":"user","uuid":"u1","parentUuid":null,"isSidechain":false,"isMeta":false,"message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            fixture,
+            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":false,"isMeta":false,"message":{{"role":"assistant","content":[{{"type":"text","text":"reply"}}],"usage":{{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":200,"cache_read_input_tokens":18000}}}}}}"#
+        )
+        .unwrap();
+        ingest_claude_code_session(&store, fixture.path()).unwrap();
+        let session_id = fixture
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let router = context_router(store, fixture_pricing_rx());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/context/sessions/{session_id}/cache-churn"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let points = json.as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["turn_index"], 0);
+        assert_eq!(points[0]["cache_read_input_tokens"], 18000);
+        assert_eq!(points[0]["cache_creation_input_tokens"], 200);
+    }
+
+    #[tokio::test]
+    async fn get_cache_churn_route_should_return_404_when_session_id_unknown() {
+        let (_dir, store, _session_id) = seeded_store();
+        let router = context_router(store, fixture_pricing_rx());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/context/sessions/does-not-exist/cache-churn")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

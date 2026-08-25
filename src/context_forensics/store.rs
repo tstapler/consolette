@@ -89,6 +89,43 @@ impl UsageProvenance {
     }
 }
 
+/// Whether a call's transcript-derived usage is corroborated by a
+/// proxy-captured reading of the same call, diverges from it, or has no
+/// proxy-side reading to compare against (plan.md Story 5.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossCheckStatus {
+    TranscriptOnly,
+    Corroborated,
+    Diverged,
+}
+
+impl CrossCheckStatus {
+    #[must_use]
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            CrossCheckStatus::TranscriptOnly => "transcript_only",
+            CrossCheckStatus::Corroborated => "corroborated",
+            CrossCheckStatus::Diverged => "diverged",
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if `value` is not one of the `CHECK`-constrained
+    /// values this column ever writes.
+    pub fn from_db_str(value: &str) -> Result<Self> {
+        match value {
+            "transcript_only" => Ok(CrossCheckStatus::TranscriptOnly),
+            "corroborated" => Ok(CrossCheckStatus::Corroborated),
+            "diverged" => Ok(CrossCheckStatus::Diverged),
+            other => Err(anyhow!(
+                "unknown proxy_cross_check status column value: {other}"
+            )),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Row types (Domain Glossary: `SessionRow`, `TurnRow`, `ApiCallRow`)
 // ---------------------------------------------------------------------------
@@ -218,6 +255,19 @@ pub struct SubagentRow {
     pub cache_read_input_tokens: u64,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+}
+
+/// Persisted transcript-vs-proxy reconciliation for one [`ApiCallRow`]
+/// (Phase 5, `research/pitfalls.md` §4). Never a second competing usage
+/// reading for the call — `call_id`'s own `ApiCallRow` stays the one
+/// source of truth for totals; this row is comparison-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProxyCrossCheckRow {
+    pub session_id: String,
+    pub call_id: String,
+    pub proxy_request_id: Option<String>,
+    pub status: CrossCheckStatus,
+    pub variance_tokens: Option<i64>,
 }
 
 /// One turn's aggregated composition/usage figures — [`ContextForensicsStore::composition_for_session`]'s
@@ -449,6 +499,25 @@ fn exec_upsert_subagent(conn: &Connection, row: &SubagentRow) -> Result<()> {
     Ok(())
 }
 
+fn exec_upsert_proxy_cross_check(conn: &Connection, row: &ProxyCrossCheckRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO proxy_cross_check (session_id, call_id, proxy_request_id, status, variance_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (session_id, call_id) DO UPDATE SET
+            proxy_request_id = excluded.proxy_request_id,
+            status = excluded.status,
+            variance_tokens = excluded.variance_tokens",
+        params![
+            row.session_id,
+            row.call_id,
+            row.proxy_request_id,
+            row.status.as_db_str(),
+            row.variance_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ContextForensicsStore
 // ---------------------------------------------------------------------------
@@ -524,6 +593,22 @@ CREATE TABLE IF NOT EXISTS subagents (
     cache_read_input_tokens      INTEGER NOT NULL,
     started_at                   TEXT,
     ended_at                     TEXT
+);
+
+-- Phase 5:
+-- UNIQUE (session_id, call_id) is additive beyond the Migration Plan's
+-- literal Phase-5 CREATE TABLE text — needed so re-running reconciliation
+-- (e.g. on rescan) replaces a call's prior verdict instead of appending a
+-- duplicate row. Harmless under CREATE TABLE IF NOT EXISTS: no existing
+-- column's constraint is tightened or loosened.
+CREATE TABLE IF NOT EXISTS proxy_cross_check (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL REFERENCES sessions(id),
+    call_id          TEXT NOT NULL REFERENCES api_calls(id),
+    proxy_request_id TEXT,
+    status           TEXT NOT NULL CHECK (status IN ('transcript_only','corroborated','diverged')),
+    variance_tokens  INTEGER,
+    UNIQUE (session_id, call_id)
 );
 ";
 
@@ -722,6 +807,91 @@ impl ContextForensicsStore {
     pub fn upsert_subagent(&self, row: &SubagentRow) -> Result<()> {
         let conn = self.lock()?;
         exec_upsert_subagent(&conn, row)
+    }
+
+    /// Insert or update a [`ProxyCrossCheckRow`], keyed on `(session_id,
+    /// call_id)` — re-running reconciliation for a call replaces its prior
+    /// verdict rather than appending a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the
+    /// underlying `rusqlite` call fails.
+    pub fn upsert_proxy_cross_check(&self, row: &ProxyCrossCheckRow) -> Result<()> {
+        let conn = self.lock()?;
+        exec_upsert_proxy_cross_check(&conn, row)
+    }
+
+    /// Every [`ProxyCrossCheckRow`] for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned, the query
+    /// fails, or a stored `status` value doesn't match a known
+    /// [`CrossCheckStatus`] variant.
+    pub fn proxy_cross_check_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ProxyCrossCheckRow>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, call_id, proxy_request_id, status, variance_tokens
+             FROM proxy_cross_check WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let raw_rows = statement
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        raw_rows
+            .into_iter()
+            .map(
+                |(session_id, call_id, proxy_request_id, status, variance_tokens)| {
+                    Ok(ProxyCrossCheckRow {
+                        session_id,
+                        call_id,
+                        proxy_request_id,
+                        status: CrossCheckStatus::from_db_str(&status)?,
+                        variance_tokens,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// A session's aggregate cross-check status for dashboard display
+    /// (Story 5.2.2): [`CrossCheckStatus::Diverged`] if any call diverged,
+    /// else [`CrossCheckStatus::Corroborated`] if any call corroborated,
+    /// else [`CrossCheckStatus::TranscriptOnly`] — the same worst-first
+    /// precedence a reader would want ("tell me if anything's wrong
+    /// first").
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the query
+    /// fails.
+    pub fn cross_check_status_for_session(&self, session_id: &str) -> Result<CrossCheckStatus> {
+        let rows = self.proxy_cross_check_for_session(session_id)?;
+        if rows
+            .iter()
+            .any(|row| row.status == CrossCheckStatus::Diverged)
+        {
+            Ok(CrossCheckStatus::Diverged)
+        } else if rows
+            .iter()
+            .any(|row| row.status == CrossCheckStatus::Corroborated)
+        {
+            Ok(CrossCheckStatus::Corroborated)
+        } else {
+            Ok(CrossCheckStatus::TranscriptOnly)
+        }
     }
 
     /// Look up one [`SubagentRow`] by `id`.

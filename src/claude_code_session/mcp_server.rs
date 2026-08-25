@@ -39,8 +39,10 @@ impl CompactionMcpServer {
     /// [`ServerHandler::call_tool`] trait method so unit tests can exercise
     /// it without constructing a live `RequestContext<RoleServer>` (which
     /// requires an active `rmcp` transport/peer and has no public
-    /// zero-dependency constructor).
-    fn dispatch(&self, request: CallToolRequestParams) -> CallToolResult {
+    /// zero-dependency constructor). `pub` (not private) so `main.rs`'s
+    /// combined `consolette mcp` server composition (a separate crate) can
+    /// delegate to it directly — see `main.rs::CombinedMcpServer`.
+    pub fn dispatch(&self, request: CallToolRequestParams) -> CallToolResult {
         if request.name != TOOL_NAME {
             return CallToolResult::error(vec![ContentBlock::text(format!(
                 "unknown tool: {}",
@@ -75,6 +77,22 @@ impl CompactionMcpServer {
     fn call_tool_for_test(&self, request: CallToolRequestParams) -> CallToolResult {
         self.dispatch(request)
     }
+}
+
+/// This server's tool definitions, exposed standalone so
+/// `main.rs::CombinedMcpServer` can list them without needing a live
+/// `RequestContext<RoleServer>`.
+#[must_use]
+pub fn tool_defs() -> Vec<Tool> {
+    vec![read_omitted_content_tool()]
+}
+
+/// `true` if `name` is a tool this server owns — lets a composite server
+/// route a `call_tool` request without duplicating this server's own tool
+/// list.
+#[must_use]
+pub fn owns_tool(name: &str) -> bool {
+    name == TOOL_NAME
 }
 
 const TOOL_NAME: &str = "read_omitted_content";
@@ -134,7 +152,7 @@ impl ServerHandler for CompactionMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
-            tools: vec![read_omitted_content_tool()],
+            tools: tool_defs(),
             ..Default::default()
         })
     }

@@ -23,6 +23,7 @@ pub mod composition;
 pub mod hook_event;
 pub mod hooks_install;
 pub mod ingest_claude_code;
+pub mod mcp_server;
 pub mod refresh;
 pub mod server;
 pub mod store;

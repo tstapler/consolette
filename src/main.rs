@@ -210,12 +210,77 @@ fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("consolette")
 }
 
+/// Combines [`CompactionMcpServer`] and
+/// [`ContextForensicsMcpServer`](consolette::context_forensics::mcp_server::ContextForensicsMcpServer)
+/// behind one `ServerHandler` (plan.md Story 5.1.1 Task 5.1.1b) — an MCP
+/// client only ever connects to one server process, so `consolette mcp`
+/// must expose both tool sets together rather than picking one.
+struct CombinedMcpServer {
+    compaction: CompactionMcpServer,
+    context_forensics: consolette::context_forensics::mcp_server::ContextForensicsMcpServer,
+}
+
+impl rmcp::ServerHandler for CombinedMcpServer {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "consolette",
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let mut tools = consolette::claude_code_session::mcp_server::tool_defs();
+        tools.extend(consolette::context_forensics::mcp_server::tool_defs());
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if consolette::claude_code_session::mcp_server::owns_tool(&request.name) {
+            Ok(self.compaction.dispatch(request))
+        } else if consolette::context_forensics::mcp_server::owns_tool(&request.name) {
+            Ok(self.context_forensics.dispatch(&request))
+        } else {
+            Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(format!("unknown tool: {}", request.name)),
+            ]))
+        }
+    }
+}
+
 async fn mcp() -> anyhow::Result<()> {
     use rmcp::{transport::io::stdio, ServiceExt};
 
     let cache = OmissionCache::open(&OmissionCache::default_cache_path())
         .context("failed to open omission cache")?;
-    let server = CompactionMcpServer::new(Arc::new(cache));
+    let store = consolette::context_forensics::store::ContextForensicsStore::open(
+        &consolette::context_forensics::store::ContextForensicsStore::default_store_path(),
+    )
+    .context("failed to open context-forensics store")?;
+    let pricing = consolette::cost_metrics::pricing::PricingTable::load_default();
+    let server = CombinedMcpServer {
+        compaction: CompactionMcpServer::new(Arc::new(cache)),
+        context_forensics:
+            consolette::context_forensics::mcp_server::ContextForensicsMcpServer::new(
+                Arc::new(store),
+                Arc::new(pricing),
+            ),
+    };
 
     let transport = stdio();
     let service = server.serve(transport).await?;

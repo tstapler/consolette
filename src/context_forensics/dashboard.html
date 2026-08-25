@@ -1,0 +1,790 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>consolette context dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1a1a1a;
+    --bg: #ffffff;
+    --border: #d0d0d0;
+    --muted: #666666;
+    --banner-info-bg: #eef4ff;
+    --banner-info-fg: #1a3d7c;
+    --banner-error-bg: #fdecec;
+    --banner-error-fg: #7c1a1a;
+    --banner-empty-bg: #f5f5f5;
+    --banner-empty-fg: #444444;
+    --chart-line: #4a90e2;
+    --chart-axis: #999999;
+    --danger-band: rgba(220, 50, 50, 0.14);
+    --danger-line: #cc2b2b;
+    --autocompact-marker: #b06fdb;
+    --tool-io: #4a90e2;
+    --conversation: #2fa86b;
+    --system: #d4a72c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6e6e6;
+      --bg: #121212;
+      --border: #3a3a3a;
+      --muted: #a0a0a0;
+      --banner-info-bg: #1a2a4a;
+      --banner-info-fg: #cfe0ff;
+      --banner-error-bg: #4a1a1a;
+      --banner-error-fg: #ffd0d0;
+      --banner-empty-bg: #1e1e1e;
+      --banner-empty-fg: #cccccc;
+      --chart-line: #6aa9ec;
+      --chart-axis: #777777;
+      --danger-band: rgba(255, 90, 90, 0.18);
+      --danger-line: #ff6b6b;
+      --autocompact-marker: #c48ce8;
+      --tool-io: #6aa9ec;
+      --conversation: #4fc98a;
+      --system: #e0bd4e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 1.5rem;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 0.25rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+  nav { margin-bottom: 1rem; font-size: 0.85rem; }
+  nav a {
+    color: var(--chart-line);
+  }
+  nav a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, details summary:focus-visible {
+    outline: 2px solid #4a90e2;
+    outline-offset: 2px;
+  }
+  #picker-row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+  #picker-row label { font-size: 0.85rem; color: var(--muted); }
+  #session-picker {
+    font-size: 0.9rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+    min-width: 260px;
+  }
+  #status-banner {
+    padding: 0.6rem 0.9rem;
+    border-radius: 6px;
+    margin-bottom: 0.75rem;
+    font-size: 0.9rem;
+  }
+  #status-banner.hidden { display: none; }
+  #status-banner.state-loading,
+  #status-banner.state-empty-corpus {
+    background: var(--banner-empty-bg);
+    color: var(--banner-empty-fg);
+  }
+  #status-banner.state-fetch-error,
+  #status-banner.state-not-found {
+    background: var(--banner-error-bg);
+    color: var(--banner-error-fg);
+  }
+  #status-banner a { color: inherit; text-decoration: underline; }
+  #status-banner button.retry {
+    margin-left: 0.5rem;
+    font: inherit;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+  }
+  section.panel {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+  }
+  .empty-region {
+    padding: 1.5rem;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .inline-error {
+    color: var(--banner-error-fg);
+    font-size: 0.85rem;
+  }
+  .inline-error a, .inline-error button {
+    margin-left: 0.5rem;
+  }
+  #scrubber-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+  #turn-scrubber { flex: 1; }
+  #turn-label { font-size: 0.85rem; color: var(--muted); min-width: 6rem; text-align: right; }
+  #composition-body {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  #composition-donut svg { width: 160px; height: 160px; }
+  table.composition-table {
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  table.composition-table th, table.composition-table td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.35rem 0.6rem;
+    text-align: left;
+  }
+  .swatch {
+    display: inline-block;
+    width: 0.85em;
+    height: 0.85em;
+    margin-right: 0.4em;
+    vertical-align: -0.1em;
+    border: 1px solid var(--fg);
+  }
+  .swatch.tool-io { background: repeating-linear-gradient(45deg, var(--tool-io), var(--tool-io) 2px, transparent 2px, transparent 4px); }
+  .swatch.conversation { background: var(--conversation); }
+  .swatch.system { background: repeating-linear-gradient(-45deg, var(--system), var(--system) 2px, transparent 2px, transparent 4px); }
+  #threshold-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+  .threshold-toggle {
+    font: inherit;
+    font-size: 0.85rem;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.3rem 0.9rem;
+    cursor: pointer;
+  }
+  .threshold-toggle[aria-pressed="true"] {
+    background: var(--danger-line);
+    color: #ffffff;
+    border-color: var(--danger-line);
+  }
+  #growth-chart-wrap svg { width: 100%; height: auto; display: block; }
+  .growth-legend { font-size: 0.8rem; color: var(--muted); margin-top: 0.4rem; }
+  .growth-legend .swatch.autocompact {
+    background: none;
+    border: none;
+    color: var(--autocompact-marker);
+  }
+  details.text-fallback summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  details.text-fallback table {
+    margin-top: 0.5rem;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  details.text-fallback th, details.text-fallback td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.3rem 0.6rem;
+    text-align: left;
+  }
+  .na-badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    padding: 0.05rem 0.4rem;
+    border: 1px dashed var(--muted);
+    border-radius: 4px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+  <nav><a href="/dashboard">&larr; Session compaction comparison</a></nav>
+  <h1>Context dashboard</h1>
+
+  <div id="picker-row">
+    <label for="session-picker">Session</label>
+    <select id="session-picker" aria-label="Select session"></select>
+  </div>
+
+  <div id="status-banner" class="hidden" role="status" aria-live="polite"></div>
+
+  <section class="panel" id="composition-panel">
+    <h2>Composition breakdown</h2>
+    <div id="scrubber-row">
+      <input id="turn-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Select turn">
+      <span id="turn-label">Turn 0</span>
+    </div>
+    <div id="composition-body">
+      <div id="composition-donut" aria-hidden="true"></div>
+      <table class="composition-table" id="composition-table">
+        <thead>
+          <tr><th>Category</th><th>Tokens</th><th>Share</th></tr>
+        </thead>
+        <tbody id="composition-table-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="growth-panel">
+    <h2>Context growth</h2>
+    <div id="threshold-row"></div>
+    <div id="growth-chart-wrap"></div>
+    <div class="growth-legend" id="growth-legend"></div>
+    <details class="text-fallback" id="growth-text-fallback">
+      <summary>Text summary</summary>
+      <div id="growth-text-body"></div>
+    </details>
+  </section>
+
+<script>
+(function () {
+  "use strict";
+
+  var THRESHOLDS = [
+    { label: "200K", value: 200000 },
+    { label: "500K", value: 500000 },
+    { label: "700K", value: 700000 },
+    { label: "1M", value: 1000000 }
+  ];
+
+  var state = {
+    sessions: [],
+    sessionId: null,
+    composition: [], // per-turn TurnComposition
+    growth: [],       // per-turn {turn_index, cumulative_tokens}
+    compactionEvents: [],
+    selectedTurnIndex: 0,
+    activeThresholds: {} // value -> bool
+  };
+
+  var bannerEl = document.getElementById("status-banner");
+  var pickerEl = document.getElementById("session-picker");
+  var scrubberEl = document.getElementById("turn-scrubber");
+  var turnLabelEl = document.getElementById("turn-label");
+  var donutEl = document.getElementById("composition-donut");
+  var tableBodyEl = document.getElementById("composition-table-body");
+  var thresholdRowEl = document.getElementById("threshold-row");
+  var chartWrapEl = document.getElementById("growth-chart-wrap");
+  var legendEl = document.getElementById("growth-legend");
+  var textFallbackBodyEl = document.getElementById("growth-text-body");
+  var compositionPanelEl = document.getElementById("composition-panel");
+  var growthPanelEl = document.getElementById("growth-panel");
+
+  /**
+   * Single state machine for #status-banner, mirroring dashboard.html's own
+   * convention: every visible/hidden banner state goes through here.
+   *
+   * States: "loading", "fetch-error", "not-found", "empty-corpus", "hidden".
+   */
+  function setBannerState(bannerState, opts) {
+    opts = opts || {};
+    bannerEl.className = "";
+    bannerEl.innerHTML = "";
+    switch (bannerState) {
+      case "loading":
+        bannerEl.classList.add("state-loading");
+        bannerEl.textContent = "Loading session data...";
+        break;
+      case "fetch-error": {
+        bannerEl.classList.add("state-fetch-error");
+        var msg = document.createElement("span");
+        msg.textContent = "Failed to load session data" + (opts.detail ? ": " + opts.detail : "") + ".";
+        bannerEl.appendChild(msg);
+        var retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.className = "retry";
+        retryBtn.textContent = "Retry";
+        retryBtn.addEventListener("click", opts.onRetry || loadSessionData);
+        bannerEl.appendChild(retryBtn);
+        break;
+      }
+      case "not-found": {
+        bannerEl.classList.add("state-not-found");
+        var nfMsg = document.createElement("span");
+        nfMsg.textContent = "Session not found. ";
+        bannerEl.appendChild(nfMsg);
+        var backLink = document.createElement("a");
+        backLink.href = "/dashboard/context";
+        backLink.textContent = "Back to context dashboard";
+        bannerEl.appendChild(backLink);
+        break;
+      }
+      case "empty-corpus":
+        bannerEl.classList.add("state-empty-corpus");
+        bannerEl.textContent = "No sessions ingested yet. Run \"consolette serve-cost\" and wait for the background rescan, or check back shortly.";
+        break;
+      case "hidden":
+      default:
+        bannerEl.classList.add("hidden");
+    }
+  }
+
+  function setPanelsVisible(visible) {
+    compositionPanelEl.style.display = visible ? "" : "none";
+    growthPanelEl.style.display = visible ? "" : "none";
+  }
+
+  // -- Session picker --------------------------------------------------
+
+  function renderPicker() {
+    while (pickerEl.firstChild) {
+      pickerEl.removeChild(pickerEl.firstChild);
+    }
+    state.sessions.forEach(function (session) {
+      var opt = document.createElement("option");
+      opt.value = session.id;
+      var label = session.project ? session.project + " / " + session.id : session.id;
+      if (session.source === "codex") {
+        label += " (codex)";
+      }
+      opt.textContent = label;
+      pickerEl.appendChild(opt);
+    });
+    pickerEl.value = state.sessionId || "";
+  }
+
+  function mostRecentSessionId(sessions) {
+    if (sessions.length === 0) {
+      return null;
+    }
+    var withDates = sessions.filter(function (s) { return !!s.started_at; });
+    if (withDates.length === 0) {
+      return sessions[sessions.length - 1].id;
+    }
+    withDates.sort(function (a, b) { return a.started_at < b.started_at ? 1 : -1; });
+    return withDates[0].id;
+  }
+
+  // -- Composition panel -------------------------------------------------
+
+  function currentTurnComposition() {
+    return state.composition[state.selectedTurnIndex] || null;
+  }
+
+  function renderComposition() {
+    var turn = currentTurnComposition();
+    turnLabelEl.textContent = "Turn " + state.selectedTurnIndex;
+
+    while (tableBodyEl.firstChild) {
+      tableBodyEl.removeChild(tableBodyEl.firstChild);
+    }
+    donutEl.innerHTML = "";
+
+    if (!turn) {
+      var emptyRow = document.createElement("div");
+      emptyRow.className = "empty-region";
+      emptyRow.textContent = "No calls recorded for this session yet.";
+      tableBodyEl.parentElement.style.display = "none";
+      donutEl.appendChild(emptyRow);
+      return;
+    }
+    tableBodyEl.parentElement.style.display = "";
+
+    var total = turn.tool_io_tokens + turn.conversation_tokens + turn.system_tokens;
+    var categories = [
+      { key: "tool_io_tokens", label: "Tool I/O", swatch: "tool-io", color: "var(--tool-io)" },
+      { key: "conversation_tokens", label: "Conversation", swatch: "conversation", color: "var(--conversation)" },
+      { key: "system_tokens", label: "System", swatch: "system", color: "var(--system)" }
+    ];
+
+    categories.forEach(function (cat) {
+      var value = turn[cat.key];
+      var tr = document.createElement("tr");
+      var th = document.createElement("th");
+      var swatch = document.createElement("span");
+      swatch.className = "swatch " + cat.swatch;
+      th.appendChild(swatch);
+      th.appendChild(document.createTextNode(cat.label));
+      tr.appendChild(th);
+      var tdVal = document.createElement("td");
+      tdVal.textContent = value.toLocaleString();
+      tr.appendChild(tdVal);
+      var tdShare = document.createElement("td");
+      tdShare.textContent = total > 0 ? (value / total * 100).toFixed(1) + "%" : "—";
+      tr.appendChild(tdShare);
+      tableBodyEl.appendChild(tr);
+    });
+
+    donutEl.appendChild(renderDonut(categories.map(function (cat) {
+      return { value: turn[cat.key], color: cat.color, label: cat.label };
+    }), total));
+  }
+
+  function renderDonut(segments, total) {
+    var size = 160;
+    var radius = 60;
+    var cx = size / 2;
+    var cy = size / 2;
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + size + " " + size);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Composition donut chart");
+
+    if (total <= 0) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", cx);
+      circle.setAttribute("cy", cy);
+      circle.setAttribute("r", radius);
+      circle.setAttribute("fill", "none");
+      circle.setAttribute("stroke", "var(--border)");
+      circle.setAttribute("stroke-width", "20");
+      svg.appendChild(circle);
+      return svg;
+    }
+
+    var angleStart = -90;
+    segments.forEach(function (seg) {
+      if (seg.value <= 0) { return; }
+      var fraction = seg.value / total;
+      var angleEnd = angleStart + fraction * 360;
+      var path = describeArc(cx, cy, radius, angleStart, angleEnd);
+      var arc = document.createElementNS(svgNS, "path");
+      arc.setAttribute("d", path);
+      arc.setAttribute("fill", "none");
+      arc.setAttribute("stroke", seg.color);
+      arc.setAttribute("stroke-width", "20");
+      arc.setAttribute("aria-hidden", "true");
+      svg.appendChild(arc);
+      angleStart = angleEnd;
+    });
+    return svg;
+  }
+
+  function polarToCartesian(cx, cy, r, angleDeg) {
+    var angleRad = (angleDeg - 90) * Math.PI / 180;
+    return { x: cx + r * Math.cos(angleRad), y: cy + r * Math.sin(angleRad) };
+  }
+
+  function describeArc(cx, cy, r, startAngle, endAngle) {
+    // Rotate the coordinate frame 90deg so 0deg points up (matches the
+    // -90 start-angle convention used by callers).
+    var start = polarToCartesian(cx, cy, r, endAngle + 90);
+    var end = polarToCartesian(cx, cy, r, startAngle + 90);
+    var largeArc = endAngle - startAngle <= 180 ? "0" : "1";
+    return ["M", start.x, start.y, "A", r, r, 0, largeArc, 0, end.x, end.y].join(" ");
+  }
+
+  // -- Growth chart --------------------------------------------------
+
+  function renderThresholdToggles() {
+    while (thresholdRowEl.firstChild) {
+      thresholdRowEl.removeChild(thresholdRowEl.firstChild);
+    }
+    THRESHOLDS.forEach(function (t) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "threshold-toggle";
+      btn.textContent = t.label;
+      var pressed = !!state.activeThresholds[t.value];
+      btn.setAttribute("aria-pressed", pressed ? "true" : "false");
+      btn.addEventListener("click", function () {
+        state.activeThresholds[t.value] = !state.activeThresholds[t.value];
+        renderThresholdToggles();
+        renderGrowthChart();
+      });
+      thresholdRowEl.appendChild(btn);
+    });
+  }
+
+  function renderGrowthChart() {
+    chartWrapEl.innerHTML = "";
+    legendEl.innerHTML = "";
+    textFallbackBodyEl.innerHTML = "";
+
+    if (state.growth.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.textContent = "No calls recorded for this session yet.";
+      chartWrapEl.appendChild(empty);
+      return;
+    }
+
+    var width = 720;
+    var height = 260;
+    var padding = { top: 16, right: 16, bottom: 28, left: 56 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+
+    var maxTurn = Math.max.apply(null, state.growth.map(function (p) { return p.turn_index; }));
+    var maxTokens = Math.max.apply(null, state.growth.map(function (p) { return p.cumulative_tokens; }).concat(
+      THRESHOLDS.filter(function (t) { return state.activeThresholds[t.value]; }).map(function (t) { return t.value; })
+    ));
+    maxTokens = Math.max(maxTokens, 1);
+
+    function xFor(turnIndex) {
+      return padding.left + (maxTurn > 0 ? (turnIndex / maxTurn) * innerW : 0);
+    }
+    function yFor(tokens) {
+      return padding.top + innerH - (tokens / maxTokens) * innerH;
+    }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Context growth per turn, with budget thresholds");
+
+    // Danger bands + dashed threshold lines (drawn first, under the data line).
+    THRESHOLDS.forEach(function (t) {
+      if (!state.activeThresholds[t.value]) { return; }
+      var y = yFor(t.value);
+      if (y < padding.top) { return; }
+      var band = document.createElementNS(svgNS, "rect");
+      band.setAttribute("x", padding.left);
+      band.setAttribute("y", padding.top);
+      band.setAttribute("width", innerW);
+      band.setAttribute("height", Math.max(0, y - padding.top));
+      band.setAttribute("fill", "var(--danger-band)");
+      svg.appendChild(band);
+
+      var line = document.createElementNS(svgNS, "line");
+      line.setAttribute("x1", padding.left);
+      line.setAttribute("x2", padding.left + innerW);
+      line.setAttribute("y1", y);
+      line.setAttribute("y2", y);
+      line.setAttribute("stroke", "var(--danger-line)");
+      line.setAttribute("stroke-width", "1.5");
+      line.setAttribute("stroke-dasharray", "6 4");
+      svg.appendChild(line);
+
+      var label = document.createElementNS(svgNS, "text");
+      label.setAttribute("x", padding.left + 4);
+      label.setAttribute("y", y - 4);
+      label.setAttribute("font-size", "10");
+      label.setAttribute("fill", "var(--danger-line)");
+      label.textContent = t.label;
+      svg.appendChild(label);
+    });
+
+    // Axis lines.
+    var axisX = document.createElementNS(svgNS, "line");
+    axisX.setAttribute("x1", padding.left);
+    axisX.setAttribute("x2", padding.left + innerW);
+    axisX.setAttribute("y1", padding.top + innerH);
+    axisX.setAttribute("y2", padding.top + innerH);
+    axisX.setAttribute("stroke", "var(--chart-axis)");
+    svg.appendChild(axisX);
+
+    // Growth line.
+    var points = state.growth.map(function (p) {
+      return xFor(p.turn_index) + "," + yFor(p.cumulative_tokens);
+    }).join(" ");
+    var polyline = document.createElementNS(svgNS, "polyline");
+    polyline.setAttribute("points", points);
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", "var(--chart-line)");
+    polyline.setAttribute("stroke-width", "2");
+    svg.appendChild(polyline);
+
+    state.growth.forEach(function (p) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", xFor(p.turn_index));
+      circle.setAttribute("cy", yFor(p.cumulative_tokens));
+      circle.setAttribute("r", p.turn_index === state.selectedTurnIndex ? 4 : 2.5);
+      circle.setAttribute("fill", "var(--chart-line)");
+      svg.appendChild(circle);
+    });
+
+    // Autocompact markers.
+    state.compactionEvents.forEach(function (event) {
+      if (event.turn_index === null || event.turn_index === undefined) { return; }
+      var matchingPoint = state.growth.filter(function (p) { return p.turn_index === event.turn_index; })[0];
+      var y = matchingPoint ? yFor(matchingPoint.cumulative_tokens) : padding.top + innerH;
+      var x = xFor(event.turn_index);
+      var marker = document.createElementNS(svgNS, "circle");
+      marker.setAttribute("cx", x);
+      marker.setAttribute("cy", y);
+      marker.setAttribute("r", "5");
+      marker.setAttribute("fill", "none");
+      marker.setAttribute("stroke", "var(--autocompact-marker)");
+      marker.setAttribute("stroke-width", "2");
+      marker.setAttribute("stroke-dasharray", "2 2");
+      marker.setAttribute("aria-label", "native compaction at turn " + event.turn_index);
+      svg.appendChild(marker);
+    });
+
+    // Y-axis labels (min/max).
+    var maxLabel = document.createElementNS(svgNS, "text");
+    maxLabel.setAttribute("x", 4);
+    maxLabel.setAttribute("y", padding.top + 8);
+    maxLabel.setAttribute("font-size", "10");
+    maxLabel.setAttribute("fill", "var(--muted)");
+    maxLabel.textContent = maxTokens.toLocaleString();
+    svg.appendChild(maxLabel);
+
+    chartWrapEl.appendChild(svg);
+
+    if (state.compactionEvents.length > 0) {
+      legendEl.textContent = "⋯ dotted marker: native (Claude Code) auto-compaction";
+    }
+
+    renderGrowthTextFallback();
+  }
+
+  function renderGrowthTextFallback() {
+    var peak = state.growth.reduce(function (max, p) {
+      return p.cumulative_tokens > max.cumulative_tokens ? p : max;
+    }, state.growth[0]);
+
+    var list = document.createElement("ul");
+
+    var peakItem = document.createElement("li");
+    peakItem.textContent = "Peak context: " + peak.cumulative_tokens.toLocaleString() + " tokens at turn " + peak.turn_index;
+    list.appendChild(peakItem);
+
+    THRESHOLDS.forEach(function (t) {
+      if (!state.activeThresholds[t.value]) { return; }
+      var crossing = state.growth.filter(function (p) { return p.cumulative_tokens >= t.value; })[0];
+      var item = document.createElement("li");
+      item.textContent = t.label + " threshold: " + (crossing ? "crossed at turn " + crossing.turn_index : "never crossed");
+      list.appendChild(item);
+    });
+
+    if (state.compactionEvents.length > 0) {
+      state.compactionEvents.forEach(function (event) {
+        var item = document.createElement("li");
+        var turnText = (event.turn_index === null || event.turn_index === undefined) ? "an untracked turn" : "turn " + event.turn_index;
+        item.textContent = "Native auto-compaction at " + turnText +
+          (typeof event.tokens_saved === "number" ? " (saved " + event.tokens_saved.toLocaleString() + " tokens)" : "");
+        list.appendChild(item);
+      });
+    }
+
+    textFallbackBodyEl.appendChild(list);
+  }
+
+  // -- Scrubber --------------------------------------------------
+
+  function renderScrubber() {
+    var maxIndex = Math.max(0, state.composition.length - 1);
+    scrubberEl.min = "0";
+    scrubberEl.max = String(maxIndex);
+    scrubberEl.value = String(Math.min(state.selectedTurnIndex, maxIndex));
+    scrubberEl.disabled = state.composition.length === 0;
+  }
+
+  scrubberEl.addEventListener("input", function () {
+    state.selectedTurnIndex = parseInt(scrubberEl.value, 10) || 0;
+    renderComposition();
+    renderGrowthChart();
+  });
+
+  // -- Data loading --------------------------------------------------
+
+  function fetchJson(url) {
+    return fetch(url).then(function (response) {
+      if (response.status === 404) {
+        var err = new Error("not found");
+        err.notFound = true;
+        throw err;
+      }
+      if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+      }
+      return response.json();
+    });
+  }
+
+  function loadSessionData() {
+    if (!state.sessionId) {
+      setPanelsVisible(false);
+      setBannerState("empty-corpus");
+      return;
+    }
+    setBannerState("loading");
+    setPanelsVisible(false);
+
+    Promise.all([
+      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/composition"),
+      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/growth")
+    ]).then(function (results) {
+      var compositionResp = results[0];
+      var growthResp = results[1];
+      state.composition = Array.isArray(compositionResp.turns) ? compositionResp.turns : [];
+      state.growth = Array.isArray(growthResp.turns) ? growthResp.turns : [];
+      state.compactionEvents = Array.isArray(growthResp.native_compaction_events) ? growthResp.native_compaction_events : [];
+      state.selectedTurnIndex = topGrowthTurnIndex(state.growth);
+
+      setBannerState("hidden");
+      setPanelsVisible(true);
+      renderScrubber();
+      renderComposition();
+      renderThresholdToggles();
+      renderGrowthChart();
+    }).catch(function (err) {
+      if (err && err.notFound) {
+        setPanelsVisible(false);
+        setBannerState("not-found");
+        return;
+      }
+      setBannerState("fetch-error", { detail: err && err.message ? err.message : String(err) });
+    });
+  }
+
+  function topGrowthTurnIndex(growth) {
+    if (growth.length === 0) { return 0; }
+    var top = growth.reduce(function (max, p) {
+      return p.cumulative_tokens > max.cumulative_tokens ? p : max;
+    }, growth[0]);
+    return top.turn_index;
+  }
+
+  function loadSessions() {
+    setBannerState("loading");
+    fetch("/v1/context/sessions")
+      .then(function (response) {
+        if (!response.ok) { throw new Error("HTTP " + response.status); }
+        return response.json();
+      })
+      .then(function (sessions) {
+        state.sessions = Array.isArray(sessions) ? sessions : [];
+        if (state.sessions.length === 0) {
+          setPanelsVisible(false);
+          setBannerState("empty-corpus");
+          return;
+        }
+        var params = new URLSearchParams(window.location.search);
+        var requested = params.get("session");
+        var known = state.sessions.some(function (s) { return s.id === requested; });
+        state.sessionId = (requested && known) ? requested : mostRecentSessionId(state.sessions);
+        renderPicker();
+        loadSessionData();
+      })
+      .catch(function (err) {
+        setBannerState("fetch-error", {
+          detail: err && err.message ? err.message : String(err),
+          onRetry: loadSessions
+        });
+      });
+  }
+
+  pickerEl.addEventListener("change", function () {
+    state.sessionId = pickerEl.value;
+    var url = new URL(window.location.href);
+    url.searchParams.set("session", state.sessionId);
+    window.history.replaceState(null, "", url);
+    loadSessionData();
+  });
+
+  loadSessions();
+})();
+</script>
+</body>
+</html>

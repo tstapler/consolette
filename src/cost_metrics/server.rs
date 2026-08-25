@@ -31,6 +31,11 @@ use crate::claude_code_session::session_bi::{
     build_session_bi_snapshot, spawn_session_bi_refresh_task, SessionBiSnapshot,
     SESSION_BI_PER_FILE_TIMEOUT, SESSION_BI_REFRESH_INTERVAL, SESSION_BI_SCAN_CONCURRENCY,
 };
+use crate::context_forensics::refresh::{
+    spawn_context_forensics_refresh_task, CONTEXT_FORENSICS_REFRESH_INTERVAL,
+};
+use crate::context_forensics::server::{context_router, context_unavailable_router};
+use crate::context_forensics::store::ContextForensicsStore;
 use crate::cost_metrics::estimator::TiktokenEstimator;
 use crate::cost_metrics::hook::CostTrackingHook;
 use crate::cost_metrics::pricing::{spawn_pricing_refresh_task, PricingTable, LITELLM_PRICING_URL};
@@ -80,6 +85,15 @@ pub struct CostServerState {
     /// Mirrors `_pricing_refresh`: held only to keep the background scan
     /// task alive for this state's lifetime.
     _session_bi_refresh: tokio::task::JoinHandle<()>,
+    /// `Some` when [`ContextForensicsStore::open`] succeeded at startup;
+    /// `None` when it failed (Story 1.4.4's fail-open contract — this
+    /// feature going down must never take `cost_metrics`'s own working
+    /// dashboard down with it). `serve_cost` merges either
+    /// [`context_router`] or [`context_unavailable_router`] depending on
+    /// which this is.
+    pub context_store: Option<Arc<ContextForensicsStore>>,
+    /// Mirrors `_session_bi_refresh`; `None` alongside `context_store: None`.
+    _context_refresh: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CostServerState {
@@ -94,8 +108,30 @@ impl CostServerState {
     /// Takes the glob directly (never resolves `$HOME` itself) so tests can
     /// point it at a fixture directory instead of a real
     /// `~/.claude/projects` tree — see [`Self::build`] for the thin
-    /// `$HOME`-resolving wrapper real callers use.
+    /// `$HOME`-resolving wrapper real callers use. Delegates to
+    /// [`Self::build_with_session_glob_and_context_store_path`] using
+    /// [`ContextForensicsStore::default_store_path`].
     pub async fn build_with_session_glob(session_glob: &str) -> Self {
+        Self::build_with_session_glob_and_context_store_path(
+            session_glob,
+            &ContextForensicsStore::default_store_path(),
+        )
+        .await
+    }
+
+    /// Real constructor, parameterized on the context-forensics store path
+    /// too (Task 1.4.4d: tests need to point this at a path that can't be
+    /// opened, to exercise the fail-open contract without touching a real
+    /// `~/.claude/consolette/context-forensics.sqlite`).
+    ///
+    /// [`ContextForensicsStore::open`] failing here is handled fail-open,
+    /// not propagated via `?`: it's logged via `tracing::error!` and
+    /// `context_store` is left `None` — every other part of this state
+    /// (tracker, pipeline, session-BI snapshot) still constructs normally.
+    pub async fn build_with_session_glob_and_context_store_path(
+        session_glob: &str,
+        context_store_path: &std::path::Path,
+    ) -> Self {
         let (pricing_tx, pricing_rx) = watch::channel(Arc::new(PricingTable::load_default()));
         let pricing_refresh = spawn_pricing_refresh_task(
             pricing_tx,
@@ -129,12 +165,36 @@ impl CostServerState {
             SESSION_BI_PER_FILE_TIMEOUT,
         );
 
+        let (context_store, context_refresh) = match ContextForensicsStore::open(context_store_path)
+        {
+            Ok(store) => {
+                let store = Arc::new(store);
+                let refresh = spawn_context_forensics_refresh_task(
+                    Arc::clone(&store),
+                    session_glob.to_string(),
+                    CONTEXT_FORENSICS_REFRESH_INTERVAL,
+                )
+                .await;
+                (Some(store), Some(refresh))
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    path = %context_store_path.display(),
+                    "context forensics store failed to open; context-forensics routes disabled"
+                );
+                (None, None)
+            }
+        };
+
         CostServerState {
             tracker,
             pipeline,
             _pricing_refresh: pricing_refresh,
             session_bi_rx,
             _session_bi_refresh: session_bi_refresh,
+            context_store,
+            _context_refresh: context_refresh,
         }
     }
 
@@ -220,8 +280,13 @@ async fn handler_dashboard_sessions(
 /// serving.
 pub async fn serve_cost(port: u16) -> anyhow::Result<()> {
     let state = CostServerState::build().await;
+    let context_routes = match &state.context_store {
+        Some(store) => context_router(Arc::clone(store)),
+        None => context_unavailable_router(),
+    };
     let router = cost_router(Arc::clone(&state.tracker))
-        .merge(dashboard_router(state.session_bi_rx.clone()));
+        .merge(dashboard_router(state.session_bi_rx.clone()))
+        .merge(context_routes);
 
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let listener = TcpListener::bind(addr).await?;
@@ -286,10 +351,29 @@ mod tests {
     /// process's pipeline+tracker+route exactly as `serve_cost` does, drive
     /// one `apply()` call through the pipeline, reconcile it, and assert
     /// the HTTP route (via axum's `oneshot`, no real bind) returns it.
+    ///
+    /// Uses `build_with_session_glob_and_context_store_path` against
+    /// isolated tempdirs rather than the real `build()` — this test only
+    /// exercises `tracker`/`pipeline`, not context-forensics, and pointing
+    /// it at the real `$HOME/.claude/projects` + shared
+    /// `~/.claude/consolette/context-forensics.sqlite` (as `build()` does)
+    /// made it race every other test/process doing the same against that
+    /// one real file, and scan Tyler's real (7000+ file, 3GB+) transcript
+    /// directory on every run — a correctness-neutral but severe slowdown,
+    /// not a hang in the ingestion logic itself (`refresh.rs` already
+    /// bounds each file with `CONTEXT_FORENSICS_PER_FILE_TIMEOUT`).
     #[tokio::test]
     async fn serve_cost_should_expose_apply_result_via_http_route_when_pipeline_and_route_share_same_tracker(
     ) {
-        let state = CostServerState::build().await;
+        let session_dir = tempfile::tempdir().expect("tempdir should succeed");
+        let session_pattern = format!("{}/*.jsonl", session_dir.path().display());
+        let context_store_dir = tempfile::tempdir().expect("tempdir should succeed");
+        let context_store_path = context_store_dir.path().join("cf.sqlite");
+        let state = CostServerState::build_with_session_glob_and_context_store_path(
+            &session_pattern,
+            &context_store_path,
+        )
+        .await;
         let router = cost_router(Arc::clone(&state.tracker));
 
         let key = SessionKey::new("serve-cost-e2e");
@@ -593,5 +677,112 @@ mod tests {
             .expect("body should read");
         let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
         assert!(body.contains("<html") || body.contains("<!DOCTYPE") || body.contains("<!doctype"));
+    }
+
+    /// Task 1.4.4c: `GET /dashboard/context` returns the context-forensics
+    /// dashboard's HTML shell, and `GET /dashboard` (the pre-existing
+    /// session-BI dashboard) is unaffected by mounting it alongside —
+    /// regression guard against `research/features.md`'s route-collision
+    /// risk.
+    #[tokio::test]
+    async fn context_dashboard_route_should_return_200_and_existing_dashboard_route_unaffected() {
+        let session_dir = tempfile::tempdir().expect("tempdir should succeed");
+        let session_pattern = format!("{}/*.jsonl", session_dir.path().display());
+        let context_store_dir = tempfile::tempdir().expect("tempdir should succeed");
+        let context_store_path = context_store_dir.path().join("cf.sqlite");
+
+        let state = CostServerState::build_with_session_glob_and_context_store_path(
+            &session_pattern,
+            &context_store_path,
+        )
+        .await;
+        assert!(
+            state.context_store.is_some(),
+            "context store should open successfully against a fresh temp path"
+        );
+
+        let router = dashboard_router(state.session_bi_rx.clone()).merge(context_router(
+            Arc::clone(state.context_store.as_ref().expect("checked above")),
+        ));
+
+        let context_response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/dashboard/context")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(context_response.status(), StatusCode::OK);
+
+        let dashboard_response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/dashboard")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(dashboard_response.status(), StatusCode::OK);
+    }
+
+    /// Task 1.4.4d: `ContextForensicsStore::open` failing (path points at a
+    /// file where a directory is expected, mirroring `OmissionCache`'s own
+    /// open-failure test simulation) must not prevent the rest of
+    /// `CostServerState` from constructing, and the fallback
+    /// `context_unavailable_router` must return `503` rather than the
+    /// process failing to start.
+    #[tokio::test]
+    async fn build_should_leave_context_store_none_and_dashboard_still_works_when_context_store_path_invalid(
+    ) {
+        let session_dir = tempfile::tempdir().expect("tempdir should succeed");
+        let session_pattern = format!("{}/*.jsonl", session_dir.path().display());
+
+        // A file where `ContextForensicsStore::open` expects to create a
+        // parent directory — `create_dir_all` fails against an existing
+        // regular file at that path.
+        let blocker_dir = tempfile::tempdir().expect("tempdir should succeed");
+        let blocker_file = blocker_dir.path().join("blocker");
+        std::fs::write(&blocker_file, b"not a directory").expect("write should succeed");
+        let invalid_context_store_path = blocker_file.join("context-forensics.sqlite");
+
+        let state = CostServerState::build_with_session_glob_and_context_store_path(
+            &session_pattern,
+            &invalid_context_store_path,
+        )
+        .await;
+        assert!(
+            state.context_store.is_none(),
+            "context store should fail open, not be constructed, against an invalid path"
+        );
+
+        let router =
+            dashboard_router(state.session_bi_rx.clone()).merge(context_unavailable_router());
+
+        let dashboard_response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/dashboard")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(dashboard_response.status(), StatusCode::OK);
+
+        let context_response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/dashboard/context")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(context_response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

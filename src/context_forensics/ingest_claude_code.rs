@@ -85,10 +85,7 @@ pub fn ingest_claude_code_session(
         .and_then(Value::as_str)
         .map(String::from);
 
-    // The session row must exist before any turns/native-compaction-events
-    // rows referencing it via `session_id` (a foreign key) — write it
-    // first, once, before the per-turn loop below.
-    store.upsert_session(&SessionRow {
+    let session_row = SessionRow {
         id: session_id.clone(),
         source: Source::ClaudeCode,
         path: path.display().to_string(),
@@ -97,90 +94,130 @@ pub fn ingest_claude_code_session(
         last_ingested_at: chrono::Utc::now().to_rfc3339(),
         chain_coverage_ratio: Some(coverage.ratio()),
         parse_failure_count: 0,
-    })?;
+    };
 
     let mut turns_ingested = 0u64;
     let mut calls_ingested = 0u64;
     let mut call_index = 0u64;
+    let mut turn_rows: Vec<TurnRow> = Vec::new();
+    let mut call_rows: Vec<ApiCallRow> = Vec::new();
 
     for (turn_index, turn) in turns.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let turn_index_u64 = turn_index as u64;
-        let turn_id = format!("{session_id}:{turn_index_u64}");
-        let mut turn_context_size = 0u64;
-        let mut pending_calls: Vec<ApiCallRow> = Vec::new();
+        let Some((turn_row, pending_calls)) =
+            collect_turn_row(&session_id, turn_index_u64, turn, &mut call_index)
+        else {
+            continue;
+        };
+        calls_ingested += pending_calls.len() as u64;
+        turns_ingested += 1;
+        turn_rows.push(turn_row);
+        call_rows.extend(pending_calls);
+    }
 
-        for row in &turn.assistant_rows {
-            let Some(call_usage) = extract_call_usage(row) else {
-                continue;
-            };
-
-            let breakdown = classify_call_composition(turn, &call_usage);
-            let context_size = call_usage
-                .input_tokens
-                .saturating_add(call_usage.cache_creation_input_tokens)
-                .saturating_add(call_usage.cache_read_input_tokens);
-            turn_context_size = turn_context_size.max(context_size);
-
-            let model = row
-                .fields()
-                .message
-                .as_ref()
-                .and_then(|message| message.get("model"))
-                .and_then(Value::as_str)
-                .map(String::from);
-
-            pending_calls.push(ApiCallRow {
-                id: format!("{session_id}:{}", row.uuid()),
+    let turn_index_by_uuid = build_turn_index_lookup(&turns);
+    let compaction_rows: Vec<NativeCompactionEventRow> = native_compaction_events_with_uuid(&rows)
+        .into_iter()
+        .map(|(row_uuid, event)| {
+            let turn_index = turn_index_by_uuid.get(row_uuid.as_str()).copied();
+            NativeCompactionEventRow {
                 session_id: session_id.clone(),
-                turn_id: Some(turn_id.clone()),
-                row_uuid: row.uuid().to_string(),
-                call_index,
-                model,
-                input_tokens: call_usage.input_tokens,
-                output_tokens: call_usage.output_tokens,
-                cache_creation_input_tokens: Some(call_usage.cache_creation_input_tokens),
-                cache_read_input_tokens: Some(call_usage.cache_read_input_tokens),
-                tool_io_tokens: breakdown.tool_io_tokens,
-                conversation_tokens: breakdown.conversation_tokens,
-                system_tokens: breakdown.system_tokens,
-                usage_provenance: UsageProvenance::TranscriptExact,
-            });
-            call_index += 1;
-        }
-
-        // The turn row must exist before any api_calls row referencing it
-        // via `turn_id` (a foreign key) — write it first, once, rather than
-        // interleaving with the per-call inserts above.
-        if !pending_calls.is_empty() {
-            store.upsert_turn(&TurnRow {
-                id: turn_id,
-                session_id: session_id.clone(),
-                turn_index: turn_index_u64,
-                user_row_uuid: turn.user_row.uuid().to_string(),
-                cumulative_tokens: turn_context_size,
-            })?;
-            for call in &pending_calls {
-                store.upsert_api_call(call)?;
+                row_uuid,
+                tokens_saved: event.tokens_saved(),
+                turn_index,
             }
-            calls_ingested += pending_calls.len() as u64;
-            turns_ingested += 1;
-        }
-    }
+        })
+        .collect();
 
-    for (row_uuid, event) in native_compaction_events_with_uuid(&rows) {
-        store.upsert_native_compaction_event(&NativeCompactionEventRow {
-            session_id: session_id.clone(),
-            row_uuid,
-            tokens_saved: event.tokens_saved(),
-        })?;
-    }
+    // One transaction for the whole session (Task 1.4.4a follow-up fix):
+    // `upsert_session`/`upsert_turn`/`upsert_api_call` each auto-commit
+    // individually, which is fine for a handful of test-fixture rows but
+    // meant one WAL-commit fsync per row when Story 1.3.3's eager rescan
+    // runs this over a real multi-thousand-file corpus. See
+    // `ContextForensicsStore::upsert_ingested_session`'s doc comment.
+    store.upsert_ingested_session(&session_row, &turn_rows, &call_rows, &compaction_rows)?;
 
     Ok(IngestSummary {
         turns_ingested,
         calls_ingested,
         parse_failures: 0,
     })
+}
+
+/// Builds one turn's [`TurnRow`] and its [`ApiCallRow`]s, extracted from
+/// [`ingest_claude_code_session`] to keep that function under clippy's
+/// line-count lint. Returns `None` when the turn has no API calls (no
+/// `TurnRow` is written for a turn that never called out — mirrors the
+/// original inline `if !pending_calls.is_empty()` skip) rather than an
+/// empty-calls `Some`, so the caller can `continue` in one branch instead of
+/// pushing then checking emptiness itself.
+fn collect_turn_row(
+    session_id: &str,
+    turn_index_u64: u64,
+    turn: &crate::claude_code_session::transcript::Turn,
+    call_index: &mut u64,
+) -> Option<(TurnRow, Vec<ApiCallRow>)> {
+    let turn_id = format!("{session_id}:{turn_index_u64}");
+    let mut turn_context_size = 0u64;
+    let mut pending_calls: Vec<ApiCallRow> = Vec::new();
+
+    for row in &turn.assistant_rows {
+        let Some(call_usage) = extract_call_usage(row) else {
+            continue;
+        };
+
+        let breakdown = classify_call_composition(turn, &call_usage);
+        let context_size = call_usage
+            .input_tokens
+            .saturating_add(call_usage.cache_creation_input_tokens)
+            .saturating_add(call_usage.cache_read_input_tokens);
+        turn_context_size = turn_context_size.max(context_size);
+
+        let model = row
+            .fields()
+            .message
+            .as_ref()
+            .and_then(|message| message.get("model"))
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        pending_calls.push(ApiCallRow {
+            id: format!("{session_id}:{}", row.uuid()),
+            session_id: session_id.to_string(),
+            turn_id: Some(turn_id.clone()),
+            row_uuid: row.uuid().to_string(),
+            call_index: *call_index,
+            model,
+            input_tokens: call_usage.input_tokens,
+            output_tokens: call_usage.output_tokens,
+            cache_creation_input_tokens: Some(call_usage.cache_creation_input_tokens),
+            cache_read_input_tokens: Some(call_usage.cache_read_input_tokens),
+            tool_io_tokens: breakdown.tool_io_tokens,
+            conversation_tokens: breakdown.conversation_tokens,
+            system_tokens: breakdown.system_tokens,
+            usage_provenance: UsageProvenance::TranscriptExact,
+        });
+        *call_index += 1;
+    }
+
+    // The turn row must exist before any api_calls row referencing it via
+    // `turn_id` (a foreign key) — the caller pushes this before extending
+    // `call_rows` so `upsert_ingested_session`'s single transaction still
+    // writes parent-before-child.
+    if pending_calls.is_empty() {
+        return None;
+    }
+    Some((
+        TurnRow {
+            id: turn_id,
+            session_id: session_id.to_string(),
+            turn_index: turn_index_u64,
+            user_row_uuid: turn.user_row.uuid().to_string(),
+            cumulative_tokens: turn_context_size,
+        },
+        pending_calls,
+    ))
 }
 
 /// Pair each [`NativeCompactionEvent`] with the `uuid` of the row it was
@@ -200,6 +237,28 @@ fn native_compaction_events_with_uuid(
                 .map(|event| (row.uuid().to_string(), event))
         })
         .collect()
+}
+
+/// `row uuid -> turn_index` for every row folded into a [`Turn`] (its
+/// `user_row` and every `assistant_rows`/`tool_rows` entry) — lets a
+/// `compact_boundary` system row (which `build_turns` typically attaches to
+/// the current turn's `assistant_rows`) be placed on the growth chart at
+/// the right turn without re-parsing the transcript at query time. A row
+/// `build_turns` dropped entirely (the "leading row" accepted gap) has no
+/// entry and its compaction event is stored with `turn_index: None`.
+fn build_turn_index_lookup(
+    turns: &[crate::claude_code_session::transcript::Turn],
+) -> std::collections::HashMap<&str, u64> {
+    let mut lookup = std::collections::HashMap::new();
+    for (turn_index, turn) in turns.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let turn_index_u64 = turn_index as u64;
+        lookup.insert(turn.user_row.uuid(), turn_index_u64);
+        for row in turn.assistant_rows.iter().chain(turn.tool_rows.iter()) {
+            lookup.insert(row.uuid(), turn_index_u64);
+        }
+    }
+    lookup
 }
 
 /// The session id: the transcript file's stem (Claude Code names session

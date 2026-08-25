@@ -18,8 +18,10 @@
 //! built-ahead-of-its-caller precedent.
 #![allow(dead_code)]
 
+pub mod budget;
 pub mod composition;
 pub mod ingest_claude_code;
 pub mod refresh;
+pub mod server;
 pub mod store;
 pub mod usage;

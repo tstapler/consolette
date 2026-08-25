@@ -10,6 +10,7 @@
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -141,11 +142,43 @@ pub struct ApiCallRow {
 
 /// Persisted native-compaction event (Claude Code's own auto-compaction, as
 /// distinct from consolette's own compaction).
+///
+/// `turn_index` is an additive column beyond the Migration Plan's literal
+/// Phase-1 `CREATE TABLE` text (which lists only `id`/`session_id`/
+/// `row_uuid`/`tokens_saved`) — needed so the growth chart (Story 1.4.3 AC2)
+/// can place a compaction marker at the right turn without re-parsing the
+/// transcript on every request. Nullable, additive, and harmless under the
+/// plan's own `CREATE TABLE IF NOT EXISTS` migration model (no constraint
+/// tightened or loosened for any existing column); disclosed here rather
+/// than silently diverging from the printed schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeCompactionEventRow {
     pub session_id: String,
     pub row_uuid: String,
     pub tokens_saved: Option<i64>,
+    pub turn_index: Option<u64>,
+}
+
+/// One turn's aggregated composition/usage figures — [`ContextForensicsStore::composition_for_session`]'s
+/// per-element shape (Story 1.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TurnComposition {
+    pub turn_index: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub tool_io_tokens: u64,
+    pub conversation_tokens: u64,
+    pub system_tokens: u64,
+}
+
+/// One point on the growth chart — [`ContextForensicsStore::growth_for_session`]'s
+/// per-element shape (Story 1.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowthPoint {
+    pub turn_index: u64,
+    pub cumulative_tokens: u64,
 }
 
 /// `rusqlite` has no `ToSql` impl for `u64` (sqlite's native integer type is
@@ -155,6 +188,126 @@ pub struct NativeCompactionEventRow {
 /// worth modeling.
 fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+// ---------------------------------------------------------------------------
+// Row-write SQL, factored out of the `ContextForensicsStore` methods below
+// so both the single-row `upsert_*` methods and `upsert_ingested_session`'s
+// one-transaction batch path share the exact same statements (see that
+// method's doc comment for why the batch path exists). Each takes `&Connection`
+// so a `&rusqlite::Transaction` (which derefs to `Connection`) works too.
+// ---------------------------------------------------------------------------
+
+fn exec_upsert_session(conn: &Connection, row: &SessionRow) -> Result<()> {
+    let parse_failure_count = to_i64(row.parse_failure_count);
+    conn.execute(
+        "INSERT INTO sessions (id, source, path, project, started_at, last_ingested_at, chain_coverage_ratio, parse_failure_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (id) DO UPDATE SET
+            source = excluded.source,
+            path = excluded.path,
+            project = excluded.project,
+            started_at = excluded.started_at,
+            last_ingested_at = excluded.last_ingested_at,
+            chain_coverage_ratio = excluded.chain_coverage_ratio,
+            parse_failure_count = excluded.parse_failure_count",
+        params![
+            row.id,
+            row.source.as_db_str(),
+            row.path,
+            row.project,
+            row.started_at,
+            row.last_ingested_at,
+            row.chain_coverage_ratio,
+            parse_failure_count,
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_upsert_turn(conn: &Connection, row: &TurnRow) -> Result<()> {
+    let turn_index = to_i64(row.turn_index);
+    let cumulative_tokens = to_i64(row.cumulative_tokens);
+    conn.execute(
+        "INSERT INTO turns (id, session_id, turn_index, user_row_uuid, cumulative_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (session_id, turn_index) DO UPDATE SET
+            id = excluded.id,
+            user_row_uuid = excluded.user_row_uuid,
+            cumulative_tokens = excluded.cumulative_tokens",
+        params![
+            row.id,
+            row.session_id,
+            turn_index,
+            row.user_row_uuid,
+            cumulative_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_upsert_api_call(conn: &Connection, row: &ApiCallRow) -> Result<()> {
+    let call_index = to_i64(row.call_index);
+    let input_tokens = to_i64(row.input_tokens);
+    let output_tokens = to_i64(row.output_tokens);
+    let cache_creation_input_tokens = row.cache_creation_input_tokens.map(to_i64);
+    let cache_read_input_tokens = row.cache_read_input_tokens.map(to_i64);
+    let tool_io_tokens = to_i64(row.tool_io_tokens);
+    let conversation_tokens = to_i64(row.conversation_tokens);
+    let system_tokens = to_i64(row.system_tokens);
+    conn.execute(
+        "INSERT INTO api_calls (
+            id, session_id, turn_id, row_uuid, call_index, model,
+            input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            tool_io_tokens, conversation_tokens, system_tokens, usage_provenance
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT (session_id, row_uuid) DO UPDATE SET
+            id = excluded.id,
+            turn_id = excluded.turn_id,
+            call_index = excluded.call_index,
+            model = excluded.model,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+            cache_read_input_tokens = excluded.cache_read_input_tokens,
+            tool_io_tokens = excluded.tool_io_tokens,
+            conversation_tokens = excluded.conversation_tokens,
+            system_tokens = excluded.system_tokens,
+            usage_provenance = excluded.usage_provenance",
+        params![
+            row.id,
+            row.session_id,
+            row.turn_id,
+            row.row_uuid,
+            call_index,
+            row.model,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            tool_io_tokens,
+            conversation_tokens,
+            system_tokens,
+            row.usage_provenance.as_db_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_upsert_native_compaction_event(
+    conn: &Connection,
+    row: &NativeCompactionEventRow,
+) -> Result<()> {
+    let turn_index = row.turn_index.map(to_i64);
+    conn.execute(
+        "INSERT INTO native_compaction_events (session_id, row_uuid, tokens_saved, turn_index)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (session_id, row_uuid) DO UPDATE SET
+            tokens_saved = excluded.tokens_saved,
+            turn_index = excluded.turn_index",
+        params![row.session_id, row.row_uuid, row.tokens_saved, turn_index],
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +358,7 @@ CREATE TABLE IF NOT EXISTS native_compaction_events (
     session_id   TEXT NOT NULL REFERENCES sessions(id),
     row_uuid     TEXT NOT NULL,
     tokens_saved INTEGER,
+    turn_index   INTEGER,
     UNIQUE (session_id, row_uuid)
 );
 ";
@@ -272,6 +426,17 @@ impl ContextForensicsStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| anyhow!("failed to set busy_timeout=5000: {error}"))?;
 
+        // The standard WAL-mode pairing: NORMAL only fsyncs at checkpoints
+        // (not every commit) while WAL itself still protects against
+        // corruption on a crash — full FULL-durability is unnecessary for a
+        // rebuildable derived cache (Migration Plan: "every table here is a
+        // derived cache, fully rebuildable... by deleting the file"). Matters
+        // once `upsert_ingested_session` commits once per session file
+        // across a multi-thousand-file real corpus (see that method's doc
+        // comment).
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|error| anyhow!("failed to set synchronous=NORMAL: {error}"))?;
+
         if path.exists() {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
                 anyhow!(
@@ -310,30 +475,7 @@ impl ContextForensicsStore {
     /// underlying `rusqlite` call fails.
     pub fn upsert_session(&self, row: &SessionRow) -> Result<()> {
         let conn = self.lock()?;
-        let parse_failure_count = to_i64(row.parse_failure_count);
-        conn.execute(
-            "INSERT INTO sessions (id, source, path, project, started_at, last_ingested_at, chain_coverage_ratio, parse_failure_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT (id) DO UPDATE SET
-                source = excluded.source,
-                path = excluded.path,
-                project = excluded.project,
-                started_at = excluded.started_at,
-                last_ingested_at = excluded.last_ingested_at,
-                chain_coverage_ratio = excluded.chain_coverage_ratio,
-                parse_failure_count = excluded.parse_failure_count",
-            params![
-                row.id,
-                row.source.as_db_str(),
-                row.path,
-                row.project,
-                row.started_at,
-                row.last_ingested_at,
-                row.chain_coverage_ratio,
-                parse_failure_count,
-            ],
-        )?;
-        Ok(())
+        exec_upsert_session(&conn, row)
     }
 
     /// Insert or update a [`TurnRow`], keyed on `(session_id, turn_index)`.
@@ -344,24 +486,7 @@ impl ContextForensicsStore {
     /// underlying `rusqlite` call fails.
     pub fn upsert_turn(&self, row: &TurnRow) -> Result<()> {
         let conn = self.lock()?;
-        let turn_index = to_i64(row.turn_index);
-        let cumulative_tokens = to_i64(row.cumulative_tokens);
-        conn.execute(
-            "INSERT INTO turns (id, session_id, turn_index, user_row_uuid, cumulative_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (session_id, turn_index) DO UPDATE SET
-                id = excluded.id,
-                user_row_uuid = excluded.user_row_uuid,
-                cumulative_tokens = excluded.cumulative_tokens",
-            params![
-                row.id,
-                row.session_id,
-                turn_index,
-                row.user_row_uuid,
-                cumulative_tokens,
-            ],
-        )?;
-        Ok(())
+        exec_upsert_turn(&conn, row)
     }
 
     /// Insert or update an [`ApiCallRow`], keyed on `(session_id, row_uuid)`.
@@ -372,51 +497,7 @@ impl ContextForensicsStore {
     /// underlying `rusqlite` call fails.
     pub fn upsert_api_call(&self, row: &ApiCallRow) -> Result<()> {
         let conn = self.lock()?;
-        let call_index = to_i64(row.call_index);
-        let input_tokens = to_i64(row.input_tokens);
-        let output_tokens = to_i64(row.output_tokens);
-        let cache_creation_input_tokens = row.cache_creation_input_tokens.map(to_i64);
-        let cache_read_input_tokens = row.cache_read_input_tokens.map(to_i64);
-        let tool_io_tokens = to_i64(row.tool_io_tokens);
-        let conversation_tokens = to_i64(row.conversation_tokens);
-        let system_tokens = to_i64(row.system_tokens);
-        conn.execute(
-            "INSERT INTO api_calls (
-                id, session_id, turn_id, row_uuid, call_index, model,
-                input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-                tool_io_tokens, conversation_tokens, system_tokens, usage_provenance
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT (session_id, row_uuid) DO UPDATE SET
-                id = excluded.id,
-                turn_id = excluded.turn_id,
-                call_index = excluded.call_index,
-                model = excluded.model,
-                input_tokens = excluded.input_tokens,
-                output_tokens = excluded.output_tokens,
-                cache_creation_input_tokens = excluded.cache_creation_input_tokens,
-                cache_read_input_tokens = excluded.cache_read_input_tokens,
-                tool_io_tokens = excluded.tool_io_tokens,
-                conversation_tokens = excluded.conversation_tokens,
-                system_tokens = excluded.system_tokens,
-                usage_provenance = excluded.usage_provenance",
-            params![
-                row.id,
-                row.session_id,
-                row.turn_id,
-                row.row_uuid,
-                call_index,
-                row.model,
-                input_tokens,
-                output_tokens,
-                cache_creation_input_tokens,
-                cache_read_input_tokens,
-                tool_io_tokens,
-                conversation_tokens,
-                system_tokens,
-                row.usage_provenance.as_db_str(),
-            ],
-        )?;
-        Ok(())
+        exec_upsert_api_call(&conn, row)
     }
 
     /// Insert or update a [`NativeCompactionEventRow`], keyed on
@@ -428,13 +509,50 @@ impl ContextForensicsStore {
     /// underlying `rusqlite` call fails.
     pub fn upsert_native_compaction_event(&self, row: &NativeCompactionEventRow) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO native_compaction_events (session_id, row_uuid, tokens_saved)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (session_id, row_uuid) DO UPDATE SET
-                tokens_saved = excluded.tokens_saved",
-            params![row.session_id, row.row_uuid, row.tokens_saved],
-        )?;
+        exec_upsert_native_compaction_event(&conn, row)
+    }
+
+    /// Upsert one whole ingested session (session + turns + calls +
+    /// native-compaction events) inside a single `SQLite` transaction.
+    ///
+    /// [`ingest_claude_code_session`](crate::context_forensics::ingest_claude_code::ingest_claude_code_session)
+    /// uses this instead of the single-row `upsert_*` methods above: each of
+    /// those auto-commits (`SQLite`'s default outside an explicit
+    /// transaction), and Task 1.4.4a wires ingestion to run eagerly, once
+    /// per corpus rescan, over every discovered transcript — on a real
+    /// multi-thousand-file `~/.claude/projects` corpus that meant one
+    /// WAL-commit fsync per row (potentially tens of thousands per rescan)
+    /// instead of one per session file, slow enough to blow well past a
+    /// minute in practice. Batching to one commit per session file (not one
+    /// per corpus, preserving Story 1.3.3's per-file failure isolation)
+    /// fixes the root cause rather than papering over the timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned, the transaction
+    /// can't be started/committed, or any row write fails (the transaction
+    /// is rolled back on drop if not committed, so a mid-batch failure never
+    /// leaves a partially-written session).
+    pub fn upsert_ingested_session(
+        &self,
+        session: &SessionRow,
+        turns: &[TurnRow],
+        calls: &[ApiCallRow],
+        native_compaction_events: &[NativeCompactionEventRow],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        exec_upsert_session(&tx, session)?;
+        for turn in turns {
+            exec_upsert_turn(&tx, turn)?;
+        }
+        for call in calls {
+            exec_upsert_api_call(&tx, call)?;
+        }
+        for event in native_compaction_events {
+            exec_upsert_native_compaction_event(&tx, event)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -700,13 +818,15 @@ impl ContextForensicsStore {
     ) -> Result<Vec<NativeCompactionEventRow>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, row_uuid, tokens_saved FROM native_compaction_events WHERE session_id = ?1",
+            "SELECT session_id, row_uuid, tokens_saved, turn_index FROM native_compaction_events WHERE session_id = ?1",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
+            let turn_index: Option<i64> = row.get(3)?;
             Ok(NativeCompactionEventRow {
                 session_id: row.get(0)?,
                 row_uuid: row.get(1)?,
                 tokens_saved: row.get(2)?,
+                turn_index: turn_index.map(|v| u64::try_from(v).unwrap_or(0)),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -729,6 +849,68 @@ impl ContextForensicsStore {
             |row| row.get(0),
         )?;
         Ok(peak.and_then(|v| u64::try_from(v).ok()).unwrap_or(0))
+    }
+
+    /// Per-turn [`TurnComposition`] for one session — every [`ApiCallRow`]
+    /// grouped by its `turn_id`, aggregated with the containing turn's
+    /// `turn_index`. A call with a `turn_id` that doesn't resolve to any
+    /// stored [`TurnRow`] (shouldn't happen given ingestion always writes
+    /// the turn first, but defensively skipped rather than panicking) is
+    /// excluded rather than crashing the whole response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the
+    /// underlying queries fail.
+    pub fn composition_for_session(&self, session_id: &str) -> Result<Vec<TurnComposition>> {
+        let turns = self.turns_for_session(session_id)?;
+        let calls = self.api_calls_for_session(session_id)?;
+
+        let turn_index_by_id: HashMap<&str, u64> = turns
+            .iter()
+            .map(|t| (t.id.as_str(), t.turn_index))
+            .collect();
+
+        let mut acc: BTreeMap<u64, TurnComposition> = BTreeMap::new();
+        for call in &calls {
+            let Some(turn_id) = &call.turn_id else {
+                continue;
+            };
+            let Some(&turn_index) = turn_index_by_id.get(turn_id.as_str()) else {
+                continue;
+            };
+            let entry = acc.entry(turn_index).or_insert(TurnComposition {
+                turn_index,
+                ..TurnComposition::default()
+            });
+            entry.input_tokens += call.input_tokens;
+            entry.output_tokens += call.output_tokens;
+            entry.cache_creation_input_tokens += call.cache_creation_input_tokens.unwrap_or(0);
+            entry.cache_read_input_tokens += call.cache_read_input_tokens.unwrap_or(0);
+            entry.tool_io_tokens += call.tool_io_tokens;
+            entry.conversation_tokens += call.conversation_tokens;
+            entry.system_tokens += call.system_tokens;
+        }
+
+        Ok(acc.into_values().collect())
+    }
+
+    /// Per-turn `(turn_index, cumulative_tokens)` growth series for one
+    /// session, ordered by `turn_index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the query
+    /// fails.
+    pub fn growth_for_session(&self, session_id: &str) -> Result<Vec<GrowthPoint>> {
+        let turns = self.turns_for_session(session_id)?;
+        Ok(turns
+            .into_iter()
+            .map(|turn| GrowthPoint {
+                turn_index: turn.turn_index,
+                cumulative_tokens: turn.cumulative_tokens,
+            })
+            .collect())
     }
 }
 

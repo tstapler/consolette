@@ -244,6 +244,68 @@
   #cost-scatter-wrap circle { cursor: pointer; }
   .trend-summary { font-size: 0.85rem; color: var(--muted); }
   #cross-session-panel { display: none; }
+  #view-full-turn-btn {
+    font: inherit;
+    font-size: 0.85rem;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    padding: 0.2rem 0.6rem;
+    margin-top: 0.6rem;
+  }
+  #inspector-panel.hidden { display: none; }
+  #inspector-panel .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  #inspector-panel .panel-header button {
+    font: inherit;
+    font-size: 0.85rem;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  #inspector-body details {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+    padding: 0.4rem 0.6rem;
+  }
+  #inspector-body summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  #inspector-body summary .row-summary {
+    font-weight: 400;
+    color: var(--muted);
+    margin-left: 0.5rem;
+  }
+  #inspector-body pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+  }
+  #inspector-error {
+    font-size: 0.85rem;
+    color: var(--banner-error-fg);
+  }
+  #inspector-error button {
+    font: inherit;
+    background: none;
+    border: none;
+    color: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+    padding: 0;
+    margin-left: 0.4rem;
+  }
 </style>
 </head>
 <body>
@@ -275,6 +337,16 @@
         <tbody id="composition-table-body"></tbody>
       </table>
     </div>
+    <button type="button" id="view-full-turn-btn">View full turn &rarr;</button>
+  </section>
+
+  <section class="panel hidden" id="inspector-panel" aria-label="Turn content inspector">
+    <div class="panel-header">
+      <h2 id="inspector-title">Turn 0 &mdash; full content</h2>
+      <button type="button" id="inspector-collapse-btn">Collapse &#9650;</button>
+    </div>
+    <div id="inspector-body"></div>
+    <div id="inspector-error" class="hidden" role="status"></div>
   </section>
 
   <section class="panel" id="growth-panel">
@@ -333,7 +405,8 @@
     activeThresholds: {}, // value -> bool
     summary: [], // Story 2.1.1 SessionSummary rows, started_at-ascending
     summarySortKey: "cost_per_call_usd",
-    summarySortDir: "desc" // "asc" | "desc"
+    summarySortDir: "desc", // "asc" | "desc"
+    inspectorOpen: false // Story 2.2.2
   };
 
   var bannerEl = document.getElementById("status-banner");
@@ -357,6 +430,12 @@
   var scatterWrapEl = document.getElementById("cost-scatter-wrap");
   var trendChartWrapEl = document.getElementById("cost-trend-chart-wrap");
   var trendSummaryEl = document.getElementById("cost-trend-summary");
+  var viewFullTurnBtn = document.getElementById("view-full-turn-btn");
+  var inspectorPanelEl = document.getElementById("inspector-panel");
+  var inspectorTitleEl = document.getElementById("inspector-title");
+  var inspectorCollapseBtn = document.getElementById("inspector-collapse-btn");
+  var inspectorBodyEl = document.getElementById("inspector-body");
+  var inspectorErrorEl = document.getElementById("inspector-error");
 
   /**
    * Single state machine for #status-banner, mirroring dashboard.html's own
@@ -410,6 +489,9 @@
   function setPanelsVisible(visible) {
     compositionPanelEl.style.display = visible ? "" : "none";
     growthPanelEl.style.display = visible ? "" : "none";
+    if (!visible) {
+      closeInspector();
+    }
   }
 
   // -- Session picker --------------------------------------------------
@@ -497,6 +579,83 @@
       return { value: turn[cat.key], color: cat.color, label: cat.label };
     }), total));
   }
+
+  // -- Turn content inspector (Story 2.2.2) -------------------------------
+  //
+  // Embedded inline, not a modal (ux.md Surface 3) — re-scrubbing while open
+  // re-fetches/re-renders in place instead of closing the panel. Each row
+  // kind is its own <details>; a kind with no rows is omitted entirely
+  // rather than shown as an empty section.
+
+  function renderInspectorRow(label, rows, startOpen) {
+    var raw = JSON.stringify(rows, null, 2);
+    var details = document.createElement("details");
+    details.open = startOpen;
+    var summary = document.createElement("summary");
+    summary.textContent = label;
+    var charCount = document.createElement("span");
+    charCount.className = "row-summary";
+    charCount.textContent = raw.length.toLocaleString() + " chars";
+    summary.appendChild(charCount);
+    details.appendChild(summary);
+    var pre = document.createElement("pre");
+    pre.textContent = raw;
+    details.appendChild(pre);
+    return details;
+  }
+
+  function renderInspectorBody(data) {
+    while (inspectorBodyEl.firstChild) {
+      inspectorBodyEl.removeChild(inspectorBodyEl.firstChild);
+    }
+    if (data.user_row !== null && data.user_row !== undefined) {
+      inspectorBodyEl.appendChild(renderInspectorRow("user_row", data.user_row, true));
+    }
+    if (data.assistant_rows && data.assistant_rows.length > 0) {
+      inspectorBodyEl.appendChild(renderInspectorRow(
+        "assistant_rows (" + data.assistant_rows.length + ")", data.assistant_rows, true));
+    }
+    if (data.tool_rows && data.tool_rows.length > 0) {
+      inspectorBodyEl.appendChild(renderInspectorRow(
+        "tool_rows (" + data.tool_rows.length + ")", data.tool_rows, false));
+    }
+  }
+
+  function loadInspectorContent(turnIndex) {
+    inspectorTitleEl.textContent = "Turn " + turnIndex + " — full content";
+    inspectorErrorEl.classList.add("hidden");
+    inspectorErrorEl.innerHTML = "";
+    fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/turns/" + turnIndex)
+      .then(renderInspectorBody)
+      .catch(function () {
+        while (inspectorBodyEl.firstChild) {
+          inspectorBodyEl.removeChild(inspectorBodyEl.firstChild);
+        }
+        inspectorErrorEl.classList.remove("hidden");
+        var msg = document.createElement("span");
+        msg.textContent = "Could not load turn content.";
+        inspectorErrorEl.appendChild(msg);
+        var retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.textContent = "Retry";
+        retryBtn.addEventListener("click", function () { loadInspectorContent(turnIndex); });
+        inspectorErrorEl.appendChild(retryBtn);
+      });
+  }
+
+  function openInspector() {
+    state.inspectorOpen = true;
+    inspectorPanelEl.classList.remove("hidden");
+    loadInspectorContent(state.selectedTurnIndex);
+  }
+
+  function closeInspector() {
+    state.inspectorOpen = false;
+    inspectorPanelEl.classList.add("hidden");
+  }
+
+  viewFullTurnBtn.addEventListener("click", openInspector);
+  inspectorCollapseBtn.addEventListener("click", closeInspector);
 
   function renderDonut(segments, total) {
     var size = 160;
@@ -756,6 +915,9 @@
     state.selectedTurnIndex = parseInt(scrubberEl.value, 10) || 0;
     renderComposition();
     renderGrowthChart();
+    if (state.inspectorOpen) {
+      loadInspectorContent(state.selectedTurnIndex);
+    }
   });
 
   // -- Data loading --------------------------------------------------
@@ -849,6 +1011,7 @@
 
   pickerEl.addEventListener("change", function () {
     state.sessionId = pickerEl.value;
+    closeInspector();
     var url = new URL(window.location.href);
     url.searchParams.set("session", state.sessionId);
     window.history.replaceState(null, "", url);

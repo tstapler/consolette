@@ -20,6 +20,7 @@
 
 pub mod budget;
 pub mod composition;
+pub mod hooks_install;
 pub mod ingest_claude_code;
 pub mod refresh;
 pub mod server;

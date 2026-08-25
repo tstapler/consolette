@@ -83,6 +83,12 @@ enum Command {
         #[arg(long, default_value = consolette::claude_code_session::DEFAULT_PRICING_MODEL)]
         pricing_model: String,
     },
+    /// Install consolette's context-forensics hooks into
+    /// `~/.claude/settings.json`, additively and idempotently.
+    ContextTrackerUp,
+    /// Remove exactly the hook entries `context-tracker up` installed,
+    /// leaving every other entry (including ones added afterward) intact.
+    ContextTrackerDown,
 }
 
 #[tokio::main]
@@ -109,7 +115,33 @@ async fn main() -> anyhow::Result<()> {
             session,
             pricing_model,
         } => compare_cost_command(&session, &pricing_model).await,
+        Command::ContextTrackerUp => context_tracker_up_command(),
+        Command::ContextTrackerDown => context_tracker_down_command(),
     }
+}
+
+fn context_tracker_up_command() -> anyhow::Result<()> {
+    let path = consolette::context_forensics::hooks_install::SettingsJsonGateway::default_path();
+    consolette::context_forensics::hooks_install::up(&path).with_context(|| {
+        format!(
+            "failed to install context-forensics hooks into {}",
+            path.display()
+        )
+    })?;
+    println!("installed context-forensics hooks into {}", path.display());
+    Ok(())
+}
+
+fn context_tracker_down_command() -> anyhow::Result<()> {
+    let path = consolette::context_forensics::hooks_install::SettingsJsonGateway::default_path();
+    consolette::context_forensics::hooks_install::down(&path).with_context(|| {
+        format!(
+            "failed to remove context-forensics hooks from {}",
+            path.display()
+        )
+    })?;
+    println!("removed context-forensics hooks from {}", path.display());
+    Ok(())
 }
 
 async fn run() -> anyhow::Result<()> {

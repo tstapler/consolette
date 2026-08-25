@@ -62,7 +62,8 @@
   nav a {
     color: var(--chart-line);
   }
-  nav a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, details summary:focus-visible {
+  nav a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, details summary:focus-visible,
+  tr[role="button"]:focus-visible, circle[role="button"]:focus-visible {
     outline: 2px solid #4a90e2;
     outline-offset: 2px;
   }
@@ -99,6 +100,10 @@
   #status-banner.state-not-found {
     background: var(--banner-error-bg);
     color: var(--banner-error-fg);
+  }
+  #status-banner.state-partial-ingestion {
+    background: var(--banner-info-bg);
+    color: var(--banner-info-fg);
   }
   #status-banner a { color: inherit; text-decoration: underline; }
   #status-banner button.retry {
@@ -370,6 +375,7 @@
     </div>
     <div id="composition-body">
       <div id="composition-donut" aria-hidden="true"></div>
+      <div id="composition-status" class="empty-region hidden" role="status" aria-live="polite"></div>
       <table class="composition-table" id="composition-table">
         <thead>
           <tr><th>Category</th><th>Tokens</th><th>Share</th></tr>
@@ -464,6 +470,7 @@
   var scrubberEl = document.getElementById("turn-scrubber");
   var turnLabelEl = document.getElementById("turn-label");
   var donutEl = document.getElementById("composition-donut");
+  var compositionStatusEl = document.getElementById("composition-status");
   var tableBodyEl = document.getElementById("composition-table-body");
   var thresholdRowEl = document.getElementById("threshold-row");
   var chartWrapEl = document.getElementById("growth-chart-wrap");
@@ -496,7 +503,8 @@
    * Single state machine for #status-banner, mirroring dashboard.html's own
    * convention: every visible/hidden banner state goes through here.
    *
-   * States: "loading", "fetch-error", "not-found", "empty-corpus", "hidden".
+   * States: "loading", "fetch-error", "not-found", "empty-corpus",
+   * "partial-ingestion", "hidden".
    */
   function setBannerState(bannerState, opts) {
     opts = opts || {};
@@ -534,6 +542,11 @@
       case "empty-corpus":
         bannerEl.classList.add("state-empty-corpus");
         bannerEl.textContent = "No sessions ingested yet. Run \"consolette serve-cost\" and wait for the background rescan, or check back shortly.";
+        break;
+      case "partial-ingestion":
+        bannerEl.classList.add("state-partial-ingestion");
+        bannerEl.textContent = opts.failureCount + " transcript line" + (opts.failureCount === 1 ? "" : "s") +
+          " could not be parsed for this session — data on this page may be incomplete.";
         break;
       case "hidden":
       default:
@@ -621,13 +634,13 @@
       tableBodyEl.removeChild(tableBodyEl.firstChild);
     }
     donutEl.innerHTML = "";
+    compositionStatusEl.textContent = "";
+    compositionStatusEl.classList.add("hidden");
 
     if (!turn) {
-      var emptyRow = document.createElement("div");
-      emptyRow.className = "empty-region";
-      emptyRow.textContent = "No calls recorded for this session yet.";
+      compositionStatusEl.textContent = "No calls recorded for this session yet.";
+      compositionStatusEl.classList.remove("hidden");
       tableBodyEl.parentElement.style.display = "none";
-      donutEl.appendChild(emptyRow);
       return;
     }
     tableBodyEl.parentElement.style.display = "";
@@ -825,6 +838,8 @@
     if (state.growth.length === 0) {
       var empty = document.createElement("div");
       empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
       empty.textContent = "No calls recorded for this session yet.";
       chartWrapEl.appendChild(empty);
       return;
@@ -997,6 +1012,8 @@
     if (state.churn.length === 0) {
       var empty = document.createElement("div");
       empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
       empty.textContent = "No calls recorded for this session yet.";
       churnChartWrapEl.appendChild(empty);
       return;
@@ -1122,7 +1139,12 @@
       state.compactionEvents = Array.isArray(growthResp.native_compaction_events) ? growthResp.native_compaction_events : [];
       state.selectedTurnIndex = topGrowthTurnIndex(state.growth);
 
-      setBannerState("hidden");
+      var currentSession = state.sessions.filter(function (s) { return s.id === state.sessionId; })[0];
+      if (currentSession && currentSession.parse_failure_count > 0) {
+        setBannerState("partial-ingestion", { failureCount: currentSession.parse_failure_count });
+      } else {
+        setBannerState("hidden");
+      }
       setPanelsVisible(true);
       renderScrubber();
       renderComposition();
@@ -1296,6 +1318,8 @@
     if (state.summary.length === 0) {
       var empty = document.createElement("div");
       empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
       empty.textContent = "No sessions ingested yet.";
       scatterWrapEl.appendChild(empty);
       return;
@@ -1373,6 +1397,8 @@
     if (state.summary.length < 2) {
       var empty = document.createElement("div");
       empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
       empty.textContent = "Not enough sessions yet for a trend";
       trendChartWrapEl.appendChild(empty);
       return;
@@ -1466,7 +1492,12 @@
     pickerRowEl.style.display = "none";
     compositionPanelEl.style.display = "none";
     growthPanelEl.style.display = "none";
-    crossSessionPanelEl.style.display = "";
+    churnPanelEl.style.display = "none";
+    // `#cross-session-panel`'s CSS default is `display: none` (an ID-selector
+    // rule, so an inline `style.display = ""` merely reverts to that CSS
+    // default instead of overriding it) — must set an explicit non-empty
+    // value to actually show it.
+    crossSessionPanelEl.style.display = "block";
     var backLink = document.createElement("a");
     backLink.href = "/dashboard/context";
     backLink.textContent = "← Session detail";

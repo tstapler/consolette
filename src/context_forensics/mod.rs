@@ -18,4 +18,5 @@
 //! built-ahead-of-its-caller precedent.
 #![allow(dead_code)]
 
+pub mod store;
 pub mod usage;

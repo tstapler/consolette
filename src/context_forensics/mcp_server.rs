@@ -10,6 +10,7 @@
 //! use — no separately-computed data, so a tool's result always agrees
 //! with the equivalent `GET /v1/context/...` route.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use rmcp::model::{
@@ -293,23 +294,23 @@ impl ServerHandler for ContextForensicsMcpServer {
         )
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> {
+        std::future::ready(Ok(ListToolsResult {
             tools: tool_defs(),
             ..Default::default()
-        })
+        }))
     }
 
-    async fn call_tool(
+    fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.dispatch(&request))
+    ) -> impl Future<Output = Result<CallToolResult, ErrorData>> {
+        std::future::ready(Ok(self.dispatch(&request)))
     }
 }
 

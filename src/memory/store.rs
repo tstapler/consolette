@@ -1,5 +1,6 @@
 //! In-memory key-value store backed by moka cache for cross-agent shared context.
 
+use std::future::Future;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -65,15 +66,16 @@ impl MemoryStore {
     /// because `moka::future::Cache` does not expose an async iterator.
     ///
     /// This isn't actually async internally (moka's `iter()` is synchronous),
-    /// but stays `async fn` to match the store's other accessors and leave
+    /// but stays awaitable to match the store's other accessors and leave
     /// room for a future backend that needs to await.
-    #[allow(clippy::unused_async)]
-    pub async fn list_all(&self) -> Vec<(String, Arc<MemoryEntry>)> {
+    pub fn list_all(&self) -> impl Future<Output = Vec<(String, Arc<MemoryEntry>)>> {
         // moka's `iter()` is synchronous and safe to call from async context.
-        self.entries
-            .iter()
-            .map(|(k, v)| ((*k).clone(), v.clone()))
-            .collect()
+        std::future::ready(
+            self.entries
+                .iter()
+                .map(|(k, v)| ((*k).clone(), v.clone()))
+                .collect(),
+        )
     }
 
     /// Return the number of live entries. May be slightly stale due to async eviction.

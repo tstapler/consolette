@@ -409,9 +409,8 @@ mod tests {
         let (_dir, store) = store();
         let lines = vec![
             user_line("u1", None, "hi"),
-            format!(
-                r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":false,"isMeta":false,"message":{{"role":"assistant","content":[{{"type":"text","text":"reply"}}],"usage":{{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":500,"cache_read_input_tokens":8000}}}}}}"#
-            ),
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":false,"isMeta":false,"message":{"role":"assistant","content":[{"type":"text","text":"reply"}],"usage":{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":500,"cache_read_input_tokens":8000}}}"#
+                .to_string(),
         ];
         let fixture = write_fixture(&lines);
 

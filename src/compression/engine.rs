@@ -7,6 +7,7 @@
 use bytes::Bytes;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, warn};
 
@@ -84,16 +85,18 @@ fn rewind_tool_def() -> Value {
 // ---------------------------------------------------------------------------
 
 impl CompressionEngine {
-    // Kept `async fn` for API consistency with the rest of the engine's
-    // lifecycle methods, even though construction itself never awaits.
-    #[allow(clippy::unused_async)]
-    pub async fn new(config: CompressionConfig, rewind_store: Arc<RewindStore>) -> Self {
-        CompressionEngine {
+    // Kept awaitable (`impl Future`) for API consistency with the rest of the
+    // engine's lifecycle methods, even though construction itself never awaits.
+    pub fn new(
+        config: CompressionConfig,
+        rewind_store: Arc<RewindStore>,
+    ) -> impl Future<Output = Self> {
+        std::future::ready(CompressionEngine {
             config,
             rewind_store,
             text_compressor: TextCompressor::new(),
             smart_crusher: SmartCrusher::new(),
-        }
+        })
     }
 
     /// Main entry point: compress `request["messages"]` in place.

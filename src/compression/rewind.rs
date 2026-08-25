@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,16 +37,16 @@ pub struct RewindStore {
 
 impl RewindStore {
     /// Create a new `RewindStore` with TTL=10 min and `max_capacity`=500.
-    // `new` is async (the underlying cache builder isn't), so a sync
-    // `Default` impl isn't possible here. Kept `async fn` for API consistency
+    // `new` is awaitable (the underlying cache builder isn't), so a sync
+    // `Default` impl isn't possible here. Kept awaitable for API consistency
     // with the rest of the store's accessors.
-    #[allow(clippy::new_without_default, clippy::unused_async)]
-    pub async fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> impl Future<Output = Self> {
         let cache = Cache::builder()
             .max_capacity(500)
             .time_to_live(Duration::from_mins(10))
             .build();
-        RewindStore { cache }
+        std::future::ready(RewindStore { cache })
     }
 
     /// Store `original` bytes and return an 8-character hex hash ID.

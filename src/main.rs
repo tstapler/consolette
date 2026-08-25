@@ -89,6 +89,13 @@ enum Command {
     /// Remove exactly the hook entries `context-tracker up` installed,
     /// leaving every other entry (including ones added afterward) intact.
     ContextTrackerDown,
+    /// Fast, fire-and-forget: read a Claude Code hook's JSON payload from
+    /// stdin and record it. Invoked by the hooks `context-tracker up`
+    /// installs, not meant to be run interactively.
+    ContextHook {
+        /// The hook event name (e.g. `PostToolUse`, `SessionStart`).
+        event: String,
+    },
 }
 
 #[tokio::main]
@@ -117,7 +124,20 @@ async fn main() -> anyhow::Result<()> {
         } => compare_cost_command(&session, &pricing_model).await,
         Command::ContextTrackerUp => context_tracker_up_command(),
         Command::ContextTrackerDown => context_tracker_down_command(),
+        Command::ContextHook { event } => context_hook_command(&event),
     }
+}
+
+fn context_hook_command(event: &str) -> anyhow::Result<()> {
+    let store = consolette::context_forensics::store::ContextForensicsStore::open(
+        &consolette::context_forensics::store::ContextForensicsStore::default_store_path(),
+    )
+    .context("failed to open context-forensics store")?;
+    consolette::context_forensics::hook_event::handle_hook_event(
+        &store,
+        event,
+        &mut std::io::stdin(),
+    )
 }
 
 fn context_tracker_up_command() -> anyhow::Result<()> {

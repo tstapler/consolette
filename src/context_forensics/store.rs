@@ -178,6 +178,48 @@ pub struct NativeCompactionEventRow {
     pub turn_index: Option<u64>,
 }
 
+/// Persisted Claude Code hook-event record (Phase 4). `session_id` is the
+/// *parent* session id from the hook's JSON payload — nullable because a
+/// `SessionStart` event can fire before Claude Code has assigned one.
+/// `payload` is the raw stdin JSON exactly as received, never re-shaped, so
+/// a later pass (e.g. subagent correlation) can extract whatever field it
+/// needs without this row type anticipating every hook's schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookEventRow {
+    pub session_id: Option<String>,
+    pub event_kind: String,
+    pub payload: String,
+    pub received_at: String,
+}
+
+/// Persisted subagent (Task-tool) invocation record (Phase 4, ADR-004).
+///
+/// `subagent_session_id` stores the hook payload's `agent_id` field, not a
+/// separate subagent session id — verified against Claude Code's own hook
+/// docs (`SubagentStart`/`SubagentStop`'s `session_id` field is the
+/// *parent* session's id in both events; `agent_id` is the only field that
+/// uniquely identifies one subagent invocation). The plan's original column
+/// name assumed a distinct subagent-owned session id existed; it doesn't,
+/// so this column holds `agent_id` instead — same column, corrected
+/// meaning, no schema change needed.
+///
+/// **v1 scope** (ADR-004): usage fields are `0` placeholders — see
+/// [`ContextForensicsStore::correlate_subagents`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubagentRow {
+    /// `"{parent_session_id}:{agent_id}"`.
+    pub id: String,
+    pub parent_session_id: String,
+    pub parent_turn_id: Option<String>,
+    pub subagent_session_id: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+}
+
 /// One turn's aggregated composition/usage figures — [`ContextForensicsStore::composition_for_session`]'s
 /// per-element shape (Story 1.4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -362,6 +404,51 @@ fn exec_upsert_native_compaction_event(
     Ok(())
 }
 
+fn exec_insert_hook_event(conn: &Connection, row: &HookEventRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO hook_events (session_id, event_kind, payload, received_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![row.session_id, row.event_kind, row.payload, row.received_at],
+    )?;
+    Ok(())
+}
+
+fn exec_upsert_subagent(conn: &Connection, row: &SubagentRow) -> Result<()> {
+    let input_tokens = to_i64(row.input_tokens);
+    let output_tokens = to_i64(row.output_tokens);
+    let cache_creation_input_tokens = to_i64(row.cache_creation_input_tokens);
+    let cache_read_input_tokens = to_i64(row.cache_read_input_tokens);
+    conn.execute(
+        "INSERT INTO subagents (
+            id, parent_session_id, parent_turn_id, subagent_session_id,
+            input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            started_at, ended_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT (id) DO UPDATE SET
+            parent_turn_id = excluded.parent_turn_id,
+            subagent_session_id = excluded.subagent_session_id,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+            cache_read_input_tokens = excluded.cache_read_input_tokens,
+            started_at = excluded.started_at,
+            ended_at = excluded.ended_at",
+        params![
+            row.id,
+            row.parent_session_id,
+            row.parent_turn_id,
+            row.subagent_session_id,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            row.started_at,
+            row.ended_at,
+        ],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ContextForensicsStore
 // ---------------------------------------------------------------------------
@@ -415,6 +502,28 @@ CREATE TABLE IF NOT EXISTS native_compaction_events (
     tokens_saved INTEGER,
     turn_index   INTEGER,
     UNIQUE (session_id, row_uuid)
+);
+
+-- Phase 4:
+CREATE TABLE IF NOT EXISTS hook_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT,
+    event_kind  TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subagents (
+    id                           TEXT PRIMARY KEY,
+    parent_session_id            TEXT NOT NULL REFERENCES sessions(id),
+    parent_turn_id                TEXT REFERENCES turns(id),
+    subagent_session_id          TEXT,
+    input_tokens                 INTEGER NOT NULL,
+    output_tokens                INTEGER NOT NULL,
+    cache_creation_input_tokens  INTEGER NOT NULL,
+    cache_read_input_tokens      INTEGER NOT NULL,
+    started_at                   TEXT,
+    ended_at                     TEXT
 );
 ";
 
@@ -565,6 +674,176 @@ impl ContextForensicsStore {
     pub fn upsert_native_compaction_event(&self, row: &NativeCompactionEventRow) -> Result<()> {
         let conn = self.lock()?;
         exec_upsert_native_compaction_event(&conn, row)
+    }
+
+    /// Append one [`HookEventRow`]. Hook events are an append-only log (no
+    /// natural unique key to upsert on — the same event firing twice is two
+    /// real occurrences, not a duplicate to collapse).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the
+    /// underlying `rusqlite` call fails.
+    pub fn insert_hook_event(&self, row: &HookEventRow) -> Result<()> {
+        let conn = self.lock()?;
+        exec_insert_hook_event(&conn, row)
+    }
+
+    /// Every [`HookEventRow`] recorded for one parent session, ordered by
+    /// insertion (`received_at`, then `id` to break same-timestamp ties).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the query
+    /// fails.
+    pub fn hook_events_for_session(&self, session_id: &str) -> Result<Vec<HookEventRow>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, event_kind, payload, received_at FROM hook_events
+             WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map(params![session_id], |row| {
+            Ok(HookEventRow {
+                session_id: row.get(0)?,
+                event_kind: row.get(1)?,
+                payload: row.get(2)?,
+                received_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Insert or update a [`SubagentRow`], keyed on `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the
+    /// underlying `rusqlite` call fails.
+    pub fn upsert_subagent(&self, row: &SubagentRow) -> Result<()> {
+        let conn = self.lock()?;
+        exec_upsert_subagent(&conn, row)
+    }
+
+    /// Look up one [`SubagentRow`] by `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or the query
+    /// fails.
+    pub fn subagent(&self, id: &str) -> Result<Option<SubagentRow>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT id, parent_session_id, parent_turn_id, subagent_session_id,
+                        input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                        started_at, ended_at
+                 FROM subagents WHERE id = ?1",
+                params![id],
+                |row| {
+                    let input_tokens: i64 = row.get(4)?;
+                    let output_tokens: i64 = row.get(5)?;
+                    let cache_creation_input_tokens: i64 = row.get(6)?;
+                    let cache_read_input_tokens: i64 = row.get(7)?;
+                    Ok(SubagentRow {
+                        id: row.get(0)?,
+                        parent_session_id: row.get(1)?,
+                        parent_turn_id: row.get(2)?,
+                        subagent_session_id: row.get(3)?,
+                        input_tokens: u64::try_from(input_tokens).unwrap_or(0),
+                        output_tokens: u64::try_from(output_tokens).unwrap_or(0),
+                        cache_creation_input_tokens: u64::try_from(cache_creation_input_tokens)
+                            .unwrap_or(0),
+                        cache_read_input_tokens: u64::try_from(cache_read_input_tokens)
+                            .unwrap_or(0),
+                        started_at: row.get(8)?,
+                        ended_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Correlates every `SubagentStart`/`SubagentStop` hook-event pair
+    /// (matched by parent `session_id` + payload `agent_id`) into one
+    /// [`SubagentRow`] each, with `AnthropicUsage` fields left as `0`
+    /// placeholders (ADR-004 v1 scope — see [`SubagentRow`]'s doc comment).
+    /// A `SubagentStart` with no matching `SubagentStop` yet is left
+    /// uncorrelated rather than written with a null `ended_at`, since a
+    /// still-running subagent isn't a fact this store can assert yet.
+    ///
+    /// Returns the number of [`SubagentRow`]s written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection lock is poisoned or any
+    /// underlying `rusqlite` call fails.
+    pub fn correlate_subagents(&self) -> Result<usize> {
+        let hook_events = {
+            let conn = self.lock()?;
+            let mut statement = conn.prepare(
+                "SELECT session_id, event_kind, payload, received_at FROM hook_events
+                 WHERE event_kind IN ('SubagentStart', 'SubagentStop')",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(HookEventRow {
+                        session_id: row.get(0)?,
+                        event_kind: row.get(1)?,
+                        payload: row.get(2)?,
+                        received_at: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        let mut starts: HashMap<(String, String), &HookEventRow> = HashMap::new();
+        let mut stops: HashMap<(String, String), &HookEventRow> = HashMap::new();
+        for event in &hook_events {
+            let Some(session_id) = &event.session_id else {
+                continue;
+            };
+            let Some(agent_id) = serde_json::from_str::<serde_json::Value>(&event.payload)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("agent_id")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                })
+            else {
+                continue;
+            };
+            let key = (session_id.clone(), agent_id);
+            if event.event_kind == "SubagentStart" {
+                starts.insert(key, event);
+            } else {
+                stops.insert(key, event);
+            }
+        }
+
+        let mut written = 0;
+        for (key, start) in &starts {
+            let Some(stop) = stops.get(key) else {
+                continue;
+            };
+            let (parent_session_id, agent_id) = key;
+            let row = SubagentRow {
+                id: format!("{parent_session_id}:{agent_id}"),
+                parent_session_id: parent_session_id.clone(),
+                parent_turn_id: None,
+                subagent_session_id: Some(agent_id.clone()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                started_at: Some(start.received_at.clone()),
+                ended_at: Some(stop.received_at.clone()),
+            };
+            self.upsert_subagent(&row)?;
+            written += 1;
+        }
+        Ok(written)
     }
 
     /// Upsert one whole ingested session (session + turns + calls +
@@ -1391,6 +1670,105 @@ mod tests {
         store.upsert_session(&sample_session("s1")).unwrap();
 
         assert_eq!(store.peak_context_tokens("s1").unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_hook_event_should_be_queryable_when_inserted() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store
+            .insert_hook_event(&HookEventRow {
+                session_id: Some("s1".to_string()),
+                event_kind: "PostToolUse".to_string(),
+                payload: r#"{"session_id": "s1"}"#.to_string(),
+                received_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        let events = store.hook_events_for_session("s1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind, "PostToolUse");
+    }
+
+    #[test]
+    fn correlate_subagents_should_write_one_row_when_start_and_stop_pair_present() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+        store
+            .insert_hook_event(&HookEventRow {
+                session_id: Some("s1".to_string()),
+                event_kind: "SubagentStart".to_string(),
+                payload: r#"{"session_id": "s1", "agent_id": "agent-1"}"#.to_string(),
+                received_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_hook_event(&HookEventRow {
+                session_id: Some("s1".to_string()),
+                event_kind: "SubagentStop".to_string(),
+                payload: r#"{"session_id": "s1", "agent_id": "agent-1"}"#.to_string(),
+                received_at: "2026-01-01T00:05:00Z".to_string(),
+            })
+            .unwrap();
+
+        let written = store.correlate_subagents().unwrap();
+
+        assert_eq!(written, 1);
+        let subagent = store.subagent("s1:agent-1").unwrap().unwrap();
+        assert_eq!(subagent.started_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(subagent.ended_at.as_deref(), Some("2026-01-01T00:05:00Z"));
+    }
+
+    #[test]
+    fn correlate_subagents_should_write_nothing_when_only_start_present() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+        store
+            .insert_hook_event(&HookEventRow {
+                session_id: Some("s1".to_string()),
+                event_kind: "SubagentStart".to_string(),
+                payload: r#"{"session_id": "s1", "agent_id": "agent-1"}"#.to_string(),
+                received_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(store.correlate_subagents().unwrap(), 0);
+    }
+
+    #[test]
+    fn peak_context_tokens_should_be_unaffected_by_subagent_rows() {
+        let dir = TempDir::new().unwrap();
+        let store = ContextForensicsStore::open(&temp_store_path(&dir)).unwrap();
+        store.upsert_session(&sample_session("s1")).unwrap();
+        store
+            .upsert_turn(&TurnRow {
+                id: "t1".to_string(),
+                session_id: "s1".to_string(),
+                turn_index: 0,
+                user_row_uuid: "u1".to_string(),
+                cumulative_tokens: 400_000,
+                user_row_json: None,
+                tool_rows_json: None,
+            })
+            .unwrap();
+        store
+            .upsert_subagent(&SubagentRow {
+                id: "s1:agent-1".to_string(),
+                parent_session_id: "s1".to_string(),
+                parent_turn_id: None,
+                subagent_session_id: Some("agent-1".to_string()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                ended_at: Some("2026-01-01T00:05:00Z".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(store.peak_context_tokens("s1").unwrap(), 400_000);
     }
 
     #[test]

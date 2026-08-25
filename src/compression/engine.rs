@@ -344,10 +344,8 @@ fn has_rewind_markers(messages: &[Value]) -> bool {
     for msg in messages {
         let content = msg.get("content");
         match content {
-            Some(Value::String(s)) => {
-                if REWIND_MARKER_RE.is_match(s) {
-                    return true;
-                }
+            Some(Value::String(s)) if REWIND_MARKER_RE.is_match(s) => {
+                return true;
             }
             Some(Value::Array(blocks)) => {
                 for block in blocks {

@@ -643,6 +643,7 @@ mod tests {
             ..Config::default()
         };
 
+        #[allow(clippy::expect_used)]
         let router = Router::from_config(&config)
             .await
             .expect("Openai-kind upstream must build a Provider");

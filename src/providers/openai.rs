@@ -164,7 +164,10 @@ impl OpenaiProvider {
     ///
     /// Returns a [`ProviderError`] if auth resolution, the HTTP request, or
     /// upstream error-status mapping fails.
-    pub async fn send_streaming_request(&self, mut body: Value) -> Result<reqwest::Response, ProviderError> {
+    pub async fn send_streaming_request(
+        &self,
+        mut body: Value,
+    ) -> Result<reqwest::Response, ProviderError> {
         body["stream"] = Value::Bool(true);
 
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -393,8 +396,10 @@ where
         }
         self.ensure_started();
         self.finished = true;
-        self.pending
-            .push_back(Self::frame("content_block_stop", &json!({"type": "content_block_stop", "index": 0})));
+        self.pending.push_back(Self::frame(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": 0}),
+        ));
         self.pending.push_back(Self::frame(
             "message_delta",
             &json!({
@@ -403,8 +408,10 @@ where
                 "usage": {"output_tokens": 0}
             }),
         ));
-        self.pending
-            .push_back(Self::frame("message_stop", &json!({"type": "message_stop"})));
+        self.pending.push_back(Self::frame(
+            "message_stop",
+            &json!({"type": "message_stop"}),
+        ));
     }
 }
 
@@ -554,7 +561,9 @@ mod tests {
         #[tokio::test]
         async fn content_delta_is_bracketed_by_start_and_stop_events() {
             let inner = stream::iter(vec![
-                Ok(sse(r#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#)),
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+                )),
                 Ok(sse(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)),
                 Ok(sse("[DONE]")),
             ]);
@@ -595,8 +604,9 @@ mod tests {
 
         #[tokio::test]
         async fn empty_stream_still_produces_well_formed_bracketing_events() {
-            let inner: futures_util::stream::Iter<std::vec::IntoIter<Result<Bytes, anyhow::Error>>> =
-                stream::iter(vec![]);
+            let inner: futures_util::stream::Iter<
+                std::vec::IntoIter<Result<Bytes, anyhow::Error>>,
+            > = stream::iter(vec![]);
             let translator = OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string());
             let out = drain(translator).await;
 

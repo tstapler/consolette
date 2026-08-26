@@ -1,0 +1,1518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>consolette context dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1a1a1a;
+    --bg: #ffffff;
+    --border: #d0d0d0;
+    --muted: #666666;
+    --banner-info-bg: #eef4ff;
+    --banner-info-fg: #1a3d7c;
+    --banner-error-bg: #fdecec;
+    --banner-error-fg: #7c1a1a;
+    --banner-empty-bg: #f5f5f5;
+    --banner-empty-fg: #444444;
+    --chart-line: #4a90e2;
+    --chart-axis: #999999;
+    --danger-band: rgba(220, 50, 50, 0.14);
+    --danger-line: #cc2b2b;
+    --autocompact-marker: #b06fdb;
+    --tool-io: #4a90e2;
+    --conversation: #2fa86b;
+    --system: #d4a72c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6e6e6;
+      --bg: #121212;
+      --border: #3a3a3a;
+      --muted: #a0a0a0;
+      --banner-info-bg: #1a2a4a;
+      --banner-info-fg: #cfe0ff;
+      --banner-error-bg: #4a1a1a;
+      --banner-error-fg: #ffd0d0;
+      --banner-empty-bg: #1e1e1e;
+      --banner-empty-fg: #cccccc;
+      --chart-line: #6aa9ec;
+      --chart-axis: #777777;
+      --danger-band: rgba(255, 90, 90, 0.18);
+      --danger-line: #ff6b6b;
+      --autocompact-marker: #c48ce8;
+      --tool-io: #6aa9ec;
+      --conversation: #4fc98a;
+      --system: #e0bd4e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 1.5rem;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 0.25rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+  nav { margin-bottom: 1rem; font-size: 0.85rem; }
+  nav a {
+    color: var(--chart-line);
+  }
+  nav a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, details summary:focus-visible,
+  tr[role="button"]:focus-visible, circle[role="button"]:focus-visible {
+    outline: 2px solid #4a90e2;
+    outline-offset: 2px;
+  }
+  #picker-row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+  #picker-row label { font-size: 0.85rem; color: var(--muted); }
+  #session-picker {
+    font-size: 0.9rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+    min-width: 260px;
+  }
+  #status-banner {
+    padding: 0.6rem 0.9rem;
+    border-radius: 6px;
+    margin-bottom: 0.75rem;
+    font-size: 0.9rem;
+  }
+  #status-banner.hidden { display: none; }
+  #status-banner.state-loading,
+  #status-banner.state-empty-corpus {
+    background: var(--banner-empty-bg);
+    color: var(--banner-empty-fg);
+  }
+  #status-banner.state-fetch-error,
+  #status-banner.state-not-found {
+    background: var(--banner-error-bg);
+    color: var(--banner-error-fg);
+  }
+  #status-banner.state-partial-ingestion {
+    background: var(--banner-info-bg);
+    color: var(--banner-info-fg);
+  }
+  #status-banner a { color: inherit; text-decoration: underline; }
+  #status-banner button.retry {
+    margin-left: 0.5rem;
+    font: inherit;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+  }
+  section.panel {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+  }
+  .empty-region {
+    padding: 1.5rem;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .inline-error {
+    color: var(--banner-error-fg);
+    font-size: 0.85rem;
+  }
+  .inline-error a, .inline-error button {
+    margin-left: 0.5rem;
+  }
+  #scrubber-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+  #turn-scrubber { flex: 1; }
+  #turn-label { font-size: 0.85rem; color: var(--muted); min-width: 6rem; text-align: right; }
+  #composition-body {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  #composition-donut svg { width: 160px; height: 160px; }
+  table.composition-table {
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  table.composition-table th, table.composition-table td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.35rem 0.6rem;
+    text-align: left;
+  }
+  .swatch {
+    display: inline-block;
+    width: 0.85em;
+    height: 0.85em;
+    margin-right: 0.4em;
+    vertical-align: -0.1em;
+    border: 1px solid var(--fg);
+  }
+  .swatch.tool-io { background: repeating-linear-gradient(45deg, var(--tool-io), var(--tool-io) 2px, transparent 2px, transparent 4px); }
+  .swatch.conversation { background: var(--conversation); }
+  .swatch.system { background: repeating-linear-gradient(-45deg, var(--system), var(--system) 2px, transparent 2px, transparent 4px); }
+  #threshold-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+  .threshold-toggle {
+    font: inherit;
+    font-size: 0.85rem;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.3rem 0.9rem;
+    cursor: pointer;
+  }
+  .threshold-toggle[aria-pressed="true"] {
+    background: var(--danger-line);
+    color: #ffffff;
+    border-color: var(--danger-line);
+  }
+  #growth-chart-wrap svg { width: 100%; height: auto; display: block; }
+  .growth-legend { font-size: 0.8rem; color: var(--muted); margin-top: 0.4rem; }
+  .growth-legend .swatch.autocompact {
+    background: none;
+    border: none;
+    color: var(--autocompact-marker);
+  }
+  details.text-fallback summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  details.text-fallback table {
+    margin-top: 0.5rem;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  details.text-fallback th, details.text-fallback td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.3rem 0.6rem;
+    text-align: left;
+  }
+  .na-badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    padding: 0.05rem 0.4rem;
+    border: 1px dashed var(--muted);
+    border-radius: 4px;
+    color: var(--muted);
+  }
+  #cross-check-badge-wrap { position: relative; }
+  .cross-check-badge {
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: none;
+    color: inherit;
+    cursor: pointer;
+  }
+  .cross-check-badge.hidden { display: none; }
+  .cross-check-badge[data-status="corroborated"] { border-color: var(--conversation); color: var(--conversation); }
+  .cross-check-badge[data-status="diverged"] { border-color: #d14343; color: #d14343; }
+  .cross-check-badge[data-status="transcript_only"] { border-color: var(--muted); color: var(--muted); }
+  .cross-check-tooltip {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: 5;
+    margin-top: 0.3rem;
+    max-width: 22rem;
+    font-size: 0.8rem;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  }
+  .cross-check-tooltip.hidden { display: none; }
+  table.summary-table {
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    width: 100%;
+    margin-bottom: 1.5rem;
+  }
+  table.summary-table th, table.summary-table td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.4rem 0.6rem;
+    text-align: left;
+  }
+  table.summary-table th button {
+    font: inherit;
+    font-weight: 600;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  table.summary-table tbody tr {
+    cursor: pointer;
+  }
+  table.summary-table tbody tr:hover {
+    background: var(--banner-empty-bg);
+  }
+  #churn-chart-wrap svg { width: 100%; height: auto; display: block; }
+  .churn-legend { font-size: 0.8rem; color: var(--muted); margin-top: 0.4rem; }
+  .churn-legend .swatch.cache-read { background: var(--chart-line); }
+  .churn-legend .swatch.cache-creation { background: var(--autocompact-marker); }
+  #cost-scatter-wrap svg, #cost-trend-chart-wrap svg { width: 100%; height: auto; display: block; }
+  #cost-scatter-wrap circle { cursor: pointer; }
+  .trend-summary { font-size: 0.85rem; color: var(--muted); }
+  #cross-session-panel { display: none; }
+  #view-full-turn-btn {
+    font: inherit;
+    font-size: 0.85rem;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    padding: 0.2rem 0.6rem;
+    margin-top: 0.6rem;
+  }
+  #inspector-panel.hidden { display: none; }
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  #inspector-panel .panel-header button {
+    font: inherit;
+    font-size: 0.85rem;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  #inspector-body details {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+    padding: 0.4rem 0.6rem;
+  }
+  #inspector-body summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  #inspector-body summary .row-summary {
+    font-weight: 400;
+    color: var(--muted);
+    margin-left: 0.5rem;
+  }
+  #inspector-body pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+  }
+  #inspector-error {
+    font-size: 0.85rem;
+    color: var(--banner-error-fg);
+  }
+  #inspector-error button {
+    font: inherit;
+    background: none;
+    border: none;
+    color: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+    padding: 0;
+    margin-left: 0.4rem;
+  }
+</style>
+</head>
+<body>
+  <nav>
+    <a href="/dashboard">&larr; Session compaction comparison</a>
+    <span id="cross-session-nav-link"></span>
+  </nav>
+  <h1 id="page-title">Context dashboard</h1>
+
+  <div id="picker-row">
+    <label for="session-picker">Session</label>
+    <select id="session-picker" aria-label="Select session"></select>
+  </div>
+
+  <div id="status-banner" class="hidden" role="status" aria-live="polite"></div>
+
+  <section class="panel" id="composition-panel">
+    <div class="panel-header">
+      <h2>Composition breakdown</h2>
+      <span id="cross-check-badge-wrap">
+        <button type="button" id="cross-check-badge" class="cross-check-badge" aria-expanded="false"></button>
+        <div id="cross-check-tooltip" class="cross-check-tooltip hidden" role="tooltip"></div>
+      </span>
+    </div>
+    <div id="scrubber-row">
+      <input id="turn-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Select turn">
+      <span id="turn-label">Turn 0</span>
+    </div>
+    <div id="composition-body">
+      <div id="composition-donut" aria-hidden="true"></div>
+      <div id="composition-status" class="empty-region hidden" role="status" aria-live="polite"></div>
+      <table class="composition-table" id="composition-table">
+        <thead>
+          <tr><th>Category</th><th>Tokens</th><th>Share</th></tr>
+        </thead>
+        <tbody id="composition-table-body"></tbody>
+      </table>
+    </div>
+    <button type="button" id="view-full-turn-btn">View full turn &rarr;</button>
+  </section>
+
+  <section class="panel hidden" id="inspector-panel" aria-label="Turn content inspector">
+    <div class="panel-header">
+      <h2 id="inspector-title">Turn 0 &mdash; full content</h2>
+      <button type="button" id="inspector-collapse-btn">Collapse &#9650;</button>
+    </div>
+    <div id="inspector-body"></div>
+    <div id="inspector-error" class="hidden" role="status"></div>
+  </section>
+
+  <section class="panel" id="growth-panel">
+    <h2>Context growth</h2>
+    <div id="threshold-row"></div>
+    <div id="growth-chart-wrap"></div>
+    <div class="growth-legend" id="growth-legend"></div>
+    <details class="text-fallback" id="growth-text-fallback">
+      <summary>Text summary</summary>
+      <div id="growth-text-body"></div>
+    </details>
+  </section>
+
+  <section class="panel" id="churn-panel">
+    <h2>Cache-read churn</h2>
+    <div id="churn-chart-wrap"></div>
+    <div class="churn-legend" id="churn-legend"></div>
+  </section>
+
+  <section class="panel" id="cross-session-panel">
+    <h2>Sessions</h2>
+    <table class="summary-table" id="summary-table">
+      <thead>
+        <tr id="summary-header-row"></tr>
+      </thead>
+      <tbody id="summary-table-body"></tbody>
+    </table>
+
+    <h2>Cost/call vs. peak context</h2>
+    <div id="cost-scatter-wrap"></div>
+
+    <h2>Cost/Call Over Time</h2>
+    <div id="cost-trend-chart-wrap"></div>
+    <p class="trend-summary" id="cost-trend-summary"></p>
+  </section>
+
+<script>
+(function () {
+  "use strict";
+
+  var THRESHOLDS = [
+    { label: "200K", value: 200000 },
+    { label: "500K", value: 500000 },
+    { label: "700K", value: 700000 },
+    { label: "1M", value: 1000000 }
+  ];
+
+  // Story 2.1.2: `/dashboard/context/sessions` is a client-side route
+  // within this same single-page dashboard (not a second HTML file) — the
+  // server (context_forensics/server.rs) serves the identical shell at
+  // both paths; this flag is the one place that decides which panel set
+  // renders.
+  var IS_CROSS_SESSION_VIEW = window.location.pathname.replace(/\/+$/, "").split("/").pop() === "sessions";
+
+  var state = {
+    sessions: [],
+    sessionId: null,
+    composition: [], // per-turn TurnComposition
+    growth: [],       // per-turn {turn_index, cumulative_tokens}
+    churn: [],        // per-turn CacheChurnPoint
+    compactionEvents: [],
+    selectedTurnIndex: 0,
+    activeThresholds: {}, // value -> bool
+    summary: [], // Story 2.1.1 SessionSummary rows, started_at-ascending
+    summarySortKey: "cost_per_call_usd",
+    summarySortDir: "desc", // "asc" | "desc"
+    inspectorOpen: false, // Story 2.2.2
+    crossCheckStatus: "transcript_only", // Story 5.2.2
+    crossCheckDetail: null,
+    crossCheckTooltipOpen: false
+  };
+
+  var bannerEl = document.getElementById("status-banner");
+  var pickerEl = document.getElementById("session-picker");
+  var scrubberEl = document.getElementById("turn-scrubber");
+  var turnLabelEl = document.getElementById("turn-label");
+  var donutEl = document.getElementById("composition-donut");
+  var compositionStatusEl = document.getElementById("composition-status");
+  var tableBodyEl = document.getElementById("composition-table-body");
+  var thresholdRowEl = document.getElementById("threshold-row");
+  var chartWrapEl = document.getElementById("growth-chart-wrap");
+  var legendEl = document.getElementById("growth-legend");
+  var textFallbackBodyEl = document.getElementById("growth-text-body");
+  var compositionPanelEl = document.getElementById("composition-panel");
+  var crossCheckBadgeEl = document.getElementById("cross-check-badge");
+  var crossCheckTooltipEl = document.getElementById("cross-check-tooltip");
+  var growthPanelEl = document.getElementById("growth-panel");
+  var churnPanelEl = document.getElementById("churn-panel");
+  var pageTitleEl = document.getElementById("page-title");
+  var crossSessionNavLinkEl = document.getElementById("cross-session-nav-link");
+  var pickerRowEl = document.getElementById("picker-row");
+  var crossSessionPanelEl = document.getElementById("cross-session-panel");
+  var summaryHeaderRowEl = document.getElementById("summary-header-row");
+  var summaryTableBodyEl = document.getElementById("summary-table-body");
+  var scatterWrapEl = document.getElementById("cost-scatter-wrap");
+  var trendChartWrapEl = document.getElementById("cost-trend-chart-wrap");
+  var trendSummaryEl = document.getElementById("cost-trend-summary");
+  var churnChartWrapEl = document.getElementById("churn-chart-wrap");
+  var churnLegendEl = document.getElementById("churn-legend");
+  var viewFullTurnBtn = document.getElementById("view-full-turn-btn");
+  var inspectorPanelEl = document.getElementById("inspector-panel");
+  var inspectorTitleEl = document.getElementById("inspector-title");
+  var inspectorCollapseBtn = document.getElementById("inspector-collapse-btn");
+  var inspectorBodyEl = document.getElementById("inspector-body");
+  var inspectorErrorEl = document.getElementById("inspector-error");
+
+  /**
+   * Single state machine for #status-banner, mirroring dashboard.html's own
+   * convention: every visible/hidden banner state goes through here.
+   *
+   * States: "loading", "fetch-error", "not-found", "empty-corpus",
+   * "partial-ingestion", "hidden".
+   */
+  function setBannerState(bannerState, opts) {
+    opts = opts || {};
+    bannerEl.className = "";
+    bannerEl.innerHTML = "";
+    switch (bannerState) {
+      case "loading":
+        bannerEl.classList.add("state-loading");
+        bannerEl.textContent = "Loading session data...";
+        break;
+      case "fetch-error": {
+        bannerEl.classList.add("state-fetch-error");
+        var msg = document.createElement("span");
+        msg.textContent = "Failed to load session data" + (opts.detail ? ": " + opts.detail : "") + ".";
+        bannerEl.appendChild(msg);
+        var retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.className = "retry";
+        retryBtn.textContent = "Retry";
+        retryBtn.addEventListener("click", opts.onRetry || loadSessionData);
+        bannerEl.appendChild(retryBtn);
+        break;
+      }
+      case "not-found": {
+        bannerEl.classList.add("state-not-found");
+        var nfMsg = document.createElement("span");
+        nfMsg.textContent = "Session not found. ";
+        bannerEl.appendChild(nfMsg);
+        var backLink = document.createElement("a");
+        backLink.href = "/dashboard/context";
+        backLink.textContent = "Back to context dashboard";
+        bannerEl.appendChild(backLink);
+        break;
+      }
+      case "empty-corpus":
+        bannerEl.classList.add("state-empty-corpus");
+        bannerEl.textContent = "No sessions ingested yet. Run \"consolette serve-cost\" and wait for the background rescan, or check back shortly.";
+        break;
+      case "partial-ingestion":
+        bannerEl.classList.add("state-partial-ingestion");
+        bannerEl.textContent = opts.failureCount + " transcript line" + (opts.failureCount === 1 ? "" : "s") +
+          " could not be parsed for this session — data on this page may be incomplete.";
+        break;
+      case "hidden":
+      default:
+        bannerEl.classList.add("hidden");
+    }
+  }
+
+  function setPanelsVisible(visible) {
+    compositionPanelEl.style.display = visible ? "" : "none";
+    growthPanelEl.style.display = visible ? "" : "none";
+    churnPanelEl.style.display = visible ? "" : "none";
+    if (!visible) {
+      closeInspector();
+    }
+  }
+
+  // -- Session picker --------------------------------------------------
+
+  function renderPicker() {
+    while (pickerEl.firstChild) {
+      pickerEl.removeChild(pickerEl.firstChild);
+    }
+    state.sessions.forEach(function (session) {
+      var opt = document.createElement("option");
+      opt.value = session.id;
+      var label = session.project ? session.project + " / " + session.id : session.id;
+      if (session.source === "codex") {
+        label += " (codex)";
+      }
+      opt.textContent = label;
+      pickerEl.appendChild(opt);
+    });
+    pickerEl.value = state.sessionId || "";
+  }
+
+  function mostRecentSessionId(sessions) {
+    if (sessions.length === 0) {
+      return null;
+    }
+    var withDates = sessions.filter(function (s) { return !!s.started_at; });
+    if (withDates.length === 0) {
+      return sessions[sessions.length - 1].id;
+    }
+    withDates.sort(function (a, b) { return a.started_at < b.started_at ? 1 : -1; });
+    return withDates[0].id;
+  }
+
+  // -- Composition panel -------------------------------------------------
+
+  function currentTurnComposition() {
+    return state.composition[state.selectedTurnIndex] || null;
+  }
+
+  var CROSS_CHECK_LABELS = {
+    corroborated: "Corroborated",
+    diverged: "Diverged",
+    transcript_only: "Transcript only"
+  };
+
+  function renderCrossCheckBadge() {
+    var status = state.crossCheckStatus;
+    var label = CROSS_CHECK_LABELS[status] || CROSS_CHECK_LABELS.transcript_only;
+    crossCheckBadgeEl.textContent = "[" + label + " ⓘ]";
+    crossCheckBadgeEl.setAttribute("data-status", status);
+    crossCheckBadgeEl.setAttribute("aria-expanded", state.crossCheckTooltipOpen ? "true" : "false");
+
+    var tooltipText = state.crossCheckDetail
+      || (status === "corroborated" ? "Every cross-checked call agreed with the live proxy capture."
+        : "No proxy-captured usage exists for this session yet; figures are transcript-derived only.");
+    crossCheckTooltipEl.textContent = tooltipText;
+    crossCheckTooltipEl.classList.toggle("hidden", !state.crossCheckTooltipOpen);
+  }
+
+  function toggleCrossCheckTooltip() {
+    state.crossCheckTooltipOpen = !state.crossCheckTooltipOpen;
+    renderCrossCheckBadge();
+  }
+
+  function renderComposition() {
+    renderCrossCheckBadge();
+    var turn = currentTurnComposition();
+    turnLabelEl.textContent = "Turn " + state.selectedTurnIndex;
+
+    while (tableBodyEl.firstChild) {
+      tableBodyEl.removeChild(tableBodyEl.firstChild);
+    }
+    donutEl.innerHTML = "";
+    compositionStatusEl.textContent = "";
+    compositionStatusEl.classList.add("hidden");
+
+    if (!turn) {
+      compositionStatusEl.textContent = "No calls recorded for this session yet.";
+      compositionStatusEl.classList.remove("hidden");
+      tableBodyEl.parentElement.style.display = "none";
+      return;
+    }
+    tableBodyEl.parentElement.style.display = "";
+
+    var total = turn.tool_io_tokens + turn.conversation_tokens + turn.system_tokens;
+    var categories = [
+      { key: "tool_io_tokens", label: "Tool I/O", swatch: "tool-io", color: "var(--tool-io)" },
+      { key: "conversation_tokens", label: "Conversation", swatch: "conversation", color: "var(--conversation)" },
+      { key: "system_tokens", label: "System", swatch: "system", color: "var(--system)" }
+    ];
+
+    categories.forEach(function (cat) {
+      var value = turn[cat.key];
+      var tr = document.createElement("tr");
+      var th = document.createElement("th");
+      var swatch = document.createElement("span");
+      swatch.className = "swatch " + cat.swatch;
+      th.appendChild(swatch);
+      th.appendChild(document.createTextNode(cat.label));
+      tr.appendChild(th);
+      var tdVal = document.createElement("td");
+      tdVal.textContent = value.toLocaleString();
+      tr.appendChild(tdVal);
+      var tdShare = document.createElement("td");
+      tdShare.textContent = total > 0 ? (value / total * 100).toFixed(1) + "%" : "—";
+      tr.appendChild(tdShare);
+      tableBodyEl.appendChild(tr);
+    });
+
+    donutEl.appendChild(renderDonut(categories.map(function (cat) {
+      return { value: turn[cat.key], color: cat.color, label: cat.label };
+    }), total));
+  }
+
+  // -- Turn content inspector (Story 2.2.2) -------------------------------
+  //
+  // Embedded inline, not a modal (ux.md Surface 3) — re-scrubbing while open
+  // re-fetches/re-renders in place instead of closing the panel. Each row
+  // kind is its own <details>; a kind with no rows is omitted entirely
+  // rather than shown as an empty section.
+
+  function renderInspectorRow(label, rows, startOpen) {
+    var raw = JSON.stringify(rows, null, 2);
+    var details = document.createElement("details");
+    details.open = startOpen;
+    var summary = document.createElement("summary");
+    summary.textContent = label;
+    var charCount = document.createElement("span");
+    charCount.className = "row-summary";
+    charCount.textContent = raw.length.toLocaleString() + " chars";
+    summary.appendChild(charCount);
+    details.appendChild(summary);
+    var pre = document.createElement("pre");
+    pre.textContent = raw;
+    details.appendChild(pre);
+    return details;
+  }
+
+  function renderInspectorBody(data) {
+    while (inspectorBodyEl.firstChild) {
+      inspectorBodyEl.removeChild(inspectorBodyEl.firstChild);
+    }
+    if (data.user_row !== null && data.user_row !== undefined) {
+      inspectorBodyEl.appendChild(renderInspectorRow("user_row", data.user_row, true));
+    }
+    if (data.assistant_rows && data.assistant_rows.length > 0) {
+      inspectorBodyEl.appendChild(renderInspectorRow(
+        "assistant_rows (" + data.assistant_rows.length + ")", data.assistant_rows, true));
+    }
+    if (data.tool_rows && data.tool_rows.length > 0) {
+      inspectorBodyEl.appendChild(renderInspectorRow(
+        "tool_rows (" + data.tool_rows.length + ")", data.tool_rows, false));
+    }
+  }
+
+  function loadInspectorContent(turnIndex) {
+    inspectorTitleEl.textContent = "Turn " + turnIndex + " — full content";
+    inspectorErrorEl.classList.add("hidden");
+    inspectorErrorEl.innerHTML = "";
+    fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/turns/" + turnIndex)
+      .then(renderInspectorBody)
+      .catch(function () {
+        while (inspectorBodyEl.firstChild) {
+          inspectorBodyEl.removeChild(inspectorBodyEl.firstChild);
+        }
+        inspectorErrorEl.classList.remove("hidden");
+        var msg = document.createElement("span");
+        msg.textContent = "Could not load turn content.";
+        inspectorErrorEl.appendChild(msg);
+        var retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.textContent = "Retry";
+        retryBtn.addEventListener("click", function () { loadInspectorContent(turnIndex); });
+        inspectorErrorEl.appendChild(retryBtn);
+      });
+  }
+
+  function openInspector() {
+    state.inspectorOpen = true;
+    inspectorPanelEl.classList.remove("hidden");
+    loadInspectorContent(state.selectedTurnIndex);
+  }
+
+  function closeInspector() {
+    state.inspectorOpen = false;
+    inspectorPanelEl.classList.add("hidden");
+  }
+
+  viewFullTurnBtn.addEventListener("click", openInspector);
+  inspectorCollapseBtn.addEventListener("click", closeInspector);
+  crossCheckBadgeEl.addEventListener("click", toggleCrossCheckTooltip);
+
+  function renderDonut(segments, total) {
+    var size = 160;
+    var radius = 60;
+    var cx = size / 2;
+    var cy = size / 2;
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + size + " " + size);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Composition donut chart");
+
+    if (total <= 0) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", cx);
+      circle.setAttribute("cy", cy);
+      circle.setAttribute("r", radius);
+      circle.setAttribute("fill", "none");
+      circle.setAttribute("stroke", "var(--border)");
+      circle.setAttribute("stroke-width", "20");
+      svg.appendChild(circle);
+      return svg;
+    }
+
+    var angleStart = -90;
+    segments.forEach(function (seg) {
+      if (seg.value <= 0) { return; }
+      var fraction = seg.value / total;
+      var angleEnd = angleStart + fraction * 360;
+      var path = describeArc(cx, cy, radius, angleStart, angleEnd);
+      var arc = document.createElementNS(svgNS, "path");
+      arc.setAttribute("d", path);
+      arc.setAttribute("fill", "none");
+      arc.setAttribute("stroke", seg.color);
+      arc.setAttribute("stroke-width", "20");
+      arc.setAttribute("aria-hidden", "true");
+      svg.appendChild(arc);
+      angleStart = angleEnd;
+    });
+    return svg;
+  }
+
+  function polarToCartesian(cx, cy, r, angleDeg) {
+    var angleRad = (angleDeg - 90) * Math.PI / 180;
+    return { x: cx + r * Math.cos(angleRad), y: cy + r * Math.sin(angleRad) };
+  }
+
+  function describeArc(cx, cy, r, startAngle, endAngle) {
+    // Rotate the coordinate frame 90deg so 0deg points up (matches the
+    // -90 start-angle convention used by callers).
+    var start = polarToCartesian(cx, cy, r, endAngle + 90);
+    var end = polarToCartesian(cx, cy, r, startAngle + 90);
+    var largeArc = endAngle - startAngle <= 180 ? "0" : "1";
+    return ["M", start.x, start.y, "A", r, r, 0, largeArc, 0, end.x, end.y].join(" ");
+  }
+
+  // -- Growth chart --------------------------------------------------
+
+  function renderThresholdToggles() {
+    while (thresholdRowEl.firstChild) {
+      thresholdRowEl.removeChild(thresholdRowEl.firstChild);
+    }
+    THRESHOLDS.forEach(function (t) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "threshold-toggle";
+      btn.textContent = t.label;
+      var pressed = !!state.activeThresholds[t.value];
+      btn.setAttribute("aria-pressed", pressed ? "true" : "false");
+      btn.addEventListener("click", function () {
+        state.activeThresholds[t.value] = !state.activeThresholds[t.value];
+        renderThresholdToggles();
+        renderGrowthChart();
+      });
+      thresholdRowEl.appendChild(btn);
+    });
+  }
+
+  function renderGrowthChart() {
+    chartWrapEl.innerHTML = "";
+    legendEl.innerHTML = "";
+    textFallbackBodyEl.innerHTML = "";
+
+    if (state.growth.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
+      empty.textContent = "No calls recorded for this session yet.";
+      chartWrapEl.appendChild(empty);
+      return;
+    }
+
+    var width = 720;
+    var height = 260;
+    var padding = { top: 16, right: 16, bottom: 28, left: 56 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+
+    var maxTurn = Math.max.apply(null, state.growth.map(function (p) { return p.turn_index; }));
+    var maxTokens = Math.max.apply(null, state.growth.map(function (p) { return p.cumulative_tokens; }).concat(
+      THRESHOLDS.filter(function (t) { return state.activeThresholds[t.value]; }).map(function (t) { return t.value; })
+    ));
+    maxTokens = Math.max(maxTokens, 1);
+
+    function xFor(turnIndex) {
+      return padding.left + (maxTurn > 0 ? (turnIndex / maxTurn) * innerW : 0);
+    }
+    function yFor(tokens) {
+      return padding.top + innerH - (tokens / maxTokens) * innerH;
+    }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Context growth per turn, with budget thresholds");
+
+    // Danger bands + dashed threshold lines (drawn first, under the data line).
+    THRESHOLDS.forEach(function (t) {
+      if (!state.activeThresholds[t.value]) { return; }
+      var y = yFor(t.value);
+      if (y < padding.top) { return; }
+      var band = document.createElementNS(svgNS, "rect");
+      band.setAttribute("x", padding.left);
+      band.setAttribute("y", padding.top);
+      band.setAttribute("width", innerW);
+      band.setAttribute("height", Math.max(0, y - padding.top));
+      band.setAttribute("fill", "var(--danger-band)");
+      svg.appendChild(band);
+
+      var line = document.createElementNS(svgNS, "line");
+      line.setAttribute("x1", padding.left);
+      line.setAttribute("x2", padding.left + innerW);
+      line.setAttribute("y1", y);
+      line.setAttribute("y2", y);
+      line.setAttribute("stroke", "var(--danger-line)");
+      line.setAttribute("stroke-width", "1.5");
+      line.setAttribute("stroke-dasharray", "6 4");
+      svg.appendChild(line);
+
+      var label = document.createElementNS(svgNS, "text");
+      label.setAttribute("x", padding.left + 4);
+      label.setAttribute("y", y - 4);
+      label.setAttribute("font-size", "10");
+      label.setAttribute("fill", "var(--danger-line)");
+      label.textContent = t.label;
+      svg.appendChild(label);
+    });
+
+    // Axis lines.
+    var axisX = document.createElementNS(svgNS, "line");
+    axisX.setAttribute("x1", padding.left);
+    axisX.setAttribute("x2", padding.left + innerW);
+    axisX.setAttribute("y1", padding.top + innerH);
+    axisX.setAttribute("y2", padding.top + innerH);
+    axisX.setAttribute("stroke", "var(--chart-axis)");
+    svg.appendChild(axisX);
+
+    // Growth line.
+    var points = state.growth.map(function (p) {
+      return xFor(p.turn_index) + "," + yFor(p.cumulative_tokens);
+    }).join(" ");
+    var polyline = document.createElementNS(svgNS, "polyline");
+    polyline.setAttribute("points", points);
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", "var(--chart-line)");
+    polyline.setAttribute("stroke-width", "2");
+    svg.appendChild(polyline);
+
+    state.growth.forEach(function (p) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", xFor(p.turn_index));
+      circle.setAttribute("cy", yFor(p.cumulative_tokens));
+      circle.setAttribute("r", p.turn_index === state.selectedTurnIndex ? 4 : 2.5);
+      circle.setAttribute("fill", "var(--chart-line)");
+      svg.appendChild(circle);
+    });
+
+    // Autocompact markers.
+    state.compactionEvents.forEach(function (event) {
+      if (event.turn_index === null || event.turn_index === undefined) { return; }
+      var matchingPoint = state.growth.filter(function (p) { return p.turn_index === event.turn_index; })[0];
+      var y = matchingPoint ? yFor(matchingPoint.cumulative_tokens) : padding.top + innerH;
+      var x = xFor(event.turn_index);
+      var marker = document.createElementNS(svgNS, "circle");
+      marker.setAttribute("cx", x);
+      marker.setAttribute("cy", y);
+      marker.setAttribute("r", "5");
+      marker.setAttribute("fill", "none");
+      marker.setAttribute("stroke", "var(--autocompact-marker)");
+      marker.setAttribute("stroke-width", "2");
+      marker.setAttribute("stroke-dasharray", "2 2");
+      marker.setAttribute("aria-label", "native compaction at turn " + event.turn_index);
+      svg.appendChild(marker);
+    });
+
+    // Y-axis labels (min/max).
+    var maxLabel = document.createElementNS(svgNS, "text");
+    maxLabel.setAttribute("x", 4);
+    maxLabel.setAttribute("y", padding.top + 8);
+    maxLabel.setAttribute("font-size", "10");
+    maxLabel.setAttribute("fill", "var(--muted)");
+    maxLabel.textContent = maxTokens.toLocaleString();
+    svg.appendChild(maxLabel);
+
+    chartWrapEl.appendChild(svg);
+
+    if (state.compactionEvents.length > 0) {
+      legendEl.textContent = "⋯ dotted marker: native (Claude Code) auto-compaction";
+    }
+
+    renderGrowthTextFallback();
+  }
+
+  function renderGrowthTextFallback() {
+    var peak = state.growth.reduce(function (max, p) {
+      return p.cumulative_tokens > max.cumulative_tokens ? p : max;
+    }, state.growth[0]);
+
+    var list = document.createElement("ul");
+
+    var peakItem = document.createElement("li");
+    peakItem.textContent = "Peak context: " + peak.cumulative_tokens.toLocaleString() + " tokens at turn " + peak.turn_index;
+    list.appendChild(peakItem);
+
+    THRESHOLDS.forEach(function (t) {
+      if (!state.activeThresholds[t.value]) { return; }
+      var crossing = state.growth.filter(function (p) { return p.cumulative_tokens >= t.value; })[0];
+      var item = document.createElement("li");
+      item.textContent = t.label + " threshold: " + (crossing ? "crossed at turn " + crossing.turn_index : "never crossed");
+      list.appendChild(item);
+    });
+
+    if (state.compactionEvents.length > 0) {
+      state.compactionEvents.forEach(function (event) {
+        var item = document.createElement("li");
+        var turnText = (event.turn_index === null || event.turn_index === undefined) ? "an untracked turn" : "turn " + event.turn_index;
+        item.textContent = "Native auto-compaction at " + turnText +
+          (typeof event.tokens_saved === "number" ? " (saved " + event.tokens_saved.toLocaleString() + " tokens)" : "");
+        list.appendChild(item);
+      });
+    }
+
+    textFallbackBodyEl.appendChild(list);
+  }
+
+  // -- Cache-read churn chart (Story 2.3.2) -------------------------------
+  //
+  // Legend/axis use the literal Anthropic API field names, not an
+  // abstracted "churn score" (ux.md/research/ux.md §2) -- Tyler cross-checks
+  // these numbers directly against raw API responses.
+
+  function renderChurnChart() {
+    churnChartWrapEl.innerHTML = "";
+    churnLegendEl.innerHTML = "";
+
+    if (state.churn.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
+      empty.textContent = "No calls recorded for this session yet.";
+      churnChartWrapEl.appendChild(empty);
+      return;
+    }
+
+    var width = 720;
+    var height = 160;
+    var padding = { top: 12, right: 16, bottom: 24, left: 56 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+    var n = state.churn.length;
+    var barGroupW = innerW / n;
+    var barW = Math.max(1, barGroupW * 0.35);
+
+    var maxY = Math.max.apply(null, state.churn.map(function (p) {
+      return Math.max(p.cache_read_input_tokens, p.cache_creation_input_tokens);
+    }).concat([1]));
+
+    function yFor(v) { return padding.top + innerH - (v / maxY) * innerH; }
+    function barHeight(v) { return (v / maxY) * innerH; }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "cache_read_input_tokens and cache_creation_input_tokens per turn");
+
+    state.churn.forEach(function (p, i) {
+      var groupX = padding.left + i * barGroupW;
+
+      var readBar = document.createElementNS(svgNS, "rect");
+      readBar.setAttribute("x", groupX);
+      readBar.setAttribute("y", yFor(p.cache_read_input_tokens));
+      readBar.setAttribute("width", barW);
+      readBar.setAttribute("height", barHeight(p.cache_read_input_tokens));
+      readBar.setAttribute("fill", "var(--chart-line)");
+      svg.appendChild(readBar);
+
+      var creationBar = document.createElementNS(svgNS, "rect");
+      creationBar.setAttribute("x", groupX + barW + 1);
+      creationBar.setAttribute("y", yFor(p.cache_creation_input_tokens));
+      creationBar.setAttribute("width", barW);
+      creationBar.setAttribute("height", barHeight(p.cache_creation_input_tokens));
+      creationBar.setAttribute("fill", "var(--autocompact-marker)");
+      svg.appendChild(creationBar);
+    });
+
+    churnChartWrapEl.appendChild(svg);
+
+    var legendItems = [
+      { swatch: "cache-read", label: "cache_read_input_tokens" },
+      { swatch: "cache-creation", label: "cache_creation_input_tokens" }
+    ];
+    legendItems.forEach(function (item) {
+      var span = document.createElement("span");
+      var swatch = document.createElement("span");
+      swatch.className = "swatch " + item.swatch;
+      span.appendChild(swatch);
+      span.appendChild(document.createTextNode(item.label));
+      span.style.marginRight = "1rem";
+      churnLegendEl.appendChild(span);
+    });
+  }
+
+  // -- Scrubber --------------------------------------------------
+
+  function renderScrubber() {
+    var maxIndex = Math.max(0, state.composition.length - 1);
+    scrubberEl.min = "0";
+    scrubberEl.max = String(maxIndex);
+    scrubberEl.value = String(Math.min(state.selectedTurnIndex, maxIndex));
+    scrubberEl.disabled = state.composition.length === 0;
+  }
+
+  scrubberEl.addEventListener("input", function () {
+    state.selectedTurnIndex = parseInt(scrubberEl.value, 10) || 0;
+    renderComposition();
+    renderGrowthChart();
+    if (state.inspectorOpen) {
+      loadInspectorContent(state.selectedTurnIndex);
+    }
+  });
+
+  // -- Data loading --------------------------------------------------
+
+  function fetchJson(url) {
+    return fetch(url).then(function (response) {
+      if (response.status === 404) {
+        var err = new Error("not found");
+        err.notFound = true;
+        throw err;
+      }
+      if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+      }
+      return response.json();
+    });
+  }
+
+  function loadSessionData() {
+    if (!state.sessionId) {
+      setPanelsVisible(false);
+      setBannerState("empty-corpus");
+      return;
+    }
+    setBannerState("loading");
+    setPanelsVisible(false);
+
+    Promise.all([
+      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/composition"),
+      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/growth"),
+      fetchJson("/v1/context/sessions/" + encodeURIComponent(state.sessionId) + "/cache-churn")
+    ]).then(function (results) {
+      var compositionResp = results[0];
+      var growthResp = results[1];
+      var churnResp = results[2];
+      state.composition = Array.isArray(compositionResp.turns) ? compositionResp.turns : [];
+      state.crossCheckStatus = compositionResp.cross_check_status || "transcript_only";
+      state.crossCheckDetail = compositionResp.cross_check_detail || null;
+      state.crossCheckTooltipOpen = false;
+      state.growth = Array.isArray(growthResp.turns) ? growthResp.turns : [];
+      state.churn = Array.isArray(churnResp) ? churnResp : [];
+      state.compactionEvents = Array.isArray(growthResp.native_compaction_events) ? growthResp.native_compaction_events : [];
+      state.selectedTurnIndex = topGrowthTurnIndex(state.growth);
+
+      var currentSession = state.sessions.filter(function (s) { return s.id === state.sessionId; })[0];
+      if (currentSession && currentSession.parse_failure_count > 0) {
+        setBannerState("partial-ingestion", { failureCount: currentSession.parse_failure_count });
+      } else {
+        setBannerState("hidden");
+      }
+      setPanelsVisible(true);
+      renderScrubber();
+      renderComposition();
+      renderThresholdToggles();
+      renderGrowthChart();
+      renderChurnChart();
+    }).catch(function (err) {
+      if (err && err.notFound) {
+        setPanelsVisible(false);
+        setBannerState("not-found");
+        return;
+      }
+      setBannerState("fetch-error", { detail: err && err.message ? err.message : String(err) });
+    });
+  }
+
+  function topGrowthTurnIndex(growth) {
+    if (growth.length === 0) { return 0; }
+    var top = growth.reduce(function (max, p) {
+      return p.cumulative_tokens > max.cumulative_tokens ? p : max;
+    }, growth[0]);
+    return top.turn_index;
+  }
+
+  function loadSessions() {
+    setBannerState("loading");
+    fetch("/v1/context/sessions")
+      .then(function (response) {
+        if (!response.ok) { throw new Error("HTTP " + response.status); }
+        return response.json();
+      })
+      .then(function (sessions) {
+        state.sessions = Array.isArray(sessions) ? sessions : [];
+        if (state.sessions.length === 0) {
+          setPanelsVisible(false);
+          setBannerState("empty-corpus");
+          return;
+        }
+        var params = new URLSearchParams(window.location.search);
+        var requested = params.get("session");
+        var known = state.sessions.some(function (s) { return s.id === requested; });
+        state.sessionId = (requested && known) ? requested : mostRecentSessionId(state.sessions);
+        renderPicker();
+        loadSessionData();
+      })
+      .catch(function (err) {
+        setBannerState("fetch-error", {
+          detail: err && err.message ? err.message : String(err),
+          onRetry: loadSessions
+        });
+      });
+  }
+
+  pickerEl.addEventListener("change", function () {
+    state.sessionId = pickerEl.value;
+    closeInspector();
+    var url = new URL(window.location.href);
+    url.searchParams.set("session", state.sessionId);
+    window.history.replaceState(null, "", url);
+    loadSessionData();
+  });
+
+  // -- Cross-session view (Story 2.1.1/2.1.2) --------------------------
+
+  var SUMMARY_COLUMNS = [
+    { key: "id", label: "Session" },
+    { key: "source", label: "Source" },
+    { key: "started_at", label: "Started" },
+    { key: "cost_per_call_usd", label: "Cost/Call" },
+    { key: "peak_context_tokens", label: "Peak Context" },
+    { key: "call_count", label: "Calls" },
+    { key: "chain_coverage_ratio", label: "Coverage" }
+  ];
+
+  function formatUsd(value) {
+    return "$" + Number(value).toFixed(4);
+  }
+
+  function sortedSummary() {
+    var key = state.summarySortKey;
+    var dir = state.summarySortDir === "asc" ? 1 : -1;
+    var rows = state.summary.slice();
+    rows.sort(function (a, b) {
+      var av = a[key];
+      var bv = b[key];
+      // Nulls (e.g. missing started_at/chain_coverage_ratio) sort last
+      // regardless of direction, mirroring cost_metrics/dashboard.html's
+      // own convention.
+      if (av === null || av === undefined) { return bv === null || bv === undefined ? 0 : 1; }
+      if (bv === null || bv === undefined) { return -1; }
+      if (av < bv) { return -1 * dir; }
+      if (av > bv) { return 1 * dir; }
+      return 0;
+    });
+    return rows;
+  }
+
+  function navigateToSession(sessionId) {
+    window.location.href = "/dashboard/context?session=" + encodeURIComponent(sessionId);
+  }
+
+  function renderSummaryHeader() {
+    while (summaryHeaderRowEl.firstChild) {
+      summaryHeaderRowEl.removeChild(summaryHeaderRowEl.firstChild);
+    }
+    SUMMARY_COLUMNS.forEach(function (col) {
+      var th = document.createElement("th");
+      var isSorted = state.summarySortKey === col.key;
+      th.setAttribute("aria-sort", isSorted ? (state.summarySortDir === "asc" ? "ascending" : "descending") : "none");
+
+      var button = document.createElement("button");
+      button.type = "button";
+      var labelSpan = document.createElement("span");
+      labelSpan.textContent = col.label;
+      button.appendChild(labelSpan);
+      if (isSorted) {
+        var arrowSpan = document.createElement("span");
+        arrowSpan.textContent = state.summarySortDir === "asc" ? "▲" : "▼";
+        button.appendChild(arrowSpan);
+      }
+      button.addEventListener("click", function () {
+        if (state.summarySortKey === col.key) {
+          state.summarySortDir = state.summarySortDir === "asc" ? "desc" : "asc";
+        } else {
+          state.summarySortKey = col.key;
+          state.summarySortDir = "asc";
+        }
+        renderSummaryHeader();
+        renderSummaryTable();
+      });
+      th.appendChild(button);
+      summaryHeaderRowEl.appendChild(th);
+    });
+  }
+
+  function renderSummaryTable() {
+    while (summaryTableBodyEl.firstChild) {
+      summaryTableBodyEl.removeChild(summaryTableBodyEl.firstChild);
+    }
+    sortedSummary().forEach(function (row) {
+      var tr = document.createElement("tr");
+      tr.tabIndex = 0;
+      tr.setAttribute("role", "button");
+      tr.setAttribute("aria-label", "View session " + row.id);
+      tr.addEventListener("click", function () { navigateToSession(row.id); });
+      tr.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); navigateToSession(row.id); }
+      });
+
+      [
+        row.id,
+        row.source,
+        row.started_at || "—",
+        formatUsd(row.cost_per_call_usd),
+        row.peak_context_tokens.toLocaleString(),
+        row.call_count.toLocaleString(),
+        row.chain_coverage_ratio === null || row.chain_coverage_ratio === undefined
+          ? "—"
+          : (row.chain_coverage_ratio * 100).toFixed(0) + "%"
+      ].forEach(function (value) {
+        var td = document.createElement("td");
+        td.textContent = value;
+        tr.appendChild(td);
+      });
+      summaryTableBodyEl.appendChild(tr);
+    });
+  }
+
+  function renderScatter() {
+    scatterWrapEl.innerHTML = "";
+    if (state.summary.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
+      empty.textContent = "No sessions ingested yet.";
+      scatterWrapEl.appendChild(empty);
+      return;
+    }
+
+    var width = 720;
+    var height = 260;
+    var padding = { top: 16, right: 16, bottom: 28, left: 64 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+
+    var maxX = Math.max.apply(null, state.summary.map(function (s) { return s.peak_context_tokens; }).concat([1]));
+    var maxY = Math.max.apply(null, state.summary.map(function (s) { return s.cost_per_call_usd; }).concat([0.0001]));
+
+    function xFor(v) { return padding.left + (v / maxX) * innerW; }
+    function yFor(v) { return padding.top + innerH - (v / maxY) * innerH; }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Cost per call vs peak context tokens, one point per session");
+
+    var axisX = document.createElementNS(svgNS, "line");
+    axisX.setAttribute("x1", padding.left);
+    axisX.setAttribute("x2", padding.left + innerW);
+    axisX.setAttribute("y1", padding.top + innerH);
+    axisX.setAttribute("y2", padding.top + innerH);
+    axisX.setAttribute("stroke", "var(--chart-axis)");
+    svg.appendChild(axisX);
+
+    state.summary.forEach(function (row) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", xFor(row.peak_context_tokens));
+      circle.setAttribute("cy", yFor(row.cost_per_call_usd));
+      circle.setAttribute("r", "5");
+      circle.setAttribute("fill", "var(--chart-line)");
+      circle.setAttribute("tabindex", "0");
+      circle.setAttribute("role", "button");
+      circle.setAttribute("aria-label", "Session " + row.id + ": " + formatUsd(row.cost_per_call_usd) + " per call, " + row.peak_context_tokens.toLocaleString() + " peak context tokens");
+      var titleEl = document.createElementNS(svgNS, "title");
+      titleEl.textContent = row.id;
+      circle.appendChild(titleEl);
+      circle.addEventListener("click", function () { navigateToSession(row.id); });
+      circle.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); navigateToSession(row.id); }
+      });
+      svg.appendChild(circle);
+    });
+
+    var yLabel = document.createElementNS(svgNS, "text");
+    yLabel.setAttribute("x", 4);
+    yLabel.setAttribute("y", padding.top + 8);
+    yLabel.setAttribute("font-size", "10");
+    yLabel.setAttribute("fill", "var(--muted)");
+    yLabel.textContent = formatUsd(maxY);
+    svg.appendChild(yLabel);
+
+    var xLabel = document.createElementNS(svgNS, "text");
+    xLabel.setAttribute("x", padding.left + innerW - 4);
+    xLabel.setAttribute("y", padding.top + innerH + 20);
+    xLabel.setAttribute("font-size", "10");
+    xLabel.setAttribute("fill", "var(--muted)");
+    xLabel.setAttribute("text-anchor", "end");
+    xLabel.textContent = maxX.toLocaleString() + " tokens";
+    svg.appendChild(xLabel);
+
+    scatterWrapEl.appendChild(svg);
+  }
+
+  function renderTrendChart() {
+    trendChartWrapEl.innerHTML = "";
+    trendSummaryEl.textContent = "";
+
+    if (state.summary.length < 2) {
+      var empty = document.createElement("div");
+      empty.className = "empty-region";
+      empty.setAttribute("role", "status");
+      empty.setAttribute("aria-live", "polite");
+      empty.textContent = "Not enough sessions yet for a trend";
+      trendChartWrapEl.appendChild(empty);
+      return;
+    }
+
+    // `state.summary` is already `started_at`-ascending (the
+    // `/v1/context/sessions/summary` response's own ordering contract) —
+    // no client-side re-sort here, so this chart always reflects
+    // chronological order regardless of the table's current sort.
+    var width = 720;
+    var height = 200;
+    var padding = { top: 16, right: 16, bottom: 24, left: 64 };
+    var innerW = width - padding.left - padding.right;
+    var innerH = height - padding.top - padding.bottom;
+
+    var maxY = Math.max.apply(null, state.summary.map(function (s) { return s.cost_per_call_usd; }).concat([0.0001]));
+
+    function xFor(i) { return padding.left + (i / (state.summary.length - 1)) * innerW; }
+    function yFor(v) { return padding.top + innerH - (v / maxY) * innerH; }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Cost per call over time across sessions, chronological order");
+
+    var points = state.summary.map(function (s, i) {
+      return xFor(i) + "," + yFor(s.cost_per_call_usd);
+    }).join(" ");
+    var polyline = document.createElementNS(svgNS, "polyline");
+    polyline.setAttribute("points", points);
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", "var(--chart-line)");
+    polyline.setAttribute("stroke-width", "2");
+    svg.appendChild(polyline);
+
+    state.summary.forEach(function (s, i) {
+      var circle = document.createElementNS(svgNS, "circle");
+      circle.setAttribute("cx", xFor(i));
+      circle.setAttribute("cy", yFor(s.cost_per_call_usd));
+      circle.setAttribute("r", "3");
+      circle.setAttribute("fill", "var(--chart-line)");
+      svg.appendChild(circle);
+    });
+
+    trendChartWrapEl.appendChild(svg);
+
+    // Never chart-only (ux.md acceptance criterion 25): a first-vs-last
+    // text summary renders alongside the trend line.
+    var first = state.summary[0];
+    var last = state.summary[state.summary.length - 1];
+    var summaryText;
+    if (first.cost_per_call_usd <= 0) {
+      summaryText = "Cost/call: " + formatUsd(first.cost_per_call_usd) + " → " + formatUsd(last.cost_per_call_usd) + " over " + state.summary.length + " sessions.";
+    } else {
+      var ratio = last.cost_per_call_usd / first.cost_per_call_usd;
+      var direction = ratio >= 1 ? "up" : "down";
+      var factor = ratio >= 1 ? ratio : (1 / ratio);
+      summaryText = "Cost/call " + direction + " " + factor.toFixed(1) + "x over " + state.summary.length + " sessions (" + formatUsd(first.cost_per_call_usd) + " → " + formatUsd(last.cost_per_call_usd) + ").";
+    }
+    trendSummaryEl.textContent = summaryText;
+  }
+
+  function loadCrossSessionSummary() {
+    setBannerState("loading");
+    fetch("/v1/context/sessions/summary")
+      .then(function (response) {
+        if (!response.ok) { throw new Error("HTTP " + response.status); }
+        return response.json();
+      })
+      .then(function (summary) {
+        state.summary = Array.isArray(summary) ? summary : [];
+        setBannerState(state.summary.length === 0 ? "empty-corpus" : "hidden");
+        renderSummaryHeader();
+        renderSummaryTable();
+        renderScatter();
+        renderTrendChart();
+      })
+      .catch(function (err) {
+        setBannerState("fetch-error", {
+          detail: err && err.message ? err.message : String(err),
+          onRetry: loadCrossSessionSummary
+        });
+      });
+  }
+
+  // -- View bootstrap ---------------------------------------------------
+
+  if (IS_CROSS_SESSION_VIEW) {
+    pageTitleEl.textContent = "Sessions";
+    pickerRowEl.style.display = "none";
+    compositionPanelEl.style.display = "none";
+    growthPanelEl.style.display = "none";
+    churnPanelEl.style.display = "none";
+    // `#cross-session-panel`'s CSS default is `display: none` (an ID-selector
+    // rule, so an inline `style.display = ""` merely reverts to that CSS
+    // default instead of overriding it) — must set an explicit non-empty
+    // value to actually show it.
+    crossSessionPanelEl.style.display = "block";
+    var backLink = document.createElement("a");
+    backLink.href = "/dashboard/context";
+    backLink.textContent = "← Session detail";
+    crossSessionNavLinkEl.appendChild(document.createTextNode(" · "));
+    crossSessionNavLinkEl.appendChild(backLink);
+    loadCrossSessionSummary();
+  } else {
+    var crossLink = document.createElement("a");
+    crossLink.href = "/dashboard/context/sessions";
+    crossLink.textContent = "Cross-session view →";
+    crossSessionNavLinkEl.appendChild(document.createTextNode(" · "));
+    crossSessionNavLinkEl.appendChild(crossLink);
+    loadSessions();
+  }
+})();
+</script>
+</body>
+</html>

@@ -50,9 +50,9 @@ pub async fn record_actual_usage_from_anthropic_response(
     _model: &str,
     anthropic_response: &serde_json::Value,
 ) -> Option<Result<(), CostTrackerError>> {
-    let (input_tokens, output_tokens) = crate::providers::extract_usage(anthropic_response)?;
+    let usage = crate::providers::extract_usage(anthropic_response)?;
     let actual = TokenCount {
-        value: input_tokens + output_tokens,
+        value: usage.input_tokens + usage.output_tokens,
         source: TokenSource::Exact,
     };
     Some(

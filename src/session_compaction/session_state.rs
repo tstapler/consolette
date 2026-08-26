@@ -12,6 +12,7 @@
 //! router integration once that spike lands) own key derivation; this module
 //! only owns what happens once a key exists.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,13 +55,13 @@ pub struct SessionStateStore {
 }
 
 impl SessionStateStore {
-    #[allow(clippy::new_without_default, clippy::unused_async)]
-    pub async fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> impl Future<Output = Self> {
         let cache = Cache::builder()
             .max_capacity(1000)
             .time_to_live(Duration::from_hours(1))
             .build();
-        SessionStateStore { cache }
+        std::future::ready(SessionStateStore { cache })
     }
 
     /// Fetch this session's state, creating an empty one if absent.

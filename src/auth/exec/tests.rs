@@ -337,5 +337,20 @@ fn resolve_command_falls_back_to_path_when_not_in_bin_dirs() {
     let dir = tempfile::tempdir().unwrap();
 
     let path = resolve_command("sh", &[dir.path().to_path_buf()]).unwrap();
-    assert_eq!(path, PathBuf::from("/bin/sh"));
+
+    // Don't hardcode /bin/sh: whether "sh" resolves under /bin or /usr/bin
+    // depends on the distro's merged-usr status and PATH ordering, not on
+    // anything resolve_command controls. Replicate its own PATH-search
+    // logic here instead of assuming a specific absolute path — this is
+    // what made the assertion fail on Ubuntu CI runners (PATH resolves
+    // "sh" to /usr/bin/sh there) while passing locally on distros where
+    // /bin is merged into /usr/bin.
+    let expected = std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("sh"))
+                .find(|p| p.is_file())
+        })
+        .unwrap();
+    assert_eq!(path, expected);
 }

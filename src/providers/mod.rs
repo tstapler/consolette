@@ -272,7 +272,8 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
         .unwrap_or("unknown")
         .to_string();
 
-    let (prompt_tokens, completion_tokens) = extract_usage(anthropic).unwrap_or((0, 0));
+    let usage = extract_usage(anthropic).unwrap_or_default();
+    let (prompt_tokens, completion_tokens) = (usage.input_tokens, usage.output_tokens);
 
     json!({
         "id": anthropic.get("id").and_then(Value::as_str).unwrap_or(""),
@@ -445,8 +446,24 @@ pub(crate) fn map_openai_finish_reason(finish_reason: Option<&str>) -> &'static 
 // statement.
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Extract `usage.input_tokens`/`usage.output_tokens` from an Anthropic
-/// Messages API response body.
+/// The four `usage.*` fields an Anthropic Messages API response (or a
+/// Claude Code transcript row's `message.usage`) carries, including the two
+/// cache-tier fields (`cache_creation_input_tokens`/
+/// `cache_read_input_tokens`) that the old `extract_usage`
+/// `Option<(u64, u64)>` return silently dropped (context-analyzer plan.md
+/// Story 1.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_field_names)] // field names match the Anthropic API's own `usage.*` keys
+pub(crate) struct AnthropicUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+/// Extract `usage.*` from an Anthropic Messages API response body (or any
+/// other JSON value carrying a top-level `usage` object of the same
+/// shape, e.g. a Claude Code transcript row's `message`).
 ///
 /// Returns `None` when the top-level `usage` object is absent or malformed;
 /// a present `usage` object with a missing/non-numeric individual field
@@ -454,19 +471,17 @@ pub(crate) fn map_openai_finish_reason(finish_reason: Option<&str>) -> &'static 
 /// (matching `translate_anthropic_to_openai`'s prior per-field behavior,
 /// now unified into this single parsing site per Task 2.2.1a).
 #[must_use]
-pub(crate) fn extract_usage(anthropic: &serde_json::Value) -> Option<(u64, u64)> {
+pub(crate) fn extract_usage(anthropic: &serde_json::Value) -> Option<AnthropicUsage> {
     use serde_json::Value;
 
     let usage = anthropic.get("usage")?;
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    Some((input_tokens, output_tokens))
+    let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+    Some(AnthropicUsage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        cache_creation_input_tokens: field("cache_creation_input_tokens"),
+        cache_read_input_tokens: field("cache_read_input_tokens"),
+    })
 }
 
 /// Calls [`translate_anthropic_to_openai`] and additionally records the
@@ -593,7 +608,50 @@ mod tests {
     #[test]
     fn extract_usage_should_default_missing_individual_field_to_zero() {
         let anthropic = json!({"usage": {"input_tokens": 12400}});
-        assert_eq!(extract_usage(&anthropic), Some((12400, 0)));
+        assert_eq!(
+            extract_usage(&anthropic),
+            Some(AnthropicUsage {
+                input_tokens: 12400,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_usage_should_populate_all_four_fields_when_full_usage_object_present() {
+        let anthropic = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 500,
+                "cache_read_input_tokens": 8000,
+            }
+        });
+        assert_eq!(
+            extract_usage(&anthropic),
+            Some(AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_input_tokens: 500,
+                cache_read_input_tokens: 8000,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_usage_should_default_missing_cache_fields_to_zero() {
+        let anthropic = json!({"usage": {"input_tokens": 100, "output_tokens": 20}});
+        assert_eq!(
+            extract_usage(&anthropic),
+            Some(AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            })
+        );
     }
 
     #[tokio::test]
@@ -778,7 +836,10 @@ mod tests {
         let anthropic = translate_openai_response_to_anthropic(&openai);
 
         assert_eq!(anthropic["id"], json!("chatcmpl-1"));
-        assert_eq!(anthropic["content"], json!([{"type": "text", "text": "hello"}]));
+        assert_eq!(
+            anthropic["content"],
+            json!([{"type": "text", "text": "hello"}])
+        );
         assert_eq!(anthropic["stop_reason"], json!("end_turn"));
         assert_eq!(anthropic["usage"]["input_tokens"], json!(10));
         assert_eq!(anthropic["usage"]["output_tokens"], json!(4));

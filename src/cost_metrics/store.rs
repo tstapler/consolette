@@ -10,6 +10,7 @@
 //! resurrect an evicted or never-seen session as a side effect of reading it.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,13 +127,13 @@ pub struct SessionCostStore {
 }
 
 impl SessionCostStore {
-    #[allow(clippy::new_without_default, clippy::unused_async)]
-    pub async fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> impl Future<Output = Self> {
         let cache = Cache::builder()
             .max_capacity(1000)
             .time_to_live(Duration::from_hours(1))
             .build();
-        SessionCostStore { cache }
+        std::future::ready(SessionCostStore { cache })
     }
 
     /// Fetch this session's state, atomically creating an empty one if
@@ -165,13 +166,12 @@ impl SessionCostStore {
     /// TTL-eviction test can wait out a near-zero `time_to_live` instead of
     /// the real one-hour default (plan.md Task 4.2.1a).
     #[cfg(test)]
-    #[allow(clippy::unused_async)]
-    pub async fn new_with_ttl(ttl: Duration) -> Self {
+    pub fn new_with_ttl(ttl: Duration) -> impl Future<Output = Self> {
         let cache = Cache::builder()
             .max_capacity(1000)
             .time_to_live(ttl)
             .build();
-        SessionCostStore { cache }
+        std::future::ready(SessionCostStore { cache })
     }
 
     /// Number of entries currently in the cache. Test-only, used to assert a

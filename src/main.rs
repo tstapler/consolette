@@ -83,6 +83,19 @@ enum Command {
         #[arg(long, default_value = consolette::claude_code_session::DEFAULT_PRICING_MODEL)]
         pricing_model: String,
     },
+    /// Install consolette's context-forensics hooks into
+    /// `~/.claude/settings.json`, additively and idempotently.
+    ContextTrackerUp,
+    /// Remove exactly the hook entries `context-tracker up` installed,
+    /// leaving every other entry (including ones added afterward) intact.
+    ContextTrackerDown,
+    /// Fast, fire-and-forget: read a Claude Code hook's JSON payload from
+    /// stdin and record it. Invoked by the hooks `context-tracker up`
+    /// installs, not meant to be run interactively.
+    ContextHook {
+        /// The hook event name (e.g. `PostToolUse`, `SessionStart`).
+        event: String,
+    },
 }
 
 #[tokio::main]
@@ -109,7 +122,46 @@ async fn main() -> anyhow::Result<()> {
             session,
             pricing_model,
         } => compare_cost_command(&session, &pricing_model).await,
+        Command::ContextTrackerUp => context_tracker_up_command(),
+        Command::ContextTrackerDown => context_tracker_down_command(),
+        Command::ContextHook { event } => context_hook_command(&event),
     }
+}
+
+fn context_hook_command(event: &str) -> anyhow::Result<()> {
+    let store = consolette::context_forensics::store::ContextForensicsStore::open(
+        &consolette::context_forensics::store::ContextForensicsStore::default_store_path(),
+    )
+    .context("failed to open context-forensics store")?;
+    consolette::context_forensics::hook_event::handle_hook_event(
+        &store,
+        event,
+        &mut std::io::stdin(),
+    )
+}
+
+fn context_tracker_up_command() -> anyhow::Result<()> {
+    let path = consolette::context_forensics::hooks_install::SettingsJsonGateway::default_path();
+    consolette::context_forensics::hooks_install::up(&path).with_context(|| {
+        format!(
+            "failed to install context-forensics hooks into {}",
+            path.display()
+        )
+    })?;
+    println!("installed context-forensics hooks into {}", path.display());
+    Ok(())
+}
+
+fn context_tracker_down_command() -> anyhow::Result<()> {
+    let path = consolette::context_forensics::hooks_install::SettingsJsonGateway::default_path();
+    consolette::context_forensics::hooks_install::down(&path).with_context(|| {
+        format!(
+            "failed to remove context-forensics hooks from {}",
+            path.display()
+        )
+    })?;
+    println!("removed context-forensics hooks from {}", path.display());
+    Ok(())
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -158,12 +210,92 @@ fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("consolette")
 }
 
+/// Combines [`CompactionMcpServer`] and
+/// [`ContextForensicsMcpServer`](consolette::context_forensics::mcp_server::ContextForensicsMcpServer)
+/// behind one `ServerHandler` (plan.md Story 5.1.1 Task 5.1.1b) — an MCP
+/// client only ever connects to one server process, so `consolette mcp`
+/// must expose both tool sets together rather than picking one.
+struct CombinedMcpServer {
+    compaction: CompactionMcpServer,
+    context_forensics: consolette::context_forensics::mcp_server::ContextForensicsMcpServer,
+}
+
+impl CombinedMcpServer {
+    /// The actual `call_tool` routing logic, factored out of
+    /// [`rmcp::ServerHandler::call_tool`] so unit tests can exercise it
+    /// without constructing a live `RequestContext<RoleServer>` (mirrors
+    /// `CompactionMcpServer::dispatch` and
+    /// `ContextForensicsMcpServer::dispatch`'s own same split, for the same
+    /// reason).
+    fn dispatch(&self, request: rmcp::model::CallToolRequestParams) -> rmcp::model::CallToolResult {
+        if consolette::claude_code_session::mcp_server::owns_tool(&request.name) {
+            self.compaction.dispatch(request)
+        } else if consolette::context_forensics::mcp_server::owns_tool(&request.name) {
+            self.context_forensics.dispatch(&request)
+        } else {
+            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                "unknown tool: {}",
+                request.name
+            ))])
+        }
+    }
+}
+
+impl rmcp::ServerHandler for CombinedMcpServer {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "consolette",
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, rmcp::ErrorData>>
+    {
+        let mut tools = consolette::claude_code_session::mcp_server::tool_defs();
+        tools.extend(consolette::context_forensics::mcp_server::tool_defs());
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
+            tools,
+            ..Default::default()
+        }))
+    }
+
+    fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>>
+    {
+        std::future::ready(Ok(self.dispatch(request)))
+    }
+}
+
 async fn mcp() -> anyhow::Result<()> {
     use rmcp::{transport::io::stdio, ServiceExt};
 
     let cache = OmissionCache::open(&OmissionCache::default_cache_path())
         .context("failed to open omission cache")?;
-    let server = CompactionMcpServer::new(Arc::new(cache));
+    let store = consolette::context_forensics::store::ContextForensicsStore::open(
+        &consolette::context_forensics::store::ContextForensicsStore::default_store_path(),
+    )
+    .context("failed to open context-forensics store")?;
+    let pricing = consolette::cost_metrics::pricing::PricingTable::load_default();
+    let server = CombinedMcpServer {
+        compaction: CompactionMcpServer::new(Arc::new(cache)),
+        context_forensics:
+            consolette::context_forensics::mcp_server::ContextForensicsMcpServer::new(
+                Arc::new(store),
+                Arc::new(pricing),
+            ),
+    };
 
     let transport = stdio();
     let service = server.serve(transport).await?;
@@ -359,4 +491,94 @@ async fn compare_cost_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use consolette::context_forensics::mcp_server::ContextForensicsMcpServer;
+    use consolette::context_forensics::store::ContextForensicsStore;
+    use consolette::cost_metrics::pricing::PricingTable;
+    use rmcp::model::CallToolRequestParams;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    fn combined_server(dir: &TempDir) -> CombinedMcpServer {
+        let cache = OmissionCache::open(&dir.path().join("omission-cache.sqlite")).unwrap();
+        let store = ContextForensicsStore::open(&dir.path().join("store.sqlite")).unwrap();
+        let pricing = PricingTable::load_default();
+        CombinedMcpServer {
+            compaction: CompactionMcpServer::new(Arc::new(cache)),
+            context_forensics: ContextForensicsMcpServer::new(Arc::new(store), Arc::new(pricing)),
+        }
+    }
+
+    fn call(tool_name: &str, args: &[(&str, serde_json::Value)]) -> CallToolRequestParams {
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        let mut map = serde_json::Map::new();
+        for (key, value) in args {
+            map.insert((*key).to_string(), value.clone());
+        }
+        params.arguments = Some(map);
+        params
+    }
+
+    #[test]
+    fn tool_defs_should_not_share_any_tool_name_between_sub_servers() {
+        let compaction_names: HashSet<String> =
+            consolette::claude_code_session::mcp_server::tool_defs()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect();
+        let context_forensics_names: HashSet<String> =
+            consolette::context_forensics::mcp_server::tool_defs()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect();
+
+        let overlap: Vec<_> = compaction_names
+            .intersection(&context_forensics_names)
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "expected no shared tool names between the two sub-servers, found {overlap:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_should_route_to_compaction_server_when_tool_owned_by_it() {
+        let dir = TempDir::new().unwrap();
+        let server = combined_server(&dir);
+
+        let result = server.dispatch(call(
+            "read_omitted_content",
+            &[
+                ("session_id", serde_json::json!("s1")),
+                ("content_id", serde_json::json!("omitted-001")),
+            ],
+        ));
+
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn dispatch_should_route_to_context_forensics_server_when_tool_owned_by_it() {
+        let dir = TempDir::new().unwrap();
+        let server = combined_server(&dir);
+
+        let result = server.dispatch(call("list_sessions_summary", &[]));
+
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn dispatch_should_return_error_when_tool_owned_by_neither_sub_server() {
+        let dir = TempDir::new().unwrap();
+        let server = combined_server(&dir);
+
+        let result = server.dispatch(call("not_a_real_tool", &[]));
+
+        assert_eq!(result.is_error, Some(true));
+    }
 }

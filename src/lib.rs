@@ -10,6 +10,7 @@ pub mod auth;
 pub mod claude_code_session;
 pub mod compression;
 pub mod config;
+pub mod context_forensics;
 pub mod cost_metrics;
 pub mod dashboard;
 pub mod entrypoint;

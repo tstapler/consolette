@@ -336,6 +336,40 @@ impl AnthropicProvider {
 
         Ok(response)
     }
+
+    /// Fetch the list of models from `GET /v1/models`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProviderError`] if header construction/auth fails, the
+    /// request times out, or the upstream responds with a non-2xx status.
+    pub async fn fetch_models(&self) -> Result<Value, ProviderError> {
+        let url = format!("{}/v1/models", self.base_url);
+        let headers = self.build_headers(&HeaderMap::new(), &url).await?;
+
+        debug!("Anthropic GET {url}");
+
+        let response = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Upstream {
+                        status: 0,
+                        body: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = response.status();
+        let (value, _status) = map_error_status(status, response).await?;
+        Ok(value)
+    }
 }
 
 /// Apply `upstream`'s configured [`AuthMethod`] to `out`.
@@ -583,6 +617,25 @@ impl Provider for AnthropicProvider {
             let (value, _status) = self.send_request(body, &headers).await?;
             Ok(ProviderResponse::Full(value))
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<super::ModelInfo>, ProviderError> {
+        let value = self.fetch_models().await?;
+        let models = value
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(Value::as_str)?.to_string();
+                Some(super::ModelInfo {
+                    id,
+                    owned_by: Some("anthropic".to_string()),
+                })
+            })
+            .collect();
+        Ok(models)
     }
 }
 

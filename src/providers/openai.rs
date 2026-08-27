@@ -158,6 +158,39 @@ impl OpenaiProvider {
         map_error_status(status, response).await
     }
 
+    /// Fetch the list of models from `GET /v1/models`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProviderError`] if auth resolution, the HTTP request, or
+    /// upstream error-status mapping fails.
+    pub async fn fetch_models(&self) -> Result<Value, ProviderError> {
+        let url = format!("{}/v1/models", self.base_url);
+        let headers = self.build_headers(&url).await?;
+
+        debug!("OpenAI GET {url}");
+
+        let response = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Upstream {
+                        status: 0,
+                        body: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = response.status();
+        map_error_status(status, response).await
+    }
+
     /// Send a streaming request to `POST /v1/chat/completions`.
     ///
     /// # Errors
@@ -302,6 +335,26 @@ impl Provider for OpenaiProvider {
             let anthropic_value = super::translate_openai_response_to_anthropic(&value);
             Ok(ProviderResponse::Full(anthropic_value))
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<super::ModelInfo>, ProviderError> {
+        let value = self.fetch_models().await?;
+        let models = value
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(Value::as_str)?.to_string();
+                let owned_by = entry
+                    .get("owned_by")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                Some(super::ModelInfo { id, owned_by })
+            })
+            .collect();
+        Ok(models)
     }
 }
 

@@ -176,6 +176,11 @@ impl CredCache {
 
 pub struct BedrockProvider {
     client: aws_sdk_bedrockruntime::Client,
+    /// Loaded once at construction alongside `client`; reused to build the
+    /// control-plane `aws_sdk_bedrock::Client` on demand for `list_models`,
+    /// since listing foundation models is a control-plane operation the
+    /// data-plane `aws_sdk_bedrockruntime::Client` has no API for.
+    aws_cfg: aws_config::SdkConfig,
     sso_lock: OnceLock<Mutex<()>>,
     cred_cache: CredCache,
     /// The upstream this provider was constructed for. Kept around (rather
@@ -229,6 +234,7 @@ impl BedrockProvider {
 
         Self {
             client,
+            aws_cfg,
             sso_lock: OnceLock::new(),
             cred_cache: CredCache::new(),
             upstream,
@@ -893,6 +899,32 @@ impl Provider for BedrockProvider {
                 .await?;
             Ok(ProviderResponse::Full(value))
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<super::ModelInfo>, ProviderError> {
+        // Model listing is a control-plane operation (`ListFoundationModels`)
+        // that the data-plane `aws_sdk_bedrockruntime::Client` used for
+        // `InvokeModel`/`Converse` has no API for, so build a second client
+        // from the same loaded AWS config.
+        let control_plane = aws_sdk_bedrock::Client::new(&self.aws_cfg);
+        let output = control_plane
+            .list_foundation_models()
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream {
+                status: 0,
+                body: e.to_string(),
+            })?;
+
+        let models = output
+            .model_summaries()
+            .iter()
+            .map(|m| super::ModelInfo {
+                id: m.model_id().to_string(),
+                owned_by: m.provider_name().map(ToString::to_string),
+            })
+            .collect();
+        Ok(models)
     }
 }
 

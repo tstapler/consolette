@@ -99,6 +99,17 @@ impl ProviderError {
     }
 }
 
+/// One model reported by an upstream's model-listing call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// The model identifier as the upstream expects it in a request body
+    /// (e.g. `"gpt-5.5"`, `"claude-opus-4-5-20251101"`,
+    /// `"us.anthropic.claude-opus-4-5-20251101-v1:0"`).
+    pub id: String,
+    /// Owning organization/provider, when the upstream reports one.
+    pub owned_by: Option<String>,
+}
+
 /// Implemented by each concrete upstream (Anthropic, Bedrock, an
 /// OpenAI-compatible endpoint, ...). Generic dispatch code — the router —
 /// depends only on this trait, never on a concrete provider type.
@@ -120,6 +131,15 @@ pub trait Provider: Send + Sync {
         headers: HeaderMap,
         stream: bool,
     ) -> Result<ProviderResponse, ProviderError>;
+
+    /// List the models this upstream currently makes available, so callers
+    /// can pick a real model id instead of guessing one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProviderError`] on auth failure or a non-2xx response from
+    /// the upstream's model-listing call.
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -66,10 +66,11 @@ impl EntrypointState {
     /// dispatch router from `config` (for example, no candidates configured
     /// or a provider fails to initialize).
     pub async fn build(config: &Config) -> anyhow::Result<Self> {
-        let dispatch_router = Arc::new(DispatchRouter::from_config(config).await?);
-        let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
         let metrics = MetricsCollector::new();
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
+        let dispatch_router =
+            Arc::new(DispatchRouter::from_config(config, Arc::clone(&metrics)).await?);
+        let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
         let route = config.routes.first();
         let server_info = Arc::new(ServerInfo {
             port: config.port,
@@ -91,38 +92,6 @@ impl EntrypointState {
             server_info,
         })
     }
-}
-
-/// Records a successful dispatch's timing into the `/metrics` counters
-/// bucket. `"none"` is the provider-attribution bucket until the router
-/// exposes which upstream actually served a request (Task 3.4.5) — shared
-/// by `messages.rs` and `chat_completions.rs`.
-pub(crate) fn record_dispatch_success(state: &EntrypointState, started: std::time::Instant) {
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    state
-        .metrics
-        .counters
-        .record_request("none", true, duration_ms, 0);
-}
-
-/// Records a failed dispatch into both the counters bucket and the
-/// deduplicated error tracker feeding `/errors/summary`.
-pub(crate) fn record_dispatch_failure(
-    state: &EntrypointState,
-    started: std::time::Instant,
-    err: &crate::providers::ProviderError,
-    model: &str,
-) {
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    state
-        .metrics
-        .counters
-        .record_request("none", false, duration_ms, 0);
-    state.metrics.counters.record_error_kind(err);
-    let _ = state
-        .metrics
-        .error_tracker
-        .push(&err.to_string(), "none", model);
 }
 
 fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {

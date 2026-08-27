@@ -3,8 +3,25 @@
 //! All counters use `AtomicU64` for lock-free concurrent access.
 //! The `ProxyMetrics` struct holds a complete snapshot of all proxy statistics.
 
+use dashmap::DashMap;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-upstream request/latency counters, keyed by upstream name in
+/// `ProxyMetrics::upstreams` (mirrors `ratelimit::RateLimiters`' `DashMap<String, _>`
+/// keying, ADR-004). Replaces the old hardcoded `requests_anthropic`/
+/// `requests_bedrock` fields so any configured upstream — not just the
+/// original two — shows up in `/metrics` (Task 3.4.5).
+#[derive(Default)]
+pub struct UpstreamCounters {
+    pub requests: AtomicU64,
+    pub success: AtomicU64,
+    pub errors: AtomicU64,
+    pub duration_sum_ms: AtomicU64,
+    pub duration_count: AtomicU64,
+    pub first_byte_sum_ms: AtomicU64,
+    pub first_byte_count: AtomicU64,
+}
 
 /// All proxy metrics as atomic counters.
 ///
@@ -13,11 +30,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct ProxyMetrics {
     // ---- Request counters ----
     pub requests_total: AtomicU64,
-    pub requests_anthropic: AtomicU64,
-    pub requests_bedrock: AtomicU64,
     pub requests_success: AtomicU64,
     pub errors_total: AtomicU64,
     pub fallback_switches: AtomicU64,
+
+    /// Per-upstream breakdown, keyed by upstream config name (e.g.
+    /// `"anthropic"`, `"bedrock"`, `"model-gateway-openai"`).
+    pub upstreams: DashMap<String, UpstreamCounters>,
 
     // ---- Error type counters ----
     pub err_timeout: AtomicU64,
@@ -48,16 +67,6 @@ pub struct ProxyMetrics {
     pub count_tokens_total: AtomicU64,
     pub count_tokens_failures: AtomicU64,
 
-    // ---- Provider latency accumulators ----
-    pub anthropic_duration_sum_ms: AtomicU64,
-    pub anthropic_duration_count: AtomicU64,
-    pub anthropic_first_byte_sum_ms: AtomicU64,
-    pub anthropic_first_byte_count: AtomicU64,
-    pub bedrock_duration_sum_ms: AtomicU64,
-    pub bedrock_duration_count: AtomicU64,
-    pub bedrock_first_byte_sum_ms: AtomicU64,
-    pub bedrock_first_byte_count: AtomicU64,
-
     // ---- Duration bucket counters ----
     pub duration_lt1s: AtomicU64,
     pub duration_1_5s: AtomicU64,
@@ -73,11 +82,11 @@ impl ProxyMetrics {
     pub fn new() -> Self {
         Self {
             requests_total: AtomicU64::new(0),
-            requests_anthropic: AtomicU64::new(0),
-            requests_bedrock: AtomicU64::new(0),
             requests_success: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
             fallback_switches: AtomicU64::new(0),
+
+            upstreams: DashMap::new(),
 
             err_timeout: AtomicU64::new(0),
             err_auth: AtomicU64::new(0),
@@ -102,15 +111,6 @@ impl ProxyMetrics {
             count_tokens_total: AtomicU64::new(0),
             count_tokens_failures: AtomicU64::new(0),
 
-            anthropic_duration_sum_ms: AtomicU64::new(0),
-            anthropic_duration_count: AtomicU64::new(0),
-            anthropic_first_byte_sum_ms: AtomicU64::new(0),
-            anthropic_first_byte_count: AtomicU64::new(0),
-            bedrock_duration_sum_ms: AtomicU64::new(0),
-            bedrock_duration_count: AtomicU64::new(0),
-            bedrock_first_byte_sum_ms: AtomicU64::new(0),
-            bedrock_first_byte_count: AtomicU64::new(0),
-
             duration_lt1s: AtomicU64::new(0),
             duration_1_5s: AtomicU64::new(0),
             duration_5_30s: AtomicU64::new(0),
@@ -119,10 +119,14 @@ impl ProxyMetrics {
         }
     }
 
-    /// Record a completed request, updating provider, duration bucket, and success/error counters.
+    /// Record one dispatch attempt against a specific upstream, updating the
+    /// global totals, that upstream's own bucket, and the duration
+    /// histogram bucket. Called once per upstream actually tried — a
+    /// request that fails over from upstream A to upstream B records twice,
+    /// once per attempt (`fallback_switches` tracks the failover itself).
     pub fn record_request(
         &self,
-        provider: &str,
+        upstream: &str,
         success: bool,
         duration_ms: u64,
         first_byte_ms: u64,
@@ -134,34 +138,24 @@ impl ProxyMetrics {
             self.errors_total.fetch_add(1, Ordering::Relaxed);
         }
 
-        match provider {
-            "anthropic" => {
-                self.requests_anthropic.fetch_add(1, Ordering::Relaxed);
-                self.anthropic_duration_sum_ms
-                    .fetch_add(duration_ms, Ordering::Relaxed);
-                self.anthropic_duration_count
-                    .fetch_add(1, Ordering::Relaxed);
-                if first_byte_ms > 0 {
-                    self.anthropic_first_byte_sum_ms
-                        .fetch_add(first_byte_ms, Ordering::Relaxed);
-                    self.anthropic_first_byte_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            "bedrock" => {
-                self.requests_bedrock.fetch_add(1, Ordering::Relaxed);
-                self.bedrock_duration_sum_ms
-                    .fetch_add(duration_ms, Ordering::Relaxed);
-                self.bedrock_duration_count.fetch_add(1, Ordering::Relaxed);
-                if first_byte_ms > 0 {
-                    self.bedrock_first_byte_sum_ms
-                        .fetch_add(first_byte_ms, Ordering::Relaxed);
-                    self.bedrock_first_byte_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            _ => {}
+        let entry = self.upstreams.entry(upstream.to_string()).or_default();
+        entry.requests.fetch_add(1, Ordering::Relaxed);
+        if success {
+            entry.success.fetch_add(1, Ordering::Relaxed);
+        } else {
+            entry.errors.fetch_add(1, Ordering::Relaxed);
         }
+        entry
+            .duration_sum_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        entry.duration_count.fetch_add(1, Ordering::Relaxed);
+        if first_byte_ms > 0 {
+            entry
+                .first_byte_sum_ms
+                .fetch_add(first_byte_ms, Ordering::Relaxed);
+            entry.first_byte_count.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(entry);
 
         // Duration bucket
         match duration_ms {
@@ -200,6 +194,52 @@ impl ProxyMetrics {
         }
     }
 
+    /// Builds the `providers` and `provider_latency` sections of `/metrics`
+    /// from the per-upstream `DashMap`, one entry per upstream actually
+    /// dispatched to at least once.
+    #[allow(clippy::cast_precision_loss)]
+    fn upstream_json(&self) -> (Value, Value) {
+        let mut providers = serde_json::Map::new();
+        let mut provider_latency = serde_json::Map::new();
+
+        for entry in &self.upstreams {
+            let name = entry.key().clone();
+            let c = entry.value();
+
+            providers.insert(
+                name.clone(),
+                json!({
+                    "requests": c.requests.load(Ordering::Relaxed),
+                    "success": c.success.load(Ordering::Relaxed),
+                    "errors": c.errors.load(Ordering::Relaxed),
+                }),
+            );
+
+            let dur_count = c.duration_count.load(Ordering::Relaxed);
+            let dur_avg = c
+                .duration_sum_ms
+                .load(Ordering::Relaxed)
+                .checked_div(dur_count)
+                .unwrap_or(0);
+            let fb_count = c.first_byte_count.load(Ordering::Relaxed);
+            let fb_avg = c
+                .first_byte_sum_ms
+                .load(Ordering::Relaxed)
+                .checked_div(fb_count)
+                .unwrap_or(0);
+            provider_latency.insert(
+                name,
+                json!({
+                    "avg_duration_ms": dur_avg,
+                    "avg_first_byte_ms": fb_avg,
+                    "requests": dur_count,
+                }),
+            );
+        }
+
+        (Value::Object(providers), Value::Object(provider_latency))
+    }
+
     /// Snapshot all counters into a `serde_json::Value` for the `/metrics` endpoint.
     #[must_use]
     // Counter values stay far below 2^52, so the `u64 as f64` conversions below
@@ -226,8 +266,7 @@ impl ProxyMetrics {
             0.0
         };
 
-        let anthropic_req = self.requests_anthropic.load(Ordering::Relaxed);
-        let bedrock_req = self.requests_bedrock.load(Ordering::Relaxed);
+        let (providers, provider_latency) = self.upstream_json();
 
         // Compression stats
         let tokens_before = self.tokens_before.load(Ordering::Relaxed);
@@ -238,32 +277,6 @@ impl ProxyMetrics {
         } else {
             0.0
         };
-
-        // Provider latency
-        let anth_dur_count = self.anthropic_duration_count.load(Ordering::Relaxed);
-        let anth_dur_avg = self
-            .anthropic_duration_sum_ms
-            .load(Ordering::Relaxed)
-            .checked_div(anth_dur_count)
-            .unwrap_or(0);
-        let anth_fb_count = self.anthropic_first_byte_count.load(Ordering::Relaxed);
-        let anth_fb_avg = self
-            .anthropic_first_byte_sum_ms
-            .load(Ordering::Relaxed)
-            .checked_div(anth_fb_count)
-            .unwrap_or(0);
-        let brk_dur_count = self.bedrock_duration_count.load(Ordering::Relaxed);
-        let brk_dur_avg = self
-            .bedrock_duration_sum_ms
-            .load(Ordering::Relaxed)
-            .checked_div(brk_dur_count)
-            .unwrap_or(0);
-        let brk_fb_count = self.bedrock_first_byte_count.load(Ordering::Relaxed);
-        let brk_fb_avg = self
-            .bedrock_first_byte_sum_ms
-            .load(Ordering::Relaxed)
-            .checked_div(brk_fb_count)
-            .unwrap_or(0);
 
         let ct_total = self.count_tokens_total.load(Ordering::Relaxed);
         let ct_failures = self.count_tokens_failures.load(Ordering::Relaxed);
@@ -282,35 +295,8 @@ impl ProxyMetrics {
                 "success_rate": (success_rate * 100.0).round() / 100.0,
                 "error_rate": (error_rate * 100.0).round() / 100.0
             },
-            "providers": {
-                "anthropic": {
-                    "requests": anthropic_req,
-                    "success": 0u64,
-                    "errors": 0u64
-                },
-                "bedrock": {
-                    "requests": bedrock_req,
-                    "success": 0u64,
-                    "errors": 0u64
-                },
-                "none": {
-                    "requests": 0u64,
-                    "success": 0u64,
-                    "errors": 0u64
-                }
-            },
-            "provider_latency": {
-                "anthropic": {
-                    "avg_duration_ms": anth_dur_avg,
-                    "avg_first_byte_ms": anth_fb_avg,
-                    "requests": anth_dur_count
-                },
-                "bedrock": {
-                    "avg_duration_ms": brk_dur_avg,
-                    "avg_first_byte_ms": brk_fb_avg,
-                    "requests": brk_dur_count
-                }
-            },
+            "providers": providers,
+            "provider_latency": provider_latency,
             "compression": {
                 "total_tokens_before": tokens_before,
                 "total_tokens_after": tokens_after,
@@ -377,13 +363,53 @@ mod tests {
     #[test]
     fn record_request_updates_totals_and_duration_bucket() {
         let m = ProxyMetrics::new();
-        m.record_request("none", true, 500, 0);
-        m.record_request("none", false, 2_000, 0);
+        m.record_request("upstream-a", true, 500, 0);
+        m.record_request("upstream-a", false, 2_000, 0);
 
         assert_eq!(m.requests_total.load(Ordering::Relaxed), 2);
         assert_eq!(m.requests_success.load(Ordering::Relaxed), 1);
         assert_eq!(m.errors_total.load(Ordering::Relaxed), 1);
         assert_eq!(m.duration_lt1s.load(Ordering::Relaxed), 1);
         assert_eq!(m.duration_1_5s.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn record_request_tracks_any_upstream_name_independently() {
+        let m = ProxyMetrics::new();
+        m.record_request("model-gateway-openai", true, 100, 20);
+        m.record_request("model-gateway-openai", true, 300, 0);
+        m.record_request("bedrock", false, 1_000, 0);
+
+        let gateway = m.upstreams.get("model-gateway-openai").unwrap();
+        assert_eq!(gateway.requests.load(Ordering::Relaxed), 2);
+        assert_eq!(gateway.success.load(Ordering::Relaxed), 2);
+        assert_eq!(gateway.duration_sum_ms.load(Ordering::Relaxed), 400);
+        assert_eq!(gateway.first_byte_count.load(Ordering::Relaxed), 1);
+        drop(gateway);
+
+        let bedrock = m.upstreams.get("bedrock").unwrap();
+        assert_eq!(bedrock.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(bedrock.errors.load(Ordering::Relaxed), 1);
+        drop(bedrock);
+
+        assert!(m.upstreams.get("anthropic").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn to_json_reports_one_providers_entry_per_upstream_seen() {
+        let m = ProxyMetrics::new();
+        m.record_request("anthropic", true, 100, 0);
+        m.record_request("model-gateway-openai", true, 200, 0);
+
+        let json = m.to_json();
+        let providers = json["providers"].as_object().unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers["anthropic"]["requests"], json!(1));
+        assert_eq!(providers["model-gateway-openai"]["requests"], json!(1));
+
+        let latency = json["provider_latency"].as_object().unwrap();
+        assert_eq!(latency["anthropic"]["avg_duration_ms"], json!(100));
     }
 }

@@ -219,6 +219,7 @@ mod tests {
         use crate::routing::router::Router as DispatchRouter;
         use crate::routing::strategy::FallbackStrategy;
 
+        let metrics = crate::metrics::MetricsCollector::new();
         EntrypointState {
             dispatch_router: std::sync::Arc::new(DispatchRouter::new(
                 vec![],
@@ -228,6 +229,7 @@ mod tests {
                 std::sync::Arc::new(crate::ratelimit::RateLimiters::new(
                     &crate::config::schema::RateLimitConfig::default(),
                 )),
+                std::sync::Arc::clone(&metrics),
             )),
             cost_tracker: std::sync::Arc::new(
                 crate::cost_metrics::tracker::CostTracker::new(
@@ -235,7 +237,7 @@ mod tests {
                 )
                 .await,
             ),
-            metrics: crate::metrics::MetricsCollector::new(),
+            metrics,
             server_info: std::sync::Arc::new(super::super::ServerInfo {
                 port: 47000,
                 route_name: "default".to_string(),

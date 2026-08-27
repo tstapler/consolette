@@ -17,6 +17,7 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Strategy, UpstreamKind};
+use crate::metrics::MetricsCollector;
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::openai::OpenaiProvider;
@@ -35,6 +36,7 @@ pub struct Router {
     strategy: Arc<dyn RoutingStrategy>,
     health: Arc<HealthRegistry>,
     admission: Arc<dyn AdmissionControl>,
+    metrics: Arc<MetricsCollector>,
 }
 
 /// Builds a live `Provider` for every configured upstream, keyed by its
@@ -82,6 +84,7 @@ impl Router {
         strategy: Arc<dyn RoutingStrategy>,
         health: Arc<HealthRegistry>,
         admission: Arc<dyn AdmissionControl>,
+        metrics: Arc<MetricsCollector>,
     ) -> Self {
         Self {
             candidates,
@@ -89,6 +92,7 @@ impl Router {
             strategy,
             health,
             admission,
+            metrics,
         }
     }
 
@@ -102,7 +106,10 @@ impl Router {
     /// Returns `Err` if any upstream fails to construct its `Provider`,
     /// if `config.routes` is empty, or if a route references an upstream
     /// name not present in `config.upstreams`.
-    pub async fn from_config(config: &Config) -> anyhow::Result<Router> {
+    pub async fn from_config(
+        config: &Config,
+        metrics: Arc<MetricsCollector>,
+    ) -> anyhow::Result<Router> {
         let providers: Vec<Arc<dyn Provider>> = build_providers(config)
             .await?
             .into_iter()
@@ -168,7 +175,7 @@ impl Router {
         );
 
         Ok(Router::new(
-            candidates, providers, strategy, health, admission,
+            candidates, providers, strategy, health, admission, metrics,
         ))
     }
 
@@ -191,6 +198,11 @@ impl Router {
     ) -> Result<ProviderResponse, ProviderError> {
         let mut already_tried: HashSet<usize> = HashSet::new();
         let mut last_error: Option<ProviderError> = None;
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
 
         loop {
             let healthy: Vec<UpstreamRef> = self
@@ -227,21 +239,64 @@ impl Router {
                 }
                 None => body.clone(),
             };
+            let attempt_started = std::time::Instant::now();
             match provider.send(request_body, headers.clone(), stream).await {
-                Ok(response) => return Ok(response),
-                Err(e) if e.is_validation() || e.is_auth() => return Err(e),
+                Ok(response) => {
+                    self.record_attempt(&chosen.name, attempt_started, Ok(()), &model);
+                    return Ok(response);
+                }
+                Err(e) if e.is_validation() || e.is_auth() => {
+                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    return Err(e);
+                }
                 Err(e) if e.is_rate_limited() => {
+                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
                     let override_duration = e.retry_after_secs().map(Duration::from_secs);
                     self.health.trip(chosen.index, override_duration);
                     last_error = Some(e);
                 }
                 Err(e) => {
+                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
                     last_error = Some(e);
                 }
             }
         }
 
         Err(last_error.unwrap_or(ProviderError::Exhausted))
+    }
+
+    /// Records one dispatch attempt's timing/outcome for `/metrics`
+    /// (Task 3.4.5) — per-upstream request/success/error counts plus, on
+    /// failure, the error-type breakdown and the deduplicated error tracker
+    /// feeding `/errors/summary`. For a streaming response this measures
+    /// time-to-headers only (`provider.send` returns once the stream is
+    /// ready, not once it's fully consumed) — full stream duration would
+    /// need a metrics-side tee analogous to `CostTrackingStream`.
+    fn record_attempt(
+        &self,
+        upstream: &str,
+        started: std::time::Instant,
+        outcome: Result<(), &ProviderError>,
+        model: &str,
+    ) {
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match outcome {
+            Ok(()) => {
+                self.metrics
+                    .counters
+                    .record_request(upstream, true, duration_ms, 0);
+            }
+            Err(e) => {
+                self.metrics
+                    .counters
+                    .record_request(upstream, false, duration_ms, 0);
+                self.metrics.counters.record_error_kind(e);
+                let _ = self
+                    .metrics
+                    .error_tracker
+                    .push(&e.to_string(), upstream, model);
+            }
+        }
     }
 }
 
@@ -330,6 +385,7 @@ mod tests {
             Arc::new(FallbackStrategy),
             health,
             Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
         )
     }
 
@@ -529,6 +585,7 @@ mod tests {
             Arc::new(ShedFor {
                 upstream: "primary",
             }),
+            MetricsCollector::new(),
         );
 
         let res = router
@@ -567,6 +624,7 @@ mod tests {
             Arc::new(FallbackStrategy),
             health,
             Arc::new(AlwaysShed),
+            MetricsCollector::new(),
         );
 
         let res = router
@@ -620,6 +678,7 @@ mod tests {
             Arc::new(WeightedStrategy),
             health,
             Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
         );
 
         for _ in 0..10 {
@@ -644,7 +703,7 @@ mod tests {
         // be set for this to succeed.
         let config = Config::default();
         #[allow(clippy::expect_used)]
-        let router = Router::from_config(&config)
+        let router = Router::from_config(&config, MetricsCollector::new())
             .await
             .expect("Config::default() must build a Router");
         assert_eq!(router.candidates.len(), 2);
@@ -682,7 +741,7 @@ mod tests {
         };
 
         #[allow(clippy::expect_used)]
-        let router = Router::from_config(&config)
+        let router = Router::from_config(&config, MetricsCollector::new())
             .await
             .expect("Openai-kind upstream must build a Provider");
         assert_eq!(router.candidates[0].name, "my-openai-upstream");
@@ -695,7 +754,7 @@ mod tests {
             routes: vec![],
             ..Config::default()
         };
-        let Err(err) = Router::from_config(&config).await else {
+        let Err(err) = Router::from_config(&config, MetricsCollector::new()).await else {
             panic!("empty routes must fail")
         };
         assert!(err.to_string().contains("no routes configured"));
@@ -719,7 +778,7 @@ mod tests {
         config.routes = vec![route_a, route_b];
 
         #[allow(clippy::expect_used)]
-        let router = Router::from_config(&config)
+        let router = Router::from_config(&config, MetricsCollector::new())
             .await
             .expect("multi-route config must still build");
         assert_eq!(router.candidates.len(), 2);
@@ -762,6 +821,7 @@ mod tests {
             name: "pinned",
             received_body: received_body.clone(),
         })];
+        let metrics = MetricsCollector::new();
         let router = Router::new(
             vec![UpstreamRef {
                 index: 0,
@@ -773,6 +833,7 @@ mod tests {
             Arc::new(FallbackStrategy),
             Arc::new(HealthRegistry::new(300)),
             Arc::new(AlwaysAllow),
+            metrics.clone(),
         );
 
         let res = router
@@ -791,6 +852,10 @@ mod tests {
             .clone()
             .expect("provider must have been called");
         assert_eq!(body["model"], serde_json::json!("gpt-5.1-codex-max"));
+
+        let pinned = metrics.counters.upstreams.get("pinned").unwrap();
+        assert_eq!(pinned.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(pinned.success.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -807,6 +872,7 @@ mod tests {
             Arc::new(FallbackStrategy),
             Arc::new(HealthRegistry::new(300)),
             Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
         );
 
         let res = router
@@ -825,5 +891,56 @@ mod tests {
             .clone()
             .expect("provider must have been called");
         assert_eq!(body["model"], serde_json::json!("claude-sonnet-4-5"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_attributes_per_upstream_metrics_across_a_failover() {
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(AlwaysErrProvider {
+                name: "primary",
+                error: || ProviderError::RateLimited,
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+            Arc::new(AlwaysOkProvider {
+                name: "fallback",
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+        ];
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![upstream(0, "primary"), upstream(1, "fallback")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics.clone(),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+        assert!(res.is_ok());
+
+        let primary = metrics.counters.upstreams.get("primary").unwrap();
+        assert_eq!(primary.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(primary.errors.load(Ordering::Relaxed), 1);
+        drop(primary);
+
+        let fallback = metrics.counters.upstreams.get("fallback").unwrap();
+        assert_eq!(fallback.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback.success.load(Ordering::Relaxed), 1);
+        drop(fallback);
+
+        assert_eq!(
+            metrics.counters.err_rate_limit.load(Ordering::Relaxed),
+            1,
+            "the primary's RateLimited error must be classified"
+        );
+        assert_eq!(
+            metrics.error_tracker.get_summary(10).len(),
+            1,
+            "the primary's failure must be pushed into the error tracker"
+        );
     }
 }

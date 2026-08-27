@@ -51,17 +51,7 @@ pub fn install(start: bool) -> anyhow::Result<()> {
         .args(["bootout", &domain_target])
         .status();
 
-    let status = Command::new("launchctl")
-        .args([
-            "bootstrap",
-            &format!("gui/{uid}"),
-            &plist_path.to_string_lossy(),
-        ])
-        .status()
-        .context("failed to run `launchctl bootstrap`")?;
-    if !status.success() {
-        bail!("`launchctl bootstrap` exited with {status}");
-    }
+    bootstrap_with_retry(&uid, &plist_path)?;
     println!("loaded {LABEL} (RunAtLoad=false — starts on next login, or pass --start now)");
 
     if start {
@@ -76,6 +66,33 @@ pub fn install(start: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// `launchctl bootstrap` immediately after a `bootout` of the same label can
+/// transiently fail with "Input/output error" — observed in practice, not
+/// documented by Apple — because launchd hasn't finished tearing down the
+/// old job yet. One short-backoff retry clears it without surfacing a
+/// spurious failure on every reinstall of an already-running agent.
+fn bootstrap_with_retry(uid: &str, plist_path: &std::path::Path) -> anyhow::Result<()> {
+    const ATTEMPTS: u32 = 3;
+
+    let domain = format!("gui/{uid}");
+    let plist_path = plist_path.to_string_lossy();
+    let mut last_status = None;
+    for attempt in 1..=ATTEMPTS {
+        let status = Command::new("launchctl")
+            .args(["bootstrap", &domain, &plist_path])
+            .status()
+            .context("failed to run `launchctl bootstrap`")?;
+        if status.success() {
+            return Ok(());
+        }
+        last_status = Some(status);
+        if attempt < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+    bail!("`launchctl bootstrap` exited with {last_status:?} after {ATTEMPTS} attempts");
 }
 
 fn current_uid() -> anyhow::Result<String> {

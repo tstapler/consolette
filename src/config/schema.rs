@@ -147,6 +147,11 @@ pub struct RouteUpstreamRef {
     pub name: String,
     #[serde(default)]
     pub weight: Option<f64>,
+    /// Overrides the `"model"` field of the outgoing request body when this
+    /// upstream is selected, so a route can pin an upstream to a specific
+    /// model instead of forwarding whatever the client requested.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -350,10 +355,12 @@ impl Default for Config {
                     RouteUpstreamRef {
                         name: "anthropic".to_string(),
                         weight: None,
+                        model: None,
                     },
                     RouteUpstreamRef {
                         name: "bedrock".to_string(),
                         weight: None,
+                        model: None,
                     },
                 ],
             }],

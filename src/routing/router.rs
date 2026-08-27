@@ -37,6 +37,43 @@ pub struct Router {
     admission: Arc<dyn AdmissionControl>,
 }
 
+/// Builds a live `Provider` for every configured upstream, keyed by its
+/// config name — independent of any route, so `consolette list-models` can
+/// enumerate every upstream's models, including ones no route currently
+/// selects.
+///
+/// # Errors
+///
+/// Returns `Err` if any upstream fails to construct its `Provider`.
+pub async fn build_providers(config: &Config) -> anyhow::Result<Vec<(String, Arc<dyn Provider>)>> {
+    let resolver: Arc<dyn SecretResolver + Send + Sync> = Arc::new(SystemSecretResolver);
+    let exec_cache = Arc::new(ExecCredentialCache::new());
+
+    let mut providers = Vec::with_capacity(config.upstreams.len());
+    for upstream in &config.upstreams {
+        let provider: Arc<dyn Provider> = match &upstream.kind {
+            UpstreamKind::Anthropic => Arc::new(AnthropicProvider::new(
+                Arc::new(upstream.clone()),
+                Arc::clone(&resolver),
+                Arc::clone(&exec_cache),
+                config.request_timeout,
+            )?),
+            UpstreamKind::Bedrock { .. } => {
+                Arc::new(BedrockProvider::new(Arc::new(upstream.clone())).await)
+            }
+            UpstreamKind::Openai { base_url } => Arc::new(OpenaiProvider::new(
+                Arc::new(upstream.clone()),
+                base_url.clone(),
+                Arc::clone(&resolver),
+                Arc::clone(&exec_cache),
+                config.request_timeout,
+            )?),
+        };
+        providers.push((upstream.name.clone(), provider));
+    }
+    Ok(providers)
+}
+
 impl Router {
     #[must_use]
     pub fn new(
@@ -66,39 +103,18 @@ impl Router {
     /// if `config.routes` is empty, or if a route references an upstream
     /// name not present in `config.upstreams`.
     pub async fn from_config(config: &Config) -> anyhow::Result<Router> {
-        let resolver: Arc<dyn SecretResolver + Send + Sync> = Arc::new(SystemSecretResolver);
-        let exec_cache = Arc::new(ExecCredentialCache::new());
-
-        let mut providers: Vec<Arc<dyn Provider>> = Vec::with_capacity(config.upstreams.len());
-        let mut bedrock_indices: Vec<usize> = Vec::new();
-        for (idx, upstream) in config.upstreams.iter().enumerate() {
-            match &upstream.kind {
-                UpstreamKind::Anthropic => {
-                    let provider = AnthropicProvider::new(
-                        Arc::new(upstream.clone()),
-                        Arc::clone(&resolver),
-                        Arc::clone(&exec_cache),
-                        config.request_timeout,
-                    )?;
-                    providers.push(Arc::new(provider) as Arc<dyn Provider>);
-                }
-                UpstreamKind::Bedrock { .. } => {
-                    let provider = BedrockProvider::new(Arc::new(upstream.clone())).await;
-                    bedrock_indices.push(idx);
-                    providers.push(Arc::new(provider) as Arc<dyn Provider>);
-                }
-                UpstreamKind::Openai { base_url } => {
-                    let provider = OpenaiProvider::new(
-                        Arc::new(upstream.clone()),
-                        base_url.clone(),
-                        Arc::clone(&resolver),
-                        Arc::clone(&exec_cache),
-                        config.request_timeout,
-                    )?;
-                    providers.push(Arc::new(provider) as Arc<dyn Provider>);
-                }
-            }
-        }
+        let providers: Vec<Arc<dyn Provider>> = build_providers(config)
+            .await?
+            .into_iter()
+            .map(|(_, provider)| provider)
+            .collect();
+        let bedrock_indices: Vec<usize> = config
+            .upstreams
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| matches!(u.kind, UpstreamKind::Bedrock { .. }))
+            .map(|(idx, _)| idx)
+            .collect();
 
         let health = Arc::new(HealthRegistry::new(config.cooldown_seconds));
         for idx in bedrock_indices {
@@ -133,6 +149,7 @@ impl Router {
                 index,
                 name: route_upstream.name.clone(),
                 weight: route_upstream.weight.unwrap_or(1.0),
+                model: route_upstream.model.clone(),
             });
         }
 
@@ -202,7 +219,15 @@ impl Router {
             }
 
             let provider = &self.providers[chosen.index];
-            match provider.send(body.clone(), headers.clone(), stream).await {
+            let request_body = match &chosen.model {
+                Some(model) => {
+                    let mut b = body.clone();
+                    b["model"] = serde_json::Value::String(model.clone());
+                    b
+                }
+                None => body.clone(),
+            };
+            match provider.send(request_body, headers.clone(), stream).await {
                 Ok(response) => return Ok(response),
                 Err(e) if e.is_validation() || e.is_auth() => return Err(e),
                 Err(e) if e.is_rate_limited() => {
@@ -247,6 +272,10 @@ mod tests {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
         }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
     }
 
     struct AlwaysErrProvider {
@@ -270,6 +299,10 @@ mod tests {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             Err((self.error)())
         }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
     }
 
     fn upstream(index: usize, name: &str) -> UpstreamRef {
@@ -277,6 +310,7 @@ mod tests {
             index,
             name: name.to_string(),
             weight: 1.0,
+            model: None,
         }
     }
 
@@ -573,11 +607,13 @@ mod tests {
                     index: 0,
                     name: "a".to_string(),
                     weight: 0.7,
+                    model: None,
                 },
                 UpstreamRef {
                     index: 1,
                     name: "b".to_string(),
                     weight: 0.3,
+                    model: None,
                 },
             ],
             providers,
@@ -621,6 +657,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn from_config_openai_kind_builds_successfully() {
         use crate::config::schema::{Route, RouteUpstreamRef, Upstream, UpstreamKind};
 
@@ -638,6 +675,7 @@ mod tests {
                 upstreams: vec![RouteUpstreamRef {
                     name: "my-openai-upstream".to_string(),
                     weight: None,
+                    model: None,
                 }],
             }],
             ..Config::default()
@@ -675,6 +713,7 @@ mod tests {
             upstreams: vec![RouteUpstreamRef {
                 name: "bedrock".to_string(),
                 weight: None,
+                model: None,
             }],
         };
         config.routes = vec![route_a, route_b];
@@ -686,5 +725,105 @@ mod tests {
         assert_eq!(router.candidates.len(), 2);
         assert_eq!(router.candidates[0].name, "anthropic");
         assert_eq!(router.candidates[1].name, "bedrock");
+    }
+
+    struct CapturingProvider {
+        name: &'static str,
+        received_body: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        #[allow(clippy::unwrap_used)]
+        async fn send(
+            &self,
+            body: serde_json::Value,
+            _headers: HeaderMap,
+            _stream: bool,
+        ) -> Result<ProviderResponse, ProviderError> {
+            *self.received_body.lock().unwrap() = Some(body);
+            Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn dispatch_overrides_model_field_when_upstream_pins_one() {
+        let received_body = Arc::new(std::sync::Mutex::new(None));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
+            name: "pinned",
+            received_body: received_body.clone(),
+        })];
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "pinned".to_string(),
+                weight: 1.0,
+                model: Some("gpt-5.1-codex-max".to_string()),
+            }],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+        );
+
+        let res = router
+            .dispatch(
+                serde_json::json!({"model": "claude-sonnet-4-5"}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+
+        assert!(res.is_ok());
+        let body = received_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+        assert_eq!(body["model"], serde_json::json!("gpt-5.1-codex-max"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn dispatch_leaves_model_field_untouched_when_upstream_has_no_override() {
+        let received_body = Arc::new(std::sync::Mutex::new(None));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
+            name: "unpinned",
+            received_body: received_body.clone(),
+        })];
+        let router = Router::new(
+            vec![upstream(0, "unpinned")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+        );
+
+        let res = router
+            .dispatch(
+                serde_json::json!({"model": "claude-sonnet-4-5"}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+
+        assert!(res.is_ok());
+        let body = received_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+        assert_eq!(body["model"], serde_json::json!("claude-sonnet-4-5"));
     }
 }

@@ -18,6 +18,7 @@ pub struct UpstreamRef {
     pub index: usize,
     pub name: String,
     pub weight: f64,
+    pub model: Option<String>,
 }
 
 /// Pure selection over an already health-filtered candidate slice.
@@ -72,6 +73,7 @@ mod tests {
             index,
             name: name.to_string(),
             weight,
+            model: None,
         }
     }
 

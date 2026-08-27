@@ -96,6 +96,20 @@ enum Command {
         /// The hook event name (e.g. `PostToolUse`, `SessionStart`).
         event: String,
     },
+    /// Query every configured upstream for the models it currently makes
+    /// available, so a route's `model` field can be set to a real id instead
+    /// of a guess.
+    ListModels,
+    /// Install or update the macOS `LaunchAgent` (`com.consolette`) that runs
+    /// `consolette run` in the background (ADR-005 Story 6.3). Safe to
+    /// re-run any time the binary or environment changes — it overwrites
+    /// the plist and reloads the agent.
+    Install {
+        /// Also start the service immediately (`launchctl kickstart -k`)
+        /// instead of waiting for the next login.
+        #[arg(long)]
+        start: bool,
+    },
 }
 
 #[tokio::main]
@@ -125,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
         Command::ContextTrackerUp => context_tracker_up_command(),
         Command::ContextTrackerDown => context_tracker_down_command(),
         Command::ContextHook { event } => context_hook_command(&event),
+        Command::ListModels => list_models_command().await,
+        Command::Install { start } => consolette::service::install(start),
     }
 }
 
@@ -174,6 +190,29 @@ async fn run() -> anyhow::Result<()> {
     );
     let state = consolette::entrypoint::EntrypointState::build(&config).await?;
     consolette::entrypoint::serve_entrypoint(config.port, state).await
+}
+
+async fn list_models_command() -> anyhow::Result<()> {
+    let config = config::load(&config_dir())?;
+    let providers = consolette::routing::router::build_providers(&config).await?;
+
+    for (name, provider) in &providers {
+        println!("{name}:");
+        match provider.list_models().await {
+            Ok(models) if models.is_empty() => println!("  (no models reported)"),
+            Ok(models) => {
+                for model in models {
+                    match model.owned_by {
+                        Some(owned_by) => println!("  {} (owned by {owned_by})", model.id),
+                        None => println!("  {}", model.id),
+                    }
+                }
+            }
+            Err(err) => println!("  error: {err}"),
+        }
+    }
+
+    Ok(())
 }
 
 fn list_sessions_command(sort: &str, limit: Option<usize>) -> anyhow::Result<()> {

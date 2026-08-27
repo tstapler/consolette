@@ -50,6 +50,7 @@ pub async fn post_v1_chat_completions(
     let anthropic_body = translate_openai_to_anthropic(&body);
 
     let (session_key, request_id) = begin_cost_tracking(&state.cost_tracker).await;
+    let dispatch_started = std::time::Instant::now();
 
     match state
         .dispatch_router
@@ -57,11 +58,15 @@ pub async fn post_v1_chat_completions(
         .await
     {
         Ok(ProviderResponse::Full(json)) => {
+            crate::entrypoint::record_dispatch_success(&state, dispatch_started);
             let openai_json =
                 translate_and_record(&state.cost_tracker, &session_key, request_id, &json).await;
             (StatusCode::OK, Json(openai_json)).into_response()
         }
         Ok(ProviderResponse::Stream(s)) => {
+            // Time-to-headers only — see messages.rs::post_v1_messages for why
+            // full stream duration isn't tracked yet.
+            crate::entrypoint::record_dispatch_success(&state, dispatch_started);
             let tee = CostTrackingStream::new(
                 s,
                 std::sync::Arc::clone(&state.cost_tracker),
@@ -79,6 +84,7 @@ pub async fn post_v1_chat_completions(
                 .unwrap()
         }
         Err(e) => {
+            crate::entrypoint::record_dispatch_failure(&state, dispatch_started, &e, &model);
             state
                 .cost_tracker
                 .record_request_failed(&session_key, request_id)
@@ -183,6 +189,7 @@ mod tests {
                 )
                 .await,
             ),
+            metrics: crate::metrics::MetricsCollector::new(),
             server_info: Arc::new(crate::entrypoint::ServerInfo {
                 port: 0,
                 route_name: "test".to_string(),

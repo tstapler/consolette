@@ -13,6 +13,7 @@ pub mod cost_tee;
 pub mod errors;
 pub mod landing;
 pub mod messages;
+pub mod observability;
 pub mod openai_stream;
 
 use std::net::SocketAddr;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use crate::config::schema::{Config, UpstreamKind};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
+use crate::metrics::MetricsCollector;
 use crate::routing::router::Router as DispatchRouter;
 
 /// One upstream's name and kind, for display on the landing page
@@ -42,18 +44,21 @@ pub struct ServerInfo {
 
 /// Shared state reachable from every entrypoint handler: the dispatch
 /// router (candidates/providers/strategy/health/admission), the cost
-/// tracker, and static server info for the landing page. Cloning shares the
-/// same underlying instances via `Arc::clone`.
+/// tracker, request/error metrics, and static server info for the landing
+/// page. Cloning shares the same underlying instances via `Arc::clone`.
 #[derive(Clone)]
 pub struct EntrypointState {
     pub dispatch_router: Arc<DispatchRouter>,
     pub cost_tracker: Arc<CostTracker>,
+    pub metrics: Arc<MetricsCollector>,
     pub server_info: Arc<ServerInfo>,
 }
 
 impl EntrypointState {
-    /// Builds the dispatch router (Task 1.1.1/1.1.2), cost tracker, and
-    /// landing-page server info from a loaded `Config`.
+    /// Builds the dispatch router (Task 1.1.1/1.1.2), cost tracker, metrics
+    /// collector (Story 6.2 Task 6.2.5), and landing-page server info from a
+    /// loaded `Config`. Spawns the background event-loop-lag monitor that
+    /// feeds `/metrics`' `lag_data`.
     ///
     /// # Errors
     ///
@@ -63,6 +68,8 @@ impl EntrypointState {
     pub async fn build(config: &Config) -> anyhow::Result<Self> {
         let dispatch_router = Arc::new(DispatchRouter::from_config(config).await?);
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
+        let metrics = MetricsCollector::new();
+        tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
         let route = config.routes.first();
         let server_info = Arc::new(ServerInfo {
             port: config.port,
@@ -80,9 +87,42 @@ impl EntrypointState {
         Ok(Self {
             dispatch_router,
             cost_tracker,
+            metrics,
             server_info,
         })
     }
+}
+
+/// Records a successful dispatch's timing into the `/metrics` counters
+/// bucket. `"none"` is the provider-attribution bucket until the router
+/// exposes which upstream actually served a request (Task 3.4.5) — shared
+/// by `messages.rs` and `chat_completions.rs`.
+pub(crate) fn record_dispatch_success(state: &EntrypointState, started: std::time::Instant) {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    state
+        .metrics
+        .counters
+        .record_request("none", true, duration_ms, 0);
+}
+
+/// Records a failed dispatch into both the counters bucket and the
+/// deduplicated error tracker feeding `/errors/summary`.
+pub(crate) fn record_dispatch_failure(
+    state: &EntrypointState,
+    started: std::time::Instant,
+    err: &crate::providers::ProviderError,
+    model: &str,
+) {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    state
+        .metrics
+        .counters
+        .record_request("none", false, duration_ms, 0);
+    state.metrics.counters.record_error_kind(err);
+    let _ = state
+        .metrics
+        .error_tracker
+        .push(&err.to_string(), "none", model);
 }
 
 fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
@@ -105,6 +145,15 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
         .route(
             "/v1/chat/completions",
             axum::routing::post(crate::entrypoint::chat_completions::post_v1_chat_completions),
+        )
+        .route(
+            "/dashboard",
+            axum::routing::get(crate::dashboard::handle_dashboard),
+        )
+        .route("/metrics", axum::routing::get(observability::get_metrics))
+        .route(
+            "/errors/summary",
+            axum::routing::get(observability::get_errors_summary),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
@@ -263,6 +312,58 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(content_type.starts_with("text/html"));
+    }
+
+    #[tokio::test]
+    async fn observability_routes_serve_expected_shapes() {
+        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let router = entrypoint_router(state);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("summary").is_some(), "missing summary: {json}");
+        assert!(
+            json.get("error_types").is_some(),
+            "missing error_types: {json}"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/errors/summary")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"], serde_json::json!([]));
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/dashboard")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]

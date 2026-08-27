@@ -183,6 +183,23 @@ impl ProxyMetrics {
         }
     }
 
+    /// Classify a dispatch failure into the `error_types` breakdown
+    /// (`timeout`/`auth`/`rate_limit`/`validation`) shown in `/metrics`.
+    pub fn record_error_kind(&self, err: &crate::providers::ProviderError) {
+        if matches!(err, crate::providers::ProviderError::Timeout) {
+            self.err_timeout.fetch_add(1, Ordering::Relaxed);
+        }
+        if err.is_auth() {
+            self.err_auth.fetch_add(1, Ordering::Relaxed);
+        }
+        if err.is_rate_limited() {
+            self.err_rate_limit.fetch_add(1, Ordering::Relaxed);
+        }
+        if err.is_validation() {
+            self.err_validation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Snapshot all counters into a `serde_json::Value` for the `/metrics` endpoint.
     #[must_use]
     // Counter values stay far below 2^52, so the `u64 as f64` conversions below
@@ -335,5 +352,38 @@ impl ProxyMetrics {
                 "validation": self.err_validation.load(Ordering::Relaxed)
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::ProviderError;
+
+    #[test]
+    fn record_error_kind_classifies_each_variant() {
+        let m = ProxyMetrics::new();
+        m.record_error_kind(&ProviderError::Timeout);
+        m.record_error_kind(&ProviderError::Auth("bad token".to_string()));
+        m.record_error_kind(&ProviderError::RateLimited);
+        m.record_error_kind(&ProviderError::Validation("bad field".to_string(), 400));
+
+        assert_eq!(m.err_timeout.load(Ordering::Relaxed), 1);
+        assert_eq!(m.err_auth.load(Ordering::Relaxed), 1);
+        assert_eq!(m.err_rate_limit.load(Ordering::Relaxed), 1);
+        assert_eq!(m.err_validation.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn record_request_updates_totals_and_duration_bucket() {
+        let m = ProxyMetrics::new();
+        m.record_request("none", true, 500, 0);
+        m.record_request("none", false, 2_000, 0);
+
+        assert_eq!(m.requests_total.load(Ordering::Relaxed), 2);
+        assert_eq!(m.requests_success.load(Ordering::Relaxed), 1);
+        assert_eq!(m.errors_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.duration_lt1s.load(Ordering::Relaxed), 1);
+        assert_eq!(m.duration_1_5s.load(Ordering::Relaxed), 1);
     }
 }

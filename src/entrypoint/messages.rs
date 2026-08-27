@@ -42,6 +42,7 @@ pub async fn post_v1_messages(
     let est_tokens = estimate_tokens(&body);
 
     let (session_key, request_id) = begin_cost_tracking(&state.cost_tracker).await;
+    let dispatch_started = std::time::Instant::now();
 
     match state
         .dispatch_router
@@ -49,6 +50,7 @@ pub async fn post_v1_messages(
         .await
     {
         Ok(ProviderResponse::Full(json)) => {
+            crate::entrypoint::record_dispatch_success(&state, dispatch_started);
             crate::cost_metrics::record_actual_usage_from_anthropic_response(
                 &state.cost_tracker,
                 &session_key,
@@ -60,6 +62,10 @@ pub async fn post_v1_messages(
             (StatusCode::OK, Json(json)).into_response()
         }
         Ok(ProviderResponse::Stream(s)) => {
+            // Time-to-headers only, not full stream duration — measuring the
+            // latter needs a metrics-side tee analogous to CostTrackingStream,
+            // which is out of scope for this port (Story 6.2 Task 6.2.5).
+            crate::entrypoint::record_dispatch_success(&state, dispatch_started);
             let tee = CostTrackingStream::new(
                 s,
                 std::sync::Arc::clone(&state.cost_tracker),
@@ -76,6 +82,7 @@ pub async fn post_v1_messages(
                 .unwrap()
         }
         Err(e) => {
+            crate::entrypoint::record_dispatch_failure(&state, dispatch_started, &e, &model);
             state
                 .cost_tracker
                 .record_request_failed(&session_key, request_id)
@@ -181,6 +188,7 @@ mod tests {
                 )
                 .await,
             ),
+            metrics: crate::metrics::MetricsCollector::new(),
             server_info: Arc::new(crate::entrypoint::ServerInfo {
                 port: 0,
                 route_name: "test".to_string(),

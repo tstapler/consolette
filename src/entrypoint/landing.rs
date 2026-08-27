@@ -37,6 +37,21 @@ const HTTP_ENDPOINTS: &[Endpoint] = &[
         path: "/v1/chat/completions",
         description: "OpenAI-compatible Chat Completions API.",
     },
+    Endpoint {
+        method: "GET",
+        path: "/dashboard",
+        description: "Live-updating monitoring dashboard (charts + recent errors).",
+    },
+    Endpoint {
+        method: "GET",
+        path: "/metrics",
+        description: "Full counters/histogram/error-tracker snapshot as JSON.",
+    },
+    Endpoint {
+        method: "GET",
+        path: "/errors/summary",
+        description: "Deduplicated error types, most recently seen first.",
+    },
 ];
 
 struct CliCommand {
@@ -220,6 +235,7 @@ mod tests {
                 )
                 .await,
             ),
+            metrics: crate::metrics::MetricsCollector::new(),
             server_info: std::sync::Arc::new(super::super::ServerInfo {
                 port: 47000,
                 route_name: "default".to_string(),

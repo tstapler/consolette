@@ -11,29 +11,49 @@
 pub mod chat_completions;
 pub mod cost_tee;
 pub mod errors;
+pub mod landing;
 pub mod messages;
 pub mod openai_stream;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::config::schema::Config;
+use crate::config::schema::{Config, UpstreamKind};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::routing::router::Router as DispatchRouter;
 
+/// One upstream's name and kind, for display on the landing page
+/// (`GET /`) — never used for dispatch, which goes through `DispatchRouter`.
+pub struct UpstreamSummary {
+    pub name: String,
+    pub kind: &'static str,
+}
+
+/// Static facts about the running server, snapshotted once at startup from
+/// the loaded `Config`, for the landing page (`GET /`) to render without
+/// needing a reference back to `Config` itself.
+pub struct ServerInfo {
+    pub port: u16,
+    pub route_name: String,
+    pub strategy: String,
+    pub upstreams: Vec<UpstreamSummary>,
+}
+
 /// Shared state reachable from every entrypoint handler: the dispatch
-/// router (candidates/providers/strategy/health/admission) and the cost
-/// tracker. Cloning shares the same underlying instances via `Arc::clone`.
+/// router (candidates/providers/strategy/health/admission), the cost
+/// tracker, and static server info for the landing page. Cloning shares the
+/// same underlying instances via `Arc::clone`.
 #[derive(Clone)]
 pub struct EntrypointState {
     pub dispatch_router: Arc<DispatchRouter>,
     pub cost_tracker: Arc<CostTracker>,
+    pub server_info: Arc<ServerInfo>,
 }
 
 impl EntrypointState {
-    /// Builds the dispatch router (Task 1.1.1/1.1.2) and cost tracker from
-    /// a loaded `Config`.
+    /// Builds the dispatch router (Task 1.1.1/1.1.2), cost tracker, and
+    /// landing-page server info from a loaded `Config`.
     ///
     /// # Errors
     ///
@@ -43,17 +63,41 @@ impl EntrypointState {
     pub async fn build(config: &Config) -> anyhow::Result<Self> {
         let dispatch_router = Arc::new(DispatchRouter::from_config(config).await?);
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
+        let route = config.routes.first();
+        let server_info = Arc::new(ServerInfo {
+            port: config.port,
+            route_name: route.map_or_else(String::new, |r| r.name.clone()),
+            strategy: route.map_or_else(String::new, |r| format!("{:?}", r.strategy)),
+            upstreams: config
+                .upstreams
+                .iter()
+                .map(|u| UpstreamSummary {
+                    name: u.name.clone(),
+                    kind: upstream_kind_label(&u.kind),
+                })
+                .collect(),
+        });
         Ok(Self {
             dispatch_router,
             cost_tracker,
+            server_info,
         })
     }
 }
 
-/// Builds the axum `Router` exposing the two entrypoint routes with
-/// request tracing applied.
+fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
+    match kind {
+        UpstreamKind::Anthropic => "anthropic",
+        UpstreamKind::Bedrock { .. } => "bedrock",
+        UpstreamKind::Openai { .. } => "openai",
+    }
+}
+
+/// Builds the axum `Router` exposing the landing page and the entrypoint
+/// routes, with request tracing applied.
 pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
     axum::Router::new()
+        .route("/", axum::routing::get(landing::get_index))
         .route(
             "/v1/messages",
             axum::routing::post(crate::entrypoint::messages::post_v1_messages),
@@ -195,6 +239,30 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn landing_page_serves_html_at_root() {
+        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let router = entrypoint_router(state);
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.starts_with("text/html"));
     }
 
     #[tokio::test]

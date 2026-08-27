@@ -137,6 +137,10 @@ mod tests {
                 .take()
                 .expect("FixedProvider::send called more than once")
         }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
     }
 
     async fn test_state_with_provider(
@@ -157,6 +161,7 @@ mod tests {
             index: 0,
             name: "test".to_string(),
             weight: 1.0,
+            model: None,
         }];
         let health = Arc::new(HealthRegistry::new(300));
         let admission = Arc::new(crate::ratelimit::RateLimiters::new(
@@ -178,6 +183,12 @@ mod tests {
                 )
                 .await,
             ),
+            server_info: Arc::new(crate::entrypoint::ServerInfo {
+                port: 0,
+                route_name: "test".to_string(),
+                strategy: "Fallback".to_string(),
+                upstreams: vec![],
+            }),
         };
         let _ = Config::default;
         (state, calls)

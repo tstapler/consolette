@@ -290,11 +290,23 @@ jobs:
       GITHUB_EMAIL: "admin+bot@axo.dev"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
+      # cargo-dist's generated job hardcodes `secrets.HOMEBREW_TAP_TOKEN` as
+      # a plain PAT — this mints a short-lived, tap-repo-scoped GitHub App
+      # installation token instead. Hand-inserted; see dist-workspace.toml's
+      # `allow-dirty` comment for why `dist generate` won't preserve this.
+      - name: Mint homebrew-tap token
+        id: tap-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: tstapler
+          repositories: homebrew-tap
       - uses: actions/checkout@v6
         with:
           persist-credentials: true
           repository: "tstapler/homebrew-tap"
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.tap-token.outputs.token }}
       # So we have access to the formula
       - name: Fetch homebrew formulae
         uses: actions/download-artifact@v8

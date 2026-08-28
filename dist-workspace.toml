@@ -18,3 +18,14 @@ targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
 ]
+# `publish-homebrew-formula` doesn't natively support GitHub App auth — it
+# hardcodes `secrets.HOMEBREW_TAP_TOKEN` as a plain token (verified against
+# cargo-dist's own template at the pinned version above). We hand-inserted a
+# `create-github-app-token` step ahead of that job's checkout instead, using
+# the `APP_ID`/`APP_PRIVATE_KEY` repo secrets to mint a short-lived,
+# tap-repo-scoped token in place of a long-lived PAT. `allow-dirty` keeps
+# `dist generate`/`dist init` from silently clobbering that hand-edit — but
+# also means neither one will re-apply it after a `cargo-dist-version` bump;
+# redo the insertion by hand each time until cargo-dist supports this
+# natively.
+allow-dirty = ["ci"]

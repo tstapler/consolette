@@ -1,16 +1,23 @@
 # Releasing consolette
 
 Follows the kibitzer/stelekit/stapler-squad pattern: `cargo-dist` builds and
-publishes, `git-cliff` writes the changelog, and version tags are pushed by
-a human — not a bot.
+publishes, `git-cliff` writes the changelog, and version tags are pushed via
+an interactively-authenticated push (a human, or Claude Code operating with
+the user's own git/gh credentials in an interactive session) — never from
+an automated CI bot.
 
-## Why a human pushes the tag
+## Why the tag can't come from CI
 
 release-please (and similar bots) commit and push using `GITHUB_TOKEN`, and
 GitHub deliberately does not let a `GITHUB_TOKEN`-authored push trigger other
 `on: push` workflows (it's a loop-prevention measure, not a bug). That means
-a bot-pushed tag would never kick off `release.yml`. Pushing the tag
-yourself sidesteps this entirely.
+a bot-pushed tag would never kick off `release.yml`. The constraint is about
+*how* the push is authenticated, not *who* runs the command: Claude Code may
+cut a release the same way a human would — `git tag` + `git push` using the
+session's own authenticated git remote — since that's an interactive push,
+not a `GITHUB_TOKEN`-authored one. It still shouldn't push a tag on its own
+initiative; only when the user asks for a release, with a version number
+they've agreed to.
 
 ## One-time setup
 

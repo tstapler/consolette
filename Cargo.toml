@@ -1,6 +1,6 @@
 [package]
 name = "consolette"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "consolette — CLI / MCP tool"
@@ -108,3 +108,7 @@ tree-sitter-cpp = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"

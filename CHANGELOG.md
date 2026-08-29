@@ -3,6 +3,12 @@
 
 ### Bug Fixes
 
+- Add missing [profile.dist] to Cargo.toml (082aaf6)
+
+
+
+### Bug Fixes
+
 - Apply cargo fmt and resolve clippy too_many_lines to fix CI (cc8d5e8)
 
 - Cache pruned content under destination session id (e2aae05)

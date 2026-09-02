@@ -52,6 +52,22 @@ const HTTP_ENDPOINTS: &[Endpoint] = &[
         path: "/errors/summary",
         description: "Deduplicated error types, most recently seen first.",
     },
+    Endpoint {
+        method: "GET",
+        path: "/api/models",
+        description: "Live model catalog per configured upstream.",
+    },
+    Endpoint {
+        method: "GET",
+        path: "/api/route",
+        description: "The active route (strategy, upstream order/weights, model overrides).",
+    },
+    Endpoint {
+        method: "POST",
+        path: "/api/route",
+        description:
+            "Replace the active route; persists to runtime-overrides.toml and applies live.",
+    },
 ];
 
 struct CliCommand {
@@ -221,15 +237,17 @@ mod tests {
 
         let metrics = crate::metrics::MetricsCollector::new();
         EntrypointState {
-            dispatch_router: std::sync::Arc::new(DispatchRouter::new(
-                vec![],
-                vec![],
-                std::sync::Arc::new(FallbackStrategy),
-                std::sync::Arc::new(HealthRegistry::new(300)),
-                std::sync::Arc::new(crate::ratelimit::RateLimiters::new(
-                    &crate::config::schema::RateLimitConfig::default(),
-                )),
-                std::sync::Arc::clone(&metrics),
+            dispatch_router: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                DispatchRouter::new(
+                    vec![],
+                    vec![],
+                    std::sync::Arc::new(FallbackStrategy),
+                    std::sync::Arc::new(HealthRegistry::new(300)),
+                    std::sync::Arc::new(crate::ratelimit::RateLimiters::new(
+                        &crate::config::schema::RateLimitConfig::default(),
+                    )),
+                    std::sync::Arc::clone(&metrics),
+                ),
             )),
             cost_tracker: std::sync::Arc::new(
                 crate::cost_metrics::tracker::CostTracker::new(
@@ -244,6 +262,7 @@ mod tests {
                 strategy: "Fallback".to_string(),
                 upstreams,
             }),
+            config_dir: std::sync::Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
         }
     }
 

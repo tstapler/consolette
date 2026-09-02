@@ -8,6 +8,7 @@
 //! Modeled directly on `src/cost_metrics/server.rs`'s
 //! `CostServerState`/`cost_router`/`serve_cost` shape.
 
+pub mod api;
 pub mod chat_completions;
 pub mod cost_tee;
 pub mod errors;
@@ -18,6 +19,8 @@ pub mod openai_stream;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use crate::config::schema::{Config, UpstreamKind};
 use crate::cost_metrics::pricing::PricingTable;
@@ -46,12 +49,21 @@ pub struct ServerInfo {
 /// router (candidates/providers/strategy/health/admission), the cost
 /// tracker, request/error metrics, and static server info for the landing
 /// page. Cloning shares the same underlying instances via `Arc::clone`.
+///
+/// `dispatch_router` is an [`ArcSwap`] rather than a bare `Arc` so the web
+/// control panel (`POST /api/route`) can hot-swap in a freshly-rebuilt
+/// `DispatchRouter` — reflecting a model-override or route-strategy change
+/// — without restarting the process. Swapping loses in-flight health/rate-
+/// limit state (cooldowns, counters) for the old router; that's an accepted
+/// trade-off since route changes are rare admin actions, not hot-path
+/// traffic.
 #[derive(Clone)]
 pub struct EntrypointState {
-    pub dispatch_router: Arc<DispatchRouter>,
+    pub dispatch_router: Arc<ArcSwap<DispatchRouter>>,
     pub cost_tracker: Arc<CostTracker>,
     pub metrics: Arc<MetricsCollector>,
     pub server_info: Arc<ServerInfo>,
+    pub config_dir: Arc<std::path::PathBuf>,
 }
 
 impl EntrypointState {
@@ -65,11 +77,12 @@ impl EntrypointState {
     /// Returns an error if `Router::from_config` fails to construct a
     /// dispatch router from `config` (for example, no candidates configured
     /// or a provider fails to initialize).
-    pub async fn build(config: &Config) -> anyhow::Result<Self> {
+    pub async fn build(config: &Config, config_dir: &std::path::Path) -> anyhow::Result<Self> {
         let metrics = MetricsCollector::new();
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
-        let dispatch_router =
-            Arc::new(DispatchRouter::from_config(config, Arc::clone(&metrics)).await?);
+        let dispatch_router = Arc::new(ArcSwap::from_pointee(
+            DispatchRouter::from_config(config, Arc::clone(&metrics)).await?,
+        ));
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
         let route = config.routes.first();
         let server_info = Arc::new(ServerInfo {
@@ -90,6 +103,7 @@ impl EntrypointState {
             cost_tracker,
             metrics,
             server_info,
+            config_dir: Arc::new(config_dir.to_path_buf()),
         })
     }
 }
@@ -123,6 +137,11 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
         .route(
             "/errors/summary",
             axum::routing::get(observability::get_errors_summary),
+        )
+        .route("/api/models", axum::routing::get(api::get_models))
+        .route(
+            "/api/route",
+            axum::routing::get(api::get_route).post(api::post_route),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
@@ -199,7 +218,11 @@ mod tests {
 
     #[tokio::test]
     async fn build_succeeds_for_default_config() {
-        let state = EntrypointState::build(&Config::default()).await;
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await;
         assert!(state.is_ok());
     }
 
@@ -207,7 +230,12 @@ mod tests {
     async fn build_clone_shares_tracker_state() {
         use crate::session_compaction::{CompactionTier, SessionKey};
 
-        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
         let clone_a = state.clone();
         let clone_b = state.clone();
 
@@ -232,7 +260,12 @@ mod tests {
 
     #[tokio::test]
     async fn entrypoint_router_routes_do_not_404() {
-        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
         let router = entrypoint_router(state);
 
         let resp = router
@@ -261,7 +294,12 @@ mod tests {
 
     #[tokio::test]
     async fn landing_page_serves_html_at_root() {
-        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
         let router = entrypoint_router(state);
 
         let resp = router
@@ -285,7 +323,12 @@ mod tests {
 
     #[tokio::test]
     async fn observability_routes_serve_expected_shapes() {
-        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
         let router = entrypoint_router(state);
 
         let resp = router
@@ -337,7 +380,12 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_shutdown_completes_promptly() {
-        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let shutdown = async move {
             let _ = rx.await;
@@ -373,7 +421,12 @@ mod tests {
         let addr = reservation.local_addr().unwrap();
         drop(reservation);
 
-        let state = EntrypointState::build(&Config::default()).await.unwrap();
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let shutdown = async move {
             let _ = rx.await;

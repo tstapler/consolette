@@ -188,7 +188,7 @@ async fn run() -> anyhow::Result<()> {
         config.upstreams.len(),
         config.routes.len()
     );
-    let state = consolette::entrypoint::EntrypointState::build(&config).await?;
+    let state = consolette::entrypoint::EntrypointState::build(&config, &config_dir()).await?;
     consolette::entrypoint::serve_entrypoint(config.port, state).await
 }
 

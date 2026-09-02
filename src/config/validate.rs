@@ -8,6 +8,11 @@ use super::ConfigError;
 
 /// Every route's upstream references must resolve to a declared upstream
 /// name, and every `ratelimit` key must reference a declared upstream.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::UnknownUpstreamReference`] if a route or
+/// `ratelimit` entry names an upstream not present in `config.upstreams`.
 pub fn validate_references(config: &Config) -> Result<(), ConfigError> {
     let known: HashSet<&str> = config.upstreams.iter().map(|u| u.name.as_str()).collect();
 

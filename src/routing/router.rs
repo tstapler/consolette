@@ -265,6 +265,14 @@ impl Router {
         Err(last_error.unwrap_or(ProviderError::Exhausted))
     }
 
+    /// Names of the upstreams this router currently dispatches to, in
+    /// candidate order — used by the web control panel to confirm a route
+    /// change actually took effect on the live router, not just on disk.
+    #[must_use]
+    pub fn candidate_names(&self) -> Vec<String> {
+        self.candidates.iter().map(|c| c.name.clone()).collect()
+    }
+
     /// Records one dispatch attempt's timing/outcome for `/metrics`
     /// (Task 3.4.5) — per-upstream request/success/error counts plus, on
     /// failure, the error-type breakdown and the deduplicated error tracker

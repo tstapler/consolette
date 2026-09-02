@@ -8,6 +8,7 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 
 use super::plugins;
+use super::runtime_overrides::RuntimeOverrides;
 use super::schema::{Config, Upstream, UpstreamKind};
 use super::validate::validate_references;
 use super::ConfigError;
@@ -47,6 +48,11 @@ pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
 
     let mut config: Config = figment.extract().map_err(Box::new)?;
     apply_legacy_env_shim(&mut config);
+
+    let overrides = RuntimeOverrides::load(config_dir)
+        .map_err(|e| ConfigError::RuntimeOverrides(e.to_string()))?;
+    overrides.apply(&mut config);
+
     validate_references(&config)?;
     Ok(config)
 }

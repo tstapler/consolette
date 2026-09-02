@@ -45,6 +45,7 @@ pub async fn post_v1_messages(
 
     match state
         .dispatch_router
+        .load()
         .dispatch(body, headers, stream, est_tokens)
         .await
     {
@@ -176,7 +177,7 @@ mod tests {
         );
 
         let state = EntrypointState {
-            dispatch_router: Arc::new(router),
+            dispatch_router: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
             cost_tracker: Arc::new(
                 crate::cost_metrics::tracker::CostTracker::new(
                     crate::cost_metrics::pricing::PricingTable::load_default(),
@@ -190,6 +191,7 @@ mod tests {
                 strategy: "Fallback".to_string(),
                 upstreams: vec![],
             }),
+            config_dir: Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
         };
         (state, calls)
     }

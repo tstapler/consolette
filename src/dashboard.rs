@@ -95,14 +95,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <div class="header">
         <h1>Claude Proxy</h1>
         <div class="status-bar">
-            <div class="provider-status">
-                <span class="status-indicator" id="anthropic-status"></span>
-                <span id="anthropic-text">Anthropic</span>
-            </div>
-            <div class="provider-status">
-                <span class="status-indicator" id="bedrock-status"></span>
-                <span id="bedrock-text">Bedrock</span>
-            </div>
+            <div class="provider-status" id="provider-status-bar" style="gap: 16px;"></div>
             <div class="refresh-time" id="refresh-time">Loading...</div>
         </div>
     </div>
@@ -159,26 +152,9 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
 
     <div class="chart-container" style="margin-bottom: 24px;">
-        <div class="chart-title">Latency by Provider</div>
-        <div class="stats-grid" style="margin-top: 12px; margin-bottom: 0;">
-            <div class="stat-card">
-                <div class="stat-label">Anthropic Avg Duration</div>
-                <div class="stat-value" id="lat-anthropic-dur">—</div>
-                <div class="stat-subtitle" id="lat-anthropic-req">0 requests</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Anthropic Avg TTFT</div>
-                <div class="stat-value" id="lat-anthropic-ttft">—</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Bedrock Avg Duration</div>
-                <div class="stat-value" id="lat-bedrock-dur">—</div>
-                <div class="stat-subtitle" id="lat-bedrock-req">0 requests</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Bedrock Avg TTFT</div>
-                <div class="stat-value" id="lat-bedrock-ttft">—</div>
-            </div>
+        <div class="chart-title">Latency by Upstream</div>
+        <div class="stats-grid" id="latency-cards" style="margin-top: 12px; margin-bottom: 0;">
+            <div class="stat-card"><div class="stat-label">No upstream traffic yet</div></div>
         </div>
     </div>
 
@@ -313,8 +289,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             providerChart = new Chart(document.getElementById('provider-chart'), {
                 type: 'doughnut',
                 data: {
-                    labels: ['Anthropic', 'Bedrock', 'Failed'],
-                    datasets: [{ data: [0, 0, 0], backgroundColor: ['#3b82f6', '#10b981', '#ef4444'] }]
+                    labels: [],
+                    datasets: [{ data: [], backgroundColor: [] }]
                 },
                 options: {
                     ...chartDefaults,
@@ -373,21 +349,21 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 document.getElementById('error-count').textContent = data.summary.total_errors.toLocaleString() + ' errors';
                 document.getElementById('fallback-count').textContent = data.summary.total_fallbacks.toLocaleString();
 
-                if (data.cooldowns) {
-                    for (const [provider, status] of Object.entries(data.cooldowns)) {
-                        const indicator = document.getElementById(provider + '-status');
-                        const text = document.getElementById(provider + '-text');
-                        if (indicator && text) {
-                            if (status.cooling_down && status.remaining_seconds > 0) {
-                                indicator.className = 'status-indicator status-cooldown';
-                                text.textContent = provider.charAt(0).toUpperCase() + provider.slice(1) + ' (' + status.remaining_seconds + 's)';
-                            } else {
-                                indicator.className = 'status-indicator status-active';
-                                text.textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
-                            }
-                        }
-                    }
-                }
+                const upstreamNames = Object.keys(data.providers || {});
+                const displayName = n => n.charAt(0).toUpperCase() + n.slice(1);
+                const palette = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444', '#14b8a6', '#eab308', '#ec4899'];
+
+                const statusBar = document.getElementById('provider-status-bar');
+                statusBar.innerHTML = upstreamNames.length === 0
+                    ? '<span style="color:#666;font-size:14px;">No upstream traffic yet</span>'
+                    : upstreamNames.map(name => {
+                        const cd = (data.cooldowns && data.cooldowns[name]) || {};
+                        const cooling = cd.cooling_down && cd.remaining_seconds > 0;
+                        const cls = cooling ? 'status-cooldown' : 'status-active';
+                        const label = displayName(name) + (cooling ? ' (' + cd.remaining_seconds + 's)' : '');
+                        return '<span style="display:flex;align-items:center;gap:8px;">'
+                            + '<span class="status-indicator ' + cls + '"></span><span>' + label + '</span></span>';
+                    }).join('');
 
                 if (data.rpm_data) {
                     rpmChart.data.labels = data.rpm_data.map(d => d.minute);
@@ -395,11 +371,9 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     rpmChart.update();
                 }
 
-                providerChart.data.datasets[0].data = [
-                    data.providers.anthropic ? data.providers.anthropic.requests : 0,
-                    data.providers.bedrock ? data.providers.bedrock.requests : 0,
-                    data.providers.none ? data.providers.none.requests : 0
-                ];
+                providerChart.data.labels = upstreamNames.map(displayName);
+                providerChart.data.datasets[0].data = upstreamNames.map(n => data.providers[n].requests || 0);
+                providerChart.data.datasets[0].backgroundColor = upstreamNames.map((_, i) => palette[i % palette.length]);
                 providerChart.update();
 
                 if (data.duration_distribution) {
@@ -494,14 +468,25 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     requestsBody.innerHTML = '<tr><td colspan="11" class="no-errors">No requests yet</td></tr>';
                 }
 
-                if (data.provider_latency) {
+                const latencyCards = document.getElementById('latency-cards');
+                const latencyNames = Object.keys(data.provider_latency || {});
+                if (latencyNames.length === 0) {
+                    latencyCards.innerHTML = '<div class="stat-card"><div class="stat-label">No upstream traffic yet</div></div>';
+                } else {
                     const fmtMs2 = ms => ms > 0 ? (ms >= 1000 ? (ms/1000).toFixed(1)+'s' : ms+'ms') : '—';
-                    for (const p of ['anthropic', 'bedrock']) {
-                        const pl = data.provider_latency[p] || {};
-                        document.getElementById('lat-' + p + '-dur').textContent = fmtMs2(pl.avg_duration_ms || 0);
-                        document.getElementById('lat-' + p + '-ttft').textContent = fmtMs2(pl.avg_first_byte_ms || 0);
-                        document.getElementById('lat-' + p + '-req').textContent = (pl.requests || 0).toLocaleString() + ' requests';
-                    }
+                    latencyCards.innerHTML = latencyNames.map(name => {
+                        const pl = data.provider_latency[name];
+                        const label = displayName(name);
+                        return '<div class="stat-card">'
+                            + '<div class="stat-label">' + label + ' Avg Duration</div>'
+                            + '<div class="stat-value">' + fmtMs2(pl.avg_duration_ms || 0) + '</div>'
+                            + '<div class="stat-subtitle">' + (pl.requests || 0).toLocaleString() + ' requests</div>'
+                            + '</div>'
+                            + '<div class="stat-card">'
+                            + '<div class="stat-label">' + label + ' Avg TTFT</div>'
+                            + '<div class="stat-value">' + fmtMs2(pl.avg_first_byte_ms || 0) + '</div>'
+                            + '</div>';
+                    }).join('');
                 }
 
                 const errorsBody = document.getElementById('errors-body');
@@ -618,4 +603,37 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 #[allow(clippy::unused_async)]
 pub async fn handle_dashboard() -> impl IntoResponse {
     Html(DASHBOARD_HTML)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DASHBOARD_HTML;
+
+    #[test]
+    fn no_upstream_is_hardcoded_by_name() {
+        for hardcoded in [
+            "anthropic-status",
+            "bedrock-status",
+            "anthropic-text",
+            "bedrock-text",
+            "lat-anthropic-dur",
+            "lat-bedrock-dur",
+        ] {
+            assert!(
+                !DASHBOARD_HTML.contains(hardcoded),
+                "dashboard must not hardcode a specific upstream's id ({hardcoded}) — \
+                 provider/latency sections must render dynamically from /metrics"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_containers_present() {
+        for id in ["provider-status-bar", "latency-cards"] {
+            assert!(
+                DASHBOARD_HTML.contains(id),
+                "missing dynamic container #{id}"
+            );
+        }
+    }
 }

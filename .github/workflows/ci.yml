@@ -26,3 +26,5 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      - name: readme-check
+        run: cargo run --quiet --bin readme-check

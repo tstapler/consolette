@@ -10,7 +10,8 @@ use consolette::claude_code_session::omission_cache::OmissionCache;
 use consolette::claude_code_session::summarize::ClaudeCliSummarizer;
 use consolette::config;
 
-/// consolette — CLI / MCP tool.
+/// Provider-agnostic LLM router: proxies Anthropic/Bedrock/OpenAI-compatible
+/// upstreams with fallback, weighted routing, and rate limiting.
 #[derive(Parser)]
 #[command(name = "consolette", version)]
 struct Cli {

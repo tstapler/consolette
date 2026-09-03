@@ -3,7 +3,7 @@ name = "consolette"
 version = "0.1.1"
 edition = "2021"
 license = "MIT"
-description = "consolette — CLI / MCP tool"
+description = "Provider-agnostic LLM router: proxies Anthropic/Bedrock/OpenAI-compatible upstreams with fallback, weighted routing, and rate limiting"
 repository = "https://github.com/tstapler/consolette"
 
 # Rust 1.74+ lints — set once here instead of per-module boilerplate.
@@ -28,6 +28,10 @@ path = "src/bin/mcp-proxy/main.rs"
 [[bin]]
 name = "cmdcrush"
 path = "src/bin/cmdcrush/main.rs"
+
+[[bin]]
+name = "readme-check"
+path = "src/bin/readme-check/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

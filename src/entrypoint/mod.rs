@@ -138,6 +138,10 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             "/errors/summary",
             axum::routing::get(observability::get_errors_summary),
         )
+        .route(
+            "/requests/{id}",
+            axum::routing::get(observability::get_request_body),
+        )
         .route("/api/models", axum::routing::get(api::get_models))
         .route(
             "/api/route",

@@ -139,6 +139,12 @@ pub struct MetricsCollector {
     pub error_tracker: Arc<ErrorTracker>,
     /// Ring buffer: last 100 requests (newest first).
     recent_requests: Mutex<VecDeque<RequestDetail>>,
+    /// Ring buffer of `(request_id, original request body)`, capped and
+    /// evicted in lockstep with `recent_requests` — backs the dashboard's
+    /// `GET /requests/{id}?stage=original` body inspector. There is no
+    /// `compressed` counterpart yet: that stage needs the `compression`
+    /// module wired into dispatch, which isn't in scope here.
+    original_bodies: Mutex<VecDeque<(String, serde_json::Value)>>,
     /// Rolling event-loop lag samples (15-min window).
     lag_samples: Mutex<VecDeque<LagSample>>,
     /// Most recent lag measurement in milliseconds.
@@ -153,6 +159,7 @@ impl MetricsCollector {
             histogram: Arc::new(DurationHistogram::with_default_window()),
             error_tracker: Arc::new(ErrorTracker::new()),
             recent_requests: Mutex::new(VecDeque::new()),
+            original_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
         })
@@ -196,6 +203,33 @@ impl MetricsCollector {
                 return;
             }
         }
+    }
+
+    /// Caches a request's original (pre-dispatch) body, capped at 100
+    /// entries in lockstep with the `recent_requests` ring buffer, for the
+    /// dashboard's `GET /requests/{id}?stage=original` inspector.
+    pub fn push_original_body(&self, request_id: String, body: serde_json::Value) {
+        let mut buf = self
+            .original_bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.len() == 100 {
+            buf.pop_back();
+        }
+        buf.push_front((request_id, body));
+    }
+
+    /// Looks up a cached original body by request id. `None` once evicted
+    /// from the ring buffer (oldest entries fall off after 100 requests).
+    #[must_use]
+    pub fn get_original_body(&self, request_id: &str) -> Option<serde_json::Value> {
+        let buf = self
+            .original_bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        buf.iter()
+            .find(|(id, _)| id == request_id)
+            .map(|(_, body)| body.clone())
     }
 
     /// Get the last `n` requests (newest first).
@@ -361,6 +395,7 @@ impl Default for MetricsCollector {
             histogram: Arc::new(DurationHistogram::with_default_window()),
             error_tracker: Arc::new(ErrorTracker::new()),
             recent_requests: Mutex::new(VecDeque::new()),
+            original_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
         }

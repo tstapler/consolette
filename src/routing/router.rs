@@ -212,6 +212,8 @@ impl Router {
                 u64::from(est_tokens),
                 &body,
             ));
+        self.metrics
+            .push_original_body(request_id.clone(), body.clone());
 
         loop {
             let healthy: Vec<UpstreamRef> = self

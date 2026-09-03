@@ -54,6 +54,12 @@ const HTTP_ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         method: "GET",
+        path: "/requests/{id}",
+        description:
+            "A cached request body, for the dashboard's inspector (?stage=original|compressed).",
+    },
+    Endpoint {
+        method: "GET",
         path: "/api/models",
         description: "Live model catalog per configured upstream.",
     },

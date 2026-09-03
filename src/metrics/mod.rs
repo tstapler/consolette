@@ -38,6 +38,10 @@ pub struct RequestDetail {
     pub tokens_after: u64,
     pub compressed: bool,
     pub stream: bool,
+    /// JSON-encoded `{content-block-type: count}` map (e.g.
+    /// `{"text":2,"tool_use":1}`) — the dashboard's `fmtTypes()` does its
+    /// own `JSON.parse` on this, so it must stay a JSON object string, not
+    /// a display string.
     pub msg_types: String,
     pub has_context_management: bool,
     pub message_count: u32,
@@ -45,6 +49,72 @@ pub struct RequestDetail {
     pub first_byte_ms: f64,
     pub bedrock_invocation_ms: u64,
     pub bedrock_first_byte_ms: u64,
+}
+
+impl RequestDetail {
+    /// Builds the initial ring-buffer entry for an incoming request, before
+    /// dispatch has picked an upstream: `provider` starts empty and timing
+    /// fields start at zero, filled in later via
+    /// [`MetricsCollector::update_request_timing`] once dispatch resolves.
+    /// `message_count`/`msg_types`/`has_context_management` are derived from
+    /// the Anthropic-shaped request `body` (already true for both
+    /// `/v1/messages` and `/v1/chat/completions`, since the latter is
+    /// translated to Anthropic's wire format before `Router::dispatch`).
+    #[must_use]
+    pub fn from_body(
+        request_id: String,
+        stream: bool,
+        tokens_before: u64,
+        body: &serde_json::Value,
+    ) -> Self {
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let messages = body.get("messages").and_then(serde_json::Value::as_array);
+        let message_count = messages.map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX));
+
+        let mut type_counts: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
+        for message in messages.into_iter().flatten() {
+            match message.get("content") {
+                Some(serde_json::Value::String(_)) => {
+                    *type_counts.entry("text".to_string()).or_insert(0) += 1;
+                }
+                Some(serde_json::Value::Array(blocks)) => {
+                    for block in blocks {
+                        let block_type = block
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        *type_counts.entry(block_type.to_string()).or_insert(0) += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let msg_types = serde_json::to_string(&type_counts).unwrap_or_else(|_| "{}".to_string());
+
+        Self {
+            request_id,
+            timestamp: Utc::now().to_rfc3339(),
+            model,
+            provider: String::new(),
+            tokens_before,
+            tokens_after: 0,
+            compressed: false,
+            stream,
+            msg_types,
+            has_context_management: body.get("context_management").is_some(),
+            message_count,
+            duration_ms: 0.0,
+            first_byte_ms: 0.0,
+            bedrock_invocation_ms: 0,
+            bedrock_first_byte_ms: 0,
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

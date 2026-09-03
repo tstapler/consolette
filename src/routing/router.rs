@@ -204,6 +204,15 @@ impl Router {
             .unwrap_or("unknown")
             .to_string();
 
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.metrics
+            .push_request(crate::metrics::RequestDetail::from_body(
+                request_id.clone(),
+                stream,
+                u64::from(est_tokens),
+                &body,
+            ));
+
         loop {
             let healthy: Vec<UpstreamRef> = self
                 .candidates
@@ -243,6 +252,20 @@ impl Router {
             match provider.send(request_body, headers.clone(), stream).await {
                 Ok(response) => {
                     self.record_attempt(&chosen.name, attempt_started, Ok(()), &model);
+                    #[allow(clippy::cast_precision_loss)]
+                    let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
+                    // First-byte time isn't separately measured here (see
+                    // `record_attempt`'s doc comment) — `provider.send`
+                    // returning is the closest proxy we have for either a
+                    // full response or a stream's headers.
+                    self.metrics.update_request_timing(
+                        &request_id,
+                        &chosen.name,
+                        duration_ms,
+                        duration_ms,
+                        0,
+                        0,
+                    );
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
@@ -950,5 +973,42 @@ mod tests {
             1,
             "the primary's failure must be pushed into the error tracker"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_populates_the_recent_requests_ring_buffer() {
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider {
+            name: "primary",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })];
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![upstream(0, "primary")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics.clone(),
+        );
+
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+            ],
+        });
+        let res = router.dispatch(body, HeaderMap::new(), false, 0).await;
+        assert!(res.is_ok());
+
+        let recent = metrics.get_recent_requests(10);
+        assert_eq!(recent.len(), 1, "dispatch must push exactly one entry");
+        let detail = &recent[0];
+        assert_eq!(detail.model, "claude-sonnet-4-5");
+        assert_eq!(detail.provider, "primary", "must be filled in on success");
+        assert_eq!(detail.message_count, 2);
+        let msg_types: serde_json::Value = serde_json::from_str(&detail.msg_types).unwrap();
+        assert_eq!(msg_types["text"], 2, "one plain-string + one text block");
     }
 }

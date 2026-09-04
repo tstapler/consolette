@@ -192,6 +192,9 @@ mod tests {
                 upstreams: vec![],
             }),
             config_dir: Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
+            session_overrides: Arc::new(
+                crate::routing::session_overrides::SessionOverrideStore::new(),
+            ),
         };
         (state, calls)
     }

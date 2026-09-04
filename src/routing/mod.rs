@@ -13,11 +13,14 @@
 
 pub mod health;
 pub mod router;
+pub mod session_overrides;
 pub mod strategy;
 
 #[allow(unused_imports)]
 pub use health::{Availability, HealthRegistry};
 #[allow(unused_imports)]
 pub use router::Router;
+#[allow(unused_imports)]
+pub use session_overrides::{SessionOverride, SessionOverrideStore};
 #[allow(unused_imports)]
 pub use strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef, WeightedStrategy};

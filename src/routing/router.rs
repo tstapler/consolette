@@ -25,6 +25,7 @@ use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
 
 use super::health::{Availability, HealthRegistry};
+use super::session_overrides::{extract_session_id, SessionOverrideStore};
 use super::strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef, WeightedStrategy};
 
 /// Owns the dispatch loop for one route: a fixed candidate list, a selection
@@ -37,6 +38,12 @@ pub struct Router {
     health: Arc<HealthRegistry>,
     admission: Arc<dyn AdmissionControl>,
     metrics: Arc<MetricsCollector>,
+    /// Session-scoped route pins, consulted before `strategy` on every
+    /// dispatch (see `dispatch`'s doc comment). Defaults to an empty store
+    /// via `Router::new`; `EntrypointState::build`/`api::post_route` carry
+    /// the *same* `Arc` across a route hot-swap via `with_session_overrides`
+    /// so a pin isn't lost just because the global route changed.
+    session_overrides: Arc<SessionOverrideStore>,
 }
 
 /// Builds a live `Provider` for every configured upstream, keyed by its
@@ -93,7 +100,19 @@ impl Router {
             health,
             admission,
             metrics,
+            session_overrides: Arc::new(SessionOverrideStore::new()),
         }
+    }
+
+    /// Swaps in a shared session-override store, replacing the empty one
+    /// `Router::new`/`from_config` starts with. Used to carry live pins
+    /// across a route hot-swap (`api::post_route` rebuilds the `Router` via
+    /// `from_config`, then calls this with the `EntrypointState`'s existing
+    /// `Arc<SessionOverrideStore>` before storing the new router).
+    #[must_use]
+    pub fn with_session_overrides(mut self, session_overrides: Arc<SessionOverrideStore>) -> Self {
+        self.session_overrides = session_overrides;
+        self
     }
 
     /// Assembles a fully dispatch-ready `Router` from a loaded [`Config`]:
@@ -179,11 +198,42 @@ impl Router {
         ))
     }
 
+    /// This dispatch's candidate list: the route's normal `self.candidates`,
+    /// unless `session_id` has a pin (`SessionOverrideStore`) whose upstream
+    /// is still part of this route, in which case that one upstream (with
+    /// the pin's model override, if any, else the upstream's own) replaces
+    /// it entirely — a pin means "use this," not "prefer this," so a pinned
+    /// upstream that's unhealthy still fails the request rather than
+    /// silently falling over to a different one. Falls back to the normal
+    /// candidates if the pinned upstream isn't in this route at all (e.g. a
+    /// route change removed it).
+    fn effective_candidates(&self, session_id: Option<&str>) -> Vec<UpstreamRef> {
+        let Some(over) = session_id.and_then(|sid| self.session_overrides.get(sid)) else {
+            return self.candidates.clone();
+        };
+        let Some(pinned) = self.candidates.iter().find(|c| c.name == over.upstream) else {
+            tracing::warn!(
+                session = session_id.unwrap_or(""),
+                upstream = %over.upstream,
+                "session-pinned upstream not in current route; falling back to normal routing"
+            );
+            return self.candidates.clone();
+        };
+        vec![UpstreamRef {
+            index: pinned.index,
+            name: pinned.name.clone(),
+            weight: pinned.weight,
+            model: over.model.clone().or_else(|| pinned.model.clone()),
+        }]
+    }
+
     /// Dispatches a request, re-selecting a different upstream on rate-limit
     /// or transient failure until candidates are exhausted. `est_tokens` is
     /// the caller's estimate of this request's token cost, used for the
     /// chosen upstream's TPM dimension (ADR-004); upstreams with no TPM
-    /// limiter ignore it.
+    /// limiter ignore it. A session-scoped pin
+    /// (`SessionOverrideStore`/`effective_candidates`) takes precedence over
+    /// this route's normal candidate list.
     ///
     /// # Errors
     ///
@@ -204,6 +254,9 @@ impl Router {
             .unwrap_or("unknown")
             .to_string();
 
+        let session_id = extract_session_id(&body);
+        let candidates = self.effective_candidates(session_id.as_deref());
+
         let request_id = uuid::Uuid::new_v4().to_string();
         self.metrics
             .push_request(crate::metrics::RequestDetail::from_body(
@@ -211,13 +264,13 @@ impl Router {
                 stream,
                 u64::from(est_tokens),
                 &body,
+                session_id.clone(),
             ));
         self.metrics
             .push_original_body(request_id.clone(), body.clone());
 
         loop {
-            let healthy: Vec<UpstreamRef> = self
-                .candidates
+            let healthy: Vec<UpstreamRef> = candidates
                 .iter()
                 .filter(|u| !already_tried.contains(&u.index) && self.health.is_available(u.index))
                 .cloned()

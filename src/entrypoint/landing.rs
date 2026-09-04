@@ -269,6 +269,9 @@ mod tests {
                 upstreams,
             }),
             config_dir: std::sync::Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
+            session_overrides: std::sync::Arc::new(
+                crate::routing::session_overrides::SessionOverrideStore::new(),
+            ),
         }
     }
 

@@ -27,6 +27,7 @@ use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::metrics::MetricsCollector;
 use crate::routing::router::Router as DispatchRouter;
+use crate::routing::session_overrides::SessionOverrideStore;
 
 /// One upstream's name and kind, for display on the landing page
 /// (`GET /`) — never used for dispatch, which goes through `DispatchRouter`.
@@ -64,6 +65,11 @@ pub struct EntrypointState {
     pub metrics: Arc<MetricsCollector>,
     pub server_info: Arc<ServerInfo>,
     pub config_dir: Arc<std::path::PathBuf>,
+    /// The single, canonical session-override store for this process.
+    /// `dispatch_router` reads it via `Router::with_session_overrides`,
+    /// which `api::post_route` re-attaches to every rebuilt `Router` so a
+    /// pin survives a route hot-swap.
+    pub session_overrides: Arc<SessionOverrideStore>,
 }
 
 impl EntrypointState {
@@ -80,8 +86,11 @@ impl EntrypointState {
     pub async fn build(config: &Config, config_dir: &std::path::Path) -> anyhow::Result<Self> {
         let metrics = MetricsCollector::new();
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
+        let session_overrides = Arc::new(SessionOverrideStore::new());
         let dispatch_router = Arc::new(ArcSwap::from_pointee(
-            DispatchRouter::from_config(config, Arc::clone(&metrics)).await?,
+            DispatchRouter::from_config(config, Arc::clone(&metrics))
+                .await?
+                .with_session_overrides(Arc::clone(&session_overrides)),
         ));
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
         let route = config.routes.first();
@@ -104,6 +113,7 @@ impl EntrypointState {
             metrics,
             server_info,
             config_dir: Arc::new(config_dir.to_path_buf()),
+            session_overrides,
         })
     }
 }
@@ -146,6 +156,13 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
         .route(
             "/api/route",
             axum::routing::get(api::get_route).post(api::post_route),
+        )
+        .route("/api/sessions", axum::routing::get(api::get_sessions))
+        .route(
+            "/api/sessions/{id}/route",
+            axum::routing::get(api::get_session_route)
+                .post(api::post_session_route)
+                .delete(api::delete_session_route),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)

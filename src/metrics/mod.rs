@@ -49,6 +49,10 @@ pub struct RequestDetail {
     pub first_byte_ms: f64,
     pub bedrock_invocation_ms: u64,
     pub bedrock_first_byte_ms: u64,
+    /// The request's `metadata.user_id` verbatim, if present — the session
+    /// key `routing::session_overrides` pins against. `None` for a request
+    /// with no `metadata.user_id` (can't be session-pinned either).
+    pub session_id: Option<String>,
 }
 
 impl RequestDetail {
@@ -66,6 +70,7 @@ impl RequestDetail {
         stream: bool,
         tokens_before: u64,
         body: &serde_json::Value,
+        session_id: Option<String>,
     ) -> Self {
         let model = body
             .get("model")
@@ -113,6 +118,7 @@ impl RequestDetail {
             first_byte_ms: 0.0,
             bedrock_invocation_ms: 0,
             bedrock_first_byte_ms: 0,
+            session_id,
         }
     }
 }

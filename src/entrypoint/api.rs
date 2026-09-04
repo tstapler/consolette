@@ -1,13 +1,21 @@
-//! Web control-panel API: `GET /api/models` (what's available per upstream)
-//! and `GET`/`POST /api/route` (current route; change model override,
-//! route strategy, and upstream membership/weights).
+//! Web control-panel API: `GET /api/models` (what's available per upstream),
+//! `GET`/`POST /api/route` (current route; change model override, route
+//! strategy, and upstream membership/weights), and
+//! `GET /api/sessions`/`GET`/`POST`/`DELETE /api/sessions/{id}/route` (pin
+//! one session to a specific upstream/model, ahead of the global route).
 //!
 //! `POST /api/route` persists the new route into
 //! `<config_dir>/runtime-overrides.toml` (surviving a restart) and hot-swaps
 //! the live `DispatchRouter` via `EntrypointState::dispatch_router`'s
 //! `ArcSwap`, so the change takes effect immediately for new requests.
+//!
+//! Session pins (`/api/sessions/{id}/route`) are the opposite on
+//! persistence: they live only in `EntrypointState::session_overrides`
+//! (in-memory), scoped to one session's lifetime rather than the process's
+//! on-disk config — see `routing::session_overrides` for why, and for the
+//! caveat on how a session id is derived from a request.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
@@ -15,6 +23,7 @@ use serde_json::{json, Value};
 use crate::config::schema::Route;
 use crate::config::RuntimeOverrides;
 use crate::routing::router::{build_providers, Router as DispatchRouter};
+use crate::routing::session_overrides::SessionOverride;
 
 use super::EntrypointState;
 
@@ -116,10 +125,87 @@ pub async fn post_route(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("failed to rebuild router: {e}") })),
             )
-        })?;
+        })?
+        .with_session_overrides(std::sync::Arc::clone(&state.session_overrides));
     state.dispatch_router.store(std::sync::Arc::new(new_router));
 
     Ok(Json(route))
+}
+
+/// Every session id seen in the last 100 requests (the same ring buffer
+/// `GET /requests/{id}` reads from), newest-seen first, each annotated with
+/// its current pin if one is set. A session with no `metadata.user_id`
+/// never appears here (see `routing::session_overrides`), so it also can't
+/// be pinned.
+pub async fn get_sessions(State(state): State<EntrypointState>) -> Json<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut sessions = Vec::new();
+    for req in state.metrics.get_recent_requests(100) {
+        let Some(session_id) = req.session_id else {
+            continue;
+        };
+        if !seen.insert(session_id.clone()) {
+            continue;
+        }
+        let over = state.session_overrides.get(&session_id);
+        sessions.push(json!({
+            "session_id": session_id,
+            "last_seen": req.timestamp,
+            "override": over,
+        }));
+    }
+    Json(json!({ "sessions": sessions }))
+}
+
+/// The pin currently set for one session, or 404 if none is set.
+///
+/// # Errors
+///
+/// Returns 404 if no override is currently set for `session_id`.
+pub async fn get_session_route(
+    State(state): State<EntrypointState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<SessionOverride>, (StatusCode, Json<Value>)> {
+    state.session_overrides.get(&session_id).map(Json).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "no override set for this session" })),
+    ))
+}
+
+/// Pins one session to a specific upstream (and optionally a model),
+/// overriding the global route for just that session's requests going
+/// forward. Takes effect immediately — no router rebuild needed, since
+/// `Router::dispatch` consults the same `SessionOverrideStore` on every
+/// call.
+///
+/// # Errors
+///
+/// Returns 400 if `upstream` doesn't match any currently configured
+/// upstream (checked against the on-disk config, not just the active
+/// route, so a session can be pinned to an upstream outside it).
+pub async fn post_session_route(
+    State(state): State<EntrypointState>,
+    Path(session_id): Path<String>,
+    Json(over): Json<SessionOverride>,
+) -> Result<Json<SessionOverride>, (StatusCode, Json<Value>)> {
+    let config = crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
+    if !config.upstreams.iter().any(|u| u.name == over.upstream) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown upstream \"{}\"", over.upstream) })),
+        ));
+    }
+    state.session_overrides.set(session_id, over.clone());
+    Ok(Json(over))
+}
+
+/// Clears a session's pin, if one was set. Idempotent: 204 either way.
+pub async fn delete_session_route(
+    State(state): State<EntrypointState>,
+    Path(session_id): Path<String>,
+) -> StatusCode {
+    state.session_overrides.clear(&session_id);
+    StatusCode::NO_CONTENT
 }
 
 #[cfg(test)]

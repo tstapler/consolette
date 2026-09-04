@@ -1,0 +1,70 @@
+X master CI · 30956884500
+Triggered via push about 12 minutes ago
+
+JOBS
+✓ shellcheck in 7s (ID 92151926991)
+X ansible-lint in 31s (ID 92151927023)
+  ✓ Set up job
+  ✓ Run actions/checkout@v4
+  ✓ Install ansible-lint
+  ✓ Install community.general collection
+  X Run ansible-lint
+  ✓ Post Run actions/checkout@v4
+  ✓ Complete job
+✓ test in 13s (ID 92151927043)
+
+ANNOTATIONS
+! Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+shellcheck: .github#2
+
+! The process '/usr/bin/git' failed with exit code 128
+shellcheck: .github#11
+
+! Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+ansible-lint: .github#2
+
+! The process '/usr/bin/git' failed with exit code 128
+ansible-lint: .github#11
+
+X Process completed with exit code 2.
+ansible-lint: .github#55
+
+! Line too long (255 > 160 characters)
+ansible-lint: roles/overlays/tasks/main.yml#61
+
+X Variables names from within roles should use overlays_ as a prefix. (register: overlay_cfgcaddy_link)
+ansible-lint: roles/overlays/tasks/main.yml#52
+
+X Variables names from within roles should use overlays_ as a prefix. (register: overlay_bootstrap_stats)
+ansible-lint: roles/overlays/tasks/main.yml#45
+
+X Variables names from within roles should use overlays_ as a prefix. (register: overlay_cfgcaddy_stats)
+ansible-lint: roles/overlays/tasks/main.yml#38
+
+X Variables names from within roles should use overlays_ as a prefix. (set_fact: overlay_dirs)
+ansible-lint: roles/overlays/tasks/main.yml#33
+
+X Variables names from within roles should use overlays_ as a prefix. (register: overlay_dirs_raw)
+ansible-lint: roles/overlays/tasks/main.yml#13
+
+X Variables names from within roles should use overlays_ as a prefix. (vars: overlay_scan_globs)
+ansible-lint: roles/overlays/defaults/main.yml#18
+
+! Line too long (255 > 160 characters)
+ansible-lint: roles/dotfiles/tasks/main.yml#46
+
+! Line too long (255 > 160 characters)
+ansible-lint: roles/dotfiles/tasks/main.yml#38
+
+! Line too long (255 > 160 characters)
+ansible-lint: roles/dotfiles/tasks/main.yml#25
+
+! Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, astral-sh/setup-uv@v5. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+test: .github#2
+
+! The process '/usr/bin/git' failed with exit code 128
+test: .github#11
+
+
+To see what failed, try: gh run view 30956884500 --log-failed
+View this run on GitHub: https://github.com/example/dotfiles/actions/runs/30956884500

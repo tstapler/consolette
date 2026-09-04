@@ -1,0 +1,87 @@
+1	---
+2	- name: Install dnsmasq
+3	  package:
+4	    name: dnsmasq
+5	    state: present
+6	  become: yes
+7	
+8	- name: Get Tailscale IPv4 address
+9	  command: tailscale ip --4
+10	  register: tailscale_ip_result
+11	  changed_when: false
+12	  failed_when: tailscale_ip_result.rc != 0
+13	
+14	- name: Set tailscale_ip fact
+15	  set_fact:
+16	    tailscale_ip: "{{ tailscale_ip_result.stdout | trim }}"
+17	
+18	- name: Ensure dnsmasq.d directory exists
+19	  file:
+20	    path: /etc/dnsmasq.d
+21	    state: directory
+22	    mode: '0755'
+23	    owner: root
+24	    group: root
+25	  become: yes
+26	
+27	- name: Deploy dnsmasq config for {{ local_domain }}
+28	  copy:
+29	    dest: /etc/dnsmasq.d/{{ dnsmasq_conf_name }}
+30	    mode: '0644'
+31	    owner: root
+32	    group: root
+33	    content: |
+34	      # Listen only on the Tailscale interface
+35	      listen-address={{ tailscale_ip }}
+36	      bind-interfaces
+37	
+38	      # Forward {{ local_domain }} queries to the local router
+39	      server=/{{ local_domain }}/{{ local_router }}
+40	
+41	      # Return this node's Tailscale IP for its own hostname so remote
+42	      # clients (connected via Tailscale) get a routable address
+43	      address=/{{ ansible_hostname }}.{{ local_domain }}/{{ tailscale_ip }}
+44	
+45	      # Don't read /etc/resolv.conf for upstream servers
+46	      no-resolv
+47	
+48	      # Don't cache negative results aggressively
+49	      neg-ttl=30
+50	  become: yes
+51	  notify: Restart dnsmasq
+52	
+53	- name: Ensure systemd drop-in directory exists for dnsmasq
+54	  file:
+55	    path: /etc/systemd/system/dnsmasq.service.d
+56	    state: directory
+57	    mode: '0755'
+58	    owner: root
+59	    group: root
+60	  become: yes
+61	
+62	- name: Deploy wait-for-tailscale systemd drop-in
+63	  copy:
+64	    dest: /etc/systemd/system/dnsmasq.service.d/wait-for-tailscale.conf
+65	    mode: '0644'
+66	    owner: root
+67	    group: root
+68	    content: |
+69	      [Unit]
+70	      After=tailscaled.service
+71	      Wants=tailscaled.service
+72	
+73	      [Service]
+74	      ExecStartPre=/bin/sh -c 'for i in $(seq 1 {{ tailscale_wait_seconds | int // 2 }}); do ip addr show tailscale0 2>/dev/null | grep -q {{ tailscale_ip }} && exit 0; sleep 2; done; exit 1'
+75	  become: yes
+76	  notify: Reload systemd daemon
+77	
+78	- name: Flush handlers so daemon-reload runs before start
+79	  meta: flush_handlers
+80	
+81	- name: Ensure dnsmasq is enabled and started
+82	  systemd:
+83	    name: dnsmasq
+84	    enabled: yes
+85	    state: started
+86	  become: yes
+87	

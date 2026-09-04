@@ -1,0 +1,188 @@
+commit a9cd9d1e7061d627bce88f2e43fbc61d6ee69b85
+Author: Dev User <dev@example.com>
+Date:   Mon Aug 10 23:42:11 2026 -0700
+
+    fix(llm-sync): warn/annotate $ARGUMENTS on Antigravity skill sync
+    
+    Antigravity skills are auto-triggered, not explicitly invoked with
+    positional args the way Claude commands are, so a bare $ARGUMENTS
+    token synced verbatim into SKILL.md was silently dead text. Add a
+    shared build_antigravity_skill_content() helper used by both write
+    sites (AntigravityTarget.save_commands and GeminiTarget.save_commands's
+    embedded Antigravity block) that warns at sync time and annotates the
+    written file. The legacy Gemini CLI .toml $ARGUMENTS->{{args}} path is
+    untouched. Adds test_gemini_sync.py as a minimal self-check and
+    documents the limitation in AGENTS.md.
+    
+    Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01BBE3c8U9NH9dL2yD9DHcBY
+
+diff --git a/user-scripts/llm-sync/AGENTS.md b/user-scripts/llm-sync/AGENTS.md
+index cd7b82f..e165b7e 100644
+--- a/user-scripts/llm-sync/AGENTS.md
++++ b/user-scripts/llm-sync/AGENTS.md
+@@ -37,6 +37,15 @@ uv run main.py --help
+ ### Antigravity
+ - **Customizations Root:** `~/.gemini/config` (global) or `.agents` (workspace)
+ - **Skills:** `~/.gemini/config/skills/<name>/SKILL.md` (Note: commands sync as skills here)
++  - **`$ARGUMENTS` limitation:** Antigravity skills are auto-triggered by relevance,
++    not explicitly invoked with positional arguments the way Claude commands
++    (`/command args...`) are — there's no `{{args}}`-equivalent substitution target
++    (confirmed against antigravity.google/docs/skills). A Claude command whose
++    content uses `$ARGUMENTS` still syncs, but the token is inert once Antigravity
++    auto-triggers the skill. `build_antigravity_skill_content()` in
++    `src/targets/gemini.py` detects this, prints a sync-time warning, and prepends
++    an HTML-comment annotation to the written `SKILL.md` so the limitation is
++    visible on disk too, not just at sync time.
+ - **Agents:** `~/.gemini/config/agents/<name>.md`
+ - **Plugins:** `~/.gemini/config/plugins/<name>/` (containing `plugin.json`, `skills/`, `hooks.json`)
+ - **MCP Config:** `~/.gemini/antigravity-cli/mcp_config.json`
+=====TEST FILE=====
+commit a9cd9d1e7061d627bce88f2e43fbc61d6ee69b85
+Author: Dev User <dev@example.com>
+Date:   Mon Aug 10 23:42:11 2026 -0700
+
+    fix(llm-sync): warn/annotate $ARGUMENTS on Antigravity skill sync
+    
+    Antigravity skills are auto-triggered, not explicitly invoked with
+    positional args the way Claude commands are, so a bare $ARGUMENTS
+    token synced verbatim into SKILL.md was silently dead text. Add a
+    shared build_antigravity_skill_content() helper used by both write
+    sites (AntigravityTarget.save_commands and GeminiTarget.save_commands's
+    embedded Antigravity block) that warns at sync time and annotates the
+    written file. The legacy Gemini CLI .toml $ARGUMENTS->{{args}} path is
+    untouched. Adds test_gemini_sync.py as a minimal self-check and
+    documents the limitation in AGENTS.md.
+    
+    Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01BBE3c8U9NH9dL2yD9DHcBY
+
+diff --git a/user-scripts/llm-sync/test_gemini_sync.py b/user-scripts/llm-sync/test_gemini_sync.py
+new file mode 100644
+index 0000000..cdd9024
+--- /dev/null
++++ b/user-scripts/llm-sync/test_gemini_sync.py
+@@ -0,0 +1,76 @@
++"""Assert-based self-check for the $ARGUMENTS -> Antigravity-skill sync gap.
++
++Run directly: uv run test_gemini_sync.py
++"""
++import sys
++import tempfile
++from pathlib import Path
++
++sys.path.append(str(Path(__file__).parent / "src"))
++
++from core import Command
++from targets.gemini import GeminiTarget, AntigravityTarget, build_antigravity_skill_content
++
++
++def test_arguments_command_gets_annotated():
++    cmd = Command(name="foo", description="does foo", content="run on $ARGUMENTS please")
++    content = build_antigravity_skill_content(cmd)
++    assert "llm-sync:" in content, "expected an inline annotation when $ARGUMENTS is present"
++    assert "$ARGUMENTS" in content, "original token should still be visible, just annotated"
++
++
++def test_plain_command_is_unaffected():
++    cmd = Command(name="bar", description="does bar", content="just do bar, no args")
++    content = build_antigravity_skill_content(cmd)
++    assert "llm-sync:" not in content, "commands without $ARGUMENTS must be byte-for-byte unaffected"
++    assert content.endswith("\n\njust do bar, no args")
++
++
++def test_gemini_target_antigravity_block_annotates():
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp = Path(tmp)
++        target = GeminiTarget(
++            agents_dir=tmp / "agents", skills_dir=tmp / "skills", commands_dir=tmp / "commands"
++        )
++        cmd = Command(name="stack", description="stack prs", content="stack $ARGUMENTS onto main")
++        target.save_commands([cmd])
++
++        skill_file = tmp / "skills" / "stack" / "SKILL.md"
++        assert skill_file.exists()
++        assert "llm-sync:" in skill_file.read_text()
++
++
++def test_antigravity_target_annotates():
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp = Path(tmp)
++        target = AntigravityTarget(agents_dir=tmp / "agents", skills_dir=tmp / "skills")
++        cmd = Command(name="stack", description="stack prs", content="stack $ARGUMENTS onto main")
++        target.save_commands([cmd])
++
++        skill_file = tmp / "skills" / "stack" / "SKILL.md"
++        assert skill_file.exists()
++        assert "llm-sync:" in skill_file.read_text()
++
++
++def test_legacy_toml_path_still_substitutes_args():
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp = Path(tmp)
++        target = GeminiTarget(
++            agents_dir=tmp / "agents", skills_dir=tmp / "skills", commands_dir=tmp / "commands"
++        )
++        cmd = Command(name="stack", description="stack prs", content="stack $ARGUMENTS onto main")
++        target.save_commands([cmd])
++
++        toml_file = tmp / "commands" / "stack.toml"
++        assert toml_file.exists()
++        toml_content = toml_file.read_text()
++        assert "{{args}}" in toml_content, "legacy .toml path must keep substituting $ARGUMENTS -> {{args}}"
++        assert "$ARGUMENTS" not in toml_content
++
++
++if __name__ == "__main__":
++    tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
++    for test in tests:
++        test()
++        print(f"ok  {test.__name__}")
++    print(f"\n{len(tests)} checks passed")
+=====TOML PATH CHECK=====
+
+    def save_skills(
+        self, skills: List[Skill], dry_run: bool = False, force: bool = False
+    ) -> int:
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        saved_count = 0
+
+        for skill in skills:
+            skill_dir = self.skills_dir / skill.name
+            skill_file = skill_dir / "SKILL.md"
+
+            if skill_file.exists() and not force:
+                continue
+
+            frontmatter = {
+                "name": skill.name,
+                "description": skill.description,
+            }
+
+            fm_yaml = yaml.dump(frontmatter, sort_keys=False)
+            full_content = f"---\n{fm_yaml}---\n\n{skill.content}"
+
+            if dry_run:
+                console.print(f"[blue]Would write {skill_file}[/blue]")
+            else:
+                skill_dir.mkdir(parents=True, exist_ok=True)
+                with open(skill_file, "w", encoding="utf-8") as f:
+                    f.write(full_content)
+                saved_count += 1
+
+        return saved_count
+
+    def save_commands(
+        self, commands: List[Command], dry_run: bool = False, force: bool = False
+    ) -> int:
+        self.commands_dir.mkdir(parents=True, exist_ok=True)
+        saved_count = 0
+
+        for cmd in commands:
+            # Legacy Gemini CLI: write .toml to commands_dir
+            cmd_path = self.commands_dir / f"{cmd.name}.toml"
+
+            if not cmd_path.exists() or force:
+                content = cmd.content.replace("$ARGUMENTS", "{{args}}")
+                desc_safe = (
+                    (cmd.description or "")

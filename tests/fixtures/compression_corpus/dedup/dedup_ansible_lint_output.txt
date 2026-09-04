@@ -1,0 +1,81 @@
+ansible-lint not found
+/home/linuxbrew/.linuxbrew/bin/uvx
+bootstrap/roles/nix/tasks/main.yml:57:3 Use `ansible.builtin.debug` or `ansible.legacy.debug` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (stat).
+bootstrap/roles/secrets/tasks/main.yml:3:3 Use `ansible.builtin.stat` or `ansible.legacy.stat` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (set_fact).
+bootstrap/roles/secrets/tasks/main.yml:15:3 Use `ansible.builtin.set_fact` or `ansible.legacy.set_fact` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (get_url).
+bootstrap/roles/secrets/tasks/main.yml:21:3 Use `ansible.builtin.get_url` or `ansible.legacy.get_url` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (command).
+bootstrap/roles/secrets/tasks/main.yml:29:3 Use `ansible.builtin.command` or `ansible.legacy.command` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (get_url).
+bootstrap/roles/secrets/tasks/main.yml:35:3 Use `ansible.builtin.get_url` or `ansible.legacy.get_url` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (command).
+bootstrap/roles/secrets/tasks/main.yml:44:3 Use `ansible.builtin.command` or `ansible.legacy.command` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (file).
+bootstrap/roles/secrets/tasks/main.yml:50:3 Use `ansible.builtin.file` or `ansible.legacy.file` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (unarchive).
+bootstrap/roles/secrets/tasks/main.yml:59:3 Use `ansible.builtin.unarchive` or `ansible.legacy.unarchive` instead.
+
+no-changed-when: Commands should not change things if nothing needs doing.
+bootstrap/roles/secrets/tasks/main.yml:70 Task/Handler: Run 1Password after-install script (Linux)
+
+fqcn[action-core]: Use FQCN for builtin module actions (command).
+bootstrap/roles/secrets/tasks/main.yml:71:3 Use `ansible.builtin.command` or `ansible.legacy.command` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (file).
+bootstrap/roles/secrets/tasks/main.yml:77:3 Use `ansible.builtin.file` or `ansible.legacy.file` instead.
+
+fqcn[action]: Use FQCN for module actions, such `community.general.pacman`.
+bootstrap/roles/secrets/tasks/main.yml:89:3 Action `pacman` is not FQCN.
+
+fqcn[action-core]: Use FQCN for builtin module actions (debug).
+bootstrap/roles/secrets/tasks/main.yml:97:3 Use `ansible.builtin.debug` or `ansible.legacy.debug` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (command).
+bootstrap/roles/secrets/tasks/main.yml:114:3 Use `ansible.builtin.command` or `ansible.legacy.command` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (fail).
+bootstrap/roles/secrets/tasks/main.yml:123:3 Use `ansible.builtin.fail` or `ansible.legacy.fail` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (command).
+bootstrap/roles/secrets/tasks/main.yml:132:3 Use `ansible.builtin.command` or `ansible.legacy.command` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (debug).
+bootstrap/roles/secrets/tasks/main.yml:141:3 Use `ansible.builtin.debug` or `ansible.legacy.debug` instead.
+
+risky-shell-pipe: Shells that use pipes should set the pipefail option.
+bootstrap/roles/secrets/tasks/main.yml:150 Task/Handler: Test secret injection via op inject dry-run
+
+fqcn[action-core]: Use FQCN for builtin module actions (shell).
+bootstrap/roles/secrets/tasks/main.yml:151:3 Use `ansible.builtin.shell` or `ansible.legacy.shell` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (debug).
+bootstrap/roles/secrets/tasks/main.yml:162:3 Use `ansible.builtin.debug` or `ansible.legacy.debug` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (user).
+bootstrap/roles/shell/tasks/main.yml:3:3 Use `ansible.builtin.user` or `ansible.legacy.user` instead.
+
+latest[git]: Result of the command may vary on subsequent runs.
+bootstrap/roles/shell/tasks/main.yml:10 Task/Handler: Clone zplug if missing
+
+fqcn[action-core]: Use FQCN for builtin module actions (git).
+bootstrap/roles/shell/tasks/main.yml:11:3 Use `ansible.builtin.git` or `ansible.legacy.git` instead.
+
+fqcn[action]: Use FQCN for module actions, such `community.general.pacman`.
+bootstrap/roles/sudo-mfa/tasks/main.yml:3:3 Action `pacman` is not FQCN.
+
+fqcn[action-core]: Use FQCN for builtin module actions (copy).
+bootstrap/roles/sudo-mfa/tasks/main.yml:14:3 Use `ansible.builtin.copy` or `ansible.legacy.copy` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (debug).
+bootstrap/roles/sudo-mfa/tasks/main.yml:26:3 Use `ansible.builtin.debug` or `ansible.legacy.debug` instead.

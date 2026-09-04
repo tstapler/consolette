@@ -1,0 +1,255 @@
+=== run 1 ===
+=== RUN   TestGetCloneURL_UsesHostSpecificURL
+--- PASS: TestGetCloneURL_UsesHostSpecificURL (0.00s)
+=== RUN   TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount
+--- PASS: TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount (0.00s)
+PASS
+ok  	github.com/example/myproject/session	0.070s
+PASS
+ok  	github.com/example/myproject/session/artifacts	0.002s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/cdp	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/binaries	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/ratelimit	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/domain	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/git	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/headless	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/memory	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/mux	0.064s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/namegen	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/prompts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/queue	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/scrollback	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/search	0.013s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tmux	0.065s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tokens	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished	0.010s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished/gogitstore	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vc	0.002s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vnc	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/workspace	0.010s [no tests to run]
+=== run 2 ===
+=== RUN   TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount
+--- PASS: TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount (0.00s)
+=== RUN   TestGetCloneURL_UsesHostSpecificURL
+--- PASS: TestGetCloneURL_UsesHostSpecificURL (0.00s)
+PASS
+ok  	github.com/example/myproject/session	0.068s
+PASS
+ok  	github.com/example/myproject/session/artifacts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/cdp	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection	0.006s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/binaries	0.002s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/ratelimit	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/domain	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/git	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/headless	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/memory	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/mux	0.061s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/namegen	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/prompts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/queue	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/scrollback	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/search	0.010s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tmux	0.060s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tokens	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished	0.012s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished/gogitstore	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vc	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vnc	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/workspace	0.011s [no tests to run]
+=== run 3 ===
+=== RUN   TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount
+--- PASS: TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount (0.00s)
+=== RUN   TestGetCloneURL_UsesHostSpecificURL
+--- PASS: TestGetCloneURL_UsesHostSpecificURL (0.00s)
+PASS
+ok  	github.com/example/myproject/session	0.072s
+PASS
+ok  	github.com/example/myproject/session/artifacts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/cdp	0.006s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/binaries	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/ratelimit	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/domain	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/git	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/headless	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/memory	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/mux	0.064s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/namegen	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/prompts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/queue	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/scrollback	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/search	0.012s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tmux	0.063s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tokens	0.006s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished	0.014s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished/gogitstore	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vc	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vnc	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/workspace	0.012s [no tests to run]
+=== run 4 ===
+=== RUN   TestGetCloneURL_UsesHostSpecificURL
+--- PASS: TestGetCloneURL_UsesHostSpecificURL (0.00s)
+=== RUN   TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount
+--- PASS: TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount (0.00s)
+PASS
+ok  	github.com/example/myproject/session	0.072s
+PASS
+ok  	github.com/example/myproject/session/artifacts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/cdp	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection	0.009s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/binaries	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/ratelimit	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/domain	0.006s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/git	0.006s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/headless	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/memory	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/mux	0.063s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/namegen	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/prompts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/queue	0.008s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/scrollback	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/search	0.011s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tmux	0.064s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tokens	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished	0.014s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished/gogitstore	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vc	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vnc	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/workspace	0.011s [no tests to run]
+=== run 5 ===
+=== RUN   TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount
+--- PASS: TestGetCloneURL_EmbedsKeychainToken_When_HostHasStoredAccount (0.00s)
+=== RUN   TestGetCloneURL_UsesHostSpecificURL
+--- PASS: TestGetCloneURL_UsesHostSpecificURL (0.00s)
+PASS
+ok  	github.com/example/myproject/session	0.072s
+PASS
+ok  	github.com/example/myproject/session/artifacts	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/cdp	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection	0.006s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/binaries	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/detection/ratelimit	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/domain	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/git	0.006s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/headless	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/memory	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/mux	0.062s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/namegen	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/prompts	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/queue	0.007s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/scrollback	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/search	0.011s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tmux	0.062s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/tokens	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished	0.013s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/unfinished/gogitstore	0.004s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vc	0.003s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/vnc	0.005s [no tests to run]
+PASS
+ok  	github.com/example/myproject/session/workspace	0.012s [no tests to run]

@@ -1,0 +1,233 @@
+1	#!/bin/bash
+2	# Install/uninstall AWS SSO credential refresh service
+3	# Runs aws-sso-util login periodically to keep credentials fresh
+4	# If session is valid, refreshes silently. If expired, opens browser.
+5	
+6	set -e
+7	
+8	SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+9	
+10	# Refresh interval in seconds (4 hours = 14400)
+11	# SSO sessions typically last 8-12 hours, so refreshing every 4 hours keeps us ahead
+12	REFRESH_INTERVAL=14400
+13	
+14	# Detect OS
+15	detect_os() {
+16	    case "$(uname -s)" in
+17	        Darwin*) echo "macos" ;;
+18	        Linux*)  echo "linux" ;;
+19	        *)       echo "unknown" ;;
+20	    esac
+21	}
+22	
+23	# Find aws-sso-util
+24	find_aws_sso_util() {
+25	    if command -v aws-sso-util &>/dev/null; then
+26	        command -v aws-sso-util
+27	    elif [ -f "$HOME/.local/bin/aws-sso-util" ]; then
+28	        echo "$HOME/.local/bin/aws-sso-util"
+29	    else
+30	        echo ""
+31	    fi
+32	}
+33	
+34	OS=$(detect_os)
+35	
+36	# macOS launchd functions
+37	macos_install() {
+38	    local plist_name="com.aws.sso-refresh.plist"
+39	    local plist_dest="${HOME}/Library/LaunchAgents/${plist_name}"
+40	    local logs_dir="${HOME}/Library/Logs"
+41	
+42	    echo "Installing AWS SSO refresh launchd service..."
+43	
+44	    local sso_util_path=$(find_aws_sso_util)
+45	    if [ -z "$sso_util_path" ]; then
+46	        echo "Error: aws-sso-util not found. Install with: pip install aws-sso-util"
+47	        exit 1
+48	    fi
+49	
+50	    mkdir -p "$logs_dir"
+51	
+52	    # Generate plist - runs every REFRESH_INTERVAL seconds
+53	    cat > "$plist_dest" <<EOF
+54	<?xml version="1.0" encoding="UTF-8"?>
+55	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+56	<plist version="1.0">
+57	<dict>
+58	    <key>Label</key>
+59	    <string>com.aws.sso-refresh</string>
+60	
+61	    <key>ProgramArguments</key>
+62	    <array>
+63	        <string>${sso_util_path}</string>
+64	        <string>login</string>
+65	        <string>--all</string>
+66	    </array>
+67	
+68	    <key>RunAtLoad</key>
+69	    <true/>
+70	
+71	    <key>StartInterval</key>
+72	    <integer>${REFRESH_INTERVAL}</integer>
+73	
+74	    <key>EnvironmentVariables</key>
+75	    <dict>
+76	        <key>PATH</key>
+77	        <string>/usr/local/bin:/opt/homebrew/bin:${HOME}/.local/bin:/usr/bin:/bin</string>
+78	        <key>HOME</key>
+79	        <string>${HOME}</string>
+80	    </dict>
+81	
+82	    <key>StandardOutPath</key>
+83	    <string>${logs_dir}/aws-sso-refresh.log</string>
+84	
+85	    <key>StandardErrorPath</key>
+86	    <string>${logs_dir}/aws-sso-refresh.error.log</string>
+87	</dict>
+88	</plist>
+89	EOF
+90	
+91	    launchctl load "$plist_dest"
+92	
+93	    echo "SSO refresh service installed."
+94	    echo "Logs: $logs_dir/aws-sso-refresh.log"
+95	    echo ""
+96	    echo "The service will:"
+97	    echo "  - Run immediately on load"
+98	    echo "  - Refresh every $(( REFRESH_INTERVAL / 3600 )) hours"
+99	    echo "  - Open browser only if SSO session has fully expired"
+100	}
+101	
+102	macos_uninstall() {
+103	    local plist_dest="${HOME}/Library/LaunchAgents/com.aws.sso-refresh.plist"
+104	
+105	    echo "Uninstalling AWS SSO refresh service..."
+106	    launchctl unload "$plist_dest" 2>/dev/null || true
+107	    rm -f "$plist_dest"
+108	    echo "Service uninstalled."
+109	}
+110	
+111	macos_status() {
+112	    if launchctl list 2>/dev/null | grep -q "com.aws.sso-refresh"; then
+113	        echo "Service is loaded"
+114	        launchctl list com.aws.sso-refresh 2>/dev/null || true
+115	    else
+116	        echo "Service is not loaded"
+117	    fi
+118	}
+119	
+120	# Linux systemd functions
+121	linux_install() {
+122	    local service_dest="${HOME}/.config/systemd/user/aws-sso-refresh.service"
+123	    local timer_dest="${HOME}/.config/systemd/user/aws-sso-refresh.timer"
+124	
+125	    echo "Installing AWS SSO refresh systemd service..."
+126	
+127	    local sso_util_path=$(find_aws_sso_util)
+128	    if [ -z "$sso_util_path" ]; then
+129	        echo "Error: aws-sso-util not found. Install with: pip install aws-sso-util"
+130	        exit 1
+131	    fi
+132	
+133	    mkdir -p "${HOME}/.config/systemd/user"
+134	
+135	    # Service file (one-shot, triggered by timer)
+136	    cat > "$service_dest" <<EOF
+137	[Unit]
+138	Description=AWS SSO Credential Refresh
+139	
+140	[Service]
+141	Type=oneshot
+142	ExecStart=${sso_util_path} login --all
+143	Environment="PATH=/usr/local/bin:${HOME}/.local/bin:/usr/bin:/bin"
+144	EOF
+145	
+146	    # Timer file
+147	    cat > "$timer_dest" <<EOF
+148	[Unit]
+149	Description=AWS SSO Credential Refresh Timer
+150	
+151	[Timer]
+152	OnBootSec=1min
+153	OnUnitActiveSec=${REFRESH_INTERVAL}s
+154	Persistent=true
+155	
+156	[Install]
+157	WantedBy=timers.target
+158	EOF
+159	
+160	    systemctl --user daemon-reload
+161	    systemctl --user enable aws-sso-refresh.timer
+162	    systemctl --user start aws-sso-refresh.timer
+163	    # Run once immediately
+164	    systemctl --user start aws-sso-refresh.service || true
+165	
+166	    echo "SSO refresh service installed."
+167	    echo "View logs: journalctl --user -u aws-sso-refresh.service"
+168	    echo ""
+169	    echo "The service will:"
+170	    echo "  - Run 1 minute after boot"
+171	    echo "  - Refresh every $(( REFRESH_INTERVAL / 3600 )) hours"
+172	    echo "  - Open browser only if SSO session has fully expired"
+173	}
+174	
+175	linux_uninstall() {
+176	    echo "Uninstalling AWS SSO refresh service..."
+177	
+178	    systemctl --user stop aws-sso-refresh.timer 2>/dev/null || true
+179	    systemctl --user disable aws-sso-refresh.timer 2>/dev/null || true
+180	    rm -f "${HOME}/.config/systemd/user/aws-sso-refresh.service"
+181	    rm -f "${HOME}/.config/systemd/user/aws-sso-refresh.timer"
+182	    systemctl --user daemon-reload
+183	
+184	    echo "Service uninstalled."
+185	}
+186	
+187	linux_status() {
+188	    echo "Timer status:"
+189	    systemctl --user status aws-sso-refresh.timer 2>/dev/null || echo "Timer not found"
+190	    echo ""
+191	    echo "Last run:"
+192	    systemctl --user status aws-sso-refresh.service 2>/dev/null || echo "Service not found"
+193	}
+194	
+195	# Main
+196	case "$1" in
+197	    install)
+198	        case "$OS" in
+199	            macos) macos_install ;;
+200	            linux) linux_install ;;
+201	            *) echo "Unsupported OS: $OS"; exit 1 ;;
+202	        esac
+203	        ;;
+204	    uninstall)
+205	        case "$OS" in
+206	            macos) macos_uninstall ;;
+207	            linux) linux_uninstall ;;
+208	            *) echo "Unsupported OS: $OS"; exit 1 ;;
+209	        esac
+210	        ;;
+211	    status)
+212	        case "$OS" in
+213	            macos) macos_status ;;
+214	            linux) linux_status ;;
+215	            *) echo "Unsupported OS: $OS"; exit 1 ;;
+216	        esac
+217	        ;;
+218	    *)
+219	        echo "AWS SSO Credential Refresh Service"
+220	        echo "Detected OS: $OS"
+221	        echo ""
+222	        echo "Usage: $0 {install|uninstall|status}"
+223	        echo ""
+224	        echo "  install   - Install periodic SSO refresh (every 4 hours)"
+225	        echo "  uninstall - Remove SSO refresh service"
+226	        echo "  status    - Check service status"
+227	        echo ""
+228	        echo "Note: If SSO session is valid, refresh is silent."
+229	        echo "      If expired, a browser window will open for re-auth."
+230	        exit 1
+231	        ;;
+232	esac
+233	

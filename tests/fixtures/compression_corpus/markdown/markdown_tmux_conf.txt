@@ -1,0 +1,70 @@
+1	
+2	#Switch Panes like in Vim
+3	bind h select-pane -L
+4	bind j select-pane -D
+5	bind k select-pane -U
+6	bind l select-pane -R
+7	
+8	
+9	
+10	# Scroll History
+11	set -g history-limit 60000
+12	
+13	# Set Status bar
+14	if-shell "command -v powerline-daemon >/dev/null 2>&1" 'run-shell "powerline-daemon -q"'
+15	if-shell "command -v powerline-config >/dev/null 2>&1" 'run-shell "powerline-config tmux setup"'
+16	
+17	set-option -g default-terminal "screen-256color"
+18	
+19	# Increase Vim Responsiveness
+20	set -sg escape-time 0
+21	
+22	# Set window notifications
+23	setw -g monitor-activity on
+24	set -g visual-activity on
+25	
+26	# Use vi mode
+27	set -g mode-keys vi
+28	set -g status-keys vi
+29	#setw -g utf8 on
+30	
+31	# Use vi keys for navigation
+32	set-window-option -g mode-keys vi
+33	
+34	# reattach-to-user-namespace no longer needed since tmux 2.6+ (handles namespace reattach natively)
+35	
+36	# reload config
+37	bind r source-file ~/.tmux.conf \; display-message "Config reloaded..."
+38	
+39	# based on https://stackoverflow.com/a/40902312/1046584
+40	run-shell "tmux setenv -g TMUX_VERSION $(tmux -V | cut -c 6-)"
+41	
+42	run-shell 'tmux setenv -g TMUX_VERSION $(tmux -V | \
+43	                            sed -En "s/^tmux\s+(\S+\s+)?([.0-9]+).*/\2/p")'
+44	
+45	if-shell -b '[ "$(echo "$TMUX_VERSION < 2.1" | bc)" = 1 ]' " \
+46	    set -g mouse-select-pane on; set -g mode-mouse on; \
+47	    set -g mouse-resize-pane on; set -g mouse-select-window on; \
+48	    set -g message-fg red; \
+49	    set -g message-bg black; \
+50	    set -g message-attr bright; \
+51	    set -g window-status-bg default; \
+52	    set -g window-status-fg default; \
+53	    set -g window-status-current-attr bold; \
+54	    set -g window-status-current-bg cyan; \
+55	    set -g window-status-current-fg default; \
+56	    set -g window-status-bell-fg red; \
+57	    set -g window-status-bell-bg black; \
+58	    set -g window-status-activity-fg white; \
+59	    set -g window-status-activity-bg black"
+60	
+61	# In version 2.1 "mouse" replaced the previous 4 mouse options
+62	if-shell -b '[ "$(echo "$TMUX_VERSION >= 2.1" | bc)" = 1 ]' \
+63	  "set -g mouse on"
+64	
+65	# UTF8 is autodetected in 2.2 onwards, but errors if explicitly set
+66	if-shell -b '[ "$(echo "$TMUX_VERSION < 2.2" | bc)" = 1 ]' \
+67	  "set -g utf8 on; set -g status-utf8 on; set -g mouse-utf8 on"
+68	
+69	# bind-key syntax changed in 2.4 -- selection / copy / paste
+70	if-shell -b '[ "$(echo "$TMUX_VERSION < 2.4" | bc)" = 1 ]' " \

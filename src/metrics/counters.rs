@@ -297,6 +297,14 @@ impl ProxyMetrics {
             },
             "providers": providers,
             "provider_latency": provider_latency,
+            // compression/memory/learn/count_tokens below: counters carried
+            // over from the legacy proxy's metrics schema for features that
+            // were never ported into `Router::dispatch()` (prompt
+            // compression, memory dedup, pattern learning, a real
+            // `count_tokens` call). Nothing writes to these atomics, so
+            // they're permanently zero — the dashboard cards they feed
+            // render but never move. Wiring one up is a new feature, not a
+            // metrics fix; see git history/ADRs before reviving one.
             "compression": {
                 "total_tokens_before": tokens_before,
                 "total_tokens_after": tokens_after,

@@ -20,6 +20,7 @@ use crate::config::schema::{Config, Strategy, UpstreamKind};
 use crate::metrics::MetricsCollector;
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
+use crate::providers::gemini::GeminiProvider;
 use crate::providers::openai::OpenaiProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
@@ -77,6 +78,9 @@ pub async fn build_providers(config: &Config) -> anyhow::Result<Vec<(String, Arc
                 Arc::clone(&exec_cache),
                 config.request_timeout,
             )?),
+            UpstreamKind::Gemini { .. } => {
+                Arc::new(GeminiProvider::stub(Arc::new(upstream.clone())))
+            }
         };
         providers.push((upstream.name.clone(), provider));
     }
@@ -143,6 +147,8 @@ impl Router {
             .collect();
 
         let health = Arc::new(HealthRegistry::new(config.cooldown_seconds));
+        // Gemini is a real network upstream — do NOT add its indices here
+        // (see project_plans/gemini-provider/implementation/plan.md Story 1.1.2).
         for idx in bedrock_indices {
             health.set_can_cooldown(idx, false);
         }
@@ -1066,4 +1072,38 @@ mod tests {
         let msg_types: serde_json::Value = serde_json::from_str(&detail.msg_types).unwrap();
         assert_eq!(msg_types["text"], 2, "one plain-string + one text block");
     }
+
+    // REQ-2 (Story 1.1.2): the exhaustive `UpstreamKind` match in
+    // `build_providers` accepts `Gemini` and constructs a stub provider.
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn build_providers_should_construct_provider_for_upstream_kind_gemini() {
+        let config = Config {
+            upstreams: vec![crate::config::schema::Upstream {
+                name: "gemini".to_string(),
+                kind: UpstreamKind::Gemini {
+                    project_id: "p1".to_string(),
+                },
+                auth: None,
+            }],
+            ..Config::default()
+        };
+
+        let providers = build_providers(&config).await.unwrap();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].0, "gemini");
+        assert_eq!(providers[0].1.name(), "gemini");
+    }
+
+    // `GeminiProvider::stub` (Task 1.1.2a/b) is deliberately infallible — it
+    // carries only an `Arc<Upstream>`, no client construction or auth
+    // validation yet — so `build_providers` has no way to fail for a
+    // `Gemini` upstream at this stage. The real, fallible
+    // `GeminiProvider::new` (Story 1.3.4) will validate auth/build the
+    // ADR-004 client pair the way `AnthropicProvider::new`/`OpenaiProvider::new`
+    // already do; REQ-2's error-propagation scenario becomes meaningfully
+    // testable then. Deferred rather than adding a contrived failure path
+    // that doesn't correspond to any real behavior at the stub stage.
 }

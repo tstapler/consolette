@@ -117,6 +117,9 @@ pub enum UpstreamKind {
     Openai {
         base_url: String,
     },
+    Gemini {
+        project_id: String,
+    },
 }
 
 // Note: no `deny_unknown_fields` here — serde does not support combining it
@@ -367,5 +370,50 @@ impl Default for Config {
             ratelimit: RateLimitConfig::default(),
             cost_metrics: CostMetricsConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{Config, UpstreamKind};
+
+    // REQ-1 (Story 1.1.1): `UpstreamKind::Gemini` parses with a required
+    // `project_id`, and fails to parse without one.
+
+    #[test]
+    fn gemini_upstream_toml_should_parse_into_upstream_kind_gemini_with_project_id() {
+        let toml = r#"
+[[upstreams]]
+name = "gemini"
+kind = "gemini"
+project_id = "my-gcp-project"
+"#;
+
+        let config: Config = toml::from_str(toml).expect("fragment should parse");
+
+        assert_eq!(config.upstreams.len(), 1);
+        match &config.upstreams[0].kind {
+            UpstreamKind::Gemini { project_id } => {
+                assert_eq!(project_id, "my-gcp-project");
+            }
+            other => panic!("expected UpstreamKind::Gemini, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_upstream_toml_should_fail_to_parse_when_project_id_missing() {
+        let toml = r#"
+[[upstreams]]
+name = "gemini"
+kind = "gemini"
+"#;
+
+        let result = toml::from_str::<Config>(toml);
+
+        assert!(
+            result.is_err(),
+            "expected parse failure for missing required project_id, got {result:?}"
+        );
     }
 }

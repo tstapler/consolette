@@ -34,9 +34,9 @@ use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
 pub(crate) use error::DRIFT_COOLDOWN_SECS;
 use error::{classify_gemini_error, GeminiErrorBody};
 use stream::GeminiToAnthropicStream;
-use tools::ThoughtSignatureCache;
 #[cfg(test)]
 use tools::ToolUseId;
+use tools::{GeminiToolCallState, ThoughtSignatureCache};
 use translate::{
     translate_anthropic_request_to_gemini, translate_gemini_response_to_anthropic,
     GeminiGenerateContentResponse,
@@ -403,7 +403,15 @@ fn classify_error_response(status: StatusCode, bytes: &[u8]) -> ProviderError {
 fn translate_success_bytes(bytes: &[u8], model: &str) -> Result<Value, ProviderError> {
     let parsed: GeminiGenerateContentResponse = serde_json::from_slice(bytes)
         .map_err(|e| ProviderError::ResponseShapeMismatch(e.to_string()))?;
-    Ok(translate_gemini_response_to_anthropic(&parsed, model))
+    // Request-scoped and discarded here — see `GeminiToolCallState`'s doc
+    // comment (tools.rs) for why this never needs to persist past this one
+    // response's translation, unlike `ThoughtSignatureCache`.
+    let mut tool_call_state = GeminiToolCallState::new();
+    Ok(translate_gemini_response_to_anthropic(
+        &parsed,
+        model,
+        &mut tool_call_state,
+    ))
 }
 
 /// Parses a `fetchAvailableModels` response body into `Vec<ModelInfo>`.

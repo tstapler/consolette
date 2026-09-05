@@ -1,11 +1,11 @@
 //! Gemini tool-call bookkeeping: `ToolUseId`, `GeminiToolCallState`,
 //! `ThoughtSignatureCache` (Story 1.6.1 onward).
 //!
-//! `ToolUseId` and `ThoughtSignatureCache` are scaffolded here in Phase 1
+//! `ToolUseId` and `ThoughtSignatureCache` were scaffolded here in Phase 1
 //! (Story 1.6.1) ahead of their first real use in Phase 3 (Story 3.3.1), so
-//! both the request-direction (`GeminiToolCallState`, added in Phase 3) and
-//! the cross-call `ThoughtSignatureCache` share one key type instead of each
-//! reinventing a raw-`String`-keyed map. See
+//! both the request-direction `GeminiToolCallState` (added in Story 3.2.1)
+//! and the cross-call `ThoughtSignatureCache` share one key type instead of
+//! each reinventing a raw-`String`-keyed map. See
 //! `project_plans/gemini-provider/implementation/plan.md`'s Epic 1.6 for the
 //! full rationale, especially why the cache must be a `GeminiProvider`-owned
 //! field keyed by `(session_key, ToolUseId)` rather than a per-`send()`-call
@@ -33,6 +33,40 @@ impl From<String> for ToolUseId {
 impl AsRef<str> for ToolUseId {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+/// Request-scoped `ToolUseId` -> Gemini function-name lookup (Story 3.2.1),
+/// built by walking one Anthropic request's `messages[]` in translation
+/// order and by registering ids synthesized while translating one Gemini
+/// response back to Anthropic shape (Story 3.2.2).
+///
+/// Deliberately NOT `GeminiProvider`-owned/persisted like
+/// `ThoughtSignatureCache`: Anthropic's wire format re-sends the full
+/// conversation history on every request, including each earlier `tool_use`
+/// block's `name` right alongside its `id`, so a fresh instance built inside
+/// each `translate_anthropic_request_to_gemini` call always has everything
+/// it needs from that call's own `messages[]` walk — no cross-request
+/// state-smuggling required.
+#[derive(Debug, Default)]
+pub(crate) struct GeminiToolCallState {
+    by_tool_use_id: std::collections::HashMap<ToolUseId, String>,
+}
+
+impl GeminiToolCallState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `id -> function_name`, overwriting any prior mapping for the
+    /// same id (matching how a re-sent `tool_use` block would be handled).
+    pub(crate) fn insert(&mut self, id: ToolUseId, function_name: String) {
+        self.by_tool_use_id.insert(id, function_name);
+    }
+
+    /// Looks up the function name registered for `id`, if any.
+    pub(crate) fn get(&self, id: &ToolUseId) -> Option<&str> {
+        self.by_tool_use_id.get(id).map(String::as_str)
     }
 }
 
@@ -111,6 +145,27 @@ impl ThoughtSignatureCache {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // Story 3.2.1 (Task 3.2.1a) — GeminiToolCallState insert/get round-trip.
+    #[test]
+    fn gemini_tool_call_state_get_should_return_registered_function_name_for_known_id() {
+        let mut state = GeminiToolCallState::new();
+        let id = ToolUseId::from("toolu_01".to_string());
+
+        state.insert(id.clone(), "get_weather".to_string());
+
+        assert_eq!(state.get(&id), Some("get_weather"));
+    }
+
+    // Story 3.2.1 (Task 3.2.1a) — unknown id looks up to None rather than
+    // panicking, matching the fail-closed lookup used by translate.rs.
+    #[test]
+    fn gemini_tool_call_state_get_should_return_none_for_unregistered_id() {
+        let state = GeminiToolCallState::new();
+        let unknown = ToolUseId::from("toolu_unknown".to_string());
+
+        assert_eq!(state.get(&unknown), None);
+    }
 
     // REQ-13 (Story 1.6.1) — pure-`tools.rs` unit test: a different session
     // key never sees an entry inserted under another session key, even for

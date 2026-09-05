@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 
 use crate::providers::ProviderError;
 
+use super::tools::{GeminiToolCallState, ToolUseId};
+
 // ---------------------------------------------------------------------------
 // Request-direction wire structs (Task 1.3.1a)
 // ---------------------------------------------------------------------------
@@ -45,6 +47,29 @@ pub(crate) struct GeminiRequest {
     pub system_instruction: Option<GeminiSystemInstruction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GeminiGenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<GeminiTool>>,
+}
+
+/// One entry of Gemini's top-level `tools[]` array — always exactly one
+/// element in practice (all of an Anthropic request's `tools[]` collapsed
+/// into a single `functionDeclarations` list), matching Gemini's documented
+/// shape of one `Tool` object carrying every declared function.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiTool {
+    pub function_declarations: Vec<GeminiFunctionDeclaration>,
+}
+
+/// One Anthropic `tools[]` entry translated into Gemini's
+/// `functionDeclarations[]` shape (Task 3.2.1c) — `input_schema` is run
+/// through [`sanitize_function_schema`] before being emitted as `parameters`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GeminiFunctionDeclaration {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: Value,
 }
 
 /// A single Gemini `contents[]` entry — the Gemini analog of an Anthropic
@@ -61,12 +86,70 @@ pub(crate) struct GeminiContent {
     pub parts: Vec<GeminiPart>,
 }
 
-/// A single Gemini content part. Text-only in Phase 1 — `functionCall`/
-/// `functionResponse` variants land in Phase 3.
+/// A single Gemini content part. Text-only in Phase 1; Phase 3 (Story 3.2.1/
+/// 3.2.2) adds `functionCall`/`functionResponse` — every field is optional
+/// since a given part is exactly one of text/`functionCall`/
+/// `functionResponse`, never more than one (Gemini's own tagged-union shape,
+/// modeled here the same way `bedrock.rs`'s content-block `Value` juggling
+/// does — as sibling `Option`s rather than a Rust `enum`, so `#[serde(flatten)]`-
+/// free (de)serialization stays a straight field-by-field mapping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct GeminiPart {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub function_call: Option<GeminiFunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub function_response: Option<GeminiFunctionResponse>,
+}
+
+impl GeminiPart {
+    fn text(text: String) -> Self {
+        Self {
+            text: Some(text),
+            function_call: None,
+            function_response: None,
+        }
+    }
+
+    fn function_call(call: GeminiFunctionCall) -> Self {
+        Self {
+            text: None,
+            function_call: Some(call),
+            function_response: None,
+        }
+    }
+
+    fn function_response(response: GeminiFunctionResponse) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: Some(response),
+        }
+    }
+}
+
+/// Gemini's `functionCall` part shape — `name`+`args` only. Unlike
+/// Anthropic's `tool_use` block, Gemini carries no independent `id`; the
+/// request/response round trip instead relies on
+/// [`super::tools::GeminiToolCallState`] (Story 3.2.1/3.2.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct GeminiFunctionCall {
+    pub name: String,
+    #[serde(default = "default_function_args")]
+    pub args: Value,
+}
+
+/// Gemini's `functionResponse` part shape — `name`+`response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct GeminiFunctionResponse {
+    pub name: String,
+    pub response: Value,
+}
+
+fn default_function_args() -> Value {
+    json!({})
 }
 
 /// Gemini's `systemInstruction` — always an **object**, never a bare string
@@ -101,18 +184,22 @@ pub(crate) struct GeminiGenerationConfig {
 /// Translate an Anthropic Messages request body into the two-layer Cloud
 /// Code Assist envelope.
 ///
-/// `Result`-returning from Phase 1 onward even though every Phase 1/2 input
-/// returns `Ok` — Phase 3's Story 3.3.2 needs an `Err` path (a `tool_use` id
-/// with no cached `thought_signature`), and designing the signature fallible
-/// now avoids a breaking one-call-site signature change later.
+/// Builds a fresh, call-local [`GeminiToolCallState`] and walks
+/// `messages[]` in order (Story 3.2.1): each `tool_use` block registers its
+/// `id -> name` mapping as it's encountered, and each `tool_result` block
+/// consults that mapping to re-associate itself with the right function
+/// name (Gemini's `functionResponse` carries no id of its own). This state
+/// is never threaded in from outside or persisted across calls — Anthropic
+/// always re-sends the full conversation history, `tool_use` blocks
+/// included, so everything a `tool_result` needs is already present earlier
+/// in this same `messages[]` array.
 ///
 /// # Errors
 ///
-/// Never returns `Err` for any Phase 1/2 (text-only, no tool calls) input —
-/// intentionally `Result`-returning ahead of Phase 3's Story 3.3.2, which
-/// needs an `Err` path (a `tool_use` id with no cached `thought_signature`);
-/// see plan.md Task 1.3.1b.
-#[allow(clippy::unnecessary_wraps)]
+/// Returns [`ProviderError::Validation`] if a `tool_result` block's
+/// `tool_use_id` doesn't match any `tool_use` id seen earlier in
+/// `messages[]` (Story 3.2.1, Task 3.2.1c). Never returns `Err` for any
+/// other Phase 1/2/3.2.1 input.
 pub(crate) fn translate_anthropic_request_to_gemini(
     anthropic: &Value,
     project_id: &str,
@@ -123,6 +210,7 @@ pub(crate) fn translate_anthropic_request_to_gemini(
         .unwrap_or("gemini-3-pro")
         .to_string();
 
+    let mut tool_call_state = GeminiToolCallState::new();
     let mut contents = Vec::new();
     if let Some(messages) = anthropic.get("messages").and_then(Value::as_array) {
         for msg in messages {
@@ -134,7 +222,7 @@ pub(crate) fn translate_anthropic_request_to_gemini(
             let content = msg.get("content").cloned().unwrap_or(Value::Null);
             contents.push(GeminiContent {
                 role,
-                parts: content_to_gemini_parts(&content),
+                parts: content_to_gemini_parts(&content, &mut tool_call_state)?,
             });
         }
     }
@@ -144,12 +232,11 @@ pub(crate) fn translate_anthropic_request_to_gemini(
             .get("system")
             .and_then(Value::as_str)
             .map(|s| GeminiSystemInstruction {
-                parts: vec![GeminiPart {
-                    text: Some(s.to_string()),
-                }],
+                parts: vec![GeminiPart::text(s.to_string())],
             });
 
     let generation_config = build_generation_config(anthropic);
+    let tools = build_gemini_tools(anthropic);
 
     Ok(CloudCodeEnvelope {
         project: project_id.to_string(),
@@ -160,26 +247,126 @@ pub(crate) fn translate_anthropic_request_to_gemini(
             contents,
             system_instruction,
             generation_config,
+            tools,
         },
     })
 }
 
-/// Anthropic `messages[].content` (string or array of `{"type":"text",...}`
-/// blocks) -> `Vec<GeminiPart>`, one part per text block.
-fn content_to_gemini_parts(content: &Value) -> Vec<GeminiPart> {
+/// Anthropic `messages[].content` (string, or array of `text`/`tool_use`/
+/// `tool_result` blocks) -> `Vec<GeminiPart>`, one part per recognized
+/// block. Unrecognized block types are silently skipped, matching Phase 1's
+/// existing text-only filtering behavior.
+fn content_to_gemini_parts(
+    content: &Value,
+    tool_call_state: &mut GeminiToolCallState,
+) -> Result<Vec<GeminiPart>, ProviderError> {
     match content {
-        Value::String(s) => vec![GeminiPart {
-            text: Some(s.clone()),
-        }],
-        Value::Array(arr) => arr
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .map(|text| GeminiPart {
-                text: Some(text.to_string()),
+        Value::String(s) => Ok(vec![GeminiPart::text(s.clone())]),
+        Value::Array(arr) => {
+            let mut parts = Vec::with_capacity(arr.len());
+            for block in arr {
+                if let Some(part) = block_to_gemini_part(block, tool_call_state)? {
+                    parts.push(part);
+                }
+            }
+            Ok(parts)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Translates one Anthropic content block (`text`/`tool_use`/`tool_result`)
+/// into a `GeminiPart`, or `None` for an unrecognized block type.
+fn block_to_gemini_part(
+    block: &Value,
+    tool_call_state: &mut GeminiToolCallState,
+) -> Result<Option<GeminiPart>, ProviderError> {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| GeminiPart::text(text.to_string()))),
+        Some("tool_use") => {
+            let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let args = block.get("input").cloned().unwrap_or_else(|| json!({}));
+
+            tool_call_state.insert(ToolUseId::from(id.to_string()), name.clone());
+
+            Ok(Some(GeminiPart::function_call(GeminiFunctionCall {
+                name,
+                args,
+            })))
+        }
+        Some("tool_result") => {
+            let tool_use_id = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = tool_call_state
+                .get(&ToolUseId::from(tool_use_id.to_string()))
+                .ok_or_else(|| {
+                    ProviderError::Validation(
+                        format!(
+                            "tool_result references unknown tool_use_id {tool_use_id:?} — no matching tool_use block seen earlier in this conversation"
+                        ),
+                        400,
+                    )
+                })?
+                .to_string();
+            let result = block.get("content").cloned().unwrap_or(Value::Null);
+
+            Ok(Some(GeminiPart::function_response(
+                GeminiFunctionResponse {
+                    name,
+                    response: json!({ "result": result }),
+                },
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Translates the Anthropic request's top-level `tools[]` array into
+/// Gemini's `functionDeclarations[]` shape (Task 3.2.1c), running each
+/// tool's `input_schema` through [`sanitize_function_schema`] first.
+/// Returns `None` when `tools[]` is absent or empty, matching
+/// `generationConfig`'s "only present when needed" convention.
+fn build_gemini_tools(anthropic: &Value) -> Option<Vec<GeminiTool>> {
+    let tools = anthropic.get("tools").and_then(Value::as_array)?;
+
+    let function_declarations: Vec<GeminiFunctionDeclaration> = tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str)?.to_string();
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let input_schema = tool
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object"}));
+            let parameters = sanitize_function_schema(&input_schema);
+
+            Some(GeminiFunctionDeclaration {
+                name,
+                description,
+                parameters,
             })
-            .collect(),
-        _ => Vec::new(),
+        })
+        .collect();
+
+    if function_declarations.is_empty() {
+        None
+    } else {
+        Some(vec![GeminiTool {
+            function_declarations,
+        }])
     }
 }
 
@@ -342,24 +529,53 @@ pub(crate) fn map_gemini_finish_reason(reason: Option<&str>) -> (&'static str, O
 
 /// Translate a strictly-parsed Gemini `generateContent` response into an
 /// Anthropic Messages response body.
+///
+/// Each `functionCall` part becomes a `tool_use` block with a synthesized
+/// `toolu_{uuid}` id (mirroring `openai.rs`'s `msg_{uuid}` pattern), and
+/// registers that id into `tool_call_state` (Story 3.2.2) so a later
+/// request-direction `tool_result` referencing it can be re-associated with
+/// the right function name via `GeminiToolCallState::get` (Story 3.2.1).
+/// Presence of a `functionCall` part takes precedence over the plain
+/// `STOP`->`end_turn` mapping: `stop_reason` becomes `"tool_use"` regardless
+/// of `finishReason`'s own value.
 #[must_use]
 pub(crate) fn translate_gemini_response_to_anthropic(
     response: &GeminiGenerateContentResponse,
     model: &str,
+    tool_call_state: &mut GeminiToolCallState,
 ) -> Value {
     let mut content: Vec<Value> = Vec::new();
     let mut stop_reason: &'static str = "end_turn";
+    let mut has_function_call = false;
 
     if let Some(candidate) = response.candidates.first() {
         for part in &candidate.content.parts {
             if let Some(text) = &part.text {
                 content.push(json!({"type": "text", "text": text}));
             }
+            if let Some(function_call) = &part.function_call {
+                has_function_call = true;
+                let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4());
+                tool_call_state.insert(
+                    ToolUseId::from(tool_use_id.clone()),
+                    function_call.name.clone(),
+                );
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": function_call.name,
+                    "input": function_call.args,
+                }));
+            }
         }
 
         let (mapped_stop_reason, synthesized) =
             map_gemini_finish_reason(candidate.finish_reason.as_deref());
-        stop_reason = mapped_stop_reason;
+        stop_reason = if has_function_call {
+            "tool_use"
+        } else {
+            mapped_stop_reason
+        };
         if let Some(text) = synthesized {
             content.push(json!({"type": "text", "text": text}));
         }
@@ -513,6 +729,141 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // Story 3.2.1 — request-direction tool_use/tool_result translation
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_map_tool_use_block_to_function_call_part_without_id(
+    ) {
+        let anthropic = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "get_weather",
+                    "input": {"city": "Boise"},
+                }],
+            }],
+        });
+
+        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(
+            value["request"]["contents"],
+            json!([{
+                "role": "model",
+                "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Boise"}}}],
+            }])
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_map_tool_result_to_function_response_via_tool_call_state(
+    ) {
+        let anthropic = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_01",
+                        "name": "get_weather",
+                        "input": {"city": "Boise"},
+                    }],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01",
+                        "content": "58F and sunny",
+                    }],
+                },
+            ],
+        });
+
+        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(
+            value["request"]["contents"][1],
+            json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": "get_weather",
+                        "response": {"result": "58F and sunny"},
+                    },
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_return_validation_error_when_tool_result_references_unknown_tool_use_id(
+    ) {
+        let anthropic = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_never_seen",
+                    "content": "irrelevant",
+                }],
+            }],
+        });
+
+        let err = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap_err();
+
+        match err {
+            ProviderError::Validation(msg, status) => {
+                assert_eq!(status, 400);
+                assert!(
+                    msg.contains("toolu_never_seen"),
+                    "expected error message to name the offending id, got: {msg}"
+                );
+            }
+            other => panic!("expected ProviderError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_translate_tools_array_into_sanitized_function_declarations(
+    ) {
+        let anthropic = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Gets the weather",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"$ref": "#/$defs/City"}},
+                    "$defs": {"City": {"type": "string"}},
+                },
+            }],
+        });
+
+        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(
+            value["request"]["tools"],
+            json!([{
+                "functionDeclarations": [{
+                    "name": "get_weather",
+                    "description": "Gets the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {}},
+                    },
+                }],
+            }])
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // Story 1.3.2 — response translation + finishReason mapping
     // ────────────────────────────────────────────────────────────────────
 
@@ -534,7 +885,11 @@ mod tests {
             },
         }));
 
-        let anthropic = translate_gemini_response_to_anthropic(&response, "gemini-3-pro");
+        let anthropic = translate_gemini_response_to_anthropic(
+            &response,
+            "gemini-3-pro",
+            &mut GeminiToolCallState::new(),
+        );
 
         assert_eq!(
             anthropic["content"],
@@ -567,7 +922,11 @@ mod tests {
             },
         }));
 
-        let anthropic = translate_gemini_response_to_anthropic(&response, "gemini-3-pro");
+        let anthropic = translate_gemini_response_to_anthropic(
+            &response,
+            "gemini-3-pro",
+            &mut GeminiToolCallState::new(),
+        );
 
         assert_eq!(anthropic["stop_reason"], json!("end_turn"));
         assert_eq!(
@@ -594,9 +953,72 @@ mod tests {
             },
         }));
 
-        let anthropic = translate_gemini_response_to_anthropic(&response, "gemini-3-pro");
+        let anthropic = translate_gemini_response_to_anthropic(
+            &response,
+            "gemini-3-pro",
+            &mut GeminiToolCallState::new(),
+        );
 
         assert_eq!(anthropic["stop_reason"], json!("max_tokens"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Story 3.2.2 — response-direction functionCall translation
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn translate_gemini_response_to_anthropic_should_synthesize_tool_use_id_and_set_stop_reason_tool_use(
+    ) {
+        let response = parse_gemini_response(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Boise"}}}],
+                },
+                "finishReason": "STOP",
+            }],
+        }));
+        let mut tool_call_state = GeminiToolCallState::new();
+
+        let anthropic =
+            translate_gemini_response_to_anthropic(&response, "gemini-3-pro", &mut tool_call_state);
+
+        assert_eq!(anthropic["stop_reason"], json!("tool_use"));
+        let blocks = anthropic["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], json!("tool_use"));
+        assert_eq!(blocks[0]["name"], json!("get_weather"));
+        assert_eq!(blocks[0]["input"], json!({"city": "Boise"}));
+        let id = blocks[0]["id"].as_str().unwrap();
+        assert!(
+            id.starts_with("toolu_"),
+            "expected a synthesized toolu_<uuid> id, got {id}"
+        );
+    }
+
+    #[test]
+    fn translate_gemini_response_to_anthropic_should_register_synthesized_id_in_tool_call_state_for_later_lookup(
+    ) {
+        let response = parse_gemini_response(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Boise"}}}],
+                },
+                "finishReason": "STOP",
+            }],
+        }));
+        let mut tool_call_state = GeminiToolCallState::new();
+
+        let anthropic =
+            translate_gemini_response_to_anthropic(&response, "gemini-3-pro", &mut tool_call_state);
+
+        let synthesized_id = anthropic["content"][0]["id"].as_str().unwrap().to_string();
+
+        assert_eq!(
+            tool_call_state.get(&ToolUseId::from(synthesized_id)),
+            Some("get_weather")
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────

@@ -78,9 +78,12 @@ pub async fn build_providers(config: &Config) -> anyhow::Result<Vec<(String, Arc
                 Arc::clone(&exec_cache),
                 config.request_timeout,
             )?),
-            UpstreamKind::Gemini { .. } => {
-                Arc::new(GeminiProvider::stub(Arc::new(upstream.clone())))
-            }
+            UpstreamKind::Gemini { .. } => Arc::new(GeminiProvider::new(
+                Arc::new(upstream.clone()),
+                Arc::clone(&resolver),
+                Arc::clone(&exec_cache),
+                config.request_timeout,
+            )?),
         };
         providers.push((upstream.name.clone(), provider));
     }
@@ -1097,13 +1100,90 @@ mod tests {
         assert_eq!(providers[0].1.name(), "gemini");
     }
 
-    // `GeminiProvider::stub` (Task 1.1.2a/b) is deliberately infallible — it
-    // carries only an `Arc<Upstream>`, no client construction or auth
-    // validation yet — so `build_providers` has no way to fail for a
-    // `Gemini` upstream at this stage. The real, fallible
-    // `GeminiProvider::new` (Story 1.3.4) will validate auth/build the
-    // ADR-004 client pair the way `AnthropicProvider::new`/`OpenaiProvider::new`
-    // already do; REQ-2's error-propagation scenario becomes meaningfully
-    // testable then. Deferred rather than adding a contrived failure path
-    // that doesn't correspond to any real behavior at the stub stage.
+    // Story 1.3.4 replaced `GeminiProvider::stub` with the real, fallible
+    // `GeminiProvider::new` (ADR-004 two-client split) above — construction
+    // only fails on a `reqwest::Client` build error (no auth validation at
+    // construction time, matching `AnthropicProvider::new`/`OpenaiProvider::new`),
+    // so `build_providers_should_construct_provider_for_upstream_kind_gemini`
+    // above still exercises the happy path with `auth: None` correctly.
+
+    // REQ-6 (Story 1.3.4f): "does the translated response actually flow back
+    // through `Router::dispatch` correctly" — a fake `Provider` standing in
+    // for `GeminiProvider` (rescoped away from a mocked-HTTP-server
+    // integration test per validation.md's Test Stack Notes; the real
+    // translation logic itself is unit-tested directly in
+    // `providers::gemini::translate`/`providers::gemini::mod`).
+    struct FakeGeminiLikeProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for FakeGeminiLikeProvider {
+        fn name(&self) -> &'static str {
+            "gemini"
+        }
+
+        async fn send(
+            &self,
+            _body: serde_json::Value,
+            _headers: HeaderMap,
+            _stream: bool,
+        ) -> Result<ProviderResponse, ProviderError> {
+            // Mirrors the Anthropic-shaped body `GeminiProvider::send`
+            // returns after translating a STOP-finish-reason Gemini response
+            // (Story 1.3.2's example fixture).
+            Ok(ProviderResponse::Full(serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "model": "gemini-3-pro",
+                "content": [{"type": "text", "text": "hello"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            })))
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_flow_translated_gemini_shaped_response_back_unchanged_and_attribute_metrics_to_gemini(
+    ) {
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(FakeGeminiLikeProvider)];
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![upstream(0, "gemini")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics.clone(),
+        );
+
+        let body = serde_json::json!({
+            "model": "gemini-3-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let result = router
+            .dispatch(body, HeaderMap::new(), false, 0)
+            .await
+            .unwrap();
+
+        match result {
+            ProviderResponse::Full(value) => {
+                assert_eq!(value["content"][0]["text"], "hello");
+                assert_eq!(value["stop_reason"], "end_turn");
+            }
+            ProviderResponse::Stream(_) => panic!("expected a full response, not a stream"),
+        }
+
+        let gemini_counters = metrics.counters.upstreams.get("gemini").unwrap();
+        assert_eq!(gemini_counters.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(gemini_counters.success.load(Ordering::Relaxed), 1);
+    }
 }

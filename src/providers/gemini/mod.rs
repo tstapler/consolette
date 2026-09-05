@@ -1,45 +1,115 @@
 //! `GeminiProvider`: Cloud Code Assist upstream (ADR-001/ADR-003).
 //!
-//! Wired-but-inert skeleton (Epic 1.1): `GeminiProvider` compiles and
-//! satisfies the `Provider` trait, but `send()` is a stub — real request/
-//! response translation lands starting Epic 1.3.
+//! Non-streaming text completions (Epic 1.3): `send()` translates an
+//! Anthropic Messages request into the Cloud Code Assist `CloudCodeEnvelope`
+//! (`translate.rs`), POSTs it to `v1internal:generateContent`, strictly
+//! parses the 2xx body (ADR-002 — a parse failure becomes
+//! `ProviderError::ResponseShapeMismatch`, never a lenient default), and
+//! translates the response back to Anthropic shape. Streaming (`stream.rs`)
+//! and tool calls (`tools.rs`'s `ThoughtSignatureCache`/`GeminiToolCallState`
+//! becoming load-bearing) land in later phases.
 
 mod error;
 mod tools;
 mod translate;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use http::HeaderMap;
+use reqwest::{Client, StatusCode};
+use serde_json::Value;
+use tracing::debug;
 
+use crate::auth::exec::ExecCredentialCache;
+use crate::auth::SecretResolver;
 use crate::config::schema::{Upstream, UpstreamKind};
 
+use super::anthropic::apply_auth_headers;
 use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
+
+use error::{classify_gemini_error, GeminiErrorBody};
+use translate::{
+    translate_anthropic_request_to_gemini, translate_gemini_response_to_anthropic,
+    GeminiGenerateContentResponse,
+};
 
 /// Provider for Google's Cloud Code Assist endpoint, structurally mirroring
 /// `OpenaiProvider` more than `AnthropicProvider` (see Domain Glossary).
 pub struct GeminiProvider {
-    /// The upstream this provider was constructed for — supplies `name`,
-    /// `auth`, and (via `UpstreamKind::Gemini::project_id`) the Cloud Code
-    /// Assist envelope's `project` field.
+    /// Pooled client for non-streaming requests.
+    client: Client,
+    /// Non-pooled client for SSE streaming (prevents pool exhaustion, ADR-004).
+    /// Unused until Phase 2's streaming `send()` path lands, but constructed
+    /// here (not lazily) to match `AnthropicProvider`/`OpenaiProvider`'s
+    /// established two-client-at-construction-time shape.
+    #[allow(dead_code)]
+    stream_client: Client,
+    /// Base URL for the Cloud Code Assist API — hardcoded, matching
+    /// `AnthropicProvider`'s precedent (`UpstreamKind::Gemini` carries no
+    /// base-URL override field).
+    base_url: String,
+    /// The upstream this provider was constructed for — supplies `name`
+    /// (for exec-cache keying/logging) and (via `UpstreamKind::Gemini::project_id`)
+    /// the Cloud Code Assist envelope's `project` field.
     upstream: Arc<Upstream>,
+    /// Resolves `SecretRef`s (env/keychain/inline) to plaintext.
+    resolver: Arc<dyn SecretResolver + Send + Sync>,
+    /// Shared cache for `exec` auth-method subprocess results.
+    exec_cache: Arc<ExecCredentialCache>,
+    // Epic 1.6 will add a thought_signatures field here (ThoughtSignatureCache).
 }
 
 impl GeminiProvider {
-    /// Wired-but-inert stub constructor (Task 1.1.2a/b). The real fallible
-    /// constructor (`GeminiProvider::new`, building the ADR-004 client pair
-    /// and validating auth) lands in Story 1.3.4.
-    #[must_use]
-    pub fn stub(upstream: Arc<Upstream>) -> Self {
-        Self { upstream }
+    /// Construct a new `GeminiProvider` for one configured `Upstream`.
+    ///
+    /// Follows the ADR-004 two-client split identically to
+    /// `AnthropicProvider::new`/`OpenaiProvider::new`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProviderError::Upstream`] if either reqwest `Client`
+    /// fails to build (e.g. an invalid TLS backend configuration).
+    pub fn new(
+        upstream: Arc<Upstream>,
+        resolver: Arc<dyn SecretResolver + Send + Sync>,
+        exec_cache: Arc<ExecCredentialCache>,
+        request_timeout_secs: u64,
+    ) -> Result<Self, ProviderError> {
+        let timeout = Duration::from_secs(request_timeout_secs);
+
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(timeout)
+            .build()
+            .map_err(|e| ProviderError::Upstream {
+                status: 0,
+                body: e.to_string(),
+            })?;
+
+        // ADR-004: separate client with pool_max_idle_per_host(0) for SSE
+        let stream_client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| ProviderError::Upstream {
+                status: 0,
+                body: e.to_string(),
+            })?;
+
+        Ok(Self {
+            client,
+            stream_client,
+            base_url: "https://cloudcode-pa.googleapis.com".to_string(),
+            upstream,
+            resolver,
+            exec_cache,
+        })
     }
 
     /// The configured Cloud Code Assist project id (ADR-003), used verbatim
     /// as `CloudCodeEnvelope.project` on every outgoing request.
-    //
-    // TODO(Epic 1.3, Story 1.3.1/1.3.4): send() must call self.project_id()
-    // when building the outgoing envelope — see plan.md Story 1.7.1.
     #[must_use]
     pub fn project_id(&self) -> &str {
         match &self.upstream.kind {
@@ -49,6 +119,221 @@ impl GeminiProvider {
             other => unreachable!("GeminiProvider constructed for non-Gemini upstream: {other:?}"),
         }
     }
+
+    /// Build the outgoing request headers: `Content-Type` plus auth per the
+    /// upstream's configured `AuthMethod`.
+    ///
+    /// On an auth failure, logs a `gemini`-specific, actionable message
+    /// (Task 1.2.2b, folded into this story) distinct from `exec.rs`'s
+    /// generic `tracing::warn!` — this one names the actual remediation
+    /// command for a locally-detected expired/missing Antigravity token.
+    async fn build_headers(&self, url: &str) -> Result<HeaderMap, ProviderError> {
+        let mut out = HeaderMap::new();
+        out.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+
+        match apply_auth_headers(
+            &self.upstream,
+            self.resolver.as_ref(),
+            &self.exec_cache,
+            &mut out,
+            url,
+        )
+        .await
+        {
+            Ok(()) => Ok(out),
+            Err(ProviderError::Auth(msg)) => {
+                tracing::error!(
+                    upstream = "gemini",
+                    %msg,
+                    "gemini upstream: token refresh failed — run 'antigravity-cli login' or reopen the Antigravity IDE to mint a fresh token"
+                );
+                Err(ProviderError::Auth(msg))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send a non-streaming request to `POST /v1internal:generateContent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProviderError`] if header construction/auth fails, the
+    /// request times out, the upstream responds with a non-2xx status, or
+    /// the 2xx body doesn't match the documented shape
+    /// (`ProviderError::ResponseShapeMismatch`, ADR-002).
+    pub async fn send_request(&self, body: Value) -> Result<Value, ProviderError> {
+        let url = format!("{}/v1internal:generateContent", self.base_url);
+        let headers = self.build_headers(&url).await?;
+
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("gemini-3-pro")
+            .to_string();
+
+        let envelope = translate_anthropic_request_to_gemini(&body, self.project_id())?;
+        let body_bytes = serde_json::to_vec(&envelope).map_err(|e| ProviderError::Upstream {
+            status: 0,
+            body: e.to_string(),
+        })?;
+
+        debug!("Gemini non-stream POST {url}");
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Upstream {
+                        status: 0,
+                        body: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Upstream {
+                status: status.as_u16(),
+                body: e.to_string(),
+            })?;
+
+        if !status.is_success() {
+            let err = classify_error_response(status, &bytes);
+            // Task 1.3.4c: a real HTTP 401/403 from Gemini itself (meaning
+            // apply_auth_headers already succeeded — the local token was NOT
+            // expired) is a distinct signal from build_headers's
+            // locally-detected-expiry log line above: possible account
+            // suspension/revocation, not routine expiry.
+            if err.is_auth() {
+                tracing::error!(
+                    "gemini upstream: request rejected with 401/403 despite a non-expired local token — this may indicate account suspension/revocation (see requirements.md's accepted ToS risk), not routine expiry; running 'antigravity-cli login' will not fix a suspension"
+                );
+            }
+            return Err(err);
+        }
+
+        translate_success_bytes(&bytes, &model)
+    }
+
+    /// Fetch the list of available models from
+    /// `POST /v1internal:fetchAvailableModels`.
+    ///
+    /// Uses POST (per plan.md's Unresolved Questions note: "try POST first,
+    /// matching `generateContent`'s method" — no live token was available to
+    /// verify this against the real endpoint; adjust if a live call 405s).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProviderError`] if header construction/auth fails, the
+    /// request times out, or the upstream responds with a non-2xx status.
+    pub async fn fetch_models(&self) -> Result<Value, ProviderError> {
+        let url = format!("{}/v1internal:fetchAvailableModels", self.base_url);
+        let headers = self.build_headers(&url).await?;
+
+        debug!("Gemini POST {url}");
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body("{}")
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Upstream {
+                        status: 0,
+                        body: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_str = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                status: status.as_u16(),
+                body: body_str,
+            });
+        }
+
+        response.json().await.map_err(|e| ProviderError::Upstream {
+            status: status.as_u16(),
+            body: e.to_string(),
+        })
+    }
+}
+
+/// Parses a non-2xx Gemini response body into a `ProviderError`. Falls back
+/// to a plain `Upstream` error if the body itself isn't the expected
+/// `GeminiErrorBody` shape (e.g. an upstream proxy's own HTML error page).
+fn classify_error_response(status: StatusCode, bytes: &[u8]) -> ProviderError {
+    match serde_json::from_slice::<GeminiErrorBody>(bytes) {
+        Ok(error_body) => classify_gemini_error(status, &error_body),
+        Err(_) => ProviderError::Upstream {
+            status: status.as_u16(),
+            body: String::from_utf8_lossy(bytes).into_owned(),
+        },
+    }
+}
+
+/// Strictly parses a 2xx `generateContent` response body and translates it
+/// to Anthropic shape. Extracted as a pure function (no network I/O) so it's
+/// directly fixture-testable per Task 1.3.4f's rescoped scope (validation.md
+/// Test Stack Notes) — no HTTP-mocking crate needed.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::ResponseShapeMismatch`] if `bytes` doesn't
+/// strictly deserialize into `GeminiGenerateContentResponse` (ADR-002 — no
+/// `.unwrap_or_default()` fallback).
+fn translate_success_bytes(bytes: &[u8], model: &str) -> Result<Value, ProviderError> {
+    let parsed: GeminiGenerateContentResponse = serde_json::from_slice(bytes)
+        .map_err(|e| ProviderError::ResponseShapeMismatch(e.to_string()))?;
+    Ok(translate_gemini_response_to_anthropic(&parsed, model))
+}
+
+/// Parses a `fetchAvailableModels` response body into `Vec<ModelInfo>`.
+/// Extracted as a pure function for the same fixture-testability reason as
+/// `translate_success_bytes`. Exact response shape is unverified (plan.md's
+/// Unresolved Questions) — this accepts `{"models":[{"name": "..."}]}`,
+/// stripping a `"models/"` resource-name prefix if present (the shape
+/// Google's public Generative Language API uses), on the theory that Cloud
+/// Code Assist's internal endpoint likely follows the same convention;
+/// confirm/adjust against the real response during Task 1.3.4h.
+fn parse_available_models(value: &Value) -> Vec<ModelInfo> {
+    value
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let raw_name = entry.get("name").and_then(Value::as_str)?;
+            let id = raw_name
+                .strip_prefix("models/")
+                .unwrap_or(raw_name)
+                .to_string();
+            Some(ModelInfo {
+                id,
+                owned_by: Some("google".to_string()),
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -59,38 +344,160 @@ impl Provider for GeminiProvider {
 
     async fn send(
         &self,
-        _body: serde_json::Value,
+        body: Value,
         _headers: HeaderMap,
-        _stream: bool,
+        stream: bool,
     ) -> Result<ProviderResponse, ProviderError> {
-        Err(ProviderError::ModelUnsupported(
-            "gemini stub not yet implemented".to_string(),
-        ))
+        if stream {
+            // Phase 2 (Story 2.1.2) wires stream:true through stream_client
+            // against streamGenerateContent — not yet implemented.
+            return Err(ProviderError::ModelUnsupported(
+                "gemini streaming not yet implemented".to_string(),
+            ));
+        }
+        let value = self.send_request(body).await?;
+        Ok(ProviderResponse::Full(value))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(vec![])
+        let value = self.fetch_models().await?;
+        Ok(parse_available_models(&value))
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn test_upstream(project_id: &str) -> Arc<Upstream> {
+        Arc::new(Upstream {
+            name: "gemini".to_string(),
+            kind: UpstreamKind::Gemini {
+                project_id: project_id.to_string(),
+            },
+            auth: None,
+        })
+    }
+
+    fn test_provider() -> GeminiProvider {
+        GeminiProvider::new(
+            test_upstream("my-gcp-project"),
+            Arc::new(crate::auth::SystemSecretResolver),
+            Arc::new(ExecCredentialCache::new()),
+            60,
+        )
+        .unwrap()
+    }
 
     // REQ-14 (Story 1.7.1): `project_id()` returns the exact configured
     // string from `UpstreamKind::Gemini`, never a default/guess.
-
     #[test]
     fn project_id_accessor_should_return_configured_project_id_from_upstream_kind_gemini() {
-        let upstream = Arc::new(Upstream {
-            name: "gemini".to_string(),
-            kind: UpstreamKind::Gemini {
-                project_id: "my-gcp-project".to_string(),
-            },
-            auth: None,
-        });
-        let provider = GeminiProvider::stub(upstream);
-
+        let provider = test_provider();
         assert_eq!(provider.project_id(), "my-gcp-project");
+    }
+
+    // REQ-6 (Story 1.3.4)
+    #[test]
+    fn gemini_provider_new_should_construct_two_distinct_reqwest_clients_matching_adr_004() {
+        let provider = test_provider();
+        assert_eq!(provider.base_url, "https://cloudcode-pa.googleapis.com");
+        // `reqwest::Client` exposes no public identity check; distinctness
+        // is enforced structurally by the two separate `Client::builder()`
+        // calls in `GeminiProvider::new` (one pooled, one
+        // `pool_max_idle_per_host(0)`), matching `AnthropicProvider::new`'s
+        // ADR-004 pattern exactly (both fields exist and both builds
+        // succeeded, asserted by `test_provider()`'s `.unwrap()` above).
+    }
+
+    // REQ-6 — pure-function fixture test (validation.md Test Stack Notes):
+    // no live HTTP mock, feeds the STOP-finish-reason fixture directly
+    // through the post-parse translation path `send()` uses internally.
+    #[test]
+    fn send_should_return_anthropic_shaped_full_response_when_upstream_returns_stop_finish_reason()
+    {
+        let body = br#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+        }"#;
+
+        let result = translate_success_bytes(body, "gemini-3-pro").unwrap();
+
+        assert_eq!(result["content"][0]["text"], "hello");
+        assert_eq!(result["stop_reason"], "end_turn");
+    }
+
+    // REQ-8 (Story 1.4.2, ADR-002) — focus area.
+    #[test]
+    fn send_should_return_response_shape_mismatch_when_candidates_field_is_missing() {
+        let body =
+            br#"{"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":0,"totalTokenCount":1}}"#;
+
+        let err = translate_success_bytes(body, "gemini-3-pro").unwrap_err();
+
+        match err {
+            ProviderError::ResponseShapeMismatch(msg) => {
+                assert!(
+                    msg.contains("candidates"),
+                    "expected the serde error to mention `candidates`, got: {msg}"
+                );
+            }
+            other => panic!("expected ResponseShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_should_return_response_shape_mismatch_when_body_is_truncated_json() {
+        let body = br#"{"candidates":[{"content":"#;
+
+        let err = translate_success_bytes(body, "gemini-3-pro").unwrap_err();
+
+        assert!(matches!(err, ProviderError::ResponseShapeMismatch(_)));
+    }
+
+    #[test]
+    fn send_should_return_ok_when_candidates_present_and_well_formed() {
+        let body = br#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
+        }"#;
+
+        assert!(translate_success_bytes(body, "gemini-3-pro").is_ok());
+    }
+
+    // REQ-6 (Story 1.3.4d/f) — pure-function fixture test, exact
+    // `fetchAvailableModels` shape unverified (see `parse_available_models`'s
+    // doc comment).
+    #[test]
+    fn list_models_should_return_gemini_3_pro_from_fetch_available_models() {
+        let value = json!({
+            "models": [
+                {"name": "models/gemini-3-pro", "displayName": "Gemini 3 Pro"}
+            ]
+        });
+
+        let models = parse_available_models(&value);
+
+        assert_eq!(
+            models,
+            vec![ModelInfo {
+                id: "gemini-3-pro".to_string(),
+                owned_by: Some("google".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn classify_error_response_should_fall_back_to_upstream_when_body_is_not_gemini_error_shape() {
+        let err = classify_error_response(StatusCode::BAD_GATEWAY, b"<html>502</html>");
+        assert!(matches!(err, ProviderError::Upstream { status: 502, .. }));
     }
 }

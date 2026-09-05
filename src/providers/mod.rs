@@ -53,6 +53,14 @@ pub enum ProviderError {
     /// candidate pool was exhausted.
     #[error("all upstream candidates exhausted")]
     Exhausted,
+    /// A 2xx response whose body didn't match the documented/expected shape
+    /// (ADR-002) — distinct from [`ProviderError::Upstream`], which means an
+    /// HTTP-level (non-2xx) failure. Currently only constructed by
+    /// `GeminiProvider` (undocumented, actively-drifting protocol), but
+    /// lives on the shared enum so `Router`/dashboard code can classify it
+    /// generically.
+    #[error("unexpected response shape from upstream: {0}")]
+    ResponseShapeMismatch(String),
 }
 
 impl From<crate::auth::AuthError> for ProviderError {
@@ -97,6 +105,13 @@ impl ProviderError {
             self,
             ProviderError::Timeout | ProviderError::Upstream { .. }
         )
+    }
+
+    /// A 2xx response that didn't match the documented shape (ADR-002) —
+    /// see [`ProviderError::ResponseShapeMismatch`]'s doc comment.
+    #[must_use]
+    pub fn is_response_shape_mismatch(&self) -> bool {
+        matches!(self, ProviderError::ResponseShapeMismatch(_))
     }
 }
 
@@ -595,6 +610,17 @@ mod tests {
             body: String::new()
         }
         .is_transient());
+    }
+
+    // REQ-7 (Story 1.4.1, ADR-002) — focus area.
+    #[test]
+    fn is_response_shape_mismatch_should_return_true_only_for_that_variant() {
+        let err = ProviderError::ResponseShapeMismatch("missing field `candidates`".to_string());
+        assert!(err.is_response_shape_mismatch());
+        assert!(!err.is_auth());
+        assert!(!err.is_validation());
+        assert!(!err.is_rate_limited());
+        assert!(!err.is_transient());
     }
 
     // ────────────────────────────────────────────────────────────────────

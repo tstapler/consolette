@@ -181,6 +181,41 @@ mod tests {
         assert_eq!(cache.get("session-b", &id), Some("sig-for-b".to_string()));
     }
 
+    // REQ-24 (Story 3.3.1, Task 3.3.1d) — happy path: a stash under
+    // `(session_key, ToolUseId)` using the synthesized `tool_use` id shape
+    // (`toolu_{uuid}`, Story 3.2.2) round-trips through `get`.
+    #[test]
+    fn thought_signature_cache_insert_should_stash_signature_keyed_by_session_and_synthesized_tool_use_id(
+    ) {
+        let cache = ThoughtSignatureCache::new();
+        let synthesized_id = ToolUseId::from(format!("toolu_{}", uuid::Uuid::new_v4()));
+
+        cache.insert(
+            "session-a",
+            synthesized_id.clone(),
+            "opaque-blob-xyz".to_string(),
+        );
+
+        assert_eq!(
+            cache.get("session-a", &synthesized_id),
+            Some("opaque-blob-xyz".to_string())
+        );
+    }
+
+    // REQ-24 (Story 3.3.1, Task 3.3.1d) — THE specific cross-conversation
+    // isolation test named in the task brief: identical `ToolUseId`,
+    // different `session_key`, must never cross-wire.
+    #[test]
+    fn thought_signature_cache_get_should_return_none_when_session_key_differs_even_with_identical_tool_use_id(
+    ) {
+        let cache = ThoughtSignatureCache::new();
+        let id = ToolUseId::from("toolu_abc123".to_string());
+
+        cache.insert("session-a", id.clone(), "sig-for-a".to_string());
+
+        assert_eq!(cache.get("session-b", &id), None);
+    }
+
     // REQ-13 (Story 1.6.1) — TTL sweep: an entry older than
     // THOUGHT_SIGNATURE_TTL_SECS is gone after the next `.insert()` call.
     //

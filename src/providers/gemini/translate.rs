@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::providers::ProviderError;
 
-use super::tools::{GeminiToolCallState, ToolUseId};
+use super::tools::{GeminiToolCallState, ThoughtSignatureCache, ToolUseId};
 
 // ---------------------------------------------------------------------------
 // Request-direction wire structs (Task 1.3.1a)
@@ -102,6 +102,15 @@ pub(crate) struct GeminiPart {
     pub function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub function_response: Option<GeminiFunctionResponse>,
+    /// Gemini 3 Pro's opaque per-`functionCall` signature (Story 3.3.1,
+    /// Task 3.3.1a) — `#[serde(rename_all = "camelCase")]` on this struct
+    /// already produces the correct `thoughtSignature` wire name. Present on
+    /// an inbound response part when Gemini supplies one (response-direction
+    /// deserialization); attached on an outbound request part when
+    /// [`translate_anthropic_request_to_gemini`] finds a cached signature to
+    /// replay for a `tool_use` block being re-sent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub thought_signature: Option<String>,
 }
 
 impl GeminiPart {
@@ -110,14 +119,16 @@ impl GeminiPart {
             text: Some(text),
             function_call: None,
             function_response: None,
+            thought_signature: None,
         }
     }
 
-    fn function_call(call: GeminiFunctionCall) -> Self {
+    fn function_call(call: GeminiFunctionCall, thought_signature: Option<String>) -> Self {
         Self {
             text: None,
             function_call: Some(call),
             function_response: None,
+            thought_signature,
         }
     }
 
@@ -126,6 +137,7 @@ impl GeminiPart {
             text: None,
             function_call: None,
             function_response: Some(response),
+            thought_signature: None,
         }
     }
 }
@@ -196,13 +208,25 @@ pub(crate) struct GeminiGenerationConfig {
 ///
 /// # Errors
 ///
-/// Returns [`ProviderError::Validation`] if a `tool_result` block's
-/// `tool_use_id` doesn't match any `tool_use` id seen earlier in
-/// `messages[]` (Story 3.2.1, Task 3.2.1c). Never returns `Err` for any
-/// other Phase 1/2/3.2.1 input.
+/// Returns [`ProviderError::Validation`] if:
+/// - a `tool_result` block's `tool_use_id` doesn't match any `tool_use` id
+///   seen earlier in `messages[]` (Story 3.2.1, Task 3.2.1c), or
+/// - a `tool_use` block being re-emitted as a `functionCall` part has no
+///   matching entry in `thought_signatures` under `session_key` (Story
+///   3.3.2, Task 3.3.2a) — every `tool_use` block this function ever sees
+///   is, by construction, part of resent conversation history (the *live*
+///   turn currently being answered has no `tool_use` block yet; that's
+///   synthesized by [`translate_gemini_response_to_anthropic`] on the
+///   response side), so a missing entry here always means "this
+///   conversation's tool-call history predates a cache eviction/restart, or
+///   didn't originate from Gemini" — never "first tool call in progress."
+///
+/// Never returns `Err` for any other Phase 1/2/3.2.1 input.
 pub(crate) fn translate_anthropic_request_to_gemini(
     anthropic: &Value,
     project_id: &str,
+    thought_signatures: &ThoughtSignatureCache,
+    session_key: &str,
 ) -> Result<CloudCodeEnvelope, ProviderError> {
     let model = anthropic
         .get("model")
@@ -222,7 +246,12 @@ pub(crate) fn translate_anthropic_request_to_gemini(
             let content = msg.get("content").cloned().unwrap_or(Value::Null);
             contents.push(GeminiContent {
                 role,
-                parts: content_to_gemini_parts(&content, &mut tool_call_state)?,
+                parts: content_to_gemini_parts(
+                    &content,
+                    &mut tool_call_state,
+                    thought_signatures,
+                    session_key,
+                )?,
             });
         }
     }
@@ -259,13 +288,17 @@ pub(crate) fn translate_anthropic_request_to_gemini(
 fn content_to_gemini_parts(
     content: &Value,
     tool_call_state: &mut GeminiToolCallState,
+    thought_signatures: &ThoughtSignatureCache,
+    session_key: &str,
 ) -> Result<Vec<GeminiPart>, ProviderError> {
     match content {
         Value::String(s) => Ok(vec![GeminiPart::text(s.clone())]),
         Value::Array(arr) => {
             let mut parts = Vec::with_capacity(arr.len());
             for block in arr {
-                if let Some(part) = block_to_gemini_part(block, tool_call_state)? {
+                if let Some(part) =
+                    block_to_gemini_part(block, tool_call_state, thought_signatures, session_key)?
+                {
                     parts.push(part);
                 }
             }
@@ -277,9 +310,18 @@ fn content_to_gemini_parts(
 
 /// Translates one Anthropic content block (`text`/`tool_use`/`tool_result`)
 /// into a `GeminiPart`, or `None` for an unrecognized block type.
+///
+/// # Errors
+///
+/// A `tool_use` block returns `Err(ProviderError::Validation(..))` (Story
+/// 3.3.2) when `thought_signatures` has no entry for `(session_key, id)` —
+/// see [`translate_anthropic_request_to_gemini`]'s doc comment for why this
+/// is safe to treat as a hard error rather than silently omitting the field.
 fn block_to_gemini_part(
     block: &Value,
     tool_call_state: &mut GeminiToolCallState,
+    thought_signatures: &ThoughtSignatureCache,
+    session_key: &str,
 ) -> Result<Option<GeminiPart>, ProviderError> {
     match block.get("type").and_then(Value::as_str) {
         Some("text") => Ok(block
@@ -297,10 +339,22 @@ fn block_to_gemini_part(
 
             tool_call_state.insert(ToolUseId::from(id.to_string()), name.clone());
 
-            Ok(Some(GeminiPart::function_call(GeminiFunctionCall {
-                name,
-                args,
-            })))
+            let tool_use_id = ToolUseId::from(id.to_string());
+            let signature = thought_signatures
+                .get(session_key, &tool_use_id)
+                .ok_or_else(|| {
+                    ProviderError::Validation(
+                        format!(
+                            "no cached thought_signature for tool_use id {id} — this conversation's tool-call history may predate a consolette restart or TTL eviction"
+                        ),
+                        400,
+                    )
+                })?;
+
+            Ok(Some(GeminiPart::function_call(
+                GeminiFunctionCall { name, args },
+                Some(signature),
+            )))
         }
         Some("tool_result") => {
             let tool_use_id = block
@@ -436,9 +490,7 @@ pub(crate) fn sanitize_function_schema(schema: &Value) -> Value {
             }
             Value::Object(cleaned)
         }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(sanitize_function_schema).collect())
-        }
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_function_schema).collect()),
         other => other.clone(),
     }
 }
@@ -538,15 +590,23 @@ pub(crate) fn map_gemini_finish_reason(reason: Option<&str>) -> (&'static str, O
 /// Presence of a `functionCall` part takes precedence over the plain
 /// `STOP`->`end_turn` mapping: `stop_reason` becomes `"tool_use"` regardless
 /// of `finishReason`'s own value.
+///
+/// Also returns each `functionCall` part's `thoughtSignature` (Story 3.3.1,
+/// Task 3.3.1b) paired with its synthesized `tool_use` id, for every part
+/// where Gemini actually supplied one — this function stays stateless (per
+/// the Pattern Decisions "Request/response translation" row) and never
+/// touches a `ThoughtSignatureCache` itself; the caller (`mod.rs`'s `send()`,
+/// which holds `&self`) is responsible for stashing these.
 #[must_use]
 pub(crate) fn translate_gemini_response_to_anthropic(
     response: &GeminiGenerateContentResponse,
     model: &str,
     tool_call_state: &mut GeminiToolCallState,
-) -> Value {
+) -> (Value, Vec<(ToolUseId, String)>) {
     let mut content: Vec<Value> = Vec::new();
     let mut stop_reason: &'static str = "end_turn";
     let mut has_function_call = false;
+    let mut thought_signatures: Vec<(ToolUseId, String)> = Vec::new();
 
     if let Some(candidate) = response.candidates.first() {
         for part in &candidate.content.parts {
@@ -560,6 +620,13 @@ pub(crate) fn translate_gemini_response_to_anthropic(
                     ToolUseId::from(tool_use_id.clone()),
                     function_call.name.clone(),
                 );
+                // Gemini doesn't necessarily send a thoughtSignature on
+                // every functionCall (defensive per Task 3.3.1b) — only
+                // stash when one is actually present.
+                if let Some(signature) = &part.thought_signature {
+                    thought_signatures
+                        .push((ToolUseId::from(tool_use_id.clone()), signature.clone()));
+                }
                 content.push(json!({
                     "type": "tool_use",
                     "id": tool_use_id,
@@ -600,20 +667,29 @@ pub(crate) fn translate_gemini_response_to_anthropic(
         },
     );
 
-    json!({
+    let value = json!({
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": content,
         "stop_reason": stop_reason,
         "usage": usage,
-    })
+    });
+
+    (value, thought_signatures)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// An empty cache, for tests whose fixtures carry no `tool_use` blocks
+    /// (so no lookup ever happens) — the session key passed alongside it is
+    /// irrelevant for those cases.
+    fn empty_cache() -> ThoughtSignatureCache {
+        ThoughtSignatureCache::new()
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // Story 1.3.1 — request translation
@@ -630,7 +706,13 @@ mod tests {
             "temperature": 0.5,
         });
 
-        let envelope = translate_anthropic_request_to_gemini(&anthropic, "my-gcp-project").unwrap();
+        let envelope = translate_anthropic_request_to_gemini(
+            &anthropic,
+            "my-gcp-project",
+            &empty_cache(),
+            "anonymous",
+        )
+        .unwrap();
         let value = serde_json::to_value(&envelope).unwrap();
 
         assert_eq!(
@@ -654,7 +736,9 @@ mod tests {
             "max_tokens": 1024,
         });
 
-        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let envelope =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap();
         let value = serde_json::to_value(&envelope).unwrap();
 
         let generation_config = value["request"]["generationConfig"].as_object().unwrap();
@@ -668,7 +752,13 @@ mod tests {
     fn translate_anthropic_request_to_gemini_should_use_configured_project_id_never_a_default() {
         let anthropic = json!({"messages": [{"role": "user", "content": "hi"}]});
 
-        let envelope = translate_anthropic_request_to_gemini(&anthropic, "my-gcp-project").unwrap();
+        let envelope = translate_anthropic_request_to_gemini(
+            &anthropic,
+            "my-gcp-project",
+            &empty_cache(),
+            "anonymous",
+        )
+        .unwrap();
 
         assert_eq!(envelope.project, "my-gcp-project");
         assert_eq!(envelope.request_type, "agent");
@@ -680,8 +770,13 @@ mod tests {
 
         // A distinctive, non-obvious project id — catches accidental
         // hardcoding of a plausible-looking default (e.g. "default-project").
-        let envelope =
-            translate_anthropic_request_to_gemini(&anthropic, "acme-corp-billing-2026").unwrap();
+        let envelope = translate_anthropic_request_to_gemini(
+            &anthropic,
+            "acme-corp-billing-2026",
+            &empty_cache(),
+            "anonymous",
+        )
+        .unwrap();
 
         assert_eq!(envelope.project, "acme-corp-billing-2026");
     }
@@ -707,7 +802,8 @@ mod tests {
 
         for fixture in fixtures {
             assert!(
-                translate_anthropic_request_to_gemini(&fixture, "p1").is_ok(),
+                translate_anthropic_request_to_gemini(&fixture, "p1", &empty_cache(), "anonymous")
+                    .is_ok(),
                 "expected Ok for {fixture}"
             );
         }
@@ -722,7 +818,9 @@ mod tests {
             ],
         });
 
-        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let envelope =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap();
 
         assert_eq!(envelope.request.contents[0].role, "user");
         assert_eq!(envelope.request.contents[1].role, "model");
@@ -733,7 +831,7 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn translate_anthropic_request_to_gemini_should_map_tool_use_block_to_function_call_part_without_id(
+    fn translate_anthropic_request_to_gemini_should_map_tool_use_block_to_function_call_part_with_cached_signature(
     ) {
         let anthropic = json!({
             "messages": [{
@@ -746,16 +844,71 @@ mod tests {
                 }],
             }],
         });
+        let cache = empty_cache();
+        cache.insert(
+            "session-a",
+            ToolUseId::from("toolu_01".to_string()),
+            "opaque-blob-xyz".to_string(),
+        );
 
-        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let envelope =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &cache, "session-a").unwrap();
         let value = serde_json::to_value(&envelope).unwrap();
 
         assert_eq!(
             value["request"]["contents"],
             json!([{
                 "role": "model",
-                "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Boise"}}}],
+                "parts": [{
+                    "functionCall": {"name": "get_weather", "args": {"city": "Boise"}},
+                    "thoughtSignature": "opaque-blob-xyz",
+                }],
             }])
+        );
+    }
+
+    // REQ-24 (Story 3.3.1, Task 3.3.1d) — the same-session replay happy
+    // path named explicitly in validation.md: a follow-up request in the
+    // SAME session that resends a prior `tool_use`/`tool_result` turn gets
+    // the exact cached signature echoed back, byte-for-byte.
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_replay_cached_signature_byte_for_byte_on_next_turn_same_session(
+    ) {
+        let anthropic = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_abc123",
+                        "name": "get_weather",
+                        "input": {"city": "Boise"},
+                    }],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_abc123",
+                        "content": "58F and sunny",
+                    }],
+                },
+            ],
+        });
+        let cache = empty_cache();
+        cache.insert(
+            "session-a",
+            ToolUseId::from("toolu_abc123".to_string()),
+            "opaque-blob-xyz".to_string(),
+        );
+
+        let envelope =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &cache, "session-a").unwrap();
+        let value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(
+            value["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            json!("opaque-blob-xyz")
         );
     }
 
@@ -783,8 +936,15 @@ mod tests {
                 },
             ],
         });
+        let cache = empty_cache();
+        cache.insert(
+            "session-a",
+            ToolUseId::from("toolu_01".to_string()),
+            "opaque-blob-xyz".to_string(),
+        );
 
-        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let envelope =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &cache, "session-a").unwrap();
         let value = serde_json::to_value(&envelope).unwrap();
 
         assert_eq!(
@@ -815,7 +975,9 @@ mod tests {
             }],
         });
 
-        let err = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap_err();
+        let err =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap_err();
 
         match err {
             ProviderError::Validation(msg, status) => {
@@ -823,6 +985,40 @@ mod tests {
                 assert!(
                     msg.contains("toolu_never_seen"),
                     "expected error message to name the offending id, got: {msg}"
+                );
+            }
+            other => panic!("expected ProviderError::Validation, got {other:?}"),
+        }
+    }
+
+    // REQ-25 (Story 3.3.2, Task 3.3.2b) — a `tool_use` id with no matching
+    // `ThoughtSignatureCache` entry under the request's session returns a
+    // clear `ProviderError::Validation`, never a silently-omitted field.
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_return_validation_error_when_no_cached_thought_signature_for_tool_use_id(
+    ) {
+        let anthropic = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_unknown999",
+                    "name": "get_weather",
+                    "input": {"city": "Boise"},
+                }],
+            }],
+        });
+
+        let err =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "session-a")
+                .unwrap_err();
+
+        match err {
+            ProviderError::Validation(msg, status) => {
+                assert_eq!(status, 400);
+                assert_eq!(
+                    msg,
+                    "no cached thought_signature for tool_use id toolu_unknown999 — this conversation's tool-call history may predate a consolette restart or TTL eviction"
                 );
             }
             other => panic!("expected ProviderError::Validation, got {other:?}"),
@@ -845,7 +1041,9 @@ mod tests {
             }],
         });
 
-        let envelope = translate_anthropic_request_to_gemini(&anthropic, "p1").unwrap();
+        let envelope =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap();
         let value = serde_json::to_value(&envelope).unwrap();
 
         assert_eq!(
@@ -885,7 +1083,7 @@ mod tests {
             },
         }));
 
-        let anthropic = translate_gemini_response_to_anthropic(
+        let (anthropic, thought_signatures) = translate_gemini_response_to_anthropic(
             &response,
             "gemini-3-pro",
             &mut GeminiToolCallState::new(),
@@ -894,6 +1092,10 @@ mod tests {
         assert_eq!(
             anthropic["content"],
             json!([{"type": "text", "text": "hello"}])
+        );
+        assert!(
+            thought_signatures.is_empty(),
+            "a text-only response carries no thoughtSignature"
         );
         assert_eq!(anthropic["stop_reason"], json!("end_turn"));
         assert_eq!(
@@ -922,7 +1124,7 @@ mod tests {
             },
         }));
 
-        let anthropic = translate_gemini_response_to_anthropic(
+        let (anthropic, _thought_signatures) = translate_gemini_response_to_anthropic(
             &response,
             "gemini-3-pro",
             &mut GeminiToolCallState::new(),
@@ -953,7 +1155,7 @@ mod tests {
             },
         }));
 
-        let anthropic = translate_gemini_response_to_anthropic(
+        let (anthropic, _thought_signatures) = translate_gemini_response_to_anthropic(
             &response,
             "gemini-3-pro",
             &mut GeminiToolCallState::new(),
@@ -980,7 +1182,7 @@ mod tests {
         }));
         let mut tool_call_state = GeminiToolCallState::new();
 
-        let anthropic =
+        let (anthropic, _thought_signatures) =
             translate_gemini_response_to_anthropic(&response, "gemini-3-pro", &mut tool_call_state);
 
         assert_eq!(anthropic["stop_reason"], json!("tool_use"));
@@ -1010,7 +1212,7 @@ mod tests {
         }));
         let mut tool_call_state = GeminiToolCallState::new();
 
-        let anthropic =
+        let (anthropic, _thought_signatures) =
             translate_gemini_response_to_anthropic(&response, "gemini-3-pro", &mut tool_call_state);
 
         let synthesized_id = anthropic["content"][0]["id"].as_str().unwrap().to_string();
@@ -1022,12 +1224,73 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // Story 3.3.1 — thoughtSignature stash (response side) + replay
+    // (request side), including cross-session isolation.
+    // ────────────────────────────────────────────────────────────────────
+
+    // REQ-24 (Task 3.3.1b happy path) — a `functionCall` part carrying
+    // `thoughtSignature` surfaces it alongside its synthesized `tool_use`
+    // id in the return value, ready for `mod.rs`'s `send()` to stash.
+    #[test]
+    fn translate_gemini_response_to_anthropic_should_surface_thought_signature_alongside_synthesized_tool_use_id(
+    ) {
+        let response = parse_gemini_response(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {"name": "get_weather", "args": {"city": "Boise"}},
+                        "thoughtSignature": "opaque-blob-xyz",
+                    }],
+                },
+                "finishReason": "STOP",
+            }],
+        }));
+        let mut tool_call_state = GeminiToolCallState::new();
+
+        let (anthropic, thought_signatures) =
+            translate_gemini_response_to_anthropic(&response, "gemini-3-pro", &mut tool_call_state);
+
+        let synthesized_id = anthropic["content"][0]["id"].as_str().unwrap().to_string();
+
+        assert_eq!(
+            thought_signatures,
+            vec![(
+                ToolUseId::from(synthesized_id),
+                "opaque-blob-xyz".to_string()
+            )]
+        );
+    }
+
+    // Defensive path (Task 3.3.1b) — Gemini doesn't necessarily send a
+    // thoughtSignature on every functionCall; when absent, nothing is
+    // surfaced for that part (never a fabricated entry).
+    #[test]
+    fn translate_gemini_response_to_anthropic_should_not_surface_an_entry_when_thought_signature_absent(
+    ) {
+        let response = parse_gemini_response(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Boise"}}}],
+                },
+                "finishReason": "STOP",
+            }],
+        }));
+        let mut tool_call_state = GeminiToolCallState::new();
+
+        let (_anthropic, thought_signatures) =
+            translate_gemini_response_to_anthropic(&response, "gemini-3-pro", &mut tool_call_state);
+
+        assert!(thought_signatures.is_empty());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // Story 3.1.1 — sanitize_function_schema
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn sanitize_function_schema_should_strip_nested_ref_and_defs_while_preserving_sibling_fields()
-    {
+    fn sanitize_function_schema_should_strip_nested_ref_and_defs_while_preserving_sibling_fields() {
         let schema = json!({
             "type": "object",
             "properties": {

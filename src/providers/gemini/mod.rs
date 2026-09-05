@@ -27,6 +27,7 @@ use tracing::debug;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::SecretResolver;
 use crate::config::schema::{Upstream, UpstreamKind};
+use crate::routing::session_overrides::extract_session_id;
 
 use super::anthropic::apply_auth_headers;
 use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
@@ -193,7 +194,17 @@ impl GeminiProvider {
             .unwrap_or("gemini-3-pro")
             .to_string();
 
-        let envelope = translate_anthropic_request_to_gemini(&body, self.project_id())?;
+        // Story 3.3.1: derived once per call per plan.md's Session-key
+        // design decision (Epic 1.6) — `metadata.user_id` when the client
+        // sends it, else a fixed "anonymous" sentinel.
+        let session_key = extract_session_id(&body).unwrap_or_else(|| "anonymous".to_string());
+
+        let envelope = translate_anthropic_request_to_gemini(
+            &body,
+            self.project_id(),
+            &self.thought_signatures,
+            &session_key,
+        )?;
         let body_bytes = serde_json::to_vec(&envelope).map_err(|e| ProviderError::Upstream {
             status: 0,
             body: e.to_string(),
@@ -243,7 +254,7 @@ impl GeminiProvider {
             return Err(err);
         }
 
-        translate_success_bytes(&bytes, &model)
+        translate_success_bytes(&bytes, &model, &self.thought_signatures, &session_key)
     }
 
     /// Constructs the (unsent) outgoing `streamGenerateContent` request —
@@ -279,7 +290,10 @@ impl GeminiProvider {
     ///
     /// Returns a [`ProviderError`] if header construction/auth fails, the
     /// request times out, or the upstream responds with a non-2xx status.
-    pub async fn send_streaming_request(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
+    pub async fn send_streaming_request(
+        &self,
+        body: &Value,
+    ) -> Result<reqwest::Response, ProviderError> {
         let url = format!("{}/v1internal:streamGenerateContent?alt=sse", self.base_url);
         let mut headers = self.build_headers(&url).await?;
         headers.insert(
@@ -287,7 +301,17 @@ impl GeminiProvider {
             reqwest::header::HeaderValue::from_static("text/event-stream"),
         );
 
-        let envelope = translate_anthropic_request_to_gemini(body, self.project_id())?;
+        // Story 3.3.1: same derivation as `send_request` — a streamed
+        // request can equally be replaying a `tool_use` turn that needs a
+        // cached signature attached.
+        let session_key = extract_session_id(body).unwrap_or_else(|| "anonymous".to_string());
+
+        let envelope = translate_anthropic_request_to_gemini(
+            body,
+            self.project_id(),
+            &self.thought_signatures,
+            &session_key,
+        )?;
         let body_bytes = serde_json::to_vec(&envelope).map_err(|e| ProviderError::Upstream {
             status: 0,
             body: e.to_string(),
@@ -296,20 +320,16 @@ impl GeminiProvider {
         let request = self.build_stream_request(headers, body_bytes)?;
         debug!("Gemini stream {} {}", request.method(), request.url());
 
-        let response = self
-            .stream_client
-            .execute(request)
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Upstream {
-                        status: 0,
-                        body: e.to_string(),
-                    }
+        let response = self.stream_client.execute(request).await.map_err(|e| {
+            if e.is_timeout() {
+                ProviderError::Timeout
+            } else {
+                ProviderError::Upstream {
+                    status: 0,
+                    body: e.to_string(),
                 }
-            })?;
+            }
+        })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -395,23 +415,35 @@ fn classify_error_response(status: StatusCode, bytes: &[u8]) -> ProviderError {
 /// directly fixture-testable per Task 1.3.4f's rescoped scope (validation.md
 /// Test Stack Notes) — no HTTP-mocking crate needed.
 ///
+/// Also stashes any `thoughtSignature`s the translation surfaces (Story
+/// 3.3.1, Task 3.3.1b) into `thought_signatures` under `session_key` — this
+/// is the one call site that actually calls `.insert()`, since
+/// `translate_gemini_response_to_anthropic` itself stays stateless and only
+/// surfaces the data.
+///
 /// # Errors
 ///
 /// Returns [`ProviderError::ResponseShapeMismatch`] if `bytes` doesn't
 /// strictly deserialize into `GeminiGenerateContentResponse` (ADR-002 — no
 /// `.unwrap_or_default()` fallback).
-fn translate_success_bytes(bytes: &[u8], model: &str) -> Result<Value, ProviderError> {
+fn translate_success_bytes(
+    bytes: &[u8],
+    model: &str,
+    thought_signatures: &ThoughtSignatureCache,
+    session_key: &str,
+) -> Result<Value, ProviderError> {
     let parsed: GeminiGenerateContentResponse = serde_json::from_slice(bytes)
         .map_err(|e| ProviderError::ResponseShapeMismatch(e.to_string()))?;
     // Request-scoped and discarded here — see `GeminiToolCallState`'s doc
     // comment (tools.rs) for why this never needs to persist past this one
     // response's translation, unlike `ThoughtSignatureCache`.
     let mut tool_call_state = GeminiToolCallState::new();
-    Ok(translate_gemini_response_to_anthropic(
-        &parsed,
-        model,
-        &mut tool_call_state,
-    ))
+    let (value, signatures) =
+        translate_gemini_response_to_anthropic(&parsed, model, &mut tool_call_state);
+    for (tool_use_id, signature) in signatures {
+        thought_signatures.insert(session_key, tool_use_id, signature);
+    }
+    Ok(value)
 }
 
 /// Parses a `fetchAvailableModels` response body into `Vec<ModelInfo>`.
@@ -504,6 +536,13 @@ mod tests {
         .unwrap()
     }
 
+    /// An empty cache + sentinel session key, for tests whose fixtures
+    /// carry no `functionCall`/`tool_use` blocks (so no stash/lookup ever
+    /// happens).
+    fn empty_cache() -> ThoughtSignatureCache {
+        ThoughtSignatureCache::new()
+    }
+
     // REQ-14 (Story 1.7.1): `project_id()` returns the exact configured
     // string from `UpstreamKind::Gemini`, never a default/guess.
     #[test]
@@ -539,7 +578,8 @@ mod tests {
             "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
         }"#;
 
-        let result = translate_success_bytes(body, "gemini-3-pro").unwrap();
+        let result =
+            translate_success_bytes(body, "gemini-3-pro", &empty_cache(), "anonymous").unwrap();
 
         assert_eq!(result["content"][0]["text"], "hello");
         assert_eq!(result["stop_reason"], "end_turn");
@@ -551,7 +591,8 @@ mod tests {
         let body =
             br#"{"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":0,"totalTokenCount":1}}"#;
 
-        let err = translate_success_bytes(body, "gemini-3-pro").unwrap_err();
+        let err =
+            translate_success_bytes(body, "gemini-3-pro", &empty_cache(), "anonymous").unwrap_err();
 
         match err {
             ProviderError::ResponseShapeMismatch(msg) => {
@@ -568,7 +609,8 @@ mod tests {
     fn send_should_return_response_shape_mismatch_when_body_is_truncated_json() {
         let body = br#"{"candidates":[{"content":"#;
 
-        let err = translate_success_bytes(body, "gemini-3-pro").unwrap_err();
+        let err =
+            translate_success_bytes(body, "gemini-3-pro", &empty_cache(), "anonymous").unwrap_err();
 
         assert!(matches!(err, ProviderError::ResponseShapeMismatch(_)));
     }
@@ -583,7 +625,7 @@ mod tests {
             "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
         }"#;
 
-        assert!(translate_success_bytes(body, "gemini-3-pro").is_ok());
+        assert!(translate_success_bytes(body, "gemini-3-pro", &empty_cache(), "anonymous").is_ok());
     }
 
     // REQ-6 (Story 1.3.4d/f) — pure-function fixture test, exact
@@ -687,5 +729,122 @@ mod tests {
             Some("sig-1".to_string()),
             "same ThoughtSignatureCache instance must persist across sequential send() calls"
         );
+    }
+
+    // REQ-24 (Story 3.3.1, Task 3.3.1d) — end-to-end version of
+    // tools.rs's cross-session isolation test, driven through
+    // `GeminiProvider`-level building blocks. No live-HTTP-mock crate
+    // exists in this repo (validation.md Test Stack Notes), so this uses
+    // the same fake-translation-fn layer `send()` itself calls internally
+    // (`translate_success_bytes`/`translate_anthropic_request_to_gemini`)
+    // against one real `GeminiProvider` instance's own `thought_signatures`
+    // field, rather than a live/mocked network round trip: cycle 1 stashes
+    // a signature under "session-a" (as `send()`'s response path would),
+    // cycle 2 proves "session-a" replays it while "session-b" — presenting
+    // the identical synthesized `tool_use` id — gets REQ-25's
+    // `Validation` error instead of session-a's signature.
+    #[test]
+    fn gemini_provider_should_not_leak_thought_signature_across_two_concurrent_sessions_end_to_end()
+    {
+        let provider = test_provider();
+
+        // Cycle 1 ("session-a"): a Gemini response carrying a
+        // functionCall+thoughtSignature gets stashed under "session-a".
+        let gemini_response_bytes = br#"{
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {"name": "get_weather", "args": {"city": "Boise"}},
+                        "thoughtSignature": "sig-for-session-a"
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        }"#;
+        let anthropic_response = translate_success_bytes(
+            gemini_response_bytes,
+            "gemini-3-pro",
+            provider.thought_signatures(),
+            "session-a",
+        )
+        .unwrap();
+        let tool_use_id = anthropic_response["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Cycle 2, same session: replaying that tool_use/tool_result turn
+        // succeeds and echoes the exact cached signature back.
+        let replay = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "get_weather",
+                        "input": {"city": "Boise"},
+                    }],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "58F and sunny",
+                    }],
+                },
+            ],
+        });
+        let envelope = translate_anthropic_request_to_gemini(
+            &replay,
+            "p1",
+            provider.thought_signatures(),
+            "session-a",
+        )
+        .unwrap();
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            value["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            json!("sig-for-session-a")
+        );
+
+        // Cycle 2, DIFFERENT session presenting the identical tool_use id:
+        // must not see session-a's signature — surfaces REQ-25's
+        // Validation error instead.
+        let cross_session_replay = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "get_weather",
+                    "input": {"city": "Boise"},
+                }],
+            }],
+        });
+        let err = translate_anthropic_request_to_gemini(
+            &cross_session_replay,
+            "p1",
+            provider.thought_signatures(),
+            "session-b",
+        )
+        .unwrap_err();
+
+        match err {
+            ProviderError::Validation(msg, status) => {
+                assert_eq!(status, 400);
+                assert!(
+                    msg.contains(&tool_use_id),
+                    "expected the error to name the offending tool_use id, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("sig-for-session-a"),
+                    "session-b must never see session-a's signature, even in an error message"
+                );
+            }
+            other => panic!("expected ProviderError::Validation, got {other:?}"),
+        }
     }
 }

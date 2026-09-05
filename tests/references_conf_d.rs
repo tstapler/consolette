@@ -16,6 +16,7 @@ fn references_dir() -> &'static Path {
 }
 
 #[test]
+#[allow(clippy::expect_used)] // assertion-adjacent lookup on a fixture whose shape the test itself asserts
 fn references_00_providers_toml_should_parse_cleanly_against_config_schema() {
     let config = load(references_dir())
         .unwrap_or_else(|e| panic!("references/conf.d/00-providers.toml failed to load: {e}"));
@@ -41,6 +42,7 @@ fn references_00_providers_toml_should_parse_cleanly_against_config_schema() {
 }
 
 #[test]
+#[allow(clippy::expect_used)] // assertion-adjacent lookup on a fixture whose shape the test itself asserts
 fn references_00_providers_toml_gemini_route_should_default_to_fallback_strategy_with_gemini_listed_last(
 ) {
     let config = load(references_dir())

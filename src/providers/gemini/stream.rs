@@ -283,6 +283,20 @@ where
                         .and_then(Value::as_array)
                     {
                         for (part_index, part) in parts.iter().enumerate() {
+                            // Fail closed (ADR-002): streaming tool-call
+                            // support isn't implemented (only the
+                            // non-streaming path stashes
+                            // functionCall/thoughtSignature) — surfacing a
+                            // functionCall part here as if it were text
+                            // would silently drop the tool_use block and
+                            // produce an incomplete answer with no error.
+                            if part.get("functionCall").is_some() {
+                                this.done = true;
+                                return Poll::Ready(Some(Err(ProviderError::ResponseShapeMismatch(
+                                    "streaming responses containing tool calls are not yet supported by this provider; retry without streaming, or use a non-tool-calling conversation".to_string(),
+                                )
+                                .into())));
+                            }
                             let kind = classify_part_kind(part);
                             let index = this.resolve_block_index(part_index, kind);
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
@@ -473,6 +487,51 @@ mod tests {
 
         // No further items — not even from the well-formed third chunk still
         // sitting in the inner stream.
+        assert!(translator.next().await.is_none());
+    }
+
+    // Fail-closed per ADR-002: a streaming chunk carrying a `functionCall`
+    // part must end the stream with `ResponseShapeMismatch`, never a
+    // silently-incomplete text-only response.
+    #[tokio::test]
+    async fn gemini_to_anthropic_stream_should_end_stream_with_response_shape_mismatch_on_function_call_part(
+    ) {
+        let inner = stream::iter(vec![
+            Ok(sse(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}}"#,
+            )),
+            Ok(sse(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"Boise"}}}]},"finishReason":"STOP"}]}}"#,
+            )),
+            // Still sitting in the inner stream's buffer after the error —
+            // must never be reached.
+            Ok(sse(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP"}]}}"#,
+            )),
+        ]);
+        let mut translator = GeminiToAnthropicStream::new(inner, "gemini-3-pro".to_string());
+
+        let mut saw_ok_frame = false;
+        let err = loop {
+            match translator.next().await {
+                Some(Ok(_)) => saw_ok_frame = true,
+                Some(Err(e)) => break e,
+                None => panic!("stream ended before yielding the expected error"),
+            }
+        };
+        assert!(
+            saw_ok_frame,
+            "expected at least one Ok frame from the valid first chunk"
+        );
+
+        let provider_err = err
+            .downcast_ref::<ProviderError>()
+            .expect("expected the Err to wrap a ProviderError");
+        assert!(
+            matches!(provider_err, ProviderError::ResponseShapeMismatch(_)),
+            "expected ResponseShapeMismatch, got {provider_err:?}"
+        );
+
         assert!(translator.next().await.is_none());
     }
 

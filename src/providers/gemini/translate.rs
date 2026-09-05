@@ -220,6 +220,43 @@ fn build_generation_config(anthropic: &Value) -> Option<GeminiGenerationConfig> 
 }
 
 // ---------------------------------------------------------------------------
+// Tool schema sanitization (Task 3.1.1a) — Gemini's `functionDeclarations[].
+// parameters` rejects JSON-Schema keywords Claude Code's tool schemas rely on
+// heavily ($ref/$defs for shared definitions, patternProperties for dynamic
+// keys). These can appear at any nesting depth inside a schema, not just the
+// top level (unlike bedrock.rs's `clean_body`, which only strips top-level
+// tool fields) — so this walks the full `Value` tree recursively.
+// ---------------------------------------------------------------------------
+
+/// Recursively strips the JSON-Schema keywords Gemini's `functionDeclarations
+/// [].parameters` doesn't accept — `"$ref"`, `"$defs"`, `"patternProperties"`
+/// — at every nesting level, leaving every other key/value untouched.
+///
+/// Not yet wired into `translate_anthropic_request_to_gemini` (Task 3.1.1c):
+/// that function doesn't translate `tools[]` at all yet — Story 3.2.1 adds
+/// `functionDeclarations[]` translation and is expected to call this on each
+/// tool's `input_schema` before emitting it.
+#[must_use]
+pub(crate) fn sanitize_function_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut cleaned = serde_json::Map::with_capacity(map.len());
+            for (key, value) in map {
+                if key == "$ref" || key == "$defs" || key == "patternProperties" {
+                    continue;
+                }
+                cleaned.insert(key.clone(), sanitize_function_schema(value));
+            }
+            Value::Object(cleaned)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(sanitize_function_schema).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Response-direction wire structs (Task 1.3.2a) — strict parsing (ADR-002):
 // no lenient defaults on required fields, so a missing/malformed `candidates`
 // key fails deserialization rather than silently producing an empty response.
@@ -560,6 +597,93 @@ mod tests {
         let anthropic = translate_gemini_response_to_anthropic(&response, "gemini-3-pro");
 
         assert_eq!(anthropic["stop_reason"], json!("max_tokens"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Story 3.1.1 — sanitize_function_schema
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_function_schema_should_strip_nested_ref_and_defs_while_preserving_sibling_fields()
+    {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "foo": {"$ref": "#/$defs/Foo", "description": "a foo"}
+            },
+            "$defs": {"Foo": {"type": "string"}}
+        });
+
+        let sanitized = sanitize_function_schema(&schema);
+
+        assert_eq!(
+            sanitized,
+            json!({
+                "type": "object",
+                "properties": {
+                    "foo": {"description": "a foo"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn sanitize_function_schema_should_strip_pattern_properties_at_any_depth() {
+        let schema = json!({
+            "type": "object",
+            "patternProperties": {"^S_": {"type": "string"}}
+        });
+
+        let sanitized = sanitize_function_schema(&schema);
+
+        assert_eq!(sanitized, json!({"type": "object"}));
+    }
+
+    #[test]
+    fn sanitize_function_schema_should_strip_keywords_buried_three_levels_deep() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "properties": {
+                        "b": {
+                            "type": "object",
+                            "properties": {
+                                "c": {
+                                    "$ref": "#/$defs/Deep",
+                                    "patternProperties": {"^x_": {"type": "number"}},
+                                    "description": "deeply nested"
+                                }
+                            },
+                            "$defs": {"Deep": {"type": "string"}}
+                        }
+                    }
+                }
+            }
+        });
+
+        let sanitized = sanitize_function_schema(&schema);
+
+        assert_eq!(
+            sanitized,
+            json!({
+                "type": "object",
+                "properties": {
+                    "a": {
+                        "type": "object",
+                        "properties": {
+                            "b": {
+                                "type": "object",
+                                "properties": {
+                                    "c": {"description": "deeply nested"}
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        );
     }
 
     #[test]

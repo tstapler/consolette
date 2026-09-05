@@ -376,6 +376,27 @@ impl Router {
         self.candidates.iter().map(|c| c.name.clone()).collect()
     }
 
+    /// Real per-candidate cooldown state from `HealthRegistry`, for
+    /// `/metrics`' `cooldowns` field (Story 1.5.1) — replaces the previous
+    /// hardcoded `anthropic`/`bedrock`-only placeholder in
+    /// `MetricsCollector::to_metrics_json`, which silently produced fake
+    /// data for every other upstream (including Gemini).
+    #[must_use]
+    pub fn cooldown_snapshot(&self) -> serde_json::Value {
+        let mut result = serde_json::Map::with_capacity(self.candidates.len());
+        for candidate in &self.candidates {
+            let remaining = self.health.remaining_secs(candidate.index);
+            result.insert(
+                candidate.name.clone(),
+                serde_json::json!({
+                    "cooling_down": remaining > 0,
+                    "remaining_seconds": remaining,
+                }),
+            );
+        }
+        serde_json::Value::Object(result)
+    }
+
     /// Records one dispatch attempt's timing/outcome for `/metrics`
     /// (Task 3.4.5) — per-upstream request/success/error counts plus, on
     /// failure, the error-type breakdown and the deduplicated error tracker
@@ -1350,5 +1371,69 @@ mod tests {
         let gemini_counters = metrics.counters.upstreams.get("gemini").unwrap();
         assert_eq!(gemini_counters.requests.load(Ordering::Relaxed), 1);
         assert_eq!(gemini_counters.success.load(Ordering::Relaxed), 1);
+    }
+
+    // REQ-11 (Story 1.5.1) — `Router::cooldown_snapshot()` real feed.
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn cooldown_snapshot_should_report_real_remaining_seconds_for_a_tripped_candidate() {
+        let health = Arc::new(HealthRegistry::new(300));
+        health.trip(1, Some(Duration::from_mins(15)));
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(AlwaysOkProvider {
+                name: "anthropic",
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+            Arc::new(AlwaysOkProvider {
+                name: "gemini",
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+        ];
+        let router = Router::new(
+            vec![upstream(0, "anthropic"), upstream(1, "gemini")],
+            providers,
+            Arc::new(FallbackStrategy),
+            health,
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let snapshot = router.cooldown_snapshot();
+
+        assert_eq!(snapshot["anthropic"]["cooling_down"], serde_json::json!(false));
+        assert_eq!(snapshot["anthropic"]["remaining_seconds"], serde_json::json!(0));
+        assert_eq!(snapshot["gemini"]["cooling_down"], serde_json::json!(true));
+        let remaining = snapshot["gemini"]["remaining_seconds"]
+            .as_u64()
+            .expect("remaining_seconds must be a u64");
+        assert!(
+            remaining > 0 && remaining <= 900,
+            "expected ~900s remaining, got {remaining}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_snapshot_should_report_zero_remaining_seconds_for_a_healthy_candidate() {
+        let health = Arc::new(HealthRegistry::new(300));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider {
+            name: "anthropic",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })];
+        let router = Router::new(
+            vec![upstream(0, "anthropic")],
+            providers,
+            Arc::new(FallbackStrategy),
+            health,
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let snapshot = router.cooldown_snapshot();
+
+        assert_eq!(
+            snapshot["anthropic"],
+            serde_json::json!({"cooling_down": false, "remaining_seconds": 0})
+        );
     }
 }

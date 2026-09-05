@@ -20,7 +20,9 @@ use super::EntrypointState;
 // Kept `async` for signature symmetry with the other Axum handlers.
 #[allow(clippy::unused_async)]
 pub async fn get_metrics(State(state): State<EntrypointState>) -> impl IntoResponse {
-    Json(state.metrics.to_metrics_json())
+    let mut result = state.metrics.to_metrics_json();
+    result["cooldowns"] = state.dispatch_router.load().cooldown_snapshot();
+    Json(result)
 }
 
 /// `GET /errors/summary` — deduplicated error types, most recently seen first.
@@ -130,6 +132,239 @@ mod tests {
             result.unwrap_err(),
             StatusCode::NOT_FOUND,
             "compression isn't wired into dispatch yet"
+        );
+    }
+
+    // ── REQ-11/REQ-12 (Story 1.5.1/1.5.2) — real `/metrics` cooldowns feed
+    // and the ship-blocking auth-vs-cooldown classification gate. ──────────
+
+    use crate::providers::{Provider, ProviderError, ProviderResponse};
+    use crate::routing::health::HealthRegistry;
+    use crate::routing::router::Router as DispatchRouter;
+    use crate::routing::strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef};
+    use axum::http::HeaderMap;
+    use std::sync::Arc;
+
+    struct AlwaysOkProvider {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for AlwaysOkProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn send(
+            &self,
+            _body: serde_json::Value,
+            _headers: HeaderMap,
+            _stream: bool,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct AlwaysAuthErrProvider {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for AlwaysAuthErrProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn send(
+            &self,
+            _body: serde_json::Value,
+            _headers: HeaderMap,
+            _stream: bool,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::Auth("token expired".to_string()))
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Builds an `EntrypointState` wrapping a caller-supplied `Router` — the
+    /// same pattern `messages.rs`'s `test_state_with_provider` uses — so a
+    /// test can control candidates/providers/health directly instead of
+    /// going through `Router::from_config`.
+    #[allow(clippy::unwrap_used)]
+    async fn state_with_router(
+        router: DispatchRouter,
+        metrics: Arc<crate::metrics::MetricsCollector>,
+    ) -> EntrypointState {
+        EntrypointState {
+            dispatch_router: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
+            cost_tracker: Arc::new(
+                crate::cost_metrics::tracker::CostTracker::new(
+                    crate::cost_metrics::pricing::PricingTable::load_default(),
+                )
+                .await,
+            ),
+            metrics,
+            server_info: Arc::new(crate::entrypoint::ServerInfo {
+                port: 0,
+                route_name: "test".to_string(),
+                strategy: "Fallback".to_string(),
+                upstreams: vec![],
+            }),
+            config_dir: Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
+            session_overrides: Arc::new(
+                crate::routing::session_overrides::SessionOverrideStore::new(),
+            ),
+        }
+    }
+
+    fn always_allow_admission() -> Arc<dyn crate::ratelimit::AdmissionControl> {
+        Arc::new(crate::ratelimit::RateLimiters::new(
+            &crate::config::schema::RateLimitConfig::default(),
+        )) as Arc<dyn crate::ratelimit::AdmissionControl>
+    }
+
+    fn upstream_ref(index: usize, name: &str) -> UpstreamRef {
+        UpstreamRef {
+            index,
+            name: name.to_string(),
+            weight: 1.0,
+            model: None,
+        }
+    }
+
+    // REQ-11's integration test — explicit adversarial-review regression
+    // requirement (Task 1.5.1d): confirms the real cooldown feed doesn't
+    // cross-contaminate entries across three simultaneous candidates, not
+    // just that a single upstream looks right in isolation.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn get_metrics_cooldowns_should_have_correct_non_cross_contaminated_entries_for_anthropic_bedrock_and_gemini(
+    ) {
+        let health = Arc::new(HealthRegistry::new(300));
+        // anthropic (index 0): left healthy.
+        health.trip(1, Some(std::time::Duration::from_secs(42))); // bedrock: normal cooldown
+        health.trip(
+            2,
+            Some(std::time::Duration::from_secs(
+                crate::providers::gemini::DRIFT_COOLDOWN_SECS,
+            )),
+        ); // gemini: drift cooldown
+
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(AlwaysOkProvider { name: "anthropic" }),
+            Arc::new(AlwaysOkProvider { name: "bedrock" }),
+            Arc::new(AlwaysOkProvider { name: "gemini" }),
+        ];
+        let metrics = crate::metrics::MetricsCollector::new();
+        let router = DispatchRouter::new(
+            vec![
+                upstream_ref(0, "anthropic"),
+                upstream_ref(1, "bedrock"),
+                upstream_ref(2, "gemini"),
+            ],
+            providers,
+            Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
+            health,
+            always_allow_admission(),
+            Arc::clone(&metrics),
+        );
+        let state = state_with_router(router, metrics).await;
+
+        let response = get_metrics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
+
+        assert_eq!(
+            json["cooldowns"]["anthropic"],
+            serde_json::json!({"cooling_down": false, "remaining_seconds": 0}),
+            "anthropic must be healthy, not contaminated by bedrock/gemini's cooldowns"
+        );
+        assert_eq!(
+            json["cooldowns"]["bedrock"]["cooling_down"],
+            serde_json::json!(true)
+        );
+        let bedrock_remaining = json["cooldowns"]["bedrock"]["remaining_seconds"]
+            .as_u64()
+            .expect("remaining_seconds must be a u64");
+        assert!(
+            bedrock_remaining > 0 && bedrock_remaining <= 42,
+            "bedrock's remaining_seconds must reflect its own 42s trip, got {bedrock_remaining}"
+        );
+        assert_eq!(
+            json["cooldowns"]["gemini"]["cooling_down"],
+            serde_json::json!(true)
+        );
+        let gemini_remaining = json["cooldowns"]["gemini"]["remaining_seconds"]
+            .as_u64()
+            .expect("remaining_seconds must be a u64");
+        assert!(
+            gemini_remaining > 42,
+            "gemini's remaining_seconds must reflect its own drift cooldown, \
+             not bedrock's 42s value, got {gemini_remaining}"
+        );
+    }
+
+    // REQ-12's ship-blocking test (validation.md: "do not mark Story 1.5.2
+    // done without this test green") — the exact regression this epic
+    // exists to prevent: `Router::dispatch`'s `is_auth()` arm never calls
+    // `health.trip(...)`, so a real Gemini auth failure must show
+    // `last_error_kind == "auth"` AND `cooling_down == false`
+    // *simultaneously* in `/metrics` — never falling through to a plain
+    // `status-active`/`status-cooldown` read.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn get_metrics_should_classify_as_status_auth_required_eligible_when_a_real_gemini_auth_failure_is_induced(
+    ) {
+        let health = Arc::new(HealthRegistry::new(300));
+        let providers: Vec<Arc<dyn Provider>> =
+            vec![Arc::new(AlwaysAuthErrProvider { name: "gemini" })];
+        let metrics = crate::metrics::MetricsCollector::new();
+        let router = DispatchRouter::new(
+            vec![upstream_ref(0, "gemini")],
+            providers,
+            Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
+            health,
+            always_allow_admission(),
+            Arc::clone(&metrics),
+        );
+
+        // Induce the real auth failure through `Router::dispatch`, exactly
+        // as a live expired-Antigravity-token request would.
+        let dispatch_result = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+        assert!(
+            matches!(dispatch_result, Err(ProviderError::Auth(_))),
+            "expected the auth failure to propagate immediately, no failover"
+        );
+
+        let state = state_with_router(router, metrics).await;
+        let response = get_metrics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
+
+        assert_eq!(
+            json["providers"]["gemini"]["last_error_kind"],
+            serde_json::json!("auth")
+        );
+        assert_eq!(
+            json["cooldowns"]["gemini"]["cooling_down"],
+            serde_json::json!(false),
+            "is_auth() must never trip HealthRegistry — this is the exact gap Story 1.5.2 \
+             exists to guard the JS against"
         );
     }
 }

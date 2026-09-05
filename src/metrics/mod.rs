@@ -383,11 +383,10 @@ impl MetricsCollector {
         result["recent_errors"] = serde_json::Value::Array(recent_errors);
         result["timestamp"] = json!(Utc::now().to_rfc3339());
 
-        // Cooldowns placeholder (wired in from FallbackState in future epics)
-        result["cooldowns"] = json!({
-            "anthropic": { "cooling_down": false, "remaining_seconds": 0 },
-            "bedrock": { "cooling_down": false, "remaining_seconds": 0 }
-        });
+        // `cooldowns` is merged in by the HTTP handler
+        // (`observability::get_metrics`) from `Router::cooldown_snapshot()`
+        // — `MetricsCollector` itself has no reference to `Router`/
+        // `HealthRegistry` (Story 1.5.1).
 
         result
     }

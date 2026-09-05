@@ -189,6 +189,22 @@ pub(crate) struct GeminiGenerationConfig {
     pub stop_sequences: Option<Vec<String>>,
 }
 
+/// Default Gemini model id used whenever a request body doesn't specify
+/// `model` — shared by every call site (`mod.rs`'s `send_request`/`send`
+/// streaming branch and this module's own request translation) so the
+/// default only ever lives in one place.
+pub(crate) const DEFAULT_GEMINI_MODEL: &str = "gemini-3-pro";
+
+/// Extracts `body.model` as a string, falling back to
+/// [`DEFAULT_GEMINI_MODEL`] when absent or not a string.
+#[must_use]
+pub(crate) fn extract_model(body: &Value) -> String {
+    body.get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_GEMINI_MODEL)
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Request translation (Task 1.3.1b)
 // ---------------------------------------------------------------------------
@@ -228,11 +244,7 @@ pub(crate) fn translate_anthropic_request_to_gemini(
     thought_signatures: &ThoughtSignatureCache,
     session_key: &str,
 ) -> Result<CloudCodeEnvelope, ProviderError> {
-    let model = anthropic
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("gemini-3-pro")
-        .to_string();
+    let model = extract_model(anthropic);
 
     let mut tool_call_state = GeminiToolCallState::new();
     let mut contents = Vec::new();
@@ -505,10 +517,9 @@ fn build_generation_config(anthropic: &Value) -> Option<GeminiGenerationConfig> 
 /// [].parameters` doesn't accept — `"$ref"`, `"$defs"`, `"patternProperties"`
 /// — at every nesting level, leaving every other key/value untouched.
 ///
-/// Not yet wired into `translate_anthropic_request_to_gemini` (Task 3.1.1c):
-/// that function doesn't translate `tools[]` at all yet — Story 3.2.1 adds
-/// `functionDeclarations[]` translation and is expected to call this on each
-/// tool's `input_schema` before emitting it.
+/// Wired into `translate_anthropic_request_to_gemini` (Task 3.1.1c) via
+/// `build_gemini_tools`, which calls this on each `tools[]` entry's
+/// `input_schema` before emitting it as `functionDeclarations[].parameters`.
 #[must_use]
 pub(crate) fn sanitize_function_schema(schema: &Value) -> Value {
     match schema {

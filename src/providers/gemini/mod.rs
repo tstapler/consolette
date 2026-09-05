@@ -39,7 +39,7 @@ use stream::GeminiToAnthropicStream;
 use tools::ToolUseId;
 use tools::{GeminiToolCallState, ThoughtSignatureCache};
 use translate::{
-    translate_anthropic_request_to_gemini, translate_gemini_response_to_anthropic,
+    extract_model, translate_anthropic_request_to_gemini, translate_gemini_response_to_anthropic,
     GeminiGenerateContentResponse,
 };
 
@@ -65,10 +65,12 @@ pub struct GeminiProvider {
     resolver: Arc<dyn SecretResolver + Send + Sync>,
     /// Shared cache for `exec` auth-method subprocess results.
     exec_cache: Arc<ExecCredentialCache>,
-    // Scaffolded per project_plans/gemini-provider/implementation/plan.md
-    // Story 1.6.1 — provider-owned so it survives across the separate
-    // send() calls Story 3.3.1 needs to bridge; populated/read starting in
-    // Story 3.3.1, once tool calls exist. Type defined in tools.rs.
+    // Per project_plans/gemini-provider/implementation/plan.md Story 1.6.1 —
+    // provider-owned so it survives across the separate send() calls Story
+    // 3.3.1 bridges: `translate_success_bytes` inserts a signature whenever a
+    // response carries one, and `translate_anthropic_request_to_gemini`
+    // reads it back when a `tool_use` block is being re-sent. Type defined
+    // in tools.rs.
     thought_signatures: ThoughtSignatureCache,
 }
 
@@ -188,11 +190,7 @@ impl GeminiProvider {
         let url = format!("{}/v1internal:generateContent", self.base_url);
         let headers = self.build_headers(&url).await?;
 
-        let model = body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("gemini-3-pro")
-            .to_string();
+        let model = extract_model(&body);
 
         // Story 3.3.1: derived once per call per plan.md's Session-key
         // design decision (Epic 1.6) — `metadata.user_id` when the client
@@ -219,16 +217,7 @@ impl GeminiProvider {
             .body(body_bytes)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Upstream {
-                        status: 0,
-                        body: e.to_string(),
-                    }
-                }
-            })?;
+            .map_err(|e| map_reqwest_error(&e))?;
 
         let status = response.status();
         let bytes = response
@@ -320,16 +309,11 @@ impl GeminiProvider {
         let request = self.build_stream_request(headers, body_bytes)?;
         debug!("Gemini stream {} {}", request.method(), request.url());
 
-        let response = self.stream_client.execute(request).await.map_err(|e| {
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Upstream {
-                    status: 0,
-                    body: e.to_string(),
-                }
-            }
-        })?;
+        let response = self
+            .stream_client
+            .execute(request)
+            .await
+            .map_err(|e| map_reqwest_error(&e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -370,16 +354,7 @@ impl GeminiProvider {
             .body("{}")
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Upstream {
-                        status: 0,
-                        body: e.to_string(),
-                    }
-                }
-            })?;
+            .map_err(|e| map_reqwest_error(&e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -394,6 +369,22 @@ impl GeminiProvider {
             status: status.as_u16(),
             body: e.to_string(),
         })
+    }
+}
+
+/// Maps a `reqwest::Error` from an outgoing request to a `ProviderError` —
+/// `ProviderError::Timeout` for a timed-out request, `ProviderError::Upstream`
+/// (status 0, since no HTTP response was ever received) for anything else.
+/// Shared by `send_request`/`send_streaming_request`/`fetch_models`, the
+/// three call sites that issue a `reqwest` request against Cloud Code Assist.
+fn map_reqwest_error(e: &reqwest::Error) -> ProviderError {
+    if e.is_timeout() {
+        ProviderError::Timeout
+    } else {
+        ProviderError::Upstream {
+            status: 0,
+            body: e.to_string(),
+        }
     }
 }
 
@@ -488,11 +479,7 @@ impl Provider for GeminiProvider {
         stream: bool,
     ) -> Result<ProviderResponse, ProviderError> {
         if stream {
-            let model = body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("gemini-3-pro")
-                .to_string();
+            let model = extract_model(&body);
             let response = self.send_streaming_request(&body).await?;
             let byte_stream = response
                 .bytes_stream()

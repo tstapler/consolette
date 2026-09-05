@@ -93,9 +93,12 @@ struct CacheEntry {
 /// plan.md's Epic 1.6 "Session-key design decision" for how `session_key` is
 /// derived and its documented residual risk.
 ///
-/// Currently never populated or read (no tool calls exist until Phase 3) —
-/// only its lifetime (provider-owned, not `send()`-call-local) matters in
-/// Phase 1.
+/// Populated by `mod.rs`'s `translate_success_bytes` (`.insert()`, whenever a
+/// Gemini response's `functionCall` part carries a `thoughtSignature`) and
+/// read by `translate.rs`'s `block_to_gemini_part` (`.get()`, when a
+/// `tool_use` block is being re-sent as a `functionCall` part) — its
+/// provider-owned (not `send()`-call-local) lifetime is what lets a
+/// signature survive across those two separate HTTP round trips.
 pub(crate) struct ThoughtSignatureCache {
     entries: DashMap<(String, ToolUseId), CacheEntry>,
 }

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use http::HeaderMap;
 
-use crate::config::schema::Upstream;
+use crate::config::schema::{Upstream, UpstreamKind};
 
 use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
 
@@ -33,6 +33,21 @@ impl GeminiProvider {
     #[must_use]
     pub fn stub(upstream: Arc<Upstream>) -> Self {
         Self { upstream }
+    }
+
+    /// The configured Cloud Code Assist project id (ADR-003), used verbatim
+    /// as `CloudCodeEnvelope.project` on every outgoing request.
+    //
+    // TODO(Epic 1.3, Story 1.3.1/1.3.4): send() must call self.project_id()
+    // when building the outgoing envelope — see plan.md Story 1.7.1.
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        match &self.upstream.kind {
+            UpstreamKind::Gemini { project_id } => project_id,
+            // Can't happen — GeminiProvider is only ever constructed for a
+            // Gemini-kind upstream, per build_providers's match arm.
+            other => unreachable!("GeminiProvider constructed for non-Gemini upstream: {other:?}"),
+        }
     }
 }
 
@@ -55,5 +70,27 @@ impl Provider for GeminiProvider {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // REQ-14 (Story 1.7.1): `project_id()` returns the exact configured
+    // string from `UpstreamKind::Gemini`, never a default/guess.
+
+    #[test]
+    fn project_id_accessor_should_return_configured_project_id_from_upstream_kind_gemini() {
+        let upstream = Arc::new(Upstream {
+            name: "gemini".to_string(),
+            kind: UpstreamKind::Gemini {
+                project_id: "my-gcp-project".to_string(),
+            },
+            auth: None,
+        });
+        let provider = GeminiProvider::stub(upstream);
+
+        assert_eq!(provider.project_id(), "my-gcp-project");
     }
 }

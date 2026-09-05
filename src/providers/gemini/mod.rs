@@ -10,6 +10,7 @@
 //! becoming load-bearing) land in later phases.
 
 mod error;
+mod stream;
 mod tools;
 mod translate;
 
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use http::HeaderMap;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
@@ -31,6 +33,7 @@ use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
 
 pub(crate) use error::DRIFT_COOLDOWN_SECS;
 use error::{classify_gemini_error, GeminiErrorBody};
+use stream::GeminiToAnthropicStream;
 use tools::ThoughtSignatureCache;
 #[cfg(test)]
 use tools::ToolUseId;
@@ -45,10 +48,9 @@ pub struct GeminiProvider {
     /// Pooled client for non-streaming requests.
     client: Client,
     /// Non-pooled client for SSE streaming (prevents pool exhaustion, ADR-004).
-    /// Unused until Phase 2's streaming `send()` path lands, but constructed
-    /// here (not lazily) to match `AnthropicProvider`/`OpenaiProvider`'s
+    /// Used by `send_streaming_request` (Story 2.1.2) — constructed eagerly
+    /// (not lazily) to match `AnthropicProvider`/`OpenaiProvider`'s
     /// established two-client-at-construction-time shape.
-    #[allow(dead_code)]
     stream_client: Client,
     /// Base URL for the Cloud Code Assist API — hardcoded, matching
     /// `AnthropicProvider`'s precedent (`UpstreamKind::Gemini` carries no
@@ -244,6 +246,86 @@ impl GeminiProvider {
         translate_success_bytes(&bytes, &model)
     }
 
+    /// Constructs the (unsent) outgoing `streamGenerateContent` request —
+    /// split out from [`Self::send_streaming_request`] so Task 2.1.2b's test
+    /// can assert the URL/method/headers directly against a captured
+    /// `reqwest::Request`, without a live network call (no HTTP-mock crate
+    /// in this repo — see validation.md's Test Stack Notes). Always issued
+    /// via `self.stream_client`, never `self.client` (ADR-004).
+    fn build_stream_request(
+        &self,
+        headers: HeaderMap,
+        body_bytes: Vec<u8>,
+    ) -> Result<reqwest::Request, ProviderError> {
+        let url = format!("{}/v1internal:streamGenerateContent?alt=sse", self.base_url);
+        self.stream_client
+            .post(&url)
+            .headers(headers)
+            .body(body_bytes)
+            .build()
+            .map_err(|e| ProviderError::Upstream {
+                status: 0,
+                body: e.to_string(),
+            })
+    }
+
+    /// Send a streaming request to `POST /v1internal:streamGenerateContent?alt=sse`
+    /// via `self.stream_client` (the `pool_max_idle_per_host(0)` client,
+    /// ADR-004 — not `self.client`), returning the raw upstream
+    /// `reqwest::Response` for the caller to wrap in a
+    /// [`stream::GeminiToAnthropicStream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProviderError`] if header construction/auth fails, the
+    /// request times out, or the upstream responds with a non-2xx status.
+    pub async fn send_streaming_request(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
+        let url = format!("{}/v1internal:streamGenerateContent?alt=sse", self.base_url);
+        let mut headers = self.build_headers(&url).await?;
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+
+        let envelope = translate_anthropic_request_to_gemini(body, self.project_id())?;
+        let body_bytes = serde_json::to_vec(&envelope).map_err(|e| ProviderError::Upstream {
+            status: 0,
+            body: e.to_string(),
+        })?;
+
+        let request = self.build_stream_request(headers, body_bytes)?;
+        debug!("Gemini stream {} {}", request.method(), request.url());
+
+        let response = self
+            .stream_client
+            .execute(request)
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Upstream {
+                        status: 0,
+                        body: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| ProviderError::Upstream {
+                    status: status.as_u16(),
+                    body: e.to_string(),
+                })?;
+            return Err(classify_error_response(status, &bytes));
+        }
+
+        Ok(response)
+    }
+
     /// Fetch the list of available models from
     /// `POST /v1internal:fetchAvailableModels`.
     ///
@@ -366,11 +448,17 @@ impl Provider for GeminiProvider {
         stream: bool,
     ) -> Result<ProviderResponse, ProviderError> {
         if stream {
-            // Phase 2 (Story 2.1.2) wires stream:true through stream_client
-            // against streamGenerateContent — not yet implemented.
-            return Err(ProviderError::ModelUnsupported(
-                "gemini streaming not yet implemented".to_string(),
-            ));
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("gemini-3-pro")
+                .to_string();
+            let response = self.send_streaming_request(&body).await?;
+            let byte_stream = response
+                .bytes_stream()
+                .map(|r| r.map_err(anyhow::Error::from));
+            let translated = GeminiToAnthropicStream::new(byte_stream, model);
+            return Ok(ProviderResponse::Stream(Box::pin(translated)));
         }
         let value = self.send_request(body).await?;
         Ok(ProviderResponse::Full(value))
@@ -510,6 +598,49 @@ mod tests {
                 owned_by: Some("google".to_string()),
             }]
         );
+    }
+
+    // REQ-19 (Story 2.1.2) — rescoped per validation.md's Test Stack Notes:
+    // no HTTP-mock crate exists in this repo, so this asserts the outgoing
+    // request's construction (client selection, URL, headers) directly
+    // against a captured `reqwest::Request`, built via the pure
+    // `build_stream_request` helper (no network I/O), rather than driving a
+    // live/mocked HTTP round trip.
+    #[test]
+    fn send_should_use_stream_client_and_stream_generate_content_endpoint_when_stream_true() {
+        let provider = test_provider();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+
+        let request = provider
+            .build_stream_request(headers, b"{}".to_vec())
+            .unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().as_str(),
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::ACCEPT)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        // `stream_client` selection (never `self.client`) is structurally
+        // guaranteed by `build_stream_request`'s body — `reqwest::Request`
+        // carries no runtime client identity to assert against directly,
+        // the same fixture-testing constraint documented on
+        // `gemini_provider_new_should_construct_two_distinct_reqwest_clients_matching_adr_004`
+        // above.
     }
 
     #[test]

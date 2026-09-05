@@ -342,6 +342,22 @@ impl Router {
                     self.health.trip(chosen.index, override_duration);
                     last_error = Some(e);
                 }
+                Err(e) if e.is_response_shape_mismatch() => {
+                    // ADR-002: a 2xx body that doesn't match the documented
+                    // shape won't self-heal on retry the way a rate limit
+                    // does — trip cooldown immediately (first occurrence),
+                    // using a longer override than the default so a
+                    // permanently-broken Gemini endpoint isn't retried on
+                    // every request forever.
+                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.health.trip(
+                        chosen.index,
+                        Some(Duration::from_secs(
+                            crate::providers::gemini::DRIFT_COOLDOWN_SECS,
+                        )),
+                    );
+                    last_error = Some(e);
+                }
                 Err(e) => {
                     self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
                     last_error = Some(e);
@@ -380,12 +396,20 @@ impl Router {
                 self.metrics
                     .counters
                     .record_request(upstream, true, duration_ms, 0);
+                // Story 1.4.4: a successful attempt clears the upstream's
+                // last error classification, so the dashboard self-heals
+                // instead of a single past failure permanently pinning its
+                // status class.
+                self.metrics.counters.set_last_error_kind(upstream, None);
             }
             Err(e) => {
                 self.metrics
                     .counters
                     .record_request(upstream, false, duration_ms, 0);
                 self.metrics.counters.record_error_kind(e);
+                self.metrics
+                    .counters
+                    .set_last_error_kind(upstream, Some(e.kind_label()));
                 let _ = self
                     .metrics
                     .error_tracker
@@ -1037,6 +1061,147 @@ mod tests {
             1,
             "the primary's failure must be pushed into the error tracker"
         );
+    }
+
+    // REQ-9 (Story 1.4.3, ADR-002) — focus area.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_trip_cooldown_for_drift_cooldown_secs_when_candidate_returns_response_shape_mismatch(
+    ) {
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(AlwaysErrProvider {
+                name: "gemini",
+                error: || ProviderError::ResponseShapeMismatch("bad shape".to_string()),
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+            Arc::new(AlwaysOkProvider {
+                name: "anthropic",
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+        ];
+        let metrics = MetricsCollector::new();
+        let health = Arc::new(HealthRegistry::new(300));
+        let router = Router::new(
+            vec![upstream(0, "gemini"), upstream(1, "anthropic")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::clone(&health),
+            Arc::new(AlwaysAllow),
+            metrics,
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_ok(), "must fail over to the healthy candidate");
+        let remaining = health.remaining_secs(0);
+        assert!(
+            remaining >= crate::providers::gemini::DRIFT_COOLDOWN_SECS - 1,
+            "gemini's cooldown must be tripped for ~DRIFT_COOLDOWN_SECS, got {remaining}s remaining"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_leave_anthropic_and_bedrock_dispatch_unaffected_when_gemini_trips_drift_cooldown(
+    ) {
+        let gemini_calls = Arc::new(AtomicU32::new(0));
+        let anthropic_calls = Arc::new(AtomicU32::new(0));
+        let bedrock_calls = Arc::new(AtomicU32::new(0));
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(AlwaysErrProvider {
+                name: "gemini",
+                error: || ProviderError::ResponseShapeMismatch("bad shape".to_string()),
+                call_count: Arc::clone(&gemini_calls),
+            }),
+            Arc::new(AlwaysOkProvider {
+                name: "anthropic",
+                call_count: Arc::clone(&anthropic_calls),
+            }),
+            Arc::new(AlwaysOkProvider {
+                name: "bedrock",
+                call_count: Arc::clone(&bedrock_calls),
+            }),
+        ];
+        let metrics = MetricsCollector::new();
+        let health = Arc::new(HealthRegistry::new(300));
+        let router = Router::new(
+            vec![
+                upstream(0, "gemini"),
+                upstream(1, "anthropic"),
+                upstream(2, "bedrock"),
+            ],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::clone(&health),
+            Arc::new(AlwaysAllow),
+            metrics,
+        );
+
+        // First dispatch: gemini errors and trips its own cooldown,
+        // anthropic serves the response. bedrock is never tried (fallback
+        // stops at the first success).
+        let res1 = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+        assert!(res1.is_ok());
+        assert_eq!(gemini_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(anthropic_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(bedrock_calls.load(Ordering::SeqCst), 0);
+
+        // Second dispatch, while gemini is still cooling down: anthropic's
+        // (and bedrock's, transitively) dispatch behavior is completely
+        // unaffected — gemini is simply excluded from the healthy pool, not
+        // retried, and not erroring anyone else's request.
+        let res2 = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+        assert!(res2.is_ok());
+        assert_eq!(
+            gemini_calls.load(Ordering::SeqCst),
+            1,
+            "gemini must not be retried while cooling down"
+        );
+        assert_eq!(anthropic_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(bedrock_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_return_last_response_shape_mismatch_error_when_all_candidates_exhausted(
+    ) {
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(AlwaysErrProvider {
+                name: "gemini",
+                error: || ProviderError::ResponseShapeMismatch("bad shape 1".to_string()),
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+            Arc::new(AlwaysErrProvider {
+                name: "gemini-2",
+                error: || ProviderError::ResponseShapeMismatch("bad shape 2".to_string()),
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+        ];
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![upstream(0, "gemini"), upstream(1, "gemini-2")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics,
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        match res {
+            Err(ProviderError::ResponseShapeMismatch(_)) => {}
+            Err(other) => panic!("expected Err(ResponseShapeMismatch(_)), got Err({other:?})"),
+            Ok(_) => panic!("expected Err(ResponseShapeMismatch(_)), got Ok(_)"),
+        }
     }
 
     #[tokio::test]

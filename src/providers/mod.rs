@@ -113,6 +113,27 @@ impl ProviderError {
     pub fn is_response_shape_mismatch(&self) -> bool {
         matches!(self, ProviderError::ResponseShapeMismatch(_))
     }
+
+    /// The real, typed error classification as a stable `&'static str`, for
+    /// per-upstream dashboard attribution (`UpstreamCounters::last_error_kind`,
+    /// Story 1.4.4) — passed through explicitly rather than re-derived by
+    /// regex-guessing keywords out of `Display` text (`ErrorTracker`'s
+    /// existing, more fragile approach for `/errors/summary`).
+    #[must_use]
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            ProviderError::RateLimited | ProviderError::RateLimitedWithRetry { .. } => {
+                "rate_limited"
+            }
+            ProviderError::Auth(_) => "auth",
+            ProviderError::Validation(..) => "validation",
+            ProviderError::Timeout => "timeout",
+            ProviderError::ModelUnsupported(_) => "model_unsupported",
+            ProviderError::Upstream { .. } => "upstream",
+            ProviderError::Exhausted => "exhausted",
+            ProviderError::ResponseShapeMismatch(_) => "response_shape_mismatch",
+        }
+    }
 }
 
 /// One model reported by an upstream's model-listing call.
@@ -621,6 +642,43 @@ mod tests {
         assert!(!err.is_validation());
         assert!(!err.is_rate_limited());
         assert!(!err.is_transient());
+    }
+
+    // REQ-10 (Story 1.4.4a) — focus area.
+    #[test]
+    fn kind_label_should_return_response_shape_mismatch_for_that_variant() {
+        assert_eq!(
+            ProviderError::ResponseShapeMismatch("missing field `candidates`".to_string())
+                .kind_label(),
+            "response_shape_mismatch"
+        );
+        assert_eq!(
+            ProviderError::Auth("token expired".to_string()).kind_label(),
+            "auth"
+        );
+        assert_eq!(
+            ProviderError::Validation("bad field".to_string(), 400).kind_label(),
+            "validation"
+        );
+        assert_eq!(ProviderError::Timeout.kind_label(), "timeout");
+        assert_eq!(ProviderError::RateLimited.kind_label(), "rate_limited");
+        assert_eq!(
+            ProviderError::RateLimitedWithRetry { retry_after: 30 }.kind_label(),
+            "rate_limited"
+        );
+        assert_eq!(
+            ProviderError::ModelUnsupported("gemini-9".to_string()).kind_label(),
+            "model_unsupported"
+        );
+        assert_eq!(
+            ProviderError::Upstream {
+                status: 502,
+                body: String::new()
+            }
+            .kind_label(),
+            "upstream"
+        );
+        assert_eq!(ProviderError::Exhausted.kind_label(), "exhausted");
     }
 
     // ────────────────────────────────────────────────────────────────────

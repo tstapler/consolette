@@ -12,6 +12,14 @@ use serde_json::Value;
 
 use crate::providers::ProviderError;
 
+/// `HealthRegistry::trip` override duration (ADR-002) applied when
+/// `Router::dispatch` sees a `ResponseShapeMismatch` from a Gemini candidate
+/// — well above the default `cooldown_seconds` (300s), since schema drift
+/// won't self-heal the way a rate limit does. Re-exported from
+/// `super::DRIFT_COOLDOWN_SECS` so `router.rs`'s call site is unaffected by
+/// which submodule defines it.
+pub(crate) const DRIFT_COOLDOWN_SECS: u64 = 1800;
+
 /// The Cloud Code Assist / Gemini error envelope:
 /// `{"error":{"code":...,"message":...,"status":...,"details":[...]}}`.
 #[derive(Debug, Clone, Deserialize)]

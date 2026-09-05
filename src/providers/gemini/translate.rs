@@ -265,7 +265,7 @@ pub(crate) fn translate_anthropic_request_to_gemini(
             });
 
     let generation_config = build_generation_config(anthropic);
-    let tools = build_gemini_tools(anthropic);
+    let tools = build_gemini_tools(anthropic)?;
 
     Ok(CloudCodeEnvelope {
         project: project_id.to_string(),
@@ -329,11 +329,21 @@ fn block_to_gemini_part(
             .and_then(Value::as_str)
             .map(|text| GeminiPart::text(text.to_string()))),
         Some("tool_use") => {
-            let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+            let id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::Validation(
+                    "tool_use block missing required field \"id\"".to_string(),
+                    400,
+                )
+            })?;
             let name = block
                 .get("name")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
+                .ok_or_else(|| {
+                    ProviderError::Validation(
+                        "tool_use block missing required field \"name\"".to_string(),
+                        400,
+                    )
+                })?
                 .to_string();
             let args = block.get("input").cloned().unwrap_or_else(|| json!({}));
 
@@ -360,7 +370,12 @@ fn block_to_gemini_part(
             let tool_use_id = block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
+                .ok_or_else(|| {
+                    ProviderError::Validation(
+                        "tool_result block missing required field \"tool_use_id\"".to_string(),
+                        400,
+                    )
+                })?;
             let name = tool_call_state
                 .get(&ToolUseId::from(tool_use_id.to_string()))
                 .ok_or_else(|| {
@@ -388,15 +403,32 @@ fn block_to_gemini_part(
 /// Translates the Anthropic request's top-level `tools[]` array into
 /// Gemini's `functionDeclarations[]` shape (Task 3.2.1c), running each
 /// tool's `input_schema` through [`sanitize_function_schema`] first.
-/// Returns `None` when `tools[]` is absent or empty, matching
+/// Returns `Ok(None)` when `tools[]` is absent or empty, matching
 /// `generationConfig`'s "only present when needed" convention.
-fn build_gemini_tools(anthropic: &Value) -> Option<Vec<GeminiTool>> {
-    let tools = anthropic.get("tools").and_then(Value::as_array)?;
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Validation`] when a `tools[]` entry is missing
+/// its required `name` field — fail-closed rather than silently dropping the
+/// malformed declaration from the outgoing `functionDeclarations[]`.
+fn build_gemini_tools(anthropic: &Value) -> Result<Option<Vec<GeminiTool>>, ProviderError> {
+    let Some(tools) = anthropic.get("tools").and_then(Value::as_array) else {
+        return Ok(None);
+    };
 
     let function_declarations: Vec<GeminiFunctionDeclaration> = tools
         .iter()
-        .filter_map(|tool| {
-            let name = tool.get("name").and_then(Value::as_str)?.to_string();
+        .map(|tool| {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProviderError::Validation(
+                        format!("tools[] entry missing required field \"name\": {tool}"),
+                        400,
+                    )
+                })?
+                .to_string();
             let description = tool
                 .get("description")
                 .and_then(Value::as_str)
@@ -407,20 +439,20 @@ fn build_gemini_tools(anthropic: &Value) -> Option<Vec<GeminiTool>> {
                 .unwrap_or_else(|| json!({"type": "object"}));
             let parameters = sanitize_function_schema(&input_schema);
 
-            Some(GeminiFunctionDeclaration {
+            Ok(GeminiFunctionDeclaration {
                 name,
                 description,
                 parameters,
             })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ProviderError>>()?;
 
     if function_declarations.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(vec![GeminiTool {
+        Ok(Some(vec![GeminiTool {
             function_declarations,
-        }])
+        }]))
     }
 }
 
@@ -1020,6 +1052,117 @@ mod tests {
                     msg,
                     "no cached thought_signature for tool_use id toolu_unknown999 — this conversation's tool-call history may predate a consolette restart or TTL eviction"
                 );
+            }
+            other => panic!("expected ProviderError::Validation, got {other:?}"),
+        }
+    }
+
+    // Fail-closed (Rust idioms review, Fix 1) — a `tool_use` block missing
+    // `id`/`name` must be a hard `ProviderError::Validation`, never a
+    // silently-defaulted empty string (which could collide with another
+    // malformed block's `""` id in `GeminiToolCallState`).
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_return_validation_error_when_tool_use_block_missing_id(
+    ) {
+        let anthropic = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "get_weather",
+                    "input": {"city": "Boise"},
+                }],
+            }],
+        });
+
+        let err =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap_err();
+
+        match err {
+            ProviderError::Validation(msg, status) => {
+                assert_eq!(status, 400);
+                assert!(msg.contains("\"id\""), "got: {msg}");
+            }
+            other => panic!("expected ProviderError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_return_validation_error_when_tool_use_block_missing_name(
+    ) {
+        let anthropic = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "input": {"city": "Boise"},
+                }],
+            }],
+        });
+
+        let err =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap_err();
+
+        match err {
+            ProviderError::Validation(msg, status) => {
+                assert_eq!(status, 400);
+                assert!(msg.contains("\"name\""), "got: {msg}");
+            }
+            other => panic!("expected ProviderError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_return_validation_error_when_tool_result_block_missing_tool_use_id(
+    ) {
+        let anthropic = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "content": "58F and sunny",
+                }],
+            }],
+        });
+
+        let err =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap_err();
+
+        match err {
+            ProviderError::Validation(msg, status) => {
+                assert_eq!(status, 400);
+                assert!(msg.contains("\"tool_use_id\""), "got: {msg}");
+            }
+            other => panic!("expected ProviderError::Validation, got {other:?}"),
+        }
+    }
+
+    // Fail-closed (Rust idioms review, Fix 2) — a `tools[]` entry missing
+    // `name` must be a hard error, never silently dropped from the outgoing
+    // `functionDeclarations[]`.
+    #[test]
+    fn translate_anthropic_request_to_gemini_should_return_validation_error_when_tools_entry_missing_name(
+    ) {
+        let anthropic = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "description": "Gets the weather",
+                "input_schema": {"type": "object"},
+            }],
+        });
+
+        let err =
+            translate_anthropic_request_to_gemini(&anthropic, "p1", &empty_cache(), "anonymous")
+                .unwrap_err();
+
+        match err {
+            ProviderError::Validation(msg, status) => {
+                assert_eq!(status, 400);
+                assert!(msg.contains("\"name\""), "got: {msg}");
             }
             other => panic!("expected ProviderError::Validation, got {other:?}"),
         }

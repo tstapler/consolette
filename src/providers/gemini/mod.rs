@@ -29,7 +29,11 @@ use crate::config::schema::{Upstream, UpstreamKind};
 use super::anthropic::apply_auth_headers;
 use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
 
+pub(crate) use error::DRIFT_COOLDOWN_SECS;
 use error::{classify_gemini_error, GeminiErrorBody};
+use tools::ThoughtSignatureCache;
+#[cfg(test)]
+use tools::ToolUseId;
 use translate::{
     translate_anthropic_request_to_gemini, translate_gemini_response_to_anthropic,
     GeminiGenerateContentResponse,
@@ -58,7 +62,11 @@ pub struct GeminiProvider {
     resolver: Arc<dyn SecretResolver + Send + Sync>,
     /// Shared cache for `exec` auth-method subprocess results.
     exec_cache: Arc<ExecCredentialCache>,
-    // Epic 1.6 will add a thought_signatures field here (ThoughtSignatureCache).
+    // Scaffolded per project_plans/gemini-provider/implementation/plan.md
+    // Story 1.6.1 — provider-owned so it survives across the separate
+    // send() calls Story 3.3.1 needs to bridge; populated/read starting in
+    // Story 3.3.1, once tool calls exist. Type defined in tools.rs.
+    thought_signatures: ThoughtSignatureCache,
 }
 
 impl GeminiProvider {
@@ -105,7 +113,16 @@ impl GeminiProvider {
             upstream,
             resolver,
             exec_cache,
+            thought_signatures: ThoughtSignatureCache::new(),
         })
+    }
+
+    /// Test-only accessor proving `thought_signatures` is a field constructed
+    /// once in `new()` — surviving across separate `send()` calls on the same
+    /// instance — rather than being (re)constructed per call (Story 1.6.1).
+    #[cfg(test)]
+    fn thought_signatures(&self) -> &ThoughtSignatureCache {
+        &self.thought_signatures
     }
 
     /// The configured Cloud Code Assist project id (ADR-003), used verbatim
@@ -499,5 +516,37 @@ mod tests {
     fn classify_error_response_should_fall_back_to_upstream_when_body_is_not_gemini_error_shape() {
         let err = classify_error_response(StatusCode::BAD_GATEWAY, b"<html>502</html>");
         assert!(matches!(err, ProviderError::Upstream { status: 502, .. }));
+    }
+
+    // REQ-13 (Story 1.6.1) — the thought_signatures field is constructed
+    // once in `new()`, not per `send()` call: a value inserted before either
+    // call is still readable via the same cache instance after both
+    // complete. `test_upstream`'s `auth: None` makes both `send()` calls
+    // fail fast on `ProviderError::Auth` before any network I/O — this test
+    // only cares about the cache's lifetime, not `send()`'s outcome, so
+    // that's fine and keeps the test hermetic.
+    #[tokio::test]
+    async fn thought_signature_cache_should_persist_across_two_sequential_send_calls_on_same_provider_instance(
+    ) {
+        let provider = test_provider();
+        let id = ToolUseId::from("toolu_01".to_string());
+        provider
+            .thought_signatures()
+            .insert("session-x", id.clone(), "sig-1".to_string());
+
+        let body = json!({
+            "model": "gemini-3-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16
+        });
+
+        let _ = provider.send(body.clone(), HeaderMap::new(), false).await;
+        let _ = provider.send(body, HeaderMap::new(), false).await;
+
+        assert_eq!(
+            provider.thought_signatures().get("session-x", &id),
+            Some("sig-1".to_string()),
+            "same ThoughtSignatureCache instance must persist across sequential send() calls"
+        );
     }
 }

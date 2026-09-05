@@ -17,11 +17,12 @@
 //! `"response"` layer: `{"response": {"candidates": [...], "usageMetadata":
 //! {...}}}` — unwrapped before walking `candidates[0].content.parts[]`.
 //!
-//! Unparseable-chunk handling (fail-closed, mirroring `bedrock.rs`'s
-//! streaming precedent at `src/providers/bedrock.rs:719-735`) is Epic 2.2's
-//! job, not this story's — an unparseable `data:` line is skipped for now,
-//! matching `OpenaiToAnthropicStream`'s existing `continue`-on-parse-failure
-//! behavior.
+//! Unparseable-chunk handling is fail-closed (Epic 2.2), mirroring
+//! `bedrock.rs`'s streaming precedent at `src/providers/bedrock.rs:719-735`:
+//! an unparseable `data:` line ends the stream with one
+//! `Err(ProviderError::ResponseShapeMismatch(..))` item, with no further
+//! items yielded after it — not `OpenaiToAnthropicStream`'s
+//! `continue`-on-parse-failure behavior.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -32,6 +33,8 @@ use eventsource_stream::Eventsource;
 use futures_core::Stream;
 use serde_json::{json, Value};
 use tracing::warn;
+
+use crate::providers::ProviderError;
 
 use super::translate::{map_gemini_finish_reason, GeminiUsageMetadata};
 
@@ -249,10 +252,19 @@ where
                     this.close("end_turn", &usage_delta_json(None));
                 }
                 Poll::Ready(Some(Ok(event))) => {
-                    let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
-                        // Unparseable data line: skipped for now (Epic 2.2
-                        // makes this fail-closed instead — see module docs).
-                        continue;
+                    let parsed = match serde_json::from_str::<Value>(&event.data) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            // Fail-closed (Epic 2.2, mirroring
+                            // bedrock.rs:719-735): end the stream with one
+                            // error item, never resuming as if nothing
+                            // happened.
+                            this.done = true;
+                            return Poll::Ready(Some(Err(ProviderError::ResponseShapeMismatch(
+                                format!("gemini stream: unparseable data line: {e}"),
+                            )
+                            .into())));
+                        }
                     };
                     let response_body = parsed.get("response").unwrap_or(&parsed);
 
@@ -300,7 +312,7 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use futures_util::stream::{self, StreamExt};
@@ -415,6 +427,53 @@ mod tests {
         // types only.
         let new_position_index = translator.resolve_block_index(5, BlockKind::Text);
         assert_eq!(new_position_index, 2);
+    }
+
+    // REQ-20 — fail-closed: an unparseable `data:` line ends the stream with
+    // `ResponseShapeMismatch`, with no further items after it (matches
+    // `bedrock.rs:719-735`'s "breaks the stream" precedent, not "skip and
+    // continue").
+    #[tokio::test]
+    async fn gemini_to_anthropic_stream_should_end_stream_with_response_shape_mismatch_on_unparseable_chunk(
+    ) {
+        let inner = stream::iter(vec![
+            Ok(sse(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}}"#,
+            )),
+            Ok(sse("not valid json")),
+            // Still sitting in the inner stream's buffer after the error —
+            // must never be reached.
+            Ok(sse(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP"}]}}"#,
+            )),
+        ]);
+        let mut translator = GeminiToAnthropicStream::new(inner, "gemini-3-pro".to_string());
+
+        // Drain the valid frames produced by the first, well-formed chunk.
+        let mut saw_ok_frame = false;
+        let err = loop {
+            match translator.next().await {
+                Some(Ok(_)) => saw_ok_frame = true,
+                Some(Err(e)) => break e,
+                None => panic!("stream ended before yielding the expected error"),
+            }
+        };
+        assert!(
+            saw_ok_frame,
+            "expected at least one Ok frame from the valid first chunk"
+        );
+
+        let provider_err = err
+            .downcast_ref::<ProviderError>()
+            .expect("expected the Err to wrap a ProviderError");
+        assert!(
+            matches!(provider_err, ProviderError::ResponseShapeMismatch(_)),
+            "expected ResponseShapeMismatch, got {provider_err:?}"
+        );
+
+        // No further items — not even from the well-formed third chunk still
+        // sitting in the inner stream.
+        assert!(translator.next().await.is_none());
     }
 
     #[tokio::test]

@@ -67,3 +67,26 @@ fn references_00_providers_toml_gemini_route_should_default_to_fallback_strategy
         "gemini must be listed last in the fallback chain"
     );
 }
+
+/// UX Acceptance Tests, "Surface 1, bullet 2": Gemini's fields must be flat
+/// directly under `[[upstreams]]`, never a nested `[upstreams.gemini]`
+/// sub-table — validation.md names this exact grep-based substitute for the
+/// manual "read the file" check.
+#[test]
+#[allow(clippy::expect_used)] // reading a fixture whose existence the parse test above already asserts
+fn config_surface_gemini_fields_should_be_flat_not_nested() {
+    let raw = std::fs::read_to_string(references_dir().join("conf.d/00-providers.toml"))
+        .expect("references/conf.d/00-providers.toml is readable");
+
+    // Check actual TOML table headers, not prose — the file's own comments
+    // mention "[upstreams.gemini]" by name to document that it's absent.
+    let has_nested_table = raw
+        .lines()
+        .map(str::trim)
+        .any(|line| !line.starts_with('#') && line.starts_with("[upstreams.gemini]"));
+    assert!(
+        !has_nested_table,
+        "gemini's project_id must sit flat under [[upstreams]], not in a nested \
+         [upstreams.gemini] table"
+    );
+}

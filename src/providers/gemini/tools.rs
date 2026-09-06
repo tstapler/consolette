@@ -11,6 +11,7 @@
 //! field keyed by `(session_key, ToolUseId)` rather than a per-`send()`-call
 //! local keyed by `ToolUseId` alone.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -76,6 +77,15 @@ impl GeminiToolCallState {
 /// across a long-lived `GeminiProvider` instance.
 const THOUGHT_SIGNATURE_TTL_SECS: u64 = 900;
 
+/// How often `insert()` runs the TTL sweep — every Nth call, rather than on
+/// every single call. A full-table `DashMap::retain()` write-locks every
+/// shard, so sweeping unconditionally on every insert serializes concurrent
+/// inserts against each other and costs O(n) regardless of which key is
+/// being touched, defeating the point of using `DashMap`. Amortizing over
+/// 128 inserts keeps eviction eventually-happening (never letting the cache
+/// grow unbounded) while making the common-case insert O(1) again.
+const SWEEP_EVERY_N_INSERTS: u64 = 128;
+
 struct CacheEntry {
     signature: String,
     inserted_at: Instant,
@@ -101,22 +111,32 @@ struct CacheEntry {
 /// signature survive across those two separate HTTP round trips.
 pub(crate) struct ThoughtSignatureCache {
     entries: DashMap<(String, ToolUseId), CacheEntry>,
+    /// Counts every `insert()` call so the TTL sweep can run every
+    /// `SWEEP_EVERY_N_INSERTS`th call instead of on every single one. `Relaxed`
+    /// is fine — this only needs to fire "close enough" to periodically, not
+    /// with any particular insert visibility ordering.
+    insert_count: AtomicU64,
 }
 
 impl ThoughtSignatureCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            insert_count: AtomicU64::new(0),
         }
     }
 
-    /// Inserts `signature` under `(session_key, id)`, first sweeping any
-    /// entry older than `THOUGHT_SIGNATURE_TTL_SECS` (sweep-on-insert, no
-    /// separate background task needed at this traffic scale).
+    /// Inserts `signature` under `(session_key, id)`. Every
+    /// `SWEEP_EVERY_N_INSERTS`th call first sweeps any entry older than
+    /// `THOUGHT_SIGNATURE_TTL_SECS` — amortized rather than unconditional, so
+    /// a full-table `DashMap::retain()` (which write-locks every shard)
+    /// doesn't serialize every concurrent insert against every other one.
     pub(crate) fn insert(&self, session_key: &str, id: ToolUseId, signature: String) {
-        let ttl = Duration::from_secs(THOUGHT_SIGNATURE_TTL_SECS);
-        self.entries
-            .retain(|_, entry| entry.inserted_at.elapsed() < ttl);
+        if self.insert_count.fetch_add(1, Ordering::Relaxed) % SWEEP_EVERY_N_INSERTS == 0 {
+            let ttl = Duration::from_secs(THOUGHT_SIGNATURE_TTL_SECS);
+            self.entries
+                .retain(|_, entry| entry.inserted_at.elapsed() < ttl);
+        }
 
         self.entries.insert(
             (session_key.to_string(), id),
@@ -245,8 +265,9 @@ mod tests {
         );
         assert_eq!(cache.len(), 1);
 
-        // Any insert sweeps stale entries first, including one for an
-        // unrelated key.
+        // A fresh cache's very first `insert()` call always lands on the
+        // sweep boundary (count 0 -> 0 % SWEEP_EVERY_N_INSERTS == 0), so it
+        // sweeps stale entries before inserting the fresh one.
         cache.insert("session-a", fresh_id.clone(), "fresh-sig".to_string());
 
         assert_eq!(cache.get("session-a", &stale_id), None);
@@ -255,5 +276,51 @@ mod tests {
             Some("fresh-sig".to_string())
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    // Rust idioms review, Fix 1 — the TTL sweep is amortized to every
+    // `SWEEP_EVERY_N_INSERTS`th call rather than running on every insert (an
+    // unconditional full-table `DashMap::retain()` write-locks every shard,
+    // serializing concurrent inserts against each other). This drives
+    // `insert_count` directly to one short of the next sweep boundary to
+    // prove a non-boundary insert skips the sweep, then proves the very next
+    // (boundary) insert still evicts — i.e. eviction is amortized, not
+    // abandoned.
+    #[test]
+    fn thought_signature_cache_insert_should_only_sweep_every_n_inserts_but_still_eventually_evict(
+    ) {
+        let cache = ThoughtSignatureCache::new();
+        let stale_id = ToolUseId::from("toolu_stale".to_string());
+        let fresh_id = ToolUseId::from("toolu_fresh".to_string());
+
+        let backdated = Instant::now()
+            .checked_sub(Duration::from_secs(THOUGHT_SIGNATURE_TTL_SECS + 60))
+            .expect("test host uptime too short to backdate an Instant");
+        cache.entries.insert(
+            ("session-a".to_string(), stale_id.clone()),
+            CacheEntry {
+                signature: "stale-sig".to_string(),
+                inserted_at: backdated,
+            },
+        );
+
+        // One insert short of the sweep boundary: must NOT sweep.
+        cache
+            .insert_count
+            .store(SWEEP_EVERY_N_INSERTS - 1, Ordering::Relaxed);
+        cache.insert("session-a", fresh_id.clone(), "fresh-sig".to_string());
+        assert_eq!(
+            cache.get("session-a", &stale_id),
+            Some("stale-sig".to_string()),
+            "sweep must not run on a non-boundary insert"
+        );
+
+        // The next insert lands exactly on the Nth-insert boundary and sweeps.
+        cache.insert("session-a", fresh_id.clone(), "fresh-sig-2".to_string());
+        assert_eq!(
+            cache.get("session-a", &stale_id),
+            None,
+            "sweep must still eventually run on the Nth insert"
+        );
     }
 }

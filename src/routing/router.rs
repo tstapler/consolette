@@ -352,9 +352,7 @@ impl Router {
                     self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
                     self.health.trip(
                         chosen.index,
-                        Some(Duration::from_secs(
-                            crate::providers::gemini::DRIFT_COOLDOWN_SECS,
-                        )),
+                        Some(Duration::from_secs(ProviderError::DRIFT_COOLDOWN_SECS)),
                     );
                     last_error = Some(e);
                 }
@@ -1118,7 +1116,7 @@ mod tests {
         assert!(res.is_ok(), "must fail over to the healthy candidate");
         let remaining = health.remaining_secs(0);
         assert!(
-            remaining >= crate::providers::gemini::DRIFT_COOLDOWN_SECS - 1,
+            remaining >= ProviderError::DRIFT_COOLDOWN_SECS - 1,
             "gemini's cooldown must be tripped for ~DRIFT_COOLDOWN_SECS, got {remaining}s remaining"
         );
     }

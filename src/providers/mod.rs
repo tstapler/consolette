@@ -70,6 +70,15 @@ impl From<crate::auth::AuthError> for ProviderError {
 }
 
 impl ProviderError {
+    /// `HealthRegistry::trip` override duration applied when `Router::dispatch`
+    /// sees a `ResponseShapeMismatch` from any candidate — well above the
+    /// default `cooldown_seconds` (300s), since schema drift won't self-heal
+    /// on retry the way a rate limit does. Lives on the shared error type
+    /// (not a concrete-provider module) so the router's generic dispatch code
+    /// never has to import a specific provider's constant — see this module's
+    /// doc comment on why the router depends only on the `Provider` trait.
+    pub const DRIFT_COOLDOWN_SECS: u64 = 1800;
+
     #[must_use]
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {

@@ -37,7 +37,6 @@ use crate::routing::session_overrides::extract_session_id;
 use super::anthropic::apply_auth_headers;
 use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
 
-pub(crate) use error::DRIFT_COOLDOWN_SECS;
 use error::{classify_gemini_error, GeminiErrorBody};
 use stream::GeminiToAnthropicStream;
 #[cfg(test)]

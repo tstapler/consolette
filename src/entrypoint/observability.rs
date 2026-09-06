@@ -253,7 +253,7 @@ mod tests {
         health.trip(
             2,
             Some(std::time::Duration::from_secs(
-                crate::providers::gemini::DRIFT_COOLDOWN_SECS,
+                ProviderError::DRIFT_COOLDOWN_SECS,
             )),
         ); // gemini: drift cooldown
 

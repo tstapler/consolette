@@ -291,8 +291,8 @@ mod tests {
     // (boundary) insert still evicts — i.e. eviction is amortized, not
     // abandoned.
     #[test]
-    fn thought_signature_cache_insert_should_only_sweep_every_n_inserts_but_still_eventually_evict(
-    ) {
+    fn thought_signature_cache_insert_should_only_sweep_every_n_inserts_but_still_eventually_evict()
+    {
         let cache = ThoughtSignatureCache::new();
         let stale_id = ToolUseId::from("toolu_stale".to_string());
         let fresh_id = ToolUseId::from("toolu_fresh".to_string());

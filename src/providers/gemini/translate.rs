@@ -1381,7 +1381,11 @@ mod tests {
 
         assert_eq!(anthropic["stop_reason"], json!("tool_use"));
         let blocks = anthropic["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2, "expected one text block and one tool_use block");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected one text block and one tool_use block"
+        );
 
         assert_eq!(blocks[0]["type"], json!("text"));
         assert_eq!(blocks[0]["text"], json!("Let me check..."));

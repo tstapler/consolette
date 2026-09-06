@@ -688,8 +688,8 @@ mod tests {
     // but not an array (e.g. renamed/restructured upstream) must also be a
     // hard ResponseShapeMismatch.
     #[test]
-    fn parse_available_models_should_return_response_shape_mismatch_when_models_field_not_an_array(
-    ) {
+    fn parse_available_models_should_return_response_shape_mismatch_when_models_field_not_an_array()
+    {
         let value = json!({"models": "not-an-array"});
 
         let err = parse_available_models(&value).unwrap_err();

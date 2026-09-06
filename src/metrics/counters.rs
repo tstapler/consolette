@@ -439,7 +439,10 @@ mod tests {
         m.set_last_error_kind("gemini", Some("auth"));
 
         let json = m.to_json();
-        assert_eq!(json["providers"]["gemini"]["last_error_kind"], json!("auth"));
+        assert_eq!(
+            json["providers"]["gemini"]["last_error_kind"],
+            json!("auth")
+        );
     }
 
     #[test]

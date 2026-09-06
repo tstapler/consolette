@@ -1399,8 +1399,14 @@ mod tests {
 
         let snapshot = router.cooldown_snapshot();
 
-        assert_eq!(snapshot["anthropic"]["cooling_down"], serde_json::json!(false));
-        assert_eq!(snapshot["anthropic"]["remaining_seconds"], serde_json::json!(0));
+        assert_eq!(
+            snapshot["anthropic"]["cooling_down"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            snapshot["anthropic"]["remaining_seconds"],
+            serde_json::json!(0)
+        );
         assert_eq!(snapshot["gemini"]["cooling_down"], serde_json::json!(true));
         let remaining = snapshot["gemini"]["remaining_seconds"]
             .as_u64()

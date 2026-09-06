@@ -328,9 +328,9 @@ where
                             let index = this.open_new_block(BlockKind::Text);
                             this.push_delta(index, &text);
                         }
-                        let usage_metadata = response_body
-                            .get("usageMetadata")
-                            .and_then(|v| serde_json::from_value::<GeminiUsageMetadata>(v.clone()).ok());
+                        let usage_metadata = response_body.get("usageMetadata").and_then(|v| {
+                            serde_json::from_value::<GeminiUsageMetadata>(v.clone()).ok()
+                        });
                         this.close(stop_reason, &usage_delta_json(usage_metadata.as_ref()));
                     }
                 }

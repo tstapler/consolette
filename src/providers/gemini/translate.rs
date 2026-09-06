@@ -295,6 +295,24 @@ pub(crate) fn translate_anthropic_request_to_gemini(
     })
 }
 
+/// Reads `value[field]` as a string, or a fail-closed
+/// `ProviderError::Validation` naming both `block_kind` and `field` when it's
+/// missing/non-string — shared by the several required-field checks below
+/// (`tool_use`/`tool_result` blocks, `tools[]` entries) so each doesn't
+/// re-spell the same `.get().and_then(Value::as_str).ok_or_else(..)` shape.
+fn require_str_field<'a>(
+    value: &'a Value,
+    field: &str,
+    block_kind: &str,
+) -> Result<&'a str, ProviderError> {
+    value.get(field).and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::Validation(
+            format!("{block_kind} missing required field \"{field}\""),
+            400,
+        )
+    })
+}
+
 /// Anthropic `messages[].content` (string, or array of `text`/`tool_use`/
 /// `tool_result` blocks) -> `Vec<GeminiPart>`, one part per recognized
 /// block. Unrecognized block types (e.g. `image`) are silently skipped.
@@ -342,22 +360,8 @@ fn block_to_gemini_part(
             .and_then(Value::as_str)
             .map(|text| GeminiPart::text(text.to_string()))),
         Some("tool_use") => {
-            let id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
-                ProviderError::Validation(
-                    "tool_use block missing required field \"id\"".to_string(),
-                    400,
-                )
-            })?;
-            let name = block
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ProviderError::Validation(
-                        "tool_use block missing required field \"name\"".to_string(),
-                        400,
-                    )
-                })?
-                .to_string();
+            let id = require_str_field(block, "id", "tool_use block")?;
+            let name = require_str_field(block, "name", "tool_use block")?.to_string();
             let args = block.get("input").cloned().unwrap_or_else(|| json!({}));
 
             tool_call_state.insert(ToolUseId::from(id.to_string()), name.clone());
@@ -380,15 +384,7 @@ fn block_to_gemini_part(
             )))
         }
         Some("tool_result") => {
-            let tool_use_id = block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ProviderError::Validation(
-                        "tool_result block missing required field \"tool_use_id\"".to_string(),
-                        400,
-                    )
-                })?;
+            let tool_use_id = require_str_field(block, "tool_use_id", "tool_result block")?;
             let name = tool_call_state
                 .get(&ToolUseId::from(tool_use_id.to_string()))
                 .ok_or_else(|| {
@@ -432,10 +428,12 @@ fn build_gemini_tools(anthropic: &Value) -> Result<Option<Vec<GeminiTool>>, Prov
     let function_declarations: Vec<GeminiFunctionDeclaration> = tools
         .iter()
         .map(|tool| {
-            let name = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
+            // Uses the extra full-value context (not just require_str_field's
+            // generic message) because a malformed tools[] entry carries no
+            // natural id of its own to name in the error the way a
+            // `tool_use`/`tool_result` block's `id`/`tool_use_id` does.
+            let name = require_str_field(tool, "name", "tools[] entry")
+                .map_err(|_| {
                     ProviderError::Validation(
                         format!("tools[] entry missing required field \"name\": {tool}"),
                         400,

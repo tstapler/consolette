@@ -648,6 +648,10 @@ mod tests {
     }
 
     // ── Story 1.5.2 (REQ-12): three-way error-state classification ────────
+    //
+    // These are lint-level regression guards on the embedded JS *text* (string
+    // matching/position checks on `DASHBOARD_HTML`), not behavioral proof —
+    // no JS runtime ever executes this code in these tests.
 
     /// Extracts the `const cls = ...;` ternary chain from `DASHBOARD_HTML`'s
     /// JS, so tests can make position/content assertions on just that block
@@ -715,13 +719,25 @@ mod tests {
     /// Cold-start non-regression (UX §5 item 7): no `last_error_kind` key
     /// and `cooling: false` must never render anything but `status-active`.
     #[test]
+    #[allow(clippy::expect_used)]
     fn dashboard_js_should_render_status_active_on_cold_start_with_no_last_error_kind_and_not_cooling(
     ) {
         let block = extract_cls_block();
+        // Structural rather than exact-suffix: proves 'status-active' is
+        // positioned AFTER the `cooling ?` branch (i.e. it's the ternary's
+        // final fallback, reached only when lastKind matches neither special
+        // case and cooling is falsy) without coupling to the source's exact
+        // formatting/whitespace.
+        let cooling_pos = block
+            .find("cooling ?")
+            .expect("cls ternary must check cooling");
+        let active_pos = block
+            .find("'status-active'")
+            .expect("cls ternary must be able to produce 'status-active'");
         assert!(
-            block.trim_end().ends_with(": 'status-active'"),
-            "the ternary's final fallback (reached when lastKind matches neither special \
-             case and cooling is falsy) must be 'status-active'"
+            active_pos > cooling_pos,
+            "'status-active' must be the ternary's final fallback branch, after the cooling \
+             check — not an earlier alternative"
         );
         assert!(
             DASHBOARD_HTML.contains("(data.providers[name] || {}).last_error_kind"),

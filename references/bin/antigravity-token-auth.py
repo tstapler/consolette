@@ -14,6 +14,7 @@ text) and exit non-zero with no stdout at all.
 """
 
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,17 +41,33 @@ def main() -> int:
         token = data["token"]
         access_token = token["access_token"]
         expiry = token["expiry"]
-    except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
+    except FileNotFoundError as exc:
         print(
-            f"antigravity-token-auth: failed to read token from {TOKEN_PATH}: {exc}",
+            f"antigravity-token-auth: no token file at {TOKEN_PATH} — run "
+            f"'antigravity-cli login' (or reopen the Antigravity IDE): {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        print(
+            f"antigravity-token-auth: malformed token file at {TOKEN_PATH}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        print(
+            f"antigravity-token-auth: cannot read token file at {TOKEN_PATH}: {exc}",
             file=sys.stderr,
         )
         return 1
 
-    # datetime.fromisoformat only accepts "+00:00"-style offsets on
-    # Python < 3.11 -- normalize a trailing "Z" so this runs on older
-    # interpreters too.
+    # datetime.fromisoformat only accepts "+00:00"-style offsets (not a
+    # trailing "Z") and, on Python < 3.11, only 0/3/6-digit fractional
+    # seconds -- normalize both so this runs on older interpreters and
+    # against the real Antigravity token file's actual precision (observed:
+    # 9-digit/nanosecond fractions, e.g. "...493304002-07:00").
     expiry_iso = expiry[:-1] + "+00:00" if expiry.endswith("Z") else expiry
+    expiry_iso = re.sub(r"(\.\d{6})\d+", r"\1", expiry_iso)
     try:
         expiry_dt = datetime.fromisoformat(expiry_iso)
     except ValueError as exc:

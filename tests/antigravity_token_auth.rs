@@ -117,6 +117,114 @@ fn antigravity_token_auth_should_exit_nonzero_with_no_stdout_when_token_file_mis
     );
 }
 
+// Fix 4 (Python idioms review): missing-file failures get a distinct,
+// actionable stderr message naming the remediation command, not a generic
+// "failed to read token" message.
+#[test]
+#[allow(clippy::expect_used)]
+fn antigravity_token_auth_should_name_remediation_command_when_token_file_missing() {
+    let home = fake_home(None);
+
+    let output = run_script(&home);
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    assert!(
+        stderr.contains("no token file at"),
+        "expected a distinct missing-file message, got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("antigravity-cli login"),
+        "expected the remediation command to be named, got: {stderr:?}"
+    );
+}
+
+// Fix 4 (Python idioms review) — malformed JSON gets a distinct,
+// actionable stderr message.
+#[test]
+#[allow(clippy::expect_used)]
+fn antigravity_token_auth_should_exit_nonzero_with_malformed_message_when_token_file_is_not_json()
+{
+    let home = fake_home(Some("not valid json"));
+
+    let output = run_script(&home);
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for malformed JSON"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "expected zero stdout on failure, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    assert!(
+        stderr.contains("malformed token file"),
+        "expected a distinct malformed-file message, got: {stderr:?}"
+    );
+}
+
+// Fix 4 (Python idioms review) — a non-dict top-level JSON value (e.g. a
+// bare JSON array) previously raised an uncaught TypeError on `data["token"]`
+// rather than being caught and reported as a malformed token file.
+#[test]
+#[allow(clippy::expect_used)]
+fn antigravity_token_auth_should_exit_nonzero_with_malformed_message_when_top_level_json_is_not_an_object(
+) {
+    let home = fake_home(Some("[1, 2, 3]"));
+
+    let output = run_script(&home);
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for a non-dict top-level JSON value"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "expected zero stdout on failure, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    assert!(
+        stderr.contains("malformed token file"),
+        "expected a distinct malformed-file message, got: {stderr:?}"
+    );
+}
+
+// Fix 3 (Python idioms review) — the real Antigravity token file's actual
+// timestamp precision is 9-digit/nanosecond fractional seconds (e.g.
+// "...493304002-07:00"), which `datetime.fromisoformat` rejects on
+// Python < 3.11 (only 0/3/6-digit fractions accepted). A valid, unexpired
+// token with this precision must be accepted, not rejected as
+// "unparseable expiry".
+#[test]
+#[allow(clippy::expect_used)]
+fn antigravity_token_auth_should_accept_real_nanosecond_precision_expiry_timestamp() {
+    let token_json = r#"{"token":{"access_token":"ya29.abc123","token_type":"Bearer","refresh_token":"1//xyz","expiry":"2099-08-20T19:35:46.493304002-07:00"},"auth_method":"consumer"}"#;
+    let home = fake_home(Some(token_json));
+
+    let output = run_script(&home);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected exit 0 for a valid, unexpired token with a 9-digit-fraction expiry, got {:?}; stderr: {stderr}",
+        output.status.code(),
+    );
+    assert!(
+        !stderr.contains("unparseable expiry"),
+        "the real timestamp precision must not be rejected as unparseable, got: {stderr}"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim_end()).expect("stdout line was not valid JSON");
+    assert_eq!(
+        parsed["headers"]["Authorization"].as_str(),
+        Some("Bearer ya29.abc123")
+    );
+}
+
 #[test]
 #[allow(clippy::expect_used)] // assertion-adjacent parsing of the subprocess's own output — a
                               // parse failure here is itself a test failure, not a setup bug

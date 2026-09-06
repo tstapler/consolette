@@ -180,6 +180,20 @@ mod tests {
         }
     }
 
+    // Rust idioms review, Fix 9 — malformed/negative retryDelay input must
+    // fall back to None (the caller then applies its own 60s default), never
+    // panic. Covers: not-numeric, negative, missing "s" suffix, NaN, empty.
+    #[test]
+    fn parse_retry_delay_seconds_should_return_none_for_malformed_or_negative_input() {
+        for input in ["soon", "-3s", "3", "NaNs", ""] {
+            assert_eq!(
+                parse_retry_delay_seconds(input),
+                None,
+                "expected None for malformed input {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn classify_gemini_error_should_return_upstream_when_5xx() {
         let body = error_body(json!({

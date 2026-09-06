@@ -8,8 +8,12 @@
 //!   `GeminiGenerateContentResponse` -> an Anthropic Messages response
 //!   `serde_json::Value`.
 //!
-//! Text-only for Phase 1 — `GeminiPart` gains `functionCall`/`functionResponse`
-//! variants in Phase 3 (see plan.md's Domain Glossary).
+//! Both directions handle text and tool calls: `GeminiPart` carries
+//! `functionCall`/`functionResponse`/`thoughtSignature` alongside `text`, and
+//! `tools[]`/`tool_use`/`tool_result` translate in both directions. Streaming
+//! is handled separately by `stream.rs`; streaming responses that contain a
+//! tool call are NOT supported and fail closed there (see `stream.rs` and
+//! ADR-002).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -76,8 +80,7 @@ pub(crate) struct GeminiFunctionDeclaration {
 /// `messages[]` entry. Role vocabulary differs (`"model"`, not `"assistant"`).
 ///
 /// Shared by both directions: also used as `GeminiCandidate::content` on the
-/// response side (Task 1.3.2a), since Phase 1's text-only `GeminiPart` shape
-/// is identical either way.
+/// response side, since `GeminiPart`'s shape is identical either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GeminiContent {
@@ -86,13 +89,12 @@ pub(crate) struct GeminiContent {
     pub parts: Vec<GeminiPart>,
 }
 
-/// A single Gemini content part. Text-only in Phase 1; Phase 3 (Story 3.2.1/
-/// 3.2.2) adds `functionCall`/`functionResponse` — every field is optional
-/// since a given part is exactly one of text/`functionCall`/
-/// `functionResponse`, never more than one (Gemini's own tagged-union shape,
-/// modeled here the same way `bedrock.rs`'s content-block `Value` juggling
-/// does — as sibling `Option`s rather than a Rust `enum`, so `#[serde(flatten)]`-
-/// free (de)serialization stays a straight field-by-field mapping).
+/// A single Gemini content part — every field is optional since a given
+/// part is exactly one of text/`functionCall`/`functionResponse`, never more
+/// than one (Gemini's own tagged-union shape, modeled here the same way
+/// `bedrock.rs`'s content-block `Value` juggling does — as sibling `Option`s
+/// rather than a Rust `enum`, so `#[serde(flatten)]`-free (de)serialization
+/// stays a straight field-by-field mapping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GeminiPart {
@@ -295,8 +297,7 @@ pub(crate) fn translate_anthropic_request_to_gemini(
 
 /// Anthropic `messages[].content` (string, or array of `text`/`tool_use`/
 /// `tool_result` blocks) -> `Vec<GeminiPart>`, one part per recognized
-/// block. Unrecognized block types are silently skipped, matching Phase 1's
-/// existing text-only filtering behavior.
+/// block. Unrecognized block types (e.g. `image`) are silently skipped.
 fn content_to_gemini_parts(
     content: &Value,
     tool_call_state: &mut GeminiToolCallState,

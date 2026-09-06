@@ -1,13 +1,18 @@
 //! `GeminiProvider`: Cloud Code Assist upstream (ADR-001/ADR-003).
 //!
-//! Non-streaming text completions (Epic 1.3): `send()` translates an
-//! Anthropic Messages request into the Cloud Code Assist `CloudCodeEnvelope`
-//! (`translate.rs`), POSTs it to `v1internal:generateContent`, strictly
-//! parses the 2xx body (ADR-002 — a parse failure becomes
-//! `ProviderError::ResponseShapeMismatch`, never a lenient default), and
-//! translates the response back to Anthropic shape. Streaming (`stream.rs`)
-//! and tool calls (`tools.rs`'s `ThoughtSignatureCache`/`GeminiToolCallState`
-//! becoming load-bearing) land in later phases.
+//! `send()` translates an Anthropic Messages request into the Cloud Code
+//! Assist `CloudCodeEnvelope` (`translate.rs`), including tool declarations
+//! and `tool_use`/`tool_result` blocks, and either POSTs it to
+//! `v1internal:generateContent` (non-streaming) or
+//! `v1internal:streamGenerateContent?alt=sse` (streaming, `stream.rs`). A
+//! non-streaming 2xx body is strictly parsed (ADR-002 — a parse failure
+//! becomes `ProviderError::ResponseShapeMismatch`, never a lenient default)
+//! and translated back to Anthropic shape, including any `functionCall`
+//! blocks and their opaque `thoughtSignature` (cached in
+//! `tools.rs`'s `ThoughtSignatureCache` for replay on a later turn). A
+//! streaming response that contains a tool call is NOT supported and fails
+//! closed (see `stream.rs`, ADR-002) — that's this provider's one real
+//! tool-call limitation today.
 
 mod error;
 mod stream;
@@ -170,7 +175,7 @@ impl GeminiProvider {
                 tracing::error!(
                     upstream = "gemini",
                     %msg,
-                    "gemini upstream: token refresh failed — run 'antigravity-cli login' or reopen the Antigravity IDE to mint a fresh token"
+                    "gemini upstream: auth failed (no automated token refresh by design, see ADR-001) — run 'antigravity-cli login' or reopen the Antigravity IDE to mint a fresh token"
                 );
                 Err(ProviderError::Auth(msg))
             }

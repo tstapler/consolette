@@ -449,13 +449,30 @@ fn translate_success_bytes(
 /// Google's public Generative Language API uses), on the theory that Cloud
 /// Code Assist's internal endpoint likely follows the same convention;
 /// confirm/adjust against the real response during Task 1.3.4h.
-fn parse_available_models(value: &Value) -> Vec<ModelInfo> {
-    value
-        .get("models")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
+///
+/// # Errors
+///
+/// Fails closed (matching this provider's tool_use/tool_result/tools[]/
+/// functionCall parsing elsewhere): a legitimately-empty `"models": []` maps
+/// to `Ok(vec![])`, but a missing or non-array `"models"` field — which
+/// otherwise looks identical to "zero models available" — is
+/// [`ProviderError::ResponseShapeMismatch`], since that distinction matters
+/// (a renamed/dropped field silently reporting zero models is schema drift,
+/// not an empty model list).
+fn parse_available_models(value: &Value) -> Result<Vec<ModelInfo>, ProviderError> {
+    let Some(models) = value.get("models") else {
+        return Err(ProviderError::ResponseShapeMismatch(
+            "fetchAvailableModels response missing \"models\" field".to_string(),
+        ));
+    };
+    let Some(models) = models.as_array() else {
+        return Err(ProviderError::ResponseShapeMismatch(format!(
+            "fetchAvailableModels response \"models\" field is not an array: {models}"
+        )));
+    };
+
+    Ok(models
+        .iter()
         .filter_map(|entry| {
             let raw_name = entry.get("name").and_then(Value::as_str)?;
             let id = raw_name
@@ -467,7 +484,7 @@ fn parse_available_models(value: &Value) -> Vec<ModelInfo> {
                 owned_by: Some("google".to_string()),
             })
         })
-        .collect()
+        .collect())
 }
 
 #[async_trait]
@@ -497,7 +514,7 @@ impl Provider for GeminiProvider {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let value = self.fetch_models().await?;
-        Ok(parse_available_models(&value))
+        parse_available_models(&value)
     }
 }
 
@@ -630,7 +647,7 @@ mod tests {
             ]
         });
 
-        let models = parse_available_models(&value);
+        let models = parse_available_models(&value).unwrap();
 
         assert_eq!(
             models,
@@ -639,6 +656,45 @@ mod tests {
                 owned_by: Some("google".to_string()),
             }]
         );
+    }
+
+    // Fail-closed (Rust idioms review, Fix 10) — a legitimately-empty
+    // "models": [] is a real Ok(vec![]), never confused with schema drift.
+    #[test]
+    fn parse_available_models_should_return_empty_vec_when_models_array_present_but_empty() {
+        let value = json!({"models": []});
+
+        assert_eq!(parse_available_models(&value).unwrap(), Vec::new());
+    }
+
+    // Fail-closed (Rust idioms review, Fix 10) — a missing "models" field
+    // must be a hard ResponseShapeMismatch, never silently treated the same
+    // as a present-but-empty array.
+    #[test]
+    fn parse_available_models_should_return_response_shape_mismatch_when_models_field_missing() {
+        let value = json!({"unrelated": "field"});
+
+        let err = parse_available_models(&value).unwrap_err();
+
+        match err {
+            ProviderError::ResponseShapeMismatch(msg) => {
+                assert!(msg.contains("models"), "got: {msg}");
+            }
+            other => panic!("expected ResponseShapeMismatch, got {other:?}"),
+        }
+    }
+
+    // Fail-closed (Rust idioms review, Fix 10) — a "models" field present
+    // but not an array (e.g. renamed/restructured upstream) must also be a
+    // hard ResponseShapeMismatch.
+    #[test]
+    fn parse_available_models_should_return_response_shape_mismatch_when_models_field_not_an_array(
+    ) {
+        let value = json!({"models": "not-an-array"});
+
+        let err = parse_available_models(&value).unwrap_err();
+
+        assert!(matches!(err, ProviderError::ResponseShapeMismatch(_)));
     }
 
     // REQ-19 (Story 2.1.2) — rescoped per validation.md's Test Stack Notes:

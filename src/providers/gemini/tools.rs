@@ -132,7 +132,11 @@ impl ThoughtSignatureCache {
     /// a full-table `DashMap::retain()` (which write-locks every shard)
     /// doesn't serialize every concurrent insert against every other one.
     pub(crate) fn insert(&self, session_key: &str, id: ToolUseId, signature: String) {
-        if self.insert_count.fetch_add(1, Ordering::Relaxed) % SWEEP_EVERY_N_INSERTS == 0 {
+        if self
+            .insert_count
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(SWEEP_EVERY_N_INSERTS)
+        {
             let ttl = Duration::from_secs(THOUGHT_SIGNATURE_TTL_SECS);
             self.entries
                 .retain(|_, entry| entry.inserted_at.elapsed() < ttl);

@@ -452,8 +452,8 @@ fn translate_success_bytes(
 ///
 /// # Errors
 ///
-/// Fails closed (matching this provider's tool_use/tool_result/tools[]/
-/// functionCall parsing elsewhere): a legitimately-empty `"models": []` maps
+/// Fails closed (matching this provider's `tool_use`/`tool_result`/`tools[]`/
+/// `functionCall` parsing elsewhere): a legitimately-empty `"models": []` maps
 /// to `Ok(vec![])`, but a missing or non-array `"models"` field — which
 /// otherwise looks identical to "zero models available" — is
 /// [`ProviderError::ResponseShapeMismatch`], since that distinction matters

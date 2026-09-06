@@ -121,19 +121,34 @@ impl<S> GeminiToAnthropicStream<S> {
         ));
     }
 
-    /// Resolves the Anthropic block index a Gemini part at `part_index`
-    /// (with the given `kind`) should emit into. If `part_index` has no
-    /// tracked block yet, or its tracked kind differs from `kind`, opens a
-    /// **new**, appended index (never reusing/overwriting an existing one)
-    /// and emits its `content_block_start` event. Otherwise reuses the
-    /// existing index for `part_index`.
-    fn resolve_block_index(&mut self, part_index: usize, kind: BlockKind) -> usize {
+    /// Resolves the Anthropic block index the next Gemini part of `kind`
+    /// should emit into. If the most-recently-opened block's kind matches
+    /// `kind`, reuses it (so multiple same-kind parts — whether split across
+    /// separate SSE chunks, e.g. incremental text deltas, or appearing
+    /// together within one chunk's `parts[]` — all continue appending to the
+    /// same running content block, matching Anthropic's own one-block-per-
+    /// content-run streaming shape). Otherwise opens a **new**, appended
+    /// index (never reusing/overwriting an existing one) and emits its
+    /// `content_block_start` event.
+    fn resolve_block_index(&mut self, kind: BlockKind) -> usize {
         self.ensure_started();
-        if let Some(existing_kind) = self.active_blocks.get(part_index) {
-            if *existing_kind == kind {
-                return part_index;
+        if let Some(last_kind) = self.active_blocks.last() {
+            if *last_kind == kind {
+                return self.active_blocks.len() - 1;
             }
         }
+        self.open_new_block(kind)
+    }
+
+    /// Unconditionally opens a new, appended block index for `kind` and
+    /// emits its `content_block_start` event — used both by
+    /// `resolve_block_index` (when the kind changed/no block is open yet)
+    /// and directly by callers that need a forced-new block regardless of
+    /// the most recently opened kind (e.g. a synthesized safety/recitation
+    /// annotation appended after generation stops, which is never a
+    /// continuation of preceding text deltas).
+    fn open_new_block(&mut self, kind: BlockKind) -> usize {
+        self.ensure_started();
         let new_index = self.active_blocks.len();
         self.active_blocks.push(kind);
         self.pending.push_back(Self::frame(
@@ -282,7 +297,7 @@ where
                         .and_then(|c| c.get("parts"))
                         .and_then(Value::as_array)
                     {
-                        for (part_index, part) in parts.iter().enumerate() {
+                        for part in parts {
                             // Fail closed (ADR-002): streaming tool-call
                             // support isn't implemented (only the
                             // non-streaming path stashes
@@ -298,7 +313,7 @@ where
                                 .into())));
                             }
                             let kind = classify_part_kind(part);
-                            let index = this.resolve_block_index(part_index, kind);
+                            let index = this.resolve_block_index(kind);
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
                                     this.push_delta(index, text);
@@ -310,8 +325,7 @@ where
                     if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
                         let (stop_reason, synthesized) = map_gemini_finish_reason(Some(reason));
                         if let Some(text) = synthesized {
-                            let index =
-                                this.resolve_block_index(this.active_blocks.len(), BlockKind::Text);
+                            let index = this.open_new_block(BlockKind::Text);
                             this.push_delta(index, &text);
                         }
                         let usage_metadata = response_body
@@ -404,43 +418,94 @@ mod tests {
         assert_eq!(message_delta["usage"]["output_tokens"], 2);
     }
 
-    // REQ-18 — edge path: proves `resolve_block_index`'s type-change branch
+    // Fix 8 (code review) — a single SSE chunk whose `parts[]` carries TWO
+    // text entries (real Gemini chunks can legitimately split text across
+    // multiple `parts[]` entries within one event) must produce ONE
+    // continuous text content block with the fragments appended in order —
+    // not two separate content blocks. This pins down a real bug found while
+    // adding this coverage: `resolve_block_index` used to key off each
+    // part's raw array index, so a second same-kind part at index 1 (with no
+    // block yet tracked at that index) always opened its own new block
+    // instead of continuing the running text block.
+    #[tokio::test]
+    async fn gemini_to_anthropic_stream_should_concatenate_two_text_parts_within_one_chunk_into_one_block(
+    ) {
+        let inner = stream::iter(vec![Ok(sse(
+            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"A"},{"text":" B"}]},"finishReason":"STOP"}]}}"#,
+        ))]);
+        let translator = GeminiToAnthropicStream::new(inner, "gemini-3-pro".to_string());
+        let out = drain(translator).await;
+
+        let events: Vec<String> = out.iter().map(|f| parse_event(f).0).collect();
+        assert_eq!(
+            events,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+            "two same-kind parts in one chunk must open exactly ONE content block, not two"
+        );
+
+        let (_, block_start) = parse_event(&out[1]);
+        assert_eq!(block_start["index"], 0);
+
+        let (_, delta1) = parse_event(&out[2]);
+        assert_eq!(delta1["index"], 0);
+        assert_eq!(delta1["delta"]["text"], "A");
+        let (_, delta2) = parse_event(&out[3]);
+        assert_eq!(delta2["index"], 0);
+        assert_eq!(delta2["delta"]["text"], " B");
+
+        let (_, block_stop) = parse_event(&out[4]);
+        assert_eq!(block_stop["index"], 0);
+    }
+
+    // REQ-18 — edge path: proves `resolve_block_index`'s kind-change branch
     // generically opens a *new*, appended index rather than
-    // reusing/overwriting an existing one. Exercised as a white-box unit
-    // test directly against `resolve_block_index` (rather than through a
-    // full SSE fixture) because only `BlockKind::Text` exists as a real
-    // variant through Phase 2 — a `#[cfg(test)]`-only second variant
-    // (`BlockKind::TestOther`) stands in for the real second variant Phase
-    // 3 adds, so the *mechanism* (not a specific Phase-3 kind) is what's
-    // proven here. See `BlockKind::TestOther`'s doc comment for why this
-    // approach was chosen over a synthetic-JSON end-to-end test.
+    // reusing/overwriting an existing one, while same-kind calls in a row
+    // reuse the most recently opened block (Fix 8's streaming-concatenation
+    // correction). Exercised as a white-box unit test directly against
+    // `resolve_block_index` (rather than through a full SSE fixture) because
+    // only `BlockKind::Text` exists as a real variant through Phase 2 — a
+    // `#[cfg(test)]`-only second variant (`BlockKind::TestOther`) stands in
+    // for the real second variant Phase 3 adds, so the *mechanism* (not a
+    // specific Phase-3 kind) is what's proven here. See
+    // `BlockKind::TestOther`'s doc comment for why this approach was chosen
+    // over a synthetic-JSON end-to-end test.
     #[test]
-    fn gemini_to_anthropic_stream_should_open_new_indexed_block_when_part_type_changes() {
+    fn gemini_to_anthropic_stream_should_open_new_indexed_block_when_kind_changes() {
         let inner = stream::iter(Vec::<Result<Bytes, anyhow::Error>>::new());
         let mut translator = GeminiToAnthropicStream::new(inner, "gemini-3-pro".to_string());
 
-        // First time part-position 0 is seen: opens index 0.
-        let first_index = translator.resolve_block_index(0, BlockKind::Text);
+        // First call: no block open yet, opens index 0.
+        let first_index = translator.resolve_block_index(BlockKind::Text);
         assert_eq!(first_index, 0);
 
-        // Same position, unchanged kind: reuses index 0 — not a new block.
-        let same_index = translator.resolve_block_index(0, BlockKind::Text);
+        // Same kind again: reuses index 0 — not a new block (this is what
+        // lets two same-kind parts/chunks in a row concatenate into one
+        // running content block).
+        let same_index = translator.resolve_block_index(BlockKind::Text);
         assert_eq!(same_index, 0);
 
-        // Position 0's kind changes: a brand-new index is opened, never
-        // reusing or silently merging into index 0.
-        let changed_index = translator.resolve_block_index(0, BlockKind::TestOther);
+        // Kind changes: a brand-new index is opened, never reusing or
+        // silently merging into index 0.
+        let changed_index = translator.resolve_block_index(BlockKind::TestOther);
         assert_eq!(changed_index, 1);
         assert_eq!(
             translator.active_blocks,
             vec![BlockKind::Text, BlockKind::TestOther]
         );
 
-        // A brand-new part-position (never seen before) also always opens
-        // its own new index, exercising the same branch with real Phase-2
-        // types only.
-        let new_position_index = translator.resolve_block_index(5, BlockKind::Text);
-        assert_eq!(new_position_index, 2);
+        // Switching back to a previously-seen kind (Text) after an
+        // intervening different kind still opens a brand-new index — never
+        // reuses the stale index 0.
+        let back_to_text_index = translator.resolve_block_index(BlockKind::Text);
+        assert_eq!(back_to_text_index, 2);
     }
 
     // REQ-20 — fail-closed: an unparseable `data:` line ends the stream with

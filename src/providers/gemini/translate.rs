@@ -1351,6 +1351,52 @@ mod tests {
         );
     }
 
+    // Fix 8 (code review) — a real Gemini response can legitimately
+    // interleave text and a functionCall within one candidate's parts[].
+    // Both must land in the resulting Anthropic content array, in order:
+    // the text block first, then the tool_use block, with the
+    // functionCall's thoughtSignature correctly surfaced for stashing.
+    #[test]
+    fn translate_gemini_response_to_anthropic_should_handle_interleaved_text_and_function_call_parts(
+    ) {
+        let response = parse_gemini_response(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "Let me check..."},
+                        {
+                            "functionCall": {"name": "get_weather", "args": {"city": "Boise"}},
+                            "thoughtSignature": "sig-xyz",
+                        },
+                    ],
+                },
+                "finishReason": "STOP",
+            }],
+        }));
+        let mut tool_call_state = GeminiToolCallState::new();
+
+        let (anthropic, thought_signatures) =
+            translate_gemini_response_to_anthropic(&response, "gemini-3-pro", &mut tool_call_state);
+
+        assert_eq!(anthropic["stop_reason"], json!("tool_use"));
+        let blocks = anthropic["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "expected one text block and one tool_use block");
+
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(blocks[0]["text"], json!("Let me check..."));
+
+        assert_eq!(blocks[1]["type"], json!("tool_use"));
+        assert_eq!(blocks[1]["name"], json!("get_weather"));
+        assert_eq!(blocks[1]["input"], json!({"city": "Boise"}));
+        let tool_use_id = blocks[1]["id"].as_str().unwrap().to_string();
+
+        assert_eq!(
+            thought_signatures,
+            vec![(ToolUseId::from(tool_use_id), "sig-xyz".to_string())]
+        );
+    }
+
     #[test]
     fn translate_gemini_response_to_anthropic_should_register_synthesized_id_in_tool_call_state_for_later_lookup(
     ) {

@@ -429,57 +429,42 @@ mod tests {
         assert!(m.upstreams.get("anthropic").is_none());
     }
 
-    // REQ-10 (Story 1.4.4b/c) — focus area.
+    // REQ-10 (Story 1.4.4b/c) — focus area. Driven through the public
+    // to_json() API (matching to_json_should_expose_last_error_kind_per_upstream
+    // below) rather than reaching into the private last_error_kind Mutex, so
+    // these stay decoupled from its internal representation.
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn set_last_error_kind_should_set_to_auth_when_gemini_auth_error_recorded() {
         let m = ProxyMetrics::new();
         m.set_last_error_kind("gemini", Some("auth"));
 
-        let entry = m.upstreams.get("gemini").unwrap();
-        assert_eq!(
-            *entry
-                .last_error_kind
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Some("auth")
-        );
+        let json = m.to_json();
+        assert_eq!(json["providers"]["gemini"]["last_error_kind"], json!("auth"));
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn set_last_error_kind_should_overwrite_not_coexist_with_stale_prior_kind() {
         let m = ProxyMetrics::new();
         m.set_last_error_kind("gemini", Some("auth"));
         m.set_last_error_kind("gemini", Some("response_shape_mismatch"));
 
-        let entry = m.upstreams.get("gemini").unwrap();
+        let json = m.to_json();
         assert_eq!(
-            *entry
-                .last_error_kind
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Some("response_shape_mismatch")
+            json["providers"]["gemini"]["last_error_kind"],
+            json!("response_shape_mismatch")
         );
     }
 
     // REQ-10 — the self-healing clear-on-success case (Story 1.4.4
     // acceptance criterion).
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn set_last_error_kind_should_reset_to_none_after_subsequent_success() {
         let m = ProxyMetrics::new();
         m.set_last_error_kind("gemini", Some("auth"));
         m.set_last_error_kind("gemini", None);
 
-        let entry = m.upstreams.get("gemini").unwrap();
-        assert_eq!(
-            *entry
-                .last_error_kind
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            None
-        );
+        let json = m.to_json();
+        assert_eq!(json["providers"]["gemini"]["last_error_kind"], json!(null));
     }
 
     #[test]

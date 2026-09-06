@@ -257,11 +257,11 @@ pub(crate) fn translate_anthropic_request_to_gemini(
                 _ => "user",
             }
             .to_string();
-            let content = msg.get("content").cloned().unwrap_or(Value::Null);
+            let content = msg.get("content").unwrap_or(&Value::Null);
             contents.push(GeminiContent {
                 role,
                 parts: content_to_gemini_parts(
-                    &content,
+                    content,
                     &mut tool_call_state,
                     thought_signatures,
                     session_key,

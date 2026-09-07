@@ -120,6 +120,7 @@ pub enum UpstreamKind {
     Gemini {
         project_id: String,
     },
+    Openrouter {},
 }
 
 // Note: no `deny_unknown_fields` here — serde does not support combining it
@@ -142,6 +143,8 @@ pub struct Upstream {
 pub enum Strategy {
     Fallback,
     Weighted,
+    #[serde(rename = "openrouter_scored")]
+    OpenrouterScored,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -376,7 +379,7 @@ impl Default for Config {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{Config, UpstreamKind};
+    use super::{Config, Strategy, UpstreamKind};
 
     // REQ-1 (Story 1.1.1): `UpstreamKind::Gemini` parses with a required
     // `project_id`, and fails to parse without one.
@@ -415,5 +418,60 @@ kind = "gemini"
             result.is_err(),
             "expected parse failure for missing required project_id, got {result:?}"
         );
+    }
+
+    // REQ-1 (Story 1.1.1): `UpstreamKind::Openrouter` / `Strategy::OpenrouterScored`.
+
+    #[test]
+    fn upstream_kind_should_deserialize_to_openrouter_variant() {
+        let toml = r#"
+[[upstreams]]
+name = "openrouter"
+kind = "openrouter"
+"#;
+
+        let config: Config = toml::from_str(toml).expect("fragment should parse");
+
+        assert_eq!(config.upstreams.len(), 1);
+        assert_eq!(config.upstreams[0].kind, UpstreamKind::Openrouter {});
+    }
+
+    #[test]
+    fn upstream_kind_openrouter_should_reject_unknown_field() {
+        let toml = r#"
+[[upstreams]]
+name = "openrouter"
+kind = "openrouter"
+base_url = "https://x"
+"#;
+
+        let result = toml::from_str::<Config>(toml);
+
+        let err = result.expect_err("expected parse failure for unknown field base_url");
+        assert!(
+            err.to_string().contains("base_url"),
+            "expected error to name the unknown field `base_url`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn strategy_should_deserialize_openrouter_scored() {
+        let toml = r#"
+[[upstreams]]
+name = "openrouter"
+kind = "openrouter"
+
+[[routes]]
+name = "default"
+strategy = "openrouter_scored"
+
+[[routes.upstreams]]
+name = "openrouter"
+"#;
+
+        let config: Config = toml::from_str(toml).expect("fragment should parse");
+
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].strategy, Strategy::OpenrouterScored);
     }
 }

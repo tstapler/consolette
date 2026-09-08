@@ -222,6 +222,8 @@ to disk").
   implementer, captured as part of Task 4.2.3c's `Retry-After`-fidelity
   regression test's live-traffic follow-up, not left for "whoever next
   touches `record_outcome`."
+  `STATUS: not completed during Phase 5 implementation — see ADR-002's
+  post-implementation note`
 
 ---
 

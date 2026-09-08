@@ -75,3 +75,25 @@ rate limits.
   synthetic-error-rate approach would under-react to a real per-model-only
   signal. Flagged in plan.md's Unresolved Questions as a watch item, not a
   blocker.
+
+## Post-implementation note (2026-09-07)
+
+Plan.md's Pre-mortem P2 #3 explicitly asked for the watch item above to be
+promoted to an *owned* validation task during Phase 5: capture at least one
+live 429 response's headers/body for a single free model under sustained
+load, and confirm whether OpenRouter's error signature is actually
+account-wide (as this ADR assumes) or per-model, ideally alongside Task
+4.2.3c's `Retry-After`-fidelity regression test.
+
+**That live-traffic capture was not done during Phase 5.** No sustained-load
+test against real OpenRouter traffic exists in the implementation — only the
+synthetic/mocked regression test for `Retry-After` fan-out described above.
+This ADR's "account-wide, not per-model" assumption is therefore still
+resting on Phase 2 research (`pitfalls.md`), not on live re-validation.
+
+This remains open: before this ADR's rejection of a sibling per-model
+rate-limit registry can be considered fully validated in production, someone
+(Tyler, or whoever next touches `record_outcome`/this ADR) needs to run a
+free model under sustained load, capture a real 429, and confirm the
+signature matches the account-wide assumption above. Flagging this to Tyler
+as an outstanding item, not a completed one.

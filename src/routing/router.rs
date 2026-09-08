@@ -17,7 +17,7 @@ use http::HeaderMap;
 
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
-use crate::config::schema::{Config, Strategy, UpstreamKind};
+use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
 use crate::metrics::MetricsCollector;
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
@@ -28,6 +28,7 @@ use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
 
 use super::health::{Availability, HealthRegistry};
+use super::openrouter_scoring::OpenrouterScoringStrategy;
 use super::session_overrides::{extract_session_id, SessionOverrideStore};
 use super::strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef, WeightedStrategy};
 
@@ -124,6 +125,87 @@ pub async fn build_providers(
     Ok((providers, openrouter_providers))
 }
 
+/// Story 4.3.1d (architecture-review Blocker 1, defense-in-depth half of
+/// plan.md's money-safety mechanism 1): an `openrouter`-kind upstream may
+/// only be dispatched to under `Strategy::OpenrouterScored`. Population of
+/// its `ModelListCache` is unconditional as of Story 2.1.2 (every
+/// `openrouter`-kind upstream is always safe to *send* to, regardless of
+/// strategy), but a `Fallback`/`Weighted` route referencing one is still a
+/// config mistake worth rejecting loudly at load time rather than letting
+/// it "work" untested. Checked over every route in `config.routes`,
+/// independent of which one `Router::from_config` actually builds a
+/// `Router` from.
+///
+/// # Errors
+///
+/// Returns `Err` naming the route and upstream if any route pairs an
+/// `openrouter`-kind upstream with a non-`OpenrouterScored` strategy.
+fn validate_openrouter_strategy_pairing(config: &Config) -> anyhow::Result<()> {
+    for candidate_route in &config.routes {
+        for route_upstream in &candidate_route.upstreams {
+            let Some(upstream) = config
+                .upstreams
+                .iter()
+                .find(|u| u.name == route_upstream.name)
+            else {
+                // An unknown-upstream reference is reported separately, by
+                // `Router::from_config`'s own candidate-building loop, when
+                // (if) this is the route actually being built.
+                continue;
+            };
+            let is_openrouter = matches!(upstream.kind, UpstreamKind::Openrouter {});
+            if is_openrouter && candidate_route.strategy != Strategy::OpenrouterScored {
+                return Err(anyhow::anyhow!(
+                    "route \"{}\" references openrouter-kind upstream \"{}\" under strategy {:?}; openrouter-kind upstreams may only be used with strategy = \"openrouter_scored\"",
+                    candidate_route.name,
+                    route_upstream.name,
+                    candidate_route.strategy
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Task 4.3.1a: constructs the `OpenrouterScoringStrategy` for a
+/// `Strategy::OpenrouterScored` route. `expand_candidates` fans the one
+/// static `openrouter`-kind `UpstreamRef` out into one per currently-cached
+/// free model, so exactly one such upstream is expected among `candidates`.
+///
+/// # Errors
+///
+/// Returns `Err` naming `route` if it references no `openrouter`-kind
+/// upstream, or (defensively) if the matched upstream has no corresponding
+/// entry in `openrouter_providers`.
+fn build_openrouter_scored_strategy(
+    route: &Route,
+    candidates: &[UpstreamRef],
+    config: &Config,
+    openrouter_providers: &HashMap<usize, Arc<OpenrouterProvider>>,
+) -> anyhow::Result<Arc<dyn RoutingStrategy>> {
+    let openrouter_index = candidates
+        .iter()
+        .find(|c| matches!(config.upstreams[c.index].kind, UpstreamKind::Openrouter {}))
+        .map(|c| c.index)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "route \"{}\" uses strategy = \"openrouter_scored\" but references no openrouter-kind upstream",
+                route.name
+            )
+        })?;
+    let provider = openrouter_providers.get(&openrouter_index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "route \"{}\": openrouter-kind upstream at index {} has no corresponding OpenrouterProvider",
+            route.name,
+            openrouter_index
+        )
+    })?;
+    Ok(Arc::new(OpenrouterScoringStrategy::new(
+        provider.model_cache(),
+        openrouter_index,
+    )) as Arc<dyn RoutingStrategy>)
+}
+
 impl Router {
     #[must_use]
     pub fn new(
@@ -164,18 +246,18 @@ impl Router {
     /// # Errors
     ///
     /// Returns `Err` if any upstream fails to construct its `Provider`,
-    /// if `config.routes` is empty, or if a route references an upstream
-    /// name not present in `config.upstreams`.
+    /// if `config.routes` is empty, if a route references an upstream name
+    /// not present in `config.upstreams`, if a route pairs an
+    /// `openrouter`-kind upstream with a `Strategy` other than
+    /// `OpenrouterScored` (Story 4.3.1's symmetric validation — checked
+    /// across *every* configured route, not just the one actually built),
+    /// or if a `Strategy::OpenrouterScored` route references no
+    /// `openrouter`-kind upstream.
     pub async fn from_config(
         config: &Config,
         metrics: Arc<MetricsCollector>,
     ) -> anyhow::Result<Router> {
-        // The `HashMap<usize, Arc<OpenrouterProvider>>` second element is
-        // unused until Epic 4.3 wires it into `OpenrouterScoringStrategy`'s
-        // construction (see plan.md Story 4.3.1) — this `from_config` match
-        // still only handles `Strategy::Fallback`/`Strategy::Weighted`
-        // below (Epic 4.3's job, not this epic's).
-        let (providers, _openrouter_providers) = build_providers(config).await?;
+        let (providers, openrouter_providers) = build_providers(config).await?;
         let providers: Vec<Arc<dyn Provider>> = providers
             .into_iter()
             .map(|(_, provider)| provider)
@@ -194,6 +276,8 @@ impl Router {
         for idx in bedrock_indices {
             health.set_can_cooldown(idx, false);
         }
+
+        validate_openrouter_strategy_pairing(config)?;
 
         let route = config
             .routes
@@ -230,6 +314,12 @@ impl Router {
         let strategy: Arc<dyn RoutingStrategy> = match route.strategy {
             Strategy::Fallback => Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
             Strategy::Weighted => Arc::new(WeightedStrategy) as Arc<dyn RoutingStrategy>,
+            Strategy::OpenrouterScored => build_openrouter_scored_strategy(
+                route,
+                &candidates,
+                config,
+                &openrouter_providers,
+            )?,
         };
 
         let admission = Arc::new(RateLimiters::new(&config.ratelimit)) as Arc<dyn AdmissionControl>;
@@ -574,6 +664,26 @@ mod tests {
             name: name.to_string(),
             weight: 1.0,
             model: None,
+        }
+    }
+
+    /// Builds a config-schema `Upstream` with an inline bearer-token secret
+    /// (Story 4.3.1's tests below): most of Epic 4.3's `from_config` unit
+    /// tests need real construction-time auth (`OpenrouterProvider::new`
+    /// resolves headers eagerly), not `auth: None`.
+    fn bearer_upstream(
+        name: &str,
+        kind: crate::config::schema::UpstreamKind,
+        token: &str,
+    ) -> crate::config::schema::Upstream {
+        crate::config::schema::Upstream {
+            name: name.to_string(),
+            kind,
+            auth: Some(crate::config::schema::AuthMethod::Bearer {
+                token: crate::config::schema::SecretRef::Inline {
+                    value: token.to_string(),
+                },
+            }),
         }
     }
 
@@ -1402,6 +1512,216 @@ mod tests {
         assert_eq!(providers[1].1.name(), "openrouter");
         assert_eq!(openrouter_providers.len(), 1);
         assert!(openrouter_providers.contains_key(&1));
+    }
+
+    // REQ-1/Blocker 5 (Story 4.3.1, Task 4.3.1b): a route using
+    // `strategy = "openrouter_scored"` whose upstreams resolve to no
+    // `openrouter`-kind upstream at all fails `from_config`, naming the
+    // route.
+    #[tokio::test]
+    async fn from_config_should_reject_openrouter_scored_route_without_openrouter_upstream() {
+        use crate::config::schema::{Route, RouteUpstreamRef};
+
+        let config = Config {
+            upstreams: vec![bearer_upstream(
+                "anthropic",
+                UpstreamKind::Anthropic,
+                "sk-ant-test",
+            )],
+            routes: vec![Route {
+                name: "or-route".to_string(),
+                strategy: Strategy::OpenrouterScored,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "anthropic".to_string(),
+                    weight: None,
+                    model: None,
+                }],
+            }],
+            ..Config::default()
+        };
+
+        let Err(err) = Router::from_config(&config, MetricsCollector::new()).await else {
+            panic!("openrouter_scored route without an openrouter-kind upstream must fail")
+        };
+        assert!(
+            err.to_string().contains("or-route"),
+            "error must name the route, got: {err}"
+        );
+    }
+
+    // REQ-1 (Story 4.3.1, Task 4.3.1a): a route using
+    // `strategy = "openrouter_scored"` with a matching `openrouter`-kind
+    // upstream builds a `Router` whose strategy is an
+    // `OpenrouterScoringStrategy` wired to that upstream's index and cache.
+    #[tokio::test]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    async fn from_config_should_wire_openrouter_scoring_strategy_to_matching_upstream() {
+        use crate::config::schema::{AuthMethod, Route, RouteUpstreamRef, Upstream};
+
+        // A broken `AuthMethod::Exec` (nonexistent binary) makes
+        // `OpenrouterProvider::new`'s eager cache refresh fail
+        // deterministically in `build_headers`, before any network I/O is
+        // attempted — the same hermetic-failure technique
+        // `cache.rs`'s `broken_auth_provider` test helper uses, chosen
+        // because this repo has no wiremock/mockito and a bearer-token
+        // upstream would otherwise make a real, network-dependent request.
+        let config = Config {
+            upstreams: vec![Upstream {
+                name: "openrouter".to_string(),
+                kind: UpstreamKind::Openrouter {},
+                auth: Some(AuthMethod::Exec {
+                    command: "/nonexistent-binary-xyz-consolette-test".to_string(),
+                    args: vec![],
+                    cache_ttl_secs: 0,
+                    timeout_secs: 1,
+                }),
+            }],
+            routes: vec![Route {
+                name: "or-route".to_string(),
+                strategy: Strategy::OpenrouterScored,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "openrouter".to_string(),
+                    weight: None,
+                    model: None,
+                }],
+            }],
+            ..Config::default()
+        };
+
+        let router = Router::from_config(&config, MetricsCollector::new())
+            .await
+            .expect("openrouter_scored route with a matching openrouter-kind upstream must build");
+        assert_eq!(router.candidates.len(), 1);
+        assert_eq!(router.candidates[0].index, 0);
+        assert_eq!(router.candidates[0].name, "openrouter");
+        assert_eq!(router.providers[0].name(), "openrouter");
+
+        // Proves the wired strategy is really `OpenrouterScoringStrategy`,
+        // not `FallbackStrategy`/`WeightedStrategy`: with the eager cache
+        // refresh having failed above, `model_cache.snapshot()` is `None`.
+        // `OpenrouterScoringStrategy::expand_candidates` fans a
+        // `None`-snapshot candidate out to zero entries, so `dispatch`
+        // returns `Exhausted` without ever attempting a provider call —
+        // `Fallback`/`Weighted` would instead pass the lone candidate
+        // through unchanged and actually attempt one (which would fail
+        // differently, via the same broken exec auth, not `Exhausted`).
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+        match res {
+            Err(ProviderError::Exhausted) => {}
+            Err(other) => panic!(
+                "expected Err(Exhausted) proving expand_candidates fanned the empty cache to \
+                 zero candidates, got Err({other:?})"
+            ),
+            Ok(_) => panic!(
+                "expected Err(Exhausted) proving expand_candidates fanned the empty cache to \
+                 zero candidates, got Ok(_)"
+            ),
+        }
+    }
+
+    // Blocker 1 (architecture-review), Story 4.3.1d/e: the *other*
+    // direction of the symmetric validation — an `openrouter`-kind upstream
+    // referenced by a `Fallback` route fails `from_config`, naming both the
+    // route and the upstream.
+    #[tokio::test]
+    async fn from_config_should_reject_fallback_route_referencing_openrouter_upstream() {
+        use crate::config::schema::{Route, RouteUpstreamRef};
+
+        let config = Config {
+            upstreams: vec![bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test")],
+            routes: vec![Route {
+                name: "r1".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "or".to_string(),
+                    weight: None,
+                    model: None,
+                }],
+            }],
+            ..Config::default()
+        };
+
+        let Err(err) = Router::from_config(&config, MetricsCollector::new()).await else {
+            panic!("a Fallback route referencing an openrouter-kind upstream must fail")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("r1"), "error must name the route, got: {msg}");
+        assert!(msg.contains("or"), "error must name the upstream, got: {msg}");
+    }
+
+    // Blocker 1 (architecture-review), `Weighted` direction — same as above.
+    #[tokio::test]
+    async fn from_config_should_reject_weighted_route_referencing_openrouter_upstream() {
+        use crate::config::schema::{Route, RouteUpstreamRef};
+
+        let config = Config {
+            upstreams: vec![bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test")],
+            routes: vec![Route {
+                name: "r1".to_string(),
+                strategy: Strategy::Weighted,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "or".to_string(),
+                    weight: None,
+                    model: None,
+                }],
+            }],
+            ..Config::default()
+        };
+
+        let Err(err) = Router::from_config(&config, MetricsCollector::new()).await else {
+            panic!("a Weighted route referencing an openrouter-kind upstream must fail")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("r1"), "error must name the route, got: {msg}");
+        assert!(msg.contains("or"), "error must name the upstream, got: {msg}");
+    }
+
+    // Blocker 1 (architecture-review), mixed-upstream direction: a
+    // `Fallback` route mixing an `openrouter`-kind upstream with a
+    // non-openrouter upstream is still rejected — the presence of *any*
+    // openrouter-kind upstream in a non-`OpenrouterScored` route's
+    // `upstreams` list is sufficient to reject it, regardless of what else
+    // is in that list.
+    #[tokio::test]
+    async fn from_config_should_reject_mixed_upstream_fallback_route_containing_openrouter_upstream(
+    ) {
+        use crate::config::schema::{Route, RouteUpstreamRef};
+
+        let config = Config {
+            upstreams: vec![
+                bearer_upstream("anthropic", UpstreamKind::Anthropic, "sk-ant-test"),
+                bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test"),
+            ],
+            routes: vec![Route {
+                name: "r1".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: vec![
+                    RouteUpstreamRef {
+                        name: "anthropic".to_string(),
+                        weight: None,
+                        model: None,
+                    },
+                    RouteUpstreamRef {
+                        name: "or".to_string(),
+                        weight: None,
+                        model: None,
+                    },
+                ],
+            }],
+            ..Config::default()
+        };
+
+        let Err(err) = Router::from_config(&config, MetricsCollector::new()).await else {
+            panic!(
+                "a Fallback route mixing an openrouter-kind upstream with a non-openrouter \
+                 upstream must still fail"
+            )
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("r1"), "error must name the route, got: {msg}");
+        assert!(msg.contains("or"), "error must name the upstream, got: {msg}");
     }
 
     // Story 1.3.4 replaced `GeminiProvider::stub` with the real, fallible

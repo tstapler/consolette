@@ -1,4 +1,4 @@
-//! Per-model rolling stats for the composite OpenRouter scoring strategy
+//! Per-model rolling stats for the composite `OpenRouter` scoring strategy
 //! (ADR-003): a rolling error-rate tracker (`RollingErrorRate`) plus the
 //! bundle (`ModelStats`) that pairs it with the existing latency
 //! `DurationHistogram`.

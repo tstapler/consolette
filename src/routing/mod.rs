@@ -13,6 +13,8 @@
 
 pub mod bench_table;
 pub mod health;
+pub mod model_stats;
+pub mod openrouter_scoring;
 pub mod router;
 pub mod session_overrides;
 pub mod strategy;

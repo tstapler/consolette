@@ -1843,4 +1843,66 @@ mod tests {
         // first of the 2 expanded candidates.
         assert_eq!(body["model"], serde_json::json!("model-a"));
     }
+
+    // REQ-4 (Story 4.2.3, Task 4.2.3c, ADR-002): a 429 from one per-model
+    // `OpenrouterScoringStrategy` candidate trips `HealthRegistry` for the
+    // *shared* upstream index those candidates all share, making every
+    // other per-model candidate at that index unavailable too — proving
+    // ADR-002's claim that the existing whole-upstream cooldown already
+    // delivers `Retry-After` fidelity without a sibling per-model registry.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn record_outcome_rate_limited_should_trip_health_registry_for_shared_index() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+            name: "openrouter",
+            error: || ProviderError::RateLimited,
+            call_count: Arc::clone(&call_count),
+        })];
+        let health = Arc::new(HealthRegistry::new(300));
+        let model_cache = Arc::new(
+            crate::providers::openrouter::cache::ModelListCache::new_with_ttl(Duration::from_mins(
+                15,
+            )),
+        );
+        let strategy = Arc::new(
+            crate::routing::openrouter_scoring::OpenrouterScoringStrategy::new(model_cache, 0),
+        );
+        let router = Router::new(
+            vec![
+                UpstreamRef {
+                    index: 0,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("a/b:free".to_string()),
+                },
+                UpstreamRef {
+                    index: 0,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("c/d:free".to_string()),
+                },
+            ],
+            providers,
+            strategy,
+            Arc::clone(&health),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(matches!(res, Err(ProviderError::RateLimited)));
+        assert!(
+            !health.is_available(0),
+            "the shared upstream index must be cooling down after one per-model 429"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "the sibling per-model candidate must never be attempted once the shared index cools down"
+        );
+    }
 }

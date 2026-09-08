@@ -124,6 +124,7 @@ fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
         UpstreamKind::Bedrock { .. } => "bedrock",
         UpstreamKind::Openai { .. } => "openai",
         UpstreamKind::Gemini { .. } => "gemini",
+        UpstreamKind::Openrouter {} => "openrouter",
     }
 }
 
@@ -256,6 +257,13 @@ mod tests {
         };
 
         assert_eq!(upstream_kind_label(&kind), "gemini");
+    }
+
+    // REQ-1 (Story 1.2.3, Task 1.2.3d): `upstream_kind_label` accepts
+    // `UpstreamKind::Openrouter`.
+    #[test]
+    fn upstream_kind_label_should_return_openrouter_for_new_variant() {
+        assert_eq!(upstream_kind_label(&UpstreamKind::Openrouter {}), "openrouter");
     }
 
     #[tokio::test]

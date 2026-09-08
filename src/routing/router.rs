@@ -8,6 +8,7 @@
 //! exponential backoff) stay inside the provider — the router only fails
 //! over to a *different* upstream.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
 use crate::providers::openai::OpenaiProvider;
+use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
 
@@ -52,15 +54,29 @@ pub struct Router {
 /// enumerate every upstream's models, including ones no route currently
 /// selects.
 ///
+/// Additionally returns a `HashMap<usize, Arc<OpenrouterProvider>>` (upstream
+/// index -> concrete handle) for every `openrouter`-kind upstream, alongside
+/// the usual `Vec<(String, Arc<dyn Provider>)>` — a type-driven-design
+/// choice (plan.md's Pattern Decisions) over `dyn Any`-downcasting, so
+/// `OpenrouterScoringStrategy` (Epic 4.3) can share the same
+/// `Arc<ModelListCache>` the provider already populated, without widening
+/// the `Provider` trait itself.
+///
 /// # Errors
 ///
 /// Returns `Err` if any upstream fails to construct its `Provider`.
-pub async fn build_providers(config: &Config) -> anyhow::Result<Vec<(String, Arc<dyn Provider>)>> {
+pub async fn build_providers(
+    config: &Config,
+) -> anyhow::Result<(
+    Vec<(String, Arc<dyn Provider>)>,
+    HashMap<usize, Arc<OpenrouterProvider>>,
+)> {
     let resolver: Arc<dyn SecretResolver + Send + Sync> = Arc::new(SystemSecretResolver);
     let exec_cache = Arc::new(ExecCredentialCache::new());
 
     let mut providers = Vec::with_capacity(config.upstreams.len());
-    for upstream in &config.upstreams {
+    let mut openrouter_providers = HashMap::new();
+    for (index, upstream) in config.upstreams.iter().enumerate() {
         let provider: Arc<dyn Provider> = match &upstream.kind {
             UpstreamKind::Anthropic => Arc::new(AnthropicProvider::new(
                 Arc::new(upstream.clone()),
@@ -84,10 +100,28 @@ pub async fn build_providers(config: &Config) -> anyhow::Result<Vec<(String, Arc
                 Arc::clone(&exec_cache),
                 config.request_timeout,
             )?),
+            UpstreamKind::Openrouter {} => {
+                // `OpenrouterProvider::new` already returns `Arc<OpenrouterProvider>`
+                // (Task 1.2.1b), not a bare `Self`, so no extra `Arc::new(..)`
+                // wrap is needed here. It also eagerly refreshes its model
+                // cache as an invariant of construction (Story 2.1.2's
+                // Blocker-1 fix) — this happens for every `openrouter`-kind
+                // upstream regardless of which `Strategy` any route pairs it
+                // with.
+                let provider = OpenrouterProvider::new(
+                    Arc::new(upstream.clone()),
+                    Arc::clone(&resolver),
+                    Arc::clone(&exec_cache),
+                    config.request_timeout,
+                )
+                .await?;
+                openrouter_providers.insert(index, Arc::clone(&provider));
+                provider as Arc<dyn Provider>
+            }
         };
         providers.push((upstream.name.clone(), provider));
     }
-    Ok(providers)
+    Ok((providers, openrouter_providers))
 }
 
 impl Router {
@@ -136,11 +170,14 @@ impl Router {
         config: &Config,
         metrics: Arc<MetricsCollector>,
     ) -> anyhow::Result<Router> {
-        let providers: Vec<Arc<dyn Provider>> = build_providers(config)
-            .await?
-            .into_iter()
-            .map(|(_, provider)| provider)
-            .collect();
+        // The `HashMap<usize, Arc<OpenrouterProvider>>` second element is
+        // unused until Epic 4.3 wires it into `OpenrouterScoringStrategy`'s
+        // construction (see plan.md Story 4.3.1) — this `from_config` match
+        // still only handles `Strategy::Fallback`/`Strategy::Weighted`
+        // below (Epic 4.3's job, not this epic's).
+        let (providers, _openrouter_providers) = build_providers(config).await?;
+        let providers: Vec<Arc<dyn Provider>> =
+            providers.into_iter().map(|(_, provider)| provider).collect();
         let bedrock_indices: Vec<usize> = config
             .upstreams
             .iter()
@@ -1279,11 +1316,61 @@ mod tests {
             ..Config::default()
         };
 
-        let providers = build_providers(&config).await.unwrap();
+        let (providers, openrouter_providers) = build_providers(&config).await.unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].0, "gemini");
         assert_eq!(providers[0].1.name(), "gemini");
+        assert!(
+            openrouter_providers.is_empty(),
+            "a non-openrouter upstream must not appear in the openrouter-index map"
+        );
+    }
+
+    // REQ-1 (Story 1.2.3, Task 1.2.3d): the exhaustive `UpstreamKind` match
+    // in `build_providers` accepts `Openrouter` and additionally returns the
+    // index -> `Arc<OpenrouterProvider>` map alongside the existing
+    // providers vec.
+    //
+    // `OpenrouterProvider::new` performs a live eager model-cache refresh as
+    // an invariant of construction (Story 2.1.2) — a failure there is
+    // logged, not propagated (see `OpenrouterProvider::new`'s doc comment),
+    // so this test doesn't depend on live network access to pass; it only
+    // asserts the construction/wiring contract this story owns.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn build_providers_should_construct_provider_for_upstream_kind_openrouter() {
+        let config = Config {
+            upstreams: vec![
+                crate::config::schema::Upstream {
+                    name: "anthropic".to_string(),
+                    kind: UpstreamKind::Anthropic,
+                    auth: Some(crate::config::schema::AuthMethod::Bearer {
+                        token: crate::config::schema::SecretRef::Inline {
+                            value: "sk-ant-test".to_string(),
+                        },
+                    }),
+                },
+                crate::config::schema::Upstream {
+                    name: "openrouter".to_string(),
+                    kind: UpstreamKind::Openrouter {},
+                    auth: Some(crate::config::schema::AuthMethod::Bearer {
+                        token: crate::config::schema::SecretRef::Inline {
+                            value: "sk-or-v1-test".to_string(),
+                        },
+                    }),
+                },
+            ],
+            ..Config::default()
+        };
+
+        let (providers, openrouter_providers) = build_providers(&config).await.unwrap();
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[1].0, "openrouter");
+        assert_eq!(providers[1].1.name(), "openrouter");
+        assert_eq!(openrouter_providers.len(), 1);
+        assert!(openrouter_providers.contains_key(&1));
     }
 
     // Story 1.3.4 replaced `GeminiProvider::stub` with the real, fallible

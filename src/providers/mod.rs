@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod gemini;
 pub mod openai;
+pub mod openrouter;
 
 use std::pin::Pin;
 

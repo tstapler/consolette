@@ -56,17 +56,19 @@ Large (3–6 weeks)
   recheck of the *specific selected model's* cached price, not just its id
   presence — together these close the "stale list" / "cache never
   populated" failure modes entirely, not just bound them. It is further
-  hardened by (c) a post-hoc cost-field backstop that is CONDITIONAL on
-  `implementation/plan.md` Task 1.2.4a confirming OpenRouter's API exposes a
-  per-request cost field — unconfirmed as of this writing. If Task 1.2.4a
-  finds no such field, mechanisms (a)+(b) still hold, but the residual
-  free→paid mid-TTL exposure reverts to bounded-but-not-closed (up to ~15
-  minutes / ~300 requests at 20 req/min, per ADR-001), and shipping with
-  that reduced guarantee requires Tyler's explicit sign-off as an accepted
-  risk before Epic 1.2/2.1 (`implementation/plan.md` Risk Control) is
-  considered complete — it is a human decision, not an engineering
-  guarantee, if it comes to that. This caveat scopes *how* the requirement
-  is provably closed; it does not weaken the requirement itself.
+  hardened by (c) a post-hoc cost-field backstop. As of 2026-09-08
+  (`sdd:6-verify`), OpenRouter's public docs confirm the needed field exists
+  (`GET /api/v1/generation?id=<id>` → `total_cost`), so (c) is implementable
+  — but it is not yet implemented (needs a live API key to verify
+  end-to-end, plus a check-every-request-vs-sampled design decision; see
+  `implementation/plan.md`'s Unresolved Questions). Until that follow-up
+  ships, mechanisms (a)+(b) still hold, but the residual free→paid mid-TTL
+  exposure remains bounded-but-not-closed (up to ~15 minutes / ~300 requests
+  at 20 req/min, per ADR-001), and shipping in the meantime without (c)
+  requires Tyler's explicit sign-off as an accepted interim risk
+  (`implementation/plan.md` Risk Control) — it is a human decision, not an
+  engineering guarantee, until (c) lands. This caveat scopes *how* the
+  requirement is provably closed; it does not weaken the requirement itself.
 - Must follow the existing `deny_unknown_fields` / `SecretRef`-based config
   conventions in `src/config/schema.rs`, and the existing `Provider` trait
   contract in `src/providers/mod.rs` (no bespoke dispatch path).

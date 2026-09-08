@@ -143,12 +143,24 @@ to disk").
      `research/pitfalls.md` §2 flagged as highest-severity.
   - **Residual risk, explicitly carried, not hidden in ADR prose**: mechanism
     3 depends on OpenRouter's API actually exposing a per-request cost
-    field — unconfirmed as of this plan (Task 1.2.4a is a research spike).
-    If it turns out no such field is accessible, the free→paid-mid-TTL
-    window reverts to being bounded-but-not-closed (≤15 minutes / ≤~300
-    requests at 20 req/min, per ADR-001), and that reduced guarantee needs
-    Tyler's explicit sign-off as an accepted risk rather than an assumed
-    one — flagged as a new Unresolved Question below.
+    field. **Update (2026-09-08, `sdd:6-verify` Layer 4):** confirmed via
+    OpenRouter's public docs (no API key needed) —
+    `GET /api/v1/generation?id=<id>`
+    (<https://openrouter.ai/docs/api/api-reference/generations/get-generation>)
+    returns a `total_cost` (USD) field for any prior generation, keyed by the
+    `id` already present on every completion response. This is cleaner than
+    the `usage: {include: true}` opt-in this plan originally anticipated — no
+    request-body change, so no risk of the accounting opt-in itself altering
+    billing behavior. **Mechanism 3 is therefore implementable**, but is not
+    yet implemented (a real feature addition — an extra HTTP round-trip per
+    checked request, a sampling-vs-every-request decision, and end-to-end
+    verification against a real key none of this session's environments
+    had) — it is a well-scoped follow-up story now, not an open unknown. The
+    free→paid-mid-TTL window remains bounded-but-not-closed (≤15 minutes /
+    ≤~300 requests at 20 req/min, per ADR-001) **until that follow-up ships**,
+    and shipping without it in the meantime still needs Tyler's explicit
+    sign-off as an accepted interim risk — see the updated Unresolved
+    Question below.
 
 ## Unresolved Questions
 
@@ -174,15 +186,18 @@ to disk").
   returned by a live `/models` call, with a retrieval-date comment — blocks
   Story 4.1.1 — owner: implementer (this plan intentionally ships that file
   with placeholder/empty rows rather than fabricated numbers).
-- [ ] Confirm whether OpenRouter's Chat Completions response (or a
+- [x] ~~Confirm whether OpenRouter's Chat Completions response (or a
   request-time `usage: {include: true}`-style opt-in, or a companion
-  `/generation?id=` lookup) exposes a genuine per-request cost/usage field —
-  needed for Story 1.2.4's post-hoc nonzero-cost hard-invalidate, which is
-  the actual backstop for the free→paid-mid-TTL money-safety gap (see Risk
-  Control) — blocks Story 1.2.4 — owner: implementer, Task 1.2.4a. If no
-  such field is accessible in any form, that finding must be brought back to
-  Tyler explicitly as a residual-risk sign-off decision (bounded-but-not-closed
-  exposure), not silently absorbed as "ship without it."
+  `/generation?id=` lookup) exposes a genuine per-request cost/usage
+  field~~ — **RESOLVED 2026-09-08** (`sdd:6-verify` Layer 4, via OpenRouter's
+  public docs, no API key needed): `GET /api/v1/generation?id=<id>` returns
+  `total_cost` (USD) for any prior generation. See Risk Control's updated
+  note above. **New follow-up, not yet a story in this plan**: implement
+  Story 1.2.4's mechanism 3 for real using this endpoint — needs a live
+  OpenRouter API key to verify end-to-end (none available in any environment
+  this project has run in so far) and a design decision on check-every-
+  request vs. sampled. — owner: Tyler/implementer, next session with a live
+  key.
 - [ ] Watch item, not a blocker (ADR-002): if OpenRouter turns out to apply
   any genuinely per-model throttling distinct from the account-wide cap,
   ADR-002's "fold into rolling error rate" decision should be revisited —

@@ -297,23 +297,41 @@ impl OpenrouterProvider {
     /// response reported a nonzero cost for a request whose model was drawn
     /// from the free-model cache.
     ///
-    /// Currently a **documented no-op**. Task 1.2.4a's research spike found
-    /// that live network access *was* available in this sandboxed
-    /// environment (confirmed: an unauthenticated `GET /models` succeeded,
-    /// and an invalid-bearer-token `POST /chat/completions` returned a real
-    /// `{"error":{"message":"User not found.","code":401}}`), but no valid
-    /// `OpenRouter` API key was available to exercise the one candidate this
-    /// story needed to check — a request-time `usage: {include: true}`
-    /// opt-in surfacing `usage.cost` in a *successful* response — without
-    /// spending real money, which is out of scope for research capture.
-    /// So: no accessible per-request cost field confirmed as of 2026-09-07
-    /// in this sandboxed environment; see plan.md Story 1.2.4 / Risk
-    /// Control — Tyler must sign off on this residual risk before relying
-    /// on mechanism 3 of the money-safety backstop.
+    /// Currently a **documented no-op**, though as of 2026-09-08 the
+    /// underlying research question is now resolved (see below) — this is a
+    /// well-scoped follow-up, not an open unknown.
+    ///
+    /// Task 1.2.4a's original research spike (2026-09-07) found live network
+    /// access available in this sandboxed environment (an unauthenticated
+    /// `GET /models` succeeded, an invalid-bearer-token `POST
+    /// /chat/completions` returned a real
+    /// `{"error":{"message":"User not found.","code":401}}`), but had no
+    /// valid `OpenRouter` API key to exercise a real cost-bearing response.
+    ///
+    /// A follow-up pass (2026-09-08, via `OpenRouter`'s public docs, no key
+    /// needed) confirmed `OpenRouter` exposes exactly the field this
+    /// mechanism needs, and it does not require opting a request into
+    /// `usage: {include: true}` at all: `GET /api/v1/generation?id=<id>`
+    /// (<https://openrouter.ai/docs/api/api-reference/generations/get-generation>)
+    /// takes the `id` already present in every completion response (success
+    /// or error) and returns a `total_cost` (USD) field, independent of
+    /// whether the original request opted into inline usage accounting.
+    /// This is the cleaner of the two viable mechanisms — no request-body
+    /// change, so no risk of the accounting opt-in itself changing billing
+    /// behavior — and needs only the same API key already configured for
+    /// this provider, called after any response already received.
+    ///
+    /// Still not implemented here: doing so is a real feature addition (an
+    /// extra HTTP round-trip per checked request; a decision on whether to
+    /// check every request or a sample; and end-to-end verification against
+    /// a real key, which this environment doesn't have) — scoped as a
+    /// follow-up story, not folded into this verification pass. Tyler must
+    /// still sign off on shipping with mechanism 3 as a no-op in the
+    /// meantime; see plan.md Story 1.2.4 / Risk Control.
     // `&self` is unused today (documented no-op), but this will become a
-    // real `self.model_cache.invalidate()` call once Task 1.2.4a's field is
-    // confirmed — keeping the method signature `&self`-shaped now avoids
-    // another call-site churn later.
+    // real `self.model_cache.invalidate()` call once implemented — keeping
+    // the method signature `&self`-shaped now avoids another call-site
+    // churn later.
     #[allow(clippy::unused_self)]
     fn check_for_unexpected_cost(&self, _model_id: &str, _response: &Value) {
         // Intentional no-op — see doc comment above and plan.md Story 1.2.4.

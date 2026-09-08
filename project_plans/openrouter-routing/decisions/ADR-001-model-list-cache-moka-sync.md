@@ -117,11 +117,15 @@ TTL is retained as a backstop-of-last-resort, not replaced):
    Story 1.2.4).
 
 **Consequences.**
-- If OpenRouter's API turns out not to expose any accessible per-request
-  cost field, mechanism 2 ships as a documented no-op, and the original
-  15-minute-TTL-bounded exposure (not eliminated) becomes the actual
-  residual guarantee — this must be surfaced to Tyler as an explicit
-  sign-off decision (see plan.md Risk Control), not silently accepted.
+- **Update (2026-09-08, `sdd:6-verify`)**: confirmed via OpenRouter's public
+  docs (no API key needed) that `GET /api/v1/generation?id=<id>` returns a
+  `total_cost` field for any prior generation — mechanism 2 is implementable.
+  It remains a documented no-op today (unimplemented, not "not possible")
+  pending a live key to verify end-to-end; see plan.md's Unresolved
+  Questions and Risk Control for the current status. Until it lands, the
+  original 15-minute-TTL-bounded exposure (not eliminated) is the actual
+  residual guarantee, and shipping in the meantime must be surfaced to
+  Tyler as an explicit interim sign-off decision, not silently accepted.
 - Mechanism 1 requires `list_free_models()` to return price alongside id
   (plan.md Story 1.2.2), which is a small, purely additive change to data
   already being parsed off `/models`' response — no new HTTP call.

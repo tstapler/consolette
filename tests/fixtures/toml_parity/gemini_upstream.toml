@@ -1,0 +1,4 @@
+[[upstreams]]
+name = "gemini"
+kind = "gemini"
+project_id = "my-gcp-project"

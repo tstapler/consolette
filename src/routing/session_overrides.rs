@@ -1,21 +1,15 @@
-//! Per-session route override store (in-memory only) and the request-body
-//! session-id extraction it keys off of.
-//!
-//! Session identity comes from the Anthropic Messages API request's
-//! `metadata.user_id` field, used verbatim as the key rather than parsed
-//! for an assumed internal structure — the exact shape Claude Code's CLI
-//! puts there hasn't been directly captured against a live request through
-//! this proxy (no session was pointed at it during development of this
-//! feature). Verify the field's actual value for a real session via
-//! `GET /requests/{id}` (the cached original body) before relying on this
-//! for anything beyond "some client sent a stable `metadata.user_id`".
-//! Absent the field entirely, no override can apply and dispatch falls
-//! through to the normal route — this fails safe either way.
+//! Per-session route override store (in-memory only). The request-body
+//! session-id extraction it keys off of lives in `crate::session` (shared
+//! across `routing` and `providers` so neither layer has to reach into the
+//! other); re-exported here so existing call sites in `routing/` keep
+//! working unchanged.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::session::extract_session_id;
 
 /// One session's pinned upstream (by config name) and optional model
 /// override, set via `POST /api/sessions/{id}/route`.
@@ -23,17 +17,6 @@ use serde::{Deserialize, Serialize};
 pub struct SessionOverride {
     pub upstream: String,
     pub model: Option<String>,
-}
-
-/// Extracts `body.metadata.user_id` verbatim as the session key. Returns
-/// `None` if the request has no `metadata.user_id` string field, in which
-/// case no session-scoped override can ever apply to it.
-#[must_use]
-pub fn extract_session_id(body: &serde_json::Value) -> Option<String> {
-    body.get("metadata")?
-        .get("user_id")?
-        .as_str()
-        .map(str::to_string)
 }
 
 /// In-memory session-id -> override map. Deliberately not persisted to
@@ -89,23 +72,6 @@ impl SessionOverrideStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_session_id_reads_metadata_user_id() {
-        let body = serde_json::json!({"metadata": {"user_id": "abc123"}});
-        assert_eq!(extract_session_id(&body), Some("abc123".to_string()));
-    }
-
-    #[test]
-    fn extract_session_id_missing_metadata_returns_none() {
-        assert_eq!(extract_session_id(&serde_json::json!({})), None);
-    }
-
-    #[test]
-    fn extract_session_id_non_string_user_id_returns_none() {
-        let body = serde_json::json!({"metadata": {"user_id": 42}});
-        assert_eq!(extract_session_id(&body), None);
-    }
 
     #[test]
     fn set_get_clear_roundtrip() {

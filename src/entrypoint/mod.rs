@@ -123,6 +123,8 @@ fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
         UpstreamKind::Anthropic => "anthropic",
         UpstreamKind::Bedrock { .. } => "bedrock",
         UpstreamKind::Openai { .. } => "openai",
+        UpstreamKind::Gemini { .. } => "gemini",
+        UpstreamKind::Openrouter {} => "openrouter",
     }
 }
 
@@ -245,6 +247,26 @@ mod tests {
         )
         .await;
         assert!(state.is_ok());
+    }
+
+    // REQ-2 (Story 1.1.2): `upstream_kind_label` accepts `UpstreamKind::Gemini`.
+    #[test]
+    fn upstream_kind_label_should_return_gemini_for_new_variant() {
+        let kind = UpstreamKind::Gemini {
+            project_id: "p1".to_string(),
+        };
+
+        assert_eq!(upstream_kind_label(&kind), "gemini");
+    }
+
+    // REQ-1 (Story 1.2.3, Task 1.2.3d): `upstream_kind_label` accepts
+    // `UpstreamKind::Openrouter`.
+    #[test]
+    fn upstream_kind_label_should_return_openrouter_for_new_variant() {
+        assert_eq!(
+            upstream_kind_label(&UpstreamKind::Openrouter {}),
+            "openrouter"
+        );
     }
 
     #[tokio::test]

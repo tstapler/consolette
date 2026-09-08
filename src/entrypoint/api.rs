@@ -47,7 +47,7 @@ pub async fn get_models(
     State(state): State<EntrypointState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let config = crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
-    let providers = build_providers(&config).await.map_err(|e| {
+    let (providers, _) = build_providers(&config).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),

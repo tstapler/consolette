@@ -61,6 +61,11 @@ pub fn map_provider_error_anthropic(err: &ProviderError) -> (StatusCode, Option<
             None,
             json!({"type":"error","error":{"type":"api_error","message":body}}),
         ),
+        ProviderError::ResponseShapeMismatch(msg) => (
+            StatusCode::BAD_GATEWAY,
+            None,
+            json!({"type":"error","error":{"type":"api_error","message":msg}}),
+        ),
     }
 }
 
@@ -117,6 +122,9 @@ pub fn map_provider_error_openai(err: &ProviderError) -> (StatusCode, Option<u64
             None,
             envelope(body, "server_error"),
         ),
+        ProviderError::ResponseShapeMismatch(msg) => {
+            (StatusCode::BAD_GATEWAY, None, envelope(msg, "server_error"))
+        }
     }
 }
 
@@ -205,6 +213,20 @@ mod tests {
         assert_eq!(body["error"]["type"], "api_error");
     }
 
+    // REQ-7 (Story 1.4.1, ADR-002) — focus area.
+    #[test]
+    fn map_provider_error_anthropic_should_return_502_bad_gateway_for_response_shape_mismatch() {
+        let (status, retry_after, body) = map_provider_error_anthropic(
+            &ProviderError::ResponseShapeMismatch("missing field `candidates`".to_string()),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(retry_after, None);
+        assert_eq!(
+            body,
+            json!({"type":"error","error":{"type":"api_error","message":"missing field `candidates`"}})
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // map_provider_error_openai (plan.md Task 3.1.2.1/3.1.2.3)
     // ────────────────────────────────────────────────────────────────────
@@ -271,5 +293,17 @@ mod tests {
             body: "weird".to_string(),
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // REQ-7 (Story 1.4.1, ADR-002) — focus area.
+    #[test]
+    fn map_provider_error_openai_should_return_502_server_error_for_response_shape_mismatch() {
+        let (status, retry_after, body) = map_provider_error_openai(
+            &ProviderError::ResponseShapeMismatch("missing field `candidates`".to_string()),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(retry_after, None);
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "missing field `candidates`");
     }
 }

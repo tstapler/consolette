@@ -22,6 +22,12 @@ use super::EntrypointState;
 pub async fn get_metrics(State(state): State<EntrypointState>) -> impl IntoResponse {
     let mut result = state.metrics.to_metrics_json();
     result["cooldowns"] = state.dispatch_router.load().cooldown_snapshot();
+    // Story 5.1.2: present only for a route whose strategy overrides
+    // `observability_snapshot()` (currently just `OpenrouterScoringStrategy`)
+    // — omitted entirely (not `null`) otherwise.
+    if let Some(scoring) = state.dispatch_router.load().openrouter_scoring_snapshot() {
+        result["openrouter_scoring"] = scoring;
+    }
     Json(result)
 }
 
@@ -365,6 +371,103 @@ mod tests {
             serde_json::json!(false),
             "is_auth() must never trip HealthRegistry — this is the exact gap Story 1.5.2 \
              exists to guard the JS against"
+        );
+    }
+
+    // ── REQ-7 (Story 5.1.2, Task 5.1.2c) — `openrouter_scoring` merge. ──────
+
+    // *Given* an active `FallbackStrategy` route, *when* `GET /metrics` is
+    // called, *then* the response has no `openrouter_scoring` key at all
+    // (not `null`).
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn get_metrics_should_omit_openrouter_scoring_key_for_fallback_strategy() {
+        let health = Arc::new(HealthRegistry::new(300));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider { name: "primary" })];
+        let metrics = crate::metrics::MetricsCollector::new();
+        let router = DispatchRouter::new(
+            vec![upstream_ref(0, "primary")],
+            providers,
+            Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
+            health,
+            always_allow_admission(),
+            Arc::clone(&metrics),
+        );
+        let state = state_with_router(router, metrics).await;
+
+        let response = get_metrics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
+
+        assert!(
+            json.as_object()
+                .expect("response must be a JSON object")
+                .get("openrouter_scoring")
+                .is_none(),
+            "openrouter_scoring key must be entirely absent for a FallbackStrategy route, got: {json}"
+        );
+    }
+
+    // *Given* an active `OpenrouterScoringStrategy` route, *when* `GET
+    // /metrics` is called, *then* the response's `openrouter_scoring` key
+    // matches `observability_snapshot()`'s output.
+    #[tokio::test]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    async fn get_metrics_should_include_openrouter_scoring_block_for_scored_route() {
+        use crate::providers::openrouter::cache::ModelListCache;
+        use crate::routing::openrouter_scoring::OpenrouterScoringStrategy;
+
+        let health = Arc::new(HealthRegistry::new(300));
+        let model_cache = Arc::new(ModelListCache::new_with_ttl(std::time::Duration::from_mins(
+            15,
+        )));
+        let strategy = Arc::new(OpenrouterScoringStrategy::new(Arc::clone(&model_cache), 0));
+        let providers: Vec<Arc<dyn Provider>> =
+            vec![Arc::new(AlwaysOkProvider { name: "openrouter" })];
+        let metrics = crate::metrics::MetricsCollector::new();
+        let router = DispatchRouter::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "openrouter".to_string(),
+                weight: 1.0,
+                model: Some("a/b:free".to_string()),
+            }],
+            providers,
+            Arc::clone(&strategy) as Arc<dyn RoutingStrategy>,
+            health,
+            always_allow_admission(),
+            Arc::clone(&metrics),
+        );
+
+        // Drive one real selection so `last_scores` (and therefore the
+        // `models` block) isn't empty.
+        router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await
+            .expect("dispatch against AlwaysOkProvider must succeed");
+
+        let expected = strategy
+            .observability_snapshot()
+            .expect("OpenrouterScoringStrategy must always return Some");
+
+        let state = state_with_router(router, metrics).await;
+        let response = get_metrics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
+
+        assert_eq!(
+            json["openrouter_scoring"]["models"]["a/b:free"],
+            expected["models"]["a/b:free"]
+        );
+        assert_eq!(
+            json["openrouter_scoring"]["cache"]["cached_model_count"],
+            expected["cache"]["cached_model_count"]
         );
     }
 }

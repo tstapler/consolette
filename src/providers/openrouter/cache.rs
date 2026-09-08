@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tracing::warn;
 
@@ -54,9 +55,13 @@ pub struct ModelListCache {
     /// free-model list to cache) so TTL eviction and `invalidate()` come
     /// from `moka` for free instead of being hand-rolled.
     cache: moka::sync::Cache<(), Arc<Vec<FreeModelEntry>>>,
-    /// Timestamp of the last *successful* refresh — `None` if no refresh
-    /// has ever succeeded.
-    last_refresh: Mutex<Option<Instant>>,
+    /// Wall-clock timestamp of the last *successful* refresh — `None` if no
+    /// refresh has ever succeeded. `DateTime<Utc>` (not `Instant`), since
+    /// Epic 5.1's `observability_snapshot()` surfaces this as an RFC3339
+    /// string (`design/ux.md`'s `openrouter_scoring.cache.last_refresh`
+    /// example) — a wall clock, not a monotonic clock, is the only thing
+    /// that can produce a calendar timestamp.
+    last_refresh: Mutex<Option<DateTime<Utc>>>,
     /// The reason the cache entry was last cleared, surfaced via
     /// `/metrics` (Observability Plan) — e.g. `"model_not_found:<id>"` or
     /// `"suppressed_systemic_404"`.
@@ -133,10 +138,11 @@ impl ModelListCache {
         self.cache.get(&())
     }
 
-    /// The timestamp of the last successful refresh, or `None` if none has
-    /// ever succeeded — surfaced via `/metrics` (Observability Plan).
+    /// The wall-clock timestamp of the last successful refresh, or `None` if
+    /// none has ever succeeded — surfaced via `/metrics` (Observability
+    /// Plan) as an RFC3339 string.
     #[must_use]
-    pub fn last_refresh(&self) -> Option<Instant> {
+    pub fn last_refresh(&self) -> Option<DateTime<Utc>> {
         *self
             .last_refresh
             .lock()
@@ -182,7 +188,7 @@ impl ModelListCache {
         *self
             .last_refresh
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Utc::now());
         Ok(())
     }
 

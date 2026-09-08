@@ -422,6 +422,13 @@ impl Router {
                 break;
             };
             already_tried.insert((chosen.index, chosen.model.clone()));
+            // Story 5.1.3: last attempt wins across retries, mirroring how
+            // `update_request_timing` already overwrites `provider` on each
+            // retry — `None` for every non-model-pinned route
+            // (`FallbackStrategy`/`WeightedStrategy` candidates always carry
+            // `model: None`).
+            self.metrics
+                .set_selected_model(&request_id, chosen.model.clone());
 
             // ADR-004: post-selection admission check, before the provider
             // call — a Shed re-selects from the remaining pool via the same
@@ -530,6 +537,18 @@ impl Router {
             );
         }
         serde_json::Value::Object(result)
+    }
+
+    /// The active strategy's `/metrics`-facing observability blob (Story
+    /// 5.1.2, Task 5.1.2a) — `Some` only when `self.strategy` overrides
+    /// `observability_snapshot()` (currently just `OpenrouterScoringStrategy`),
+    /// `None` for `FallbackStrategy`/`WeightedStrategy`'s default. The HTTP
+    /// handler (`entrypoint::observability::get_metrics`) merges this in
+    /// under the `openrouter_scoring` key only when it's `Some`, omitting
+    /// the key entirely otherwise.
+    #[must_use]
+    pub fn openrouter_scoring_snapshot(&self) -> Option<serde_json::Value> {
+        self.strategy.observability_snapshot()
     }
 
     /// Records one dispatch attempt's timing/outcome for `/metrics`
@@ -2223,6 +2242,77 @@ mod tests {
             call_count.load(Ordering::SeqCst),
             1,
             "the sibling per-model candidate must never be attempted once the shared index cools down"
+        );
+    }
+
+    // ── REQ-7 (Story 5.1.3, Task 5.1.3c) — `RequestDetail.selected_model`. ──
+
+    // *Given* a dispatch that selects a per-model candidate
+    // `UpstreamRef{model: Some("a/b:free"), ..}`, *when* the request
+    // completes, *then* its `RequestDetail.selected_model ==
+    // Some("a/b:free".to_string())`.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_set_selected_model_on_request_detail() {
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider {
+            name: "openrouter",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })];
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "openrouter".to_string(),
+                weight: 1.0,
+                model: Some("a/b:free".to_string()),
+            }],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            Arc::clone(&metrics),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_ok());
+        let recent = metrics.get_recent_requests(1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].selected_model, Some("a/b:free".to_string()));
+    }
+
+    // *Given* a dispatch on `FallbackStrategy` (candidates always have
+    // `model: None`), *when* the request completes, *then*
+    // `RequestDetail.selected_model == None`.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_leave_selected_model_none_for_fallback_strategy() {
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider {
+            name: "primary",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })];
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![upstream(0, "primary")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            Arc::clone(&metrics),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_ok());
+        let recent = metrics.get_recent_requests(1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].selected_model, None,
+            "FallbackStrategy candidates always carry model: None"
         );
     }
 }

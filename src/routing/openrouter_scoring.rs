@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use dashmap::{DashMap, DashSet};
 use rand::Rng;
+use serde_json::json;
 use tracing::{debug, warn};
 
 use crate::providers::openrouter::{FreeModelEntry, ModelListCache};
@@ -80,6 +81,17 @@ fn normalize_lower_is_better(values: &[f64]) -> Vec<f64> {
         .iter()
         .map(|v| 1.0 - (v - min) / (max - min))
         .collect()
+}
+
+/// One candidate's fully-scored state: the public `ScoreBreakdown` (kept for
+/// `/metrics`, Story 5.1.1) plus the 3 normalized components that fed its
+/// `composite`, kept internally so `select()` can log them (Story 5.1.4)
+/// without recomputing or widening `ScoreBreakdown`'s own public shape.
+struct ScoredCandidate {
+    breakdown: ScoreBreakdown,
+    norm_latency: f64,
+    norm_error: f64,
+    bench_score: f64,
 }
 
 /// One candidate's raw (pre-normalization) signal state, extracted from
@@ -161,6 +173,19 @@ impl OpenrouterScoringStrategy {
     /// (`0.5` on every term) and is not tracked in `last_scores`/
     /// `warned_unranked` — there's no model id to key either on.
     fn compute_scores(&self, healthy: &[UpstreamRef]) -> Vec<ScoreBreakdown> {
+        self.compute_scores_detailed(healthy)
+            .into_iter()
+            .map(|s| s.breakdown)
+            .collect()
+    }
+
+    /// Same computation as `compute_scores`, but also returns each
+    /// candidate's normalized `norm_latency`/`norm_error`/`bench_score`
+    /// components alongside its `ScoreBreakdown` — `select()` (Story 5.1.4)
+    /// needs these for its structured log line; `ScoreBreakdown` itself
+    /// stays limited to the `/metrics`-facing fields (Story 5.1.1) so this
+    /// doesn't widen that public, `/metrics`-serialized shape.
+    fn compute_scores_detailed(&self, healthy: &[UpstreamRef]) -> Vec<ScoredCandidate> {
         let raws: Vec<RawSignal> = healthy.iter().map(|c| self.raw_signal_for(c)).collect();
 
         // Min-max normalization is computed over only the *real* (non-cold)
@@ -195,7 +220,13 @@ impl OpenrouterScoringStrategy {
                 } else {
                     err_iter.next().unwrap_or(NEUTRAL)
                 };
-                self.breakdown_for(&raw, norm_latency, norm_error)
+                let (breakdown, bench_score) = self.breakdown_for(&raw, norm_latency, norm_error);
+                ScoredCandidate {
+                    breakdown,
+                    norm_latency,
+                    norm_error,
+                    bench_score,
+                }
             })
             .collect()
     }
@@ -235,8 +266,19 @@ impl OpenrouterScoringStrategy {
     /// Combines one candidate's already-normalized `norm_latency`/`norm_error`
     /// with its absolute bench score (warning once if unranked, Task
     /// 4.2.1c) into a `ScoreBreakdown`, recording it into `last_scores` as a
-    /// side effect when the candidate has a model id.
-    fn breakdown_for(&self, raw: &RawSignal, norm_latency: f64, norm_error: f64) -> ScoreBreakdown {
+    /// side effect when the candidate has a model id. Returns the resolved
+    /// bench value alongside the breakdown (the neutral default when
+    /// unranked, the real `bench_rank` otherwise) — `compute_scores_detailed`
+    /// needs this raw value for `select()`'s log line (Story 5.1.4);
+    /// `ScoreBreakdown.bench_rank` alone can't serve that purpose since it's
+    /// `None` (not `NEUTRAL`) for an unranked model, by design (Story
+    /// 5.1.1's `bench_rank: null` acceptance criterion).
+    fn breakdown_for(
+        &self,
+        raw: &RawSignal,
+        norm_latency: f64,
+        norm_error: f64,
+    ) -> (ScoreBreakdown, f64) {
         let bench_rank = raw.model_id.as_deref().and_then(bench_score);
         let bench = bench_rank.unwrap_or_else(|| {
             if let Some(model_id) = &raw.model_id {
@@ -256,7 +298,7 @@ impl OpenrouterScoringStrategy {
         if let Some(model_id) = &raw.model_id {
             self.last_scores.insert(model_id.clone(), breakdown.clone());
         }
-        breakdown
+        (breakdown, bench)
     }
 
     /// Task 4.2.1c: logs `tracing::warn!` exactly once per unranked model
@@ -318,7 +360,7 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
             return None;
         }
 
-        let scores = self.compute_scores(healthy);
+        let scores = self.compute_scores_detailed(healthy);
         let mut rng = rand::thread_rng();
         let explore = rng.gen::<f64>() < EPSILON_EXPLORATION;
 
@@ -326,11 +368,11 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
             rng.gen_range(0..healthy.len())
         } else {
             let mut best_idx = 0;
-            let mut best_score = scores[0].composite;
-            for (idx, breakdown) in scores.iter().enumerate().skip(1) {
-                if breakdown.composite > best_score {
+            let mut best_score = scores[0].breakdown.composite;
+            for (idx, scored) in scores.iter().enumerate().skip(1) {
+                if scored.breakdown.composite > best_score {
                     best_idx = idx;
-                    best_score = breakdown.composite;
+                    best_score = scored.breakdown.composite;
                 }
             }
             best_idx
@@ -340,10 +382,18 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
         if let Some(model_id) = &chosen.model {
             self.last_explore.insert(model_id.clone(), explore);
         }
+        // Story 5.1.4: exactly one `debug!` per selecting call, naming the
+        // chosen model and all 4 score fields (design/ux.md §4's exact log
+        // shape) plus `explore` (Pre-mortem P2 #2) so an epsilon-greedy
+        // exploration pick is distinguishable after the fact from a genuine
+        // scoring failure.
         debug!(
             model = chosen.model.as_deref().unwrap_or(""),
             explore,
-            composite = scores[chosen_idx].composite,
+            norm_latency = scores[chosen_idx].norm_latency,
+            norm_error = scores[chosen_idx].norm_error,
+            bench_score = scores[chosen_idx].bench_score,
+            composite = scores[chosen_idx].breakdown.composite,
             "openrouter: selected candidate"
         );
 
@@ -430,6 +480,51 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
                 _ => {}
             }
         }
+    }
+
+    /// Story 5.1.1: model-list cache state plus every currently-known
+    /// model's last-computed `ScoreBreakdown`, for `/metrics`'
+    /// `openrouter_scoring` block (design/ux.md §2's exact shape).
+    ///
+    /// `models` is built from `self.last_scores` (every model this strategy
+    /// has ever scored, not just the cache's current live snapshot) so a
+    /// model's score breakdown survives one refresh cycle after it briefly
+    /// drops out of the free-model list, matching `expand_candidates`'s own
+    /// GC-on-next-refresh timing rather than instantly disappearing from
+    /// `/metrics` the moment the cache rotates.
+    fn observability_snapshot(&self) -> Option<serde_json::Value> {
+        let snapshot = self.model_cache.snapshot();
+        let cached_model_count = snapshot.as_ref().map_or(0, |s| s.len());
+        let last_refresh = self.model_cache.last_refresh();
+        let age_secs = last_refresh.map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds());
+
+        let models: serde_json::Map<String, serde_json::Value> = self
+            .last_scores
+            .iter()
+            .map(|entry| {
+                let breakdown = entry.value();
+                (
+                    entry.key().clone(),
+                    json!({
+                        "latency_p50_ms": breakdown.latency_p50_ms,
+                        "error_rate": breakdown.error_rate,
+                        "bench_rank": breakdown.bench_rank,
+                        "composite_score": breakdown.composite,
+                        "sample_count": breakdown.sample_count,
+                    }),
+                )
+            })
+            .collect();
+
+        Some(json!({
+            "cache": {
+                "cached_model_count": cached_model_count,
+                "age_secs": age_secs,
+                "last_refresh": last_refresh.map(|t| t.to_rfc3339()),
+                "last_invalidation_reason": self.model_cache.last_invalidation_reason(),
+            },
+            "models": models,
+        }))
     }
 }
 
@@ -895,5 +990,202 @@ mod tests {
             3,
             "a cold cache must not wipe rolling history"
         );
+    }
+
+    // --- Story 5.1.1: observability_snapshot() ---
+
+    // REQ-7 (Task 5.1.1b): after one `select()` call over 2 candidates, the
+    // returned JSON's `models` object has exactly 2 keys matching those 2
+    // model ids, each with all 5 fields present.
+    #[test]
+    fn observability_snapshot_should_include_all_scored_models() {
+        let strategy = strategy_with_index(0);
+        seed_stats(&strategy, "a/model:free", &[100], &[true, true]);
+        seed_stats(&strategy, "b/model:free", &[500], &[false]);
+        let candidates = vec![
+            candidate(0, Some("a/model:free")),
+            candidate(0, Some("b/model:free")),
+        ];
+
+        strategy.select(&candidates).expect("pool is non-empty");
+
+        let snapshot = strategy
+            .observability_snapshot()
+            .expect("OpenrouterScoringStrategy must always return Some");
+        let models = snapshot["models"]
+            .as_object()
+            .expect("models must be a JSON object");
+        assert_eq!(models.len(), 2);
+        for id in ["a/model:free", "b/model:free"] {
+            let entry = &models[id];
+            assert!(entry.get("latency_p50_ms").is_some());
+            assert!(entry.get("error_rate").is_some());
+            assert!(entry.get("bench_rank").is_some());
+            assert!(entry.get("composite_score").is_some());
+            assert!(entry.get("sample_count").is_some());
+        }
+        assert_eq!(snapshot["cache"]["cached_model_count"], json!(0));
+        assert_eq!(snapshot["cache"]["last_refresh"], json!(null));
+        assert_eq!(snapshot["cache"]["age_secs"], json!(null));
+        assert_eq!(snapshot["cache"]["last_invalidation_reason"], json!(null));
+    }
+
+    #[test]
+    fn observability_snapshot_should_report_cache_state() {
+        let cache = Arc::new(CacheImpl::new_with_ttl(Duration::from_mins(15)));
+        cache.seed_for_test(vec![free_model("a/b:free"), free_model("c/d:free")]);
+        let strategy = OpenrouterScoringStrategy::new(Arc::clone(&cache), 0);
+
+        let snapshot = strategy
+            .observability_snapshot()
+            .expect("OpenrouterScoringStrategy must always return Some");
+
+        assert_eq!(snapshot["cache"]["cached_model_count"], json!(2));
+        assert_eq!(
+            snapshot["models"]
+                .as_object()
+                .expect("models must be a JSON object")
+                .len(),
+            0,
+            "no select() call has happened yet, so no model has a ScoreBreakdown"
+        );
+    }
+
+    // --- Story 5.1.4: structured selection log line ---
+
+    /// Formats one event's message plus every field as `key=value` pairs,
+    /// space-separated — enough for this test's substring assertions
+    /// without depending on `tracing_subscriber`'s own formatter.
+    struct FieldVisitor(String);
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            if field.name() == "message" {
+                let _ = write!(self.0, "{value:?} ");
+            } else {
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+    }
+
+    /// A hand-rolled, process-wide `tracing::Subscriber` that captures every
+    /// event's message/fields keyed by the capturing thread's `ThreadId`
+    /// (Rust's test harness runs each `#[test]` fn on its own thread, so
+    /// this gives per-test isolation without a shared, cross-test-polluted
+    /// buffer).
+    ///
+    /// Installed via `set_global_default` (once, guarded by `OnceLock`)
+    /// rather than the scoped `tracing::subscriber::set_default` pattern
+    /// `cost_metrics/pricing.rs`'s tests use: `tracing-core` caches each
+    /// callsite's `Interest` process-wide, combined via a logical AND across
+    /// every currently-registered `Dispatch`. `select()`'s `debug!` callsite
+    /// is hit by a dozen other tests in this module with no subscriber
+    /// installed at all (an invisible, unregistered `Dispatch::none()`);
+    /// under `cargo test`'s default parallelism, a `set_default`-scoped
+    /// subscriber created concurrently with those calls can have its
+    /// `Interest` re-combined down to `never()` before this test's own
+    /// `select()` call ever runs — confirmed empirically: this test passes
+    /// reliably under `--test-threads=1` with a scoped `set_default`
+    /// subscriber, but fails intermittently-turned-reliably-wrong under
+    /// default parallel execution. A single global-for-the-process
+    /// dispatcher, installed once and never torn down, sidesteps that
+    /// entirely: every thread's `Dispatch::current()` resolves to it for the
+    /// rest of the run (no thread ever again sees a bare
+    /// `Dispatch::none()`), so there is no "combined with a differently-
+    /// interested concurrent dispatch" case left to race.
+    #[derive(Clone, Default)]
+    struct GlobalCapturingSubscriber;
+
+    static CAPTURED_EVENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, Vec<String>>>,
+    > = std::sync::OnceLock::new();
+
+    fn captured_events_map(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, Vec<String>>>
+    {
+        CAPTURED_EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    impl tracing::Subscriber for GlobalCapturingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = FieldVisitor(String::new());
+            event.record(&mut visitor);
+            captured_events_map()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(std::thread::current().id())
+                .or_default()
+                .push(visitor.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Installs `GlobalCapturingSubscriber` as the process-wide default,
+    /// exactly once — idempotent across every test that calls it (a second
+    /// `set_global_default` call would `Err`, silently ignored, since the
+    /// first installation already satisfies every caller).
+    fn init_global_log_capture() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(GlobalCapturingSubscriber);
+        });
+    }
+
+    /// This test's own captured events, newline-joined, then cleared so a
+    /// re-run (or another test on a thread id the OS happens to reuse)
+    /// starts fresh.
+    fn take_this_threads_captured_logs() -> String {
+        let mut map = captured_events_map()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.remove(&std::thread::current().id())
+            .unwrap_or_default()
+            .join("\n")
+    }
+
+    // REQ-7 (Task 5.1.4b): `select()` emits exactly one `debug`-level
+    // tracing event per call, naming the chosen model id and its 4 score
+    // fields (`norm_latency`/`norm_error`/`bench_score`/`composite`). No
+    // `tracing-test`-style dev-dependency exists in this repo (see
+    // `GlobalCapturingSubscriber`'s doc comment for why this doesn't reuse
+    // `cost_metrics/pricing.rs`'s scoped `tracing_subscriber::fmt`-based
+    // capture pattern instead).
+    #[test]
+    fn select_should_emit_debug_log_with_score_breakdown() {
+        init_global_log_capture();
+        let _ = take_this_threads_captured_logs(); // clear any stale entry.
+
+        let strategy = strategy_with_index(0);
+        seed_stats(&strategy, "a/b:free", &[100], &[true, true]);
+        let candidates = vec![candidate(0, Some("a/b:free"))];
+
+        strategy.select(&candidates).expect("pool is non-empty");
+
+        let logs = take_this_threads_captured_logs();
+        assert_eq!(
+            logs.matches("openrouter: selected candidate").count(),
+            1,
+            "exactly one selection event expected per select() call, logs: {logs}"
+        );
+        assert!(logs.contains("model=\"a/b:free\""), "logs: {logs}");
+        assert!(logs.contains("norm_latency="), "logs: {logs}");
+        assert!(logs.contains("norm_error="), "logs: {logs}");
+        assert!(logs.contains("bench_score="), "logs: {logs}");
+        assert!(logs.contains("composite="), "logs: {logs}");
     }
 }

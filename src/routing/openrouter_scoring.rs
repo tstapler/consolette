@@ -168,14 +168,36 @@ impl OpenrouterScoringStrategy {
     /// stays sync/in-memory throughout (ADR-003's "no I/O, no lock held
     /// across an `.await`" constraint), just not purely side-effect-free.
     ///
-    /// A candidate with no `.model` (a non-openrouter passthrough candidate
-    /// that reached `select()` in a mixed route) scores fully neutral
-    /// (`0.5` on every term) and is not tracked in `last_scores`/
-    /// `warned_unranked` — there's no model id to key either on.
+    /// A candidate with no `.model` scores fully neutral (`0.5` on every
+    /// term) and is not tracked in `last_scores`/`warned_unranked` — there's
+    /// no model id to key either on. In practice `select()` (Task 4.3.1g)
+    /// filters `healthy` down to `self.openrouter_index` before this ever
+    /// runs, so a non-openrouter passthrough candidate from a mixed route
+    /// can no longer reach it that way; this function stays defined over
+    /// any `&[UpstreamRef]` regardless, since it's also exercised directly
+    /// by tests.
     fn compute_scores(&self, healthy: &[UpstreamRef]) -> Vec<ScoreBreakdown> {
         self.compute_scores_detailed(healthy)
             .into_iter()
             .map(|s| s.breakdown)
+            .collect()
+    }
+
+    /// Defense-in-depth (Task 4.3.1g, adversarial-review Concern): filters
+    /// `healthy` down to only candidates at `self.openrouter_index`.
+    /// `Router::from_config`'s `validate_openrouter_strategy_pairing`
+    /// already rejects, at config-load time, any `openrouter_scored` route
+    /// that mixes in a non-openrouter (e.g. paid) upstream — but `select()`
+    /// must not depend on that alone. A paid candidate scores a neutral
+    /// cold-start default (`0.5`) same as everything else, so without this
+    /// filter a config-validation bug (or a caller constructing this
+    /// strategy directly, bypassing `Router::from_config` entirely) could
+    /// let `select()` choose it and dispatch a real request to it.
+    fn scoped_to_own_index(&self, healthy: &[UpstreamRef]) -> Vec<UpstreamRef> {
+        healthy
+            .iter()
+            .filter(|c| c.index == self.openrouter_index)
+            .cloned()
             .collect()
     }
 
@@ -356,6 +378,8 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
     /// by manual scan rather than `Iterator::max_by`); 10% of the time, a
     /// uniformly random candidate is picked regardless of score.
     fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef> {
+        let scoped = self.scoped_to_own_index(healthy);
+        let healthy = scoped.as_slice();
         if healthy.is_empty() {
             return None;
         }
@@ -732,6 +756,47 @@ mod tests {
     fn select_should_return_none_when_no_healthy_candidates() {
         let strategy = strategy_with_index(0);
         assert!(strategy.select(&[]).is_none());
+    }
+
+    // Task 4.3.1g defense-in-depth: even if a non-openrouter candidate
+    // somehow reaches `select()` (config validation bypassed, a future bug
+    // in `validate_openrouter_strategy_pairing`, or a caller constructing
+    // this strategy directly), `select()` itself must never choose it —
+    // this is the belt to `Router::from_config`'s suspenders.
+    #[test]
+    fn select_should_never_choose_a_candidate_outside_the_openrouter_index() {
+        let strategy = strategy_with_index(0);
+        // The off-index "paid" candidate has no seeded stats, so it scores
+        // a neutral 0.5 composite — same as a cold-start openrouter
+        // candidate would — proving the exclusion is by index, not score.
+        let openrouter_candidate = candidate(0, Some("free/model:free"));
+        let paid_candidate = candidate(1, Some("paid/model"));
+        let candidates = vec![openrouter_candidate.clone(), paid_candidate];
+
+        for _ in 0..200 {
+            let selected = strategy
+                .select(&candidates)
+                .expect("the openrouter-index candidate is still present");
+            assert_eq!(
+                selected.index, 0,
+                "select() must never choose a candidate outside self.openrouter_index, even \
+                 during epsilon-greedy exploration"
+            );
+            assert_eq!(selected.model.as_deref(), Some("free/model:free"));
+        }
+    }
+
+    // Task 4.3.1g defense-in-depth: if *every* healthy candidate is off this
+    // strategy's own index (the only-openrouter-candidate has been health-
+    // filtered out already, or every remaining candidate is a mixed-route
+    // paid upstream), `select()` must return `None` rather than falling
+    // back to scoring and choosing one of them.
+    #[test]
+    fn select_should_return_none_when_all_candidates_are_outside_the_openrouter_index() {
+        let strategy = strategy_with_index(0);
+        let candidates = vec![candidate(1, Some("paid/model"))];
+
+        assert!(strategy.select(&candidates).is_none());
     }
 
     #[test]

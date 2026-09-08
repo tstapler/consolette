@@ -136,10 +136,20 @@ pub async fn build_providers(
 /// independent of which one `Router::from_config` actually builds a
 /// `Router` from.
 ///
+/// Also enforces the *reverse* direction (Task 4.3.1g, adversarial-review
+/// Concern): a route using `strategy = "openrouter_scored"` must not
+/// itself list any non-`openrouter`-kind (e.g. paid) upstream. Without
+/// this, a single misconfigured route mixing an `openrouter`-kind upstream
+/// with a paid one could let `dispatch()` silently fall through to the
+/// paid upstream once the free pool is exhausted — precisely the "silently
+/// spend money" outcome this feature exists to prevent (a paid fallback
+/// must be a separate route, per requirements.md's Scope).
+///
 /// # Errors
 ///
 /// Returns `Err` naming the route and upstream if any route pairs an
-/// `openrouter`-kind upstream with a non-`OpenrouterScored` strategy.
+/// `openrouter`-kind upstream with a non-`OpenrouterScored` strategy, or if
+/// an `openrouter_scored` route lists any non-`openrouter`-kind upstream.
 fn validate_openrouter_strategy_pairing(config: &Config) -> anyhow::Result<()> {
     for candidate_route in &config.routes {
         for route_upstream in &candidate_route.upstreams {
@@ -160,6 +170,13 @@ fn validate_openrouter_strategy_pairing(config: &Config) -> anyhow::Result<()> {
                     candidate_route.name,
                     route_upstream.name,
                     candidate_route.strategy
+                ));
+            }
+            if !is_openrouter && candidate_route.strategy == Strategy::OpenrouterScored {
+                return Err(anyhow::anyhow!(
+                    "route \"{}\" uses strategy = \"openrouter_scored\" but upstream \"{}\" is not openrouter-kind; mixing a scored free-model pool with a paid upstream in one route risks silent paid fallback on exhaustion — configure the paid upstream as a separate route instead",
+                    candidate_route.name,
+                    route_upstream.name
                 ));
             }
         }
@@ -1741,6 +1758,54 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("r1"), "error must name the route, got: {msg}");
         assert!(msg.contains("or"), "error must name the upstream, got: {msg}");
+    }
+
+    // Task 4.3.1g (adversarial-review Concern), reverse mixed-upstream
+    // direction: an `openrouter_scored` route must not itself list a
+    // non-openrouter (e.g. paid) upstream — without this guard, a
+    // misconfigured route mixing a free `openrouter`-kind pool with a paid
+    // upstream could silently fall through to the paid upstream once the
+    // free pool is exhausted, spending real money on a route believed to be
+    // free-only.
+    #[tokio::test]
+    async fn from_config_should_reject_openrouter_scored_route_mixing_paid_upstream() {
+        use crate::config::schema::{Route, RouteUpstreamRef};
+
+        let config = Config {
+            upstreams: vec![
+                bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test"),
+                bearer_upstream("paid-anthropic", UpstreamKind::Anthropic, "sk-ant-test"),
+            ],
+            routes: vec![Route {
+                name: "r2".to_string(),
+                strategy: Strategy::OpenrouterScored,
+                upstreams: vec![
+                    RouteUpstreamRef {
+                        name: "or".to_string(),
+                        weight: None,
+                        model: None,
+                    },
+                    RouteUpstreamRef {
+                        name: "paid-anthropic".to_string(),
+                        weight: None,
+                        model: None,
+                    },
+                ],
+            }],
+            ..Config::default()
+        };
+
+        let Err(err) = Router::from_config(&config, MetricsCollector::new()).await else {
+            panic!(
+                "an openrouter_scored route mixing in a non-openrouter (paid) upstream must fail"
+            )
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("r2"), "error must name the route, got: {msg}");
+        assert!(
+            msg.contains("paid-anthropic"),
+            "error must name the offending non-openrouter upstream, got: {msg}"
+        );
     }
 
     // Story 1.3.4 replaced `GeminiProvider::stub` with the real, fallible

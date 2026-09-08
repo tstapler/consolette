@@ -1,4 +1,4 @@
-//! Static coding-benchmark ranking table for OpenRouter free models
+//! Static coding-benchmark ranking table for `OpenRouter` free models
 //! (Epic 4.1). Feeds the `bench` term of the composite scoring formula
 //! (`0.5·error + 0.3·latency + 0.2·bench`, ADR-003) via [`bench_score`];
 //! this module does not implement the scoring itself (Epic 4.2).

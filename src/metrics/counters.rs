@@ -21,6 +21,13 @@ pub struct UpstreamCounters {
     pub duration_count: AtomicU64,
     pub first_byte_sum_ms: AtomicU64,
     pub first_byte_count: AtomicU64,
+    /// The most recent *typed* `ProviderError::kind_label()` classification
+    /// for this upstream — `None` after a successful request (Story 1.4.4:
+    /// root-cause fix so the dashboard self-heals instead of pinning a
+    /// stale error state forever after one past failure). Set via
+    /// `ProxyMetrics::set_last_error_kind`, never derived by re-guessing
+    /// keywords out of an error's `Display` text.
+    pub last_error_kind: std::sync::Mutex<Option<&'static str>>,
 }
 
 /// All proxy metrics as atomic counters.
@@ -177,6 +184,19 @@ impl ProxyMetrics {
         }
     }
 
+    /// Sets (or, with `None`, clears) the given upstream's most recent
+    /// typed error classification (Story 1.4.4). Called with `Some(kind)`
+    /// on a failed dispatch attempt and `None` on a successful one, so a
+    /// past failure never permanently pins the dashboard's status class
+    /// after the upstream recovers.
+    pub fn set_last_error_kind(&self, upstream: &str, kind: Option<&'static str>) {
+        let entry = self.upstreams.entry(upstream.to_string()).or_default();
+        *entry
+            .last_error_kind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = kind;
+    }
+
     /// Classify a dispatch failure into the `error_types` breakdown
     /// (`timeout`/`auth`/`rate_limit`/`validation`) shown in `/metrics`.
     pub fn record_error_kind(&self, err: &crate::providers::ProviderError) {
@@ -206,12 +226,17 @@ impl ProxyMetrics {
             let name = entry.key().clone();
             let c = entry.value();
 
+            let last_error_kind = *c
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             providers.insert(
                 name.clone(),
                 json!({
                     "requests": c.requests.load(Ordering::Relaxed),
                     "success": c.success.load(Ordering::Relaxed),
                     "errors": c.errors.load(Ordering::Relaxed),
+                    "last_error_kind": last_error_kind,
                 }),
             );
 
@@ -402,6 +427,73 @@ mod tests {
         drop(bedrock);
 
         assert!(m.upstreams.get("anthropic").is_none());
+    }
+
+    // REQ-10 (Story 1.4.4b/c) — focus area.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_last_error_kind_should_set_to_auth_when_gemini_auth_error_recorded() {
+        let m = ProxyMetrics::new();
+        m.set_last_error_kind("gemini", Some("auth"));
+
+        let entry = m.upstreams.get("gemini").unwrap();
+        assert_eq!(
+            *entry
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("auth")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_last_error_kind_should_overwrite_not_coexist_with_stale_prior_kind() {
+        let m = ProxyMetrics::new();
+        m.set_last_error_kind("gemini", Some("auth"));
+        m.set_last_error_kind("gemini", Some("response_shape_mismatch"));
+
+        let entry = m.upstreams.get("gemini").unwrap();
+        assert_eq!(
+            *entry
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("response_shape_mismatch")
+        );
+    }
+
+    // REQ-10 — the self-healing clear-on-success case (Story 1.4.4
+    // acceptance criterion).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_last_error_kind_should_reset_to_none_after_subsequent_success() {
+        let m = ProxyMetrics::new();
+        m.set_last_error_kind("gemini", Some("auth"));
+        m.set_last_error_kind("gemini", None);
+
+        let entry = m.upstreams.get("gemini").unwrap();
+        assert_eq!(
+            *entry
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn to_json_should_expose_last_error_kind_per_upstream() {
+        let m = ProxyMetrics::new();
+        m.record_request("gemini", false, 100, 0);
+        m.set_last_error_kind("gemini", Some("response_shape_mismatch"));
+
+        let json = m.to_json();
+        assert_eq!(
+            json["providers"]["gemini"]["last_error_kind"],
+            json!("response_shape_mismatch")
+        );
     }
 
     #[test]

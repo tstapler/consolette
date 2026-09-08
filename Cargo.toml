@@ -83,7 +83,7 @@ aws-sdk-bedrockruntime = "1"
 aws-sdk-bedrock = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 tokio-retry = "0.3"
 backoff = { version = "0.4", features = ["tokio"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -114,6 +114,11 @@ arc-swap = "1.9.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Additive feature on top of [dependencies]' tokio — enables `start_paused`/
+# `tokio::time::advance` for Epic 2.1's background-refresh-task weak-ref
+# exit test (`src/providers/openrouter/mod.rs`), so it can fast-forward
+# past `MODEL_LIST_REFRESH_INTERVAL` (5 minutes) without a real sleep.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.dist]
 inherits = "release"

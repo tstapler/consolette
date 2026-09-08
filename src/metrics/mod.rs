@@ -53,6 +53,21 @@ pub struct RequestDetail {
     /// key `routing::session_overrides` pins against. `None` for a request
     /// with no `metadata.user_id` (can't be session-pinned either).
     pub session_id: Option<String>,
+    /// The specific per-model candidate dispatch actually selected (e.g.
+    /// `"deepseek/deepseek-chat-v3.1:free"`), populated post-selection via
+    /// [`MetricsCollector::set_selected_model`] (Story 5.1.3). `None` at
+    /// construction and for every non-model-pinned route
+    /// (`FallbackStrategy`/`WeightedStrategy` candidates always carry
+    /// `model: None`).
+    pub selected_model: Option<String>,
+    /// Whether `selected_model`'s pick was an epsilon-greedy exploration
+    /// choice rather than the greedy argmax one (Pre-mortem P2 #2),
+    /// populated post-selection via
+    /// [`MetricsCollector::set_selected_model_was_exploration`]. `None` at
+    /// construction, for every non-model-pinned route, and for a strategy
+    /// that doesn't track the distinction — same nullability convention as
+    /// `selected_model`.
+    pub selected_model_was_exploration: Option<bool>,
 }
 
 impl RequestDetail {
@@ -119,6 +134,8 @@ impl RequestDetail {
             bedrock_invocation_ms: 0,
             bedrock_first_byte_ms: 0,
             session_id,
+            selected_model: None,
+            selected_model_was_exploration: None,
         }
     }
 }
@@ -185,6 +202,19 @@ impl MetricsCollector {
         buf.push_front(detail);
     }
 
+    /// Shared in-place-mutate-by-id pattern behind `update_request_timing`,
+    /// `set_selected_model`, and `set_selected_model_was_exploration`: a
+    /// no-op once the request has aged out of the 100-entry ring buffer.
+    fn mutate_request(&self, request_id: &str, f: impl FnOnce(&mut RequestDetail)) {
+        let mut buf = self
+            .recent_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(r) = buf.iter_mut().find(|r| r.request_id == request_id) {
+            f(r);
+        }
+    }
+
     /// Update timing fields on an existing request by ID.
     pub fn update_request_timing(
         &self,
@@ -195,20 +225,34 @@ impl MetricsCollector {
         bedrock_invocation_ms: u64,
         bedrock_first_byte_ms: u64,
     ) {
-        let mut buf = self
-            .recent_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for r in buf.iter_mut() {
-            if r.request_id == request_id {
-                r.provider = provider.to_string();
-                r.duration_ms = (duration_ms * 10.0).round() / 10.0;
-                r.first_byte_ms = (first_byte_ms * 10.0).round() / 10.0;
-                r.bedrock_invocation_ms = bedrock_invocation_ms;
-                r.bedrock_first_byte_ms = bedrock_first_byte_ms;
-                return;
-            }
-        }
+        self.mutate_request(request_id, |r| {
+            r.provider = provider.to_string();
+            r.duration_ms = (duration_ms * 10.0).round() / 10.0;
+            r.first_byte_ms = (first_byte_ms * 10.0).round() / 10.0;
+            r.bedrock_invocation_ms = bedrock_invocation_ms;
+            r.bedrock_first_byte_ms = bedrock_first_byte_ms;
+        });
+    }
+
+    /// Sets `selected_model` on an existing request by ID (Story 5.1.3).
+    /// Called once per dispatch attempt with the currently-chosen
+    /// candidate's model, so the last attempt wins across retries, matching
+    /// how `provider` is already overwritten on each retry in
+    /// `update_request_timing`.
+    pub fn set_selected_model(&self, request_id: &str, model: Option<String>) {
+        self.mutate_request(request_id, |r| r.selected_model = model);
+    }
+
+    /// Sets `selected_model_was_exploration` on an existing request by ID
+    /// (Pre-mortem P2 #2), called alongside `set_selected_model`.
+    pub fn set_selected_model_was_exploration(
+        &self,
+        request_id: &str,
+        was_exploration: Option<bool>,
+    ) {
+        self.mutate_request(request_id, |r| {
+            r.selected_model_was_exploration = was_exploration;
+        });
     }
 
     /// Caches a request's original (pre-dispatch) body, capped at 100
@@ -383,11 +427,10 @@ impl MetricsCollector {
         result["recent_errors"] = serde_json::Value::Array(recent_errors);
         result["timestamp"] = json!(Utc::now().to_rfc3339());
 
-        // Cooldowns placeholder (wired in from FallbackState in future epics)
-        result["cooldowns"] = json!({
-            "anthropic": { "cooling_down": false, "remaining_seconds": 0 },
-            "bedrock": { "cooling_down": false, "remaining_seconds": 0 }
-        });
+        // `cooldowns` is merged in by the HTTP handler
+        // (`observability::get_metrics`) from `Router::cooldown_snapshot()`
+        // — `MetricsCollector` itself has no reference to `Router`/
+        // `HealthRegistry` (Story 1.5.1).
 
         result
     }

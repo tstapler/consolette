@@ -40,6 +40,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         .status-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
         .status-active { background: #10b981; }
         .status-cooldown { background: #f59e0b; }
+        .status-auth-required { background: #ef4444; }
+        .status-schema-drift { background: #8b5cf6; }
         .refresh-time { color: #888; font-size: 14px; }
         .stats-grid {
             display: grid;
@@ -359,8 +361,16 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     : upstreamNames.map(name => {
                         const cd = (data.cooldowns && data.cooldowns[name]) || {};
                         const cooling = cd.cooling_down && cd.remaining_seconds > 0;
-                        const cls = cooling ? 'status-cooldown' : 'status-active';
-                        const label = displayName(name) + (cooling ? ' (' + cd.remaining_seconds + 's)' : '');
+                        const lastKind = (data.providers[name] || {}).last_error_kind;
+                        const cls = lastKind === 'auth' ? 'status-auth-required'
+                            : lastKind === 'response_shape_mismatch' ? 'status-schema-drift'
+                            : cooling ? 'status-cooldown'
+                            : 'status-active';
+                        const suffix = cls === 'status-auth-required' ? ' (needs re-auth)'
+                            : cls === 'status-schema-drift' ? ' (schema drift — code fix needed)'
+                            : cooling ? ' (' + cd.remaining_seconds + 's)'
+                            : '';
+                        const label = displayName(name) + suffix;
                         return '<span style="display:flex;align-items:center;gap:8px;">'
                             + '<span class="status-indicator ' + cls + '"></span><span>' + label + '</span></span>';
                     }).join('');
@@ -635,5 +645,169 @@ mod tests {
                 "missing dynamic container #{id}"
             );
         }
+    }
+
+    // ── Story 1.5.2 (REQ-12): three-way error-state classification ────────
+
+    /// Extracts the `const cls = ...;` ternary chain from `DASHBOARD_HTML`'s
+    /// JS, so tests can make position/content assertions on just that block
+    /// instead of the whole page string.
+    #[allow(clippy::expect_used)]
+    fn extract_cls_block() -> &'static str {
+        let start = DASHBOARD_HTML
+            .find("const cls = lastKind")
+            .expect("cls ternary must exist in loadMetrics()'s JS");
+        let after = &DASHBOARD_HTML[start..];
+        let end = after
+            .find(";\n")
+            .expect("cls ternary must be terminated by a semicolon");
+        &after[..end]
+    }
+
+    #[test]
+    fn dashboard_html_should_render_status_auth_required_class_and_css_rule() {
+        assert!(
+            DASHBOARD_HTML.contains(".status-auth-required { background: #ef4444; }"),
+            "missing .status-auth-required CSS rule"
+        );
+        assert!(
+            extract_cls_block().contains("'status-auth-required'"),
+            "cls ternary must be able to produce 'status-auth-required'"
+        );
+    }
+
+    #[test]
+    fn dashboard_html_should_render_status_schema_drift_class_and_css_rule() {
+        assert!(
+            DASHBOARD_HTML.contains(".status-schema-drift { background: #8b5cf6; }"),
+            "missing .status-schema-drift CSS rule"
+        );
+        assert!(
+            extract_cls_block().contains("'status-schema-drift'"),
+            "cls ternary must be able to produce 'status-schema-drift'"
+        );
+    }
+
+    /// Regression guard (REQ-12, adversarial-review finding): the design
+    /// correction in plan.md Story 1.5.2 requires `last_error_kind` to be
+    /// checked BEFORE `cooling`, since a real auth failure never trips
+    /// `cooling_down`. If a future edit re-introduces the
+    /// `cooling ? ... : 'status-active'` binary and gates the new classes
+    /// behind it, this must fail loudly.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn dashboard_js_status_logic_should_check_last_error_kind_before_cooling() {
+        let block = extract_cls_block();
+        let auth_pos = block
+            .find("lastKind === 'auth' ?")
+            .expect("cls ternary must check lastKind === 'auth' first");
+        let cooling_pos = block
+            .find("cooling ?")
+            .expect("cls ternary must still fall back to a cooling check");
+        assert!(
+            auth_pos < cooling_pos,
+            "last_error_kind must be checked BEFORE cooling — auth errors never trip \
+             cooling_down, so gating status-auth-required behind `cooling` would silently \
+             hide it (see plan.md Story 1.5.2's design-correction note)"
+        );
+    }
+
+    /// Cold-start non-regression (UX §5 item 7): no `last_error_kind` key
+    /// and `cooling: false` must never render anything but `status-active`.
+    #[test]
+    fn dashboard_js_should_render_status_active_on_cold_start_with_no_last_error_kind_and_not_cooling(
+    ) {
+        let block = extract_cls_block();
+        assert!(
+            block.trim_end().ends_with(": 'status-active'"),
+            "the ternary's final fallback (reached when lastKind matches neither special \
+             case and cooling is falsy) must be 'status-active'"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("(data.providers[name] || {}).last_error_kind"),
+            "missing-provider-entry lookup must be guarded so a cold-start upstream with no \
+             /metrics data never throws or misclassifies"
+        );
+    }
+
+    /// Non-regression: an ordinary self-healing cooldown (e.g.
+    /// `last_error_kind: \"rate_limited\"`, `cooling: true`) must still
+    /// render the existing amber `status-cooldown`, unaffected by the two
+    /// new classes.
+    #[test]
+    fn dashboard_js_should_still_render_status_cooldown_for_rate_limited_kind_when_cooling_true() {
+        let block = extract_cls_block();
+        assert!(
+            block.contains("cooling ? 'status-cooldown'"),
+            "a cooling upstream whose last_error_kind is neither 'auth' nor \
+             'response_shape_mismatch' (e.g. \"rate_limited\") must still render \
+             status-cooldown"
+        );
+    }
+
+    /// UX §5 item 8: color is never the only signal — both new classes must
+    /// pair with a distinct, non-overlapping text suffix.
+    #[test]
+    fn dashboard_js_new_status_classes_should_each_pair_with_a_distinct_text_suffix() {
+        assert!(
+            DASHBOARD_HTML.contains("' (needs re-auth)'"),
+            "status-auth-required must pair with a '(needs re-auth)' text suffix"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("' (schema drift — code fix needed)'"),
+            "status-schema-drift must pair with a '(schema drift — code fix needed)' text suffix"
+        );
+        assert!(
+            !"(needs re-auth)".contains("(schema drift — code fix needed)")
+                && !"(schema drift — code fix needed)".contains("(needs re-auth)"),
+            "the two suffixes must be non-overlapping (UX §5 item 2)"
+        );
+    }
+
+    /// UX §5 item 9 / plan.md's own convention: adding the two new classes
+    /// must not introduce any upstream-name-specific string into
+    /// `DASHBOARD_HTML` — the classification stays driven by
+    /// `last_error_kind`/`cooling`, generically, for every upstream.
+    #[test]
+    fn no_upstream_is_hardcoded_by_name_should_continue_to_pass_unmodified_after_gemini_additions()
+    {
+        for hardcoded in [
+            "gemini-status",
+            "gemini-text",
+            "lat-gemini-dur",
+            "\"gemini\"",
+        ] {
+            assert!(
+                !DASHBOARD_HTML.contains(hardcoded),
+                "dashboard must not hardcode Gemini's name ({hardcoded}) — the new status \
+                 classes must be driven by last_error_kind/cooling generically"
+            );
+        }
+    }
+
+    // MAJOR finding (PR #16 Gate 2 review): the tests above only check that
+    // each class string appears *somewhere* in the ternary block, and that
+    // one condition's position precedes another's — never that a specific
+    // `lastKind` value maps to its *own* specific class. A swap of the two
+    // consequents (`'auth' ? 'status-schema-drift' : ... 'response_shape_mismatch'
+    // ? 'status-auth-required'`) would pass every test above. These two
+    // assert direct adjacency between condition and consequent instead.
+
+    #[test]
+    fn dashboard_js_should_map_auth_kind_to_auth_required_class_specifically() {
+        let block = extract_cls_block();
+        assert!(
+            block.contains("lastKind === 'auth' ? 'status-auth-required'"),
+            "lastKind === 'auth' must map directly to 'status-auth-required'"
+        );
+    }
+
+    #[test]
+    fn dashboard_js_should_map_response_shape_mismatch_kind_to_schema_drift_class_specifically() {
+        let block = extract_cls_block();
+        assert!(
+            block.contains("lastKind === 'response_shape_mismatch' ? 'status-schema-drift'"),
+            "lastKind === 'response_shape_mismatch' must map directly to 'status-schema-drift'"
+        );
     }
 }

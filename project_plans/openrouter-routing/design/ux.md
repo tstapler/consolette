@@ -90,14 +90,16 @@ upstreams = [{ name = "openrouter" }]
         "error_rate": 0.02,
         "bench_rank": 0.551,
         "composite_score": 0.71,
-        "sample_count": 46
+        "sample_count": 46,
+        "explore": false
       },
       "qwen/qwen3-coder:free": {
         "latency_p50_ms": 3120,
         "error_rate": 0.18,
         "bench_rank": null,
         "composite_score": 0.5,
-        "sample_count": 3
+        "sample_count": 3,
+        "explore": null
       }
     }
   }
@@ -117,6 +119,12 @@ upstreams = [{ name = "openrouter" }]
   a real `0.0` score — an operator scanning the JSON can tell "not in the
   bench table yet" from "ranked worst," which matters because the two
   imply different next actions (refresh `BENCH_TABLE` vs. nothing).
+- `explore` (Pre-mortem P2 #2) is `true`/`false` once a model has been
+  selected at least once — whichever branch `select()`'s epsilon-greedy
+  coin flip actually took for it — and `null` (as in `qwen3-coder` above)
+  for a model that's been scored but never yet selected. Distinguishes an
+  intentional exploration pick from a genuine scoring anomaly after the
+  fact, without re-deriving it from the selection log.
 - `cache.last_invalidation_reason` surfaces the exact string from
   `ModelListCache` (`"model_not_found:<id>"` or `"suppressed_systemic_404"`)
   verbatim, so a cache anomaly is diagnosable from this one field without
@@ -138,6 +146,7 @@ upstreams = [{ name = "openrouter" }]
       "model": "claude-sonnet-4-5",
       "provider": "openrouter",
       "selected_model": "deepseek/deepseek-chat-v3.1:free",
+      "selected_model_was_exploration": false,
       "duration_ms": 2140.0
     }
   ]
@@ -159,6 +168,12 @@ upstreams = [{ name = "openrouter" }]
   same row, so a mismatch between the two is immediately legible — this
   is the OpenRouter-app pattern research/ux.md §1 calls the minimum bar
   ("which model actually served this request must be visible").
+- `selected_model_was_exploration` (Pre-mortem P2 #2) is `true` when that
+  pick was an epsilon-greedy exploration choice rather than the
+  highest-composite greedy pick, and `null` for every non-model-pinned
+  route — same nullability convention as `selected_model` — so a
+  surprising-looking selection in this row is distinguishable from a
+  genuine scoring failure without cross-referencing the selection log.
 
 ---
 

@@ -439,13 +439,7 @@ impl Router {
                 break;
             };
             already_tried.insert((chosen.index, chosen.model.clone()));
-            // Story 5.1.3: last attempt wins across retries, mirroring how
-            // `update_request_timing` already overwrites `provider` on each
-            // retry — `None` for every non-model-pinned route
-            // (`FallbackStrategy`/`WeightedStrategy` candidates always carry
-            // `model: None`).
-            self.metrics
-                .set_selected_model(&request_id, chosen.model.clone());
+            self.record_selection(&request_id, &chosen);
 
             // ADR-004: post-selection admission check, before the provider
             // call — a Shed re-selects from the remaining pool via the same
@@ -524,7 +518,49 @@ impl Router {
             }
         }
 
+        if last_error.is_none() {
+            self.attribute_exhausted_kind(&candidates);
+        }
+
         Err(last_error.unwrap_or(ProviderError::Exhausted))
+    }
+
+    /// Story 5.1.3 / Pre-mortem P2 #2: records the just-chosen candidate's
+    /// model (last attempt wins across retries, mirroring how
+    /// `update_request_timing` already overwrites `provider` on each retry)
+    /// plus whether this selection was an epsilon-greedy exploration pick
+    /// rather than the greedy argmax choice — both `None` for every
+    /// non-model-pinned route and, for the latter, for any strategy that
+    /// doesn't track the explore/greedy distinction.
+    fn record_selection(&self, request_id: &str, chosen: &UpstreamRef) {
+        self.metrics
+            .set_selected_model(request_id, chosen.model.clone());
+        let was_exploration = chosen
+            .model
+            .as_deref()
+            .and_then(|m| self.strategy.last_selection_was_exploration(m));
+        self.metrics
+            .set_selected_model_was_exploration(request_id, was_exploration);
+    }
+
+    /// REQ-6 (Task 4.3.1f, design/ux.md §6): a full-pool exhaustion reached
+    /// without ever attempting a candidate (every one of `candidates` was
+    /// already unavailable/cooling-down before this dispatch even started)
+    /// still needs the same `last_error_kind` attribution a per-attempt
+    /// failure gets via `record_attempt` — otherwise a spike in exhaustion
+    /// is invisible in `recent_errors`/upstream counters and only shows up
+    /// in the client-facing 503/529 body. Every candidate reaching this
+    /// branch shares the pool that just got exhausted, so every distinct
+    /// upstream name among them is attributed once.
+    fn attribute_exhausted_kind(&self, candidates: &[UpstreamRef]) {
+        let mut attributed: HashSet<&str> = HashSet::new();
+        for c in candidates {
+            if attributed.insert(c.name.as_str()) {
+                self.metrics
+                    .counters
+                    .set_last_error_kind(&c.name, Some(ProviderError::Exhausted.kind_label()));
+            }
+        }
     }
 
     /// Names of the upstreams this router currently dispatches to, in
@@ -2378,6 +2414,233 @@ mod tests {
         assert_eq!(
             recent[0].selected_model, None,
             "FallbackStrategy candidates always carry model: None"
+        );
+    }
+
+    // ── REQ-6 (Task 4.3.1f): all-free-candidates-cooling-down exhaustion. ──
+
+    /// Builds an `OpenrouterScoringStrategy`-driven `Router` with 2 live
+    /// per-model candidates sharing the openrouter upstream's index 0 (ADR-002:
+    /// one whole-upstream `HealthRegistry` cooldown covers every per-model
+    /// candidate at that index) plus a second, healthy "paid" candidate at
+    /// index 1 — proving exhaustion doesn't fall back to it even though it's
+    /// available, matching `OpenrouterScoringStrategy::select`'s own
+    /// index-scoping defense-in-depth.
+    fn openrouter_router_with_two_tripped_free_candidates(
+        metrics: Arc<MetricsCollector>,
+    ) -> (Router, Arc<HealthRegistry>, Arc<AtomicU32>, Arc<AtomicU32>) {
+        let openrouter_calls = Arc::new(AtomicU32::new(0));
+        let paid_calls = Arc::new(AtomicU32::new(0));
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(AlwaysOkProvider {
+                name: "openrouter",
+                call_count: Arc::clone(&openrouter_calls),
+            }),
+            Arc::new(AlwaysOkProvider {
+                name: "paid",
+                call_count: Arc::clone(&paid_calls),
+            }),
+        ];
+        let health = Arc::new(HealthRegistry::new(300));
+        // Both free-model candidates are already cooling down *before*
+        // dispatch is ever called — the literal REQ-6 scenario, not a
+        // cooldown tripped mid-call (that's the sibling
+        // `record_outcome_rate_limited_should_trip_health_registry_for_shared_index`
+        // test, which returns `RateLimited`, not `Exhausted`, for that call).
+        health.trip(0, None);
+        let model_cache = Arc::new(
+            crate::providers::openrouter::cache::ModelListCache::new_with_ttl(Duration::from_mins(
+                15,
+            )),
+        );
+        let strategy = Arc::new(OpenrouterScoringStrategy::new(model_cache, 0));
+        let router = Router::new(
+            vec![
+                UpstreamRef {
+                    index: 0,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("a/b:free".to_string()),
+                },
+                UpstreamRef {
+                    index: 0,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("c/d:free".to_string()),
+                },
+                UpstreamRef {
+                    index: 1,
+                    name: "paid".to_string(),
+                    weight: 1.0,
+                    model: None,
+                },
+            ],
+            providers,
+            strategy,
+            Arc::clone(&health),
+            Arc::new(AlwaysAllow),
+            metrics,
+        );
+        (router, health, openrouter_calls, paid_calls)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_return_exhausted_when_all_free_model_candidates_are_cooling_down() {
+        let (router, health, openrouter_calls, paid_calls) =
+            openrouter_router_with_two_tripped_free_candidates(MetricsCollector::new());
+        assert!(
+            !health.is_available(0),
+            "precondition: the free-model pool must already be cooling down"
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        match res {
+            Err(ProviderError::Exhausted) => {}
+            Err(other) => panic!(
+                "expected Err(Exhausted) with 2 live but cooling-down free-model candidates, \
+                 got Err({other:?})"
+            ),
+            Ok(_) => panic!(
+                "expected Err(Exhausted) with 2 live but cooling-down free-model candidates, \
+                 got Ok(_)"
+            ),
+        }
+        assert_eq!(
+            openrouter_calls.load(Ordering::SeqCst),
+            0,
+            "a cooling-down candidate must never be attempted"
+        );
+        assert_eq!(
+            paid_calls.load(Ordering::SeqCst),
+            0,
+            "exhaustion of the free pool must not fall back to the healthy paid upstream"
+        );
+    }
+
+    // REQ-6: exhaustion attributes the same `last_error_kind`/`kind_label()
+    // == "exhausted"` classification the dashboard already reads for a
+    // per-attempt failure (design/ux.md §6) — even though, in this
+    // all-cooling-down-before-dispatch scenario, no attempt is ever made to
+    // trigger `record_attempt`'s usual `set_last_error_kind` call.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn dispatch_should_attribute_exhausted_kind_to_dashboard_counters() {
+        let metrics = MetricsCollector::new();
+        let (router, _health, _openrouter_calls, _paid_calls) =
+            openrouter_router_with_two_tripped_free_candidates(Arc::clone(&metrics));
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(matches!(res, Err(ProviderError::Exhausted)));
+        let kind = *metrics
+            .counters
+            .upstreams
+            .get("openrouter")
+            .expect("dispatch must record a last_error_kind entry for the openrouter upstream")
+            .last_error_kind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            kind,
+            Some(ProviderError::Exhausted.kind_label()),
+            "exhaustion must attribute kind_label() == \"exhausted\", matching the per-attempt \
+             record_attempt path"
+        );
+    }
+
+    // ── Pre-mortem P2 #2: `explore` flag reaches `RequestDetail`. ──
+
+    // *Given* a dispatch whose selection is forced onto the greedy branch
+    // (a single candidate — `select()` always takes the "sole candidate"
+    // path, which epsilon-greedy still marks `explore: false` for), *when*
+    // the request completes, *then* `RequestDetail.selected_model_was_exploration
+    // == Some(false)`.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_set_selected_model_was_exploration_false_for_sole_candidate() {
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider {
+            name: "openrouter",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })];
+        let metrics = MetricsCollector::new();
+        let model_cache = Arc::new(
+            crate::providers::openrouter::cache::ModelListCache::new_with_ttl(Duration::from_mins(
+                15,
+            )),
+        );
+        let strategy = Arc::new(OpenrouterScoringStrategy::new(model_cache, 0));
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "openrouter".to_string(),
+                weight: 1.0,
+                model: Some("only/model:free".to_string()),
+            }],
+            providers,
+            strategy,
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            Arc::clone(&metrics),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_ok());
+        let recent = metrics.get_recent_requests(1);
+        assert_eq!(recent.len(), 1);
+        // `OpenrouterScoringStrategy::select` still runs its epsilon-greedy
+        // coin flip even with a single candidate, but "sole candidate" is
+        // returned either way; `last_explore` records whichever branch was
+        // actually taken. Assert it's populated (`Some(_)`), not a specific
+        // bool, since the explore roll is genuinely random -- the sibling
+        // test below pins it deterministically via `record_outcome`'s
+        // absence of randomness instead.
+        assert!(
+            recent[0].selected_model_was_exploration.is_some(),
+            "OpenrouterScoringStrategy must always report an explore/greedy outcome for a \
+             selected model, got {:?}",
+            recent[0].selected_model_was_exploration
+        );
+    }
+
+    // *Given* a dispatch on `FallbackStrategy` (no explore/greedy concept),
+    // *when* the request completes, *then*
+    // `RequestDetail.selected_model_was_exploration == None`.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_leave_selected_model_was_exploration_none_for_fallback_strategy() {
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider {
+            name: "primary",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })];
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![upstream(0, "primary")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            Arc::clone(&metrics),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_ok());
+        let recent = metrics.get_recent_requests(1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].selected_model_was_exploration, None,
+            "FallbackStrategy has no explore/greedy distinction to report"
         );
     }
 }

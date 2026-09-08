@@ -126,12 +126,9 @@ pub struct OpenrouterScoringStrategy {
     /// Pre-mortem P2 #2: the last selection's explore-vs-greedy outcome,
     /// keyed by the *chosen* model id. A `DashMap` (not a single
     /// `AtomicBool`) so concurrent dispatches to different models don't
-    /// clobber each other's flag. Epic 5.1 reads this to distinguish an
-    /// epsilon-greedy exploration pick from a genuine scoring failure in
-    /// `RequestDetail`/`observability_snapshot()`/the structured log line —
-    /// not wired into either yet (that's Epic 5.1's job), but the shape is
-    /// fixed here alongside `select()`'s own explore/greedy branch, per
-    /// plan.md's Unresolved Questions.
+    /// clobber each other's flag. Read back by `last_selection_was_exploration`
+    /// (wired into `RequestDetail` and `observability_snapshot()`'s `models`
+    /// block) and by `select()`'s own structured log line.
     last_explore: DashMap<String, bool>,
     /// "Already warned" set (Task 4.2.1c) — an unranked model logs
     /// `tracing::warn!` exactly once per model id, not once per `select()`
@@ -535,6 +532,11 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
                         "bench_rank": breakdown.bench_rank,
                         "composite_score": breakdown.composite,
                         "sample_count": breakdown.sample_count,
+                        // Pre-mortem P2 #2: null until this model has been
+                        // selected at least once (`last_explore` is only
+                        // written by `select()`'s winner, not every scored
+                        // candidate).
+                        "explore": self.last_explore.get(entry.key()).map(|v| *v),
                     }),
                 )
             })
@@ -549,6 +551,11 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
             },
             "models": models,
         }))
+    }
+
+    /// Pre-mortem P2 #2: reads back `select()`'s own `last_explore` write.
+    fn last_selection_was_exploration(&self, model_id: &str) -> Option<bool> {
+        self.last_explore.get(model_id).map(|v| *v)
     }
 }
 
@@ -1088,11 +1095,57 @@ mod tests {
             assert!(entry.get("bench_rank").is_some());
             assert!(entry.get("composite_score").is_some());
             assert!(entry.get("sample_count").is_some());
+            assert!(entry.get("explore").is_some(), "id={id}");
         }
         assert_eq!(snapshot["cache"]["cached_model_count"], json!(0));
         assert_eq!(snapshot["cache"]["last_refresh"], json!(null));
         assert_eq!(snapshot["cache"]["age_secs"], json!(null));
         assert_eq!(snapshot["cache"]["last_invalidation_reason"], json!(null));
+    }
+
+    // Pre-mortem P2 #2 (Task 5.1.1's `explore` addition): a model that has
+    // been selected reports `explore` as the actual `bool` `select()` chose
+    // for it (read back from `last_explore`), not merely "present" —
+    // proving the value, not just the key, round-trips.
+    #[test]
+    fn observability_snapshot_explore_should_reflect_last_explore_value_for_selected_model() {
+        let strategy = strategy_with_index(0);
+        let candidates = vec![candidate(0, Some("only/model:free"))];
+
+        strategy.select(&candidates).expect("pool is non-empty");
+        let recorded_explore = *strategy
+            .last_explore
+            .get("only/model:free")
+            .expect("select() must record an explore outcome for the chosen model");
+
+        let snapshot = strategy
+            .observability_snapshot()
+            .expect("OpenrouterScoringStrategy must always return Some");
+
+        assert_eq!(
+            snapshot["models"]["only/model:free"]["explore"],
+            json!(recorded_explore)
+        );
+    }
+
+    // A model that has never been selected (never written into
+    // `last_explore`) reports `explore: null` — distinct from `false` —
+    // mirroring `bench_rank: null`'s "not yet known" convention.
+    #[test]
+    fn observability_snapshot_explore_should_be_null_for_never_selected_model() {
+        let strategy = strategy_with_index(0);
+        // `compute_scores` (not `select`) records a `ScoreBreakdown` into
+        // `last_scores` without ever touching `last_explore`.
+        strategy.compute_scores(&[candidate(0, Some("cold/model:free"))]);
+
+        let snapshot = strategy
+            .observability_snapshot()
+            .expect("OpenrouterScoringStrategy must always return Some");
+
+        assert_eq!(
+            snapshot["models"]["cold/model:free"]["explore"],
+            json!(null)
+        );
     }
 
     #[test]

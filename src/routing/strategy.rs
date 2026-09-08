@@ -52,6 +52,13 @@ pub trait RoutingStrategy: Send + Sync {
     fn observability_snapshot(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// Pre-mortem P2 #2: was the last selection of `model_id` an
+    /// epsilon-greedy exploration pick rather than a greedy one? Default:
+    /// `None` (no strategy but `OpenrouterScoringStrategy` tracks this).
+    fn last_selection_was_exploration(&self, _model_id: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// Ordered fallback: first healthy candidate wins. Candidates arrive in

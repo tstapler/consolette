@@ -142,8 +142,7 @@ fn antigravity_token_auth_should_name_remediation_command_when_token_file_missin
 // actionable stderr message.
 #[test]
 #[allow(clippy::expect_used)]
-fn antigravity_token_auth_should_exit_nonzero_with_malformed_message_when_token_file_is_not_json()
-{
+fn antigravity_token_auth_should_exit_nonzero_with_malformed_message_when_token_file_is_not_json() {
     let home = fake_home(Some("not valid json"));
 
     let output = run_script(&home);

@@ -771,7 +771,12 @@ mod tests {
     #[test]
     fn no_upstream_is_hardcoded_by_name_should_continue_to_pass_unmodified_after_gemini_additions()
     {
-        for hardcoded in ["gemini-status", "gemini-text", "lat-gemini-dur", "\"gemini\""] {
+        for hardcoded in [
+            "gemini-status",
+            "gemini-text",
+            "lat-gemini-dur",
+            "\"gemini\"",
+        ] {
             assert!(
                 !DASHBOARD_HTML.contains(hardcoded),
                 "dashboard must not hardcode Gemini's name ({hardcoded}) — the new status \

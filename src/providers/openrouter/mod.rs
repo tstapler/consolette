@@ -47,6 +47,11 @@ const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const HTTP_REFERER: &str = "https://github.com/tstapler/consolette";
 const X_TITLE: &str = "consolette";
 
+/// How often the background task (Story 2.1.2) refreshes `model_cache`,
+/// well under `cache::MODEL_LIST_TTL` (15 minutes) so in normal operation
+/// the TTL is a backstop, not the primary refresh driver.
+const MODEL_LIST_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
+
 /// Provider for `OpenRouter`'s OpenAI-compatible Chat Completions API.
 pub struct OpenrouterProvider {
     /// Pooled client for non-streaming requests.
@@ -73,19 +78,25 @@ impl OpenrouterProvider {
     /// Construct a new `OpenrouterProvider` for one configured `Upstream`.
     ///
     /// Returns `Arc<Self>` rather than a bare `Self` — a deliberate
-    /// divergence from `OpenaiProvider::new`/`GeminiProvider::new` — because
-    /// Epic 2.1 hands `model_cache` a `Weak<Self>` back-reference via
-    /// `Arc::new_cyclic`. This epic doesn't need that yet (no background
-    /// task, no `Weak` — that wiring is Epic 2.1's Story 2.1.2 job), but
-    /// keeps the `Arc`-returning shape so Epic 2.1 doesn't have to change
-    /// every call site again.
+    /// divergence from `OpenaiProvider::new`/`GeminiProvider::new` — built
+    /// via `Arc::new_cyclic` so `model_cache` can hold a `Weak<Self>`
+    /// back-reference (Story 2.1.2), which Story 2.1.3's on-demand refetch
+    /// trigger needs to call back into `list_free_models()` without the
+    /// `RoutingStrategy`/`Router` orchestrating it.
     ///
-    /// Eagerly populates `model_cache` before returning (Story 2.1.2's
-    /// Blocker-1 fix): a failed refresh is logged, not propagated, so a
-    /// transient `OpenRouter` outage at startup doesn't fail the whole
-    /// process — `model_cache.snapshot()` is simply `None` until a later
-    /// refresh succeeds (background refresh itself is Epic 2.1's job; this
-    /// epic performs only the one eager attempt).
+    /// Eagerly populates `model_cache` before returning (architecture-review
+    /// Blocker 1 fix, Story 2.1.2): a failed refresh is logged, not
+    /// propagated, so a transient `OpenRouter` outage at startup doesn't
+    /// fail the whole process — `model_cache.snapshot()` is simply `None`
+    /// until a later refresh succeeds. This runs unconditionally for every
+    /// `openrouter`-kind upstream `build_providers` constructs, regardless
+    /// of which `Strategy` (if any) later references it — see plan.md's
+    /// "Cache-population lifecycle ownership" Pattern Decision.
+    ///
+    /// Also spawns a background task that refreshes `model_cache` every
+    /// `MODEL_LIST_REFRESH_INTERVAL`, holding only `Weak<ModelListCache>` +
+    /// `Weak<Self>` so it stops (rather than leaking forever) once a route
+    /// hot-swap orphans this provider.
     ///
     /// # Errors
     ///
@@ -109,13 +120,13 @@ impl OpenrouterProvider {
             .pool_max_idle_per_host(0)
             .build()?;
 
-        let provider = Arc::new(Self {
+        let provider = Arc::new_cyclic(|weak_self| Self {
             client,
             stream_client,
             upstream,
             resolver,
             exec_cache,
-            model_cache: Arc::new(ModelListCache::new()),
+            model_cache: Arc::new(ModelListCache::new(weak_self.clone())),
         });
 
         if let Err(e) = provider.model_cache.refresh(provider.as_ref()).await {
@@ -125,6 +136,8 @@ impl OpenrouterProvider {
                  model_cache.snapshot() will be None until a later refresh succeeds"
             );
         }
+
+        spawn_background_refresh_task(&provider);
 
         Ok(provider)
     }
@@ -139,27 +152,42 @@ impl OpenrouterProvider {
     #[cfg(test)]
     #[allow(clippy::expect_used)]
     fn test_provider() -> Self {
+        Self::test_provider_with_upstream(Upstream {
+            name: "test-openrouter".to_string(),
+            kind: crate::config::schema::UpstreamKind::Openrouter {},
+            auth: Some(crate::config::schema::AuthMethod::Bearer {
+                token: crate::config::schema::SecretRef::Inline {
+                    value: "sk-or-v1-test".to_string(),
+                },
+            }),
+        })
+    }
+
+    /// Like [`Self::test_provider`], but with a caller-supplied `Upstream`
+    /// (e.g. a broken `AuthMethod::Exec` so `build_headers`/`refresh()`
+    /// fail hermetically, without live network access — see
+    /// `cache.rs`'s `broken_auth_provider` test helper).
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn test_provider_with_upstream(upstream: Upstream) -> Self {
         Self {
             client: Client::builder().build().expect("client should build"),
             stream_client: Client::builder().build().expect("client should build"),
-            upstream: Arc::new(Upstream {
-                name: "test-openrouter".to_string(),
-                kind: crate::config::schema::UpstreamKind::Openrouter {},
-                auth: Some(crate::config::schema::AuthMethod::Bearer {
-                    token: crate::config::schema::SecretRef::Inline {
-                        value: "sk-or-v1-test".to_string(),
-                    },
-                }),
-            }),
+            upstream: Arc::new(upstream),
             resolver: Arc::new(crate::auth::SystemSecretResolver),
             exec_cache: Arc::new(ExecCredentialCache::new()),
-            model_cache: Arc::new(ModelListCache::new()),
+            model_cache: Arc::new(ModelListCache::new_with_ttl(cache::MODEL_LIST_TTL)),
         }
     }
 
-    #[cfg(test)]
-    fn model_cache(&self) -> &Arc<ModelListCache> {
-        &self.model_cache
+    /// Cheap `Arc::clone` accessor for `model_cache`: lets
+    /// `ModelListCache::trigger_immediate_refresh` (Story 2.1.3) get back
+    /// from an upgraded `Weak<Self>` to the cache it should refresh, and
+    /// will let `OpenrouterScoringStrategy` (Epic 3+) share the same cache
+    /// `send()` verifies against.
+    #[must_use]
+    pub fn model_cache(&self) -> Arc<ModelListCache> {
+        Arc::clone(&self.model_cache)
     }
 
     /// Build the outgoing request headers: `Content-Type` plus auth per the
@@ -341,6 +369,74 @@ impl OpenrouterProvider {
         let value = models::fetch_models_raw(self).await?;
         Ok(models::parse_free_model_entries(&value))
     }
+
+    /// Pre-flight per-dispatch price recheck (Task 2.1.2c, money-safety
+    /// backstop mechanism 2): verifies the *specific selected model's*
+    /// cached price is `(0.0, 0.0)`, not just that its id is present in the
+    /// free-model list — defense-in-depth against a future bug in
+    /// `list_free_models()`'s own filter, not by itself a fix for the
+    /// free→paid-mid-TTL gap (that's Story 1.2.4's post-hoc cost check).
+    ///
+    /// A `None` snapshot (cold cache) falls through and lets the real API
+    /// call be the source of truth — reachable only for a session-pinned
+    /// dispatch (an unpinned candidate at a cold cache is dropped earlier
+    /// by `expand_candidates`, Story 4.2.4), so reaching this branch means
+    /// a request is about to be forwarded with zero local price
+    /// verification. Logged via `tracing::warn!` so that bypass is visible
+    /// rather than indistinguishable from the normal, verified path
+    /// (adversarial-review Concern, 2026-09-07 re-review).
+    fn check_cached_price(&self, model: &str) -> Result<(), ProviderError> {
+        let Some(list) = self.model_cache.snapshot() else {
+            warn!(
+                model,
+                "openrouter: dispatching model with no cache snapshot to verify price against \
+                 — price recheck bypassed"
+            );
+            return Ok(());
+        };
+
+        let is_verified_free = list
+            .iter()
+            .any(|e| e.id == model && e.price_prompt == 0.0 && e.price_completion == 0.0);
+        if is_verified_free {
+            Ok(())
+        } else {
+            Err(ProviderError::ModelUnsupported(model.to_string()))
+        }
+    }
+
+    /// Feeds a dispatch error back into `model_cache`'s data-policy-vs-
+    /// staleness invalidation (Story 2.1.3) when it's a model-not-found
+    /// classification, then returns the error unchanged so call sites can
+    /// keep using `?`/`map_err` normally.
+    fn observe_dispatch_error(&self, err: ProviderError) -> ProviderError {
+        if let ProviderError::ModelUnsupported(ref id) = err {
+            self.model_cache.record_not_found_and_maybe_invalidate(id);
+        }
+        err
+    }
+}
+
+/// Spawns `OpenrouterProvider::new()`'s background model-list refresh task
+/// (Story 2.1.2): refreshes `model_cache` every `MODEL_LIST_REFRESH_INTERVAL`,
+/// holding only `Weak<ModelListCache>` + `Weak<OpenrouterProvider>` so it
+/// exits — rather than leaking for the process's lifetime — the first time
+/// either fails to upgrade (e.g. a route hot-swap orphaned this provider).
+fn spawn_background_refresh_task(provider: &Arc<OpenrouterProvider>) {
+    let weak_cache = Arc::downgrade(&provider.model_cache);
+    let weak_provider = Arc::downgrade(provider);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(MODEL_LIST_REFRESH_INTERVAL).await;
+            let (Some(cache), Some(provider)) = (weak_cache.upgrade(), weak_provider.upgrade())
+            else {
+                break;
+            };
+            if let Err(e) = cache.refresh(&provider).await {
+                warn!(error = %e, "openrouter model-list background refresh failed");
+            }
+        }
+    });
 }
 
 /// The `OpenRouter` error envelope: `{"error": {"message": ..., "code": ...}}`.
@@ -483,17 +579,24 @@ impl Provider for OpenrouterProvider {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        self.check_cached_price(&model)?;
         let openai_body = super::translate_anthropic_request_to_openai(&body);
 
         if stream {
-            let response = self.send_streaming_request(openai_body).await?;
+            let response = self
+                .send_streaming_request(openai_body)
+                .await
+                .map_err(|e| self.observe_dispatch_error(e))?;
             let byte_stream = response
                 .bytes_stream()
                 .map(|r| r.map_err(anyhow::Error::from));
             let translated = OpenrouterToAnthropicStream::new(byte_stream, model);
             Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
-            let value = self.send_request(openai_body).await?;
+            let value = self
+                .send_request(openai_body)
+                .await
+                .map_err(|e| self.observe_dispatch_error(e))?;
             let anthropic_value = super::translate_openai_response_to_anthropic(&value);
             Ok(ProviderResponse::Full(anthropic_value))
         }
@@ -680,9 +783,19 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// `FreeModelEntry` constructor for tests that just need one
+    /// zero-priced entry seeded into `model_cache`.
+    fn free_entry(id: &str) -> FreeModelEntry {
+        FreeModelEntry {
+            id: id.to_string(),
+            price_prompt: 0.0,
+            price_completion: 0.0,
+        }
+    }
 
     // REQ-1 (Story 1.2.1, Task 1.2.1e). Per this epic's established test
     // pattern deviation (no wiremock/mockito in this repo): header
@@ -759,11 +872,7 @@ mod tests {
     #[test]
     fn send_should_hard_invalidate_cache_on_nonzero_cost_for_free_model() {
         let provider = OpenrouterProvider::test_provider();
-        provider.model_cache().seed_for_test(vec![FreeModelEntry {
-            id: "a/b:free".to_string(),
-            price_prompt: 0.0,
-            price_completion: 0.0,
-        }]);
+        provider.model_cache().seed_for_test(vec![free_entry("a/b:free")]);
 
         let response_with_nonzero_cost = serde_json::json!({
             "id": "gen-1",
@@ -785,11 +894,7 @@ mod tests {
     #[test]
     fn send_should_not_invalidate_cache_when_cost_is_zero_or_absent() {
         let provider = OpenrouterProvider::test_provider();
-        provider.model_cache().seed_for_test(vec![FreeModelEntry {
-            id: "a/b:free".to_string(),
-            price_prompt: 0.0,
-            price_completion: 0.0,
-        }]);
+        provider.model_cache().seed_for_test(vec![free_entry("a/b:free")]);
 
         let ordinary_response = serde_json::json!({
             "id": "gen-2",
@@ -801,5 +906,144 @@ mod tests {
         provider.check_for_unexpected_cost("a/b:free", &ordinary_response);
 
         assert!(provider.model_cache().snapshot().is_some());
+    }
+
+    // REQ-3 (Story 2.1.2, Task 2.1.2c/d) — per-dispatch price recheck.
+
+    #[tokio::test]
+    async fn send_should_return_model_unsupported_when_cached_price_is_nonzero() {
+        let provider = OpenrouterProvider::test_provider();
+        provider.model_cache().seed_for_test(vec![FreeModelEntry {
+            id: "a/b:paid".to_string(),
+            price_prompt: 0.000_002,
+            price_completion: 0.000_004,
+        }]);
+
+        let err = provider
+            .check_cached_price("a/b:paid")
+            .expect_err("a cached nonzero price must be rejected without a network call");
+
+        assert!(matches!(
+            err,
+            ProviderError::ModelUnsupported(model) if model == "a/b:paid"
+        ));
+    }
+
+    #[test]
+    fn check_cached_price_should_reject_model_absent_from_cache() {
+        let provider = OpenrouterProvider::test_provider();
+        provider.model_cache().seed_for_test(vec![free_entry("a/b:free")]);
+
+        let err = provider
+            .check_cached_price("not-in-list:free")
+            .expect_err("a model absent from the cached list must be rejected");
+
+        assert!(matches!(
+            err,
+            ProviderError::ModelUnsupported(model) if model == "not-in-list:free"
+        ));
+    }
+
+    #[test]
+    fn check_cached_price_should_pass_through_on_cold_cache() {
+        // A `None` snapshot (cold cache) is the only case Task 2.1.2c
+        // explicitly falls through on — the real API call becomes the
+        // source of truth. This is reachable only for a session-pinned
+        // dispatch in production (`expand_candidates` drops an unpinned
+        // candidate at a cold cache first), so it also logs a
+        // `tracing::warn!` naming the model — see `check_cached_price`'s
+        // doc comment; asserting on emitted log output isn't covered here
+        // (this repo doesn't have a tracing-test-style dev-dependency), so
+        // this test covers the behavioral half of that acceptance
+        // criterion only.
+        let provider = OpenrouterProvider::test_provider();
+        assert!(provider.model_cache().snapshot().is_none());
+
+        assert!(provider.check_cached_price("anything:free").is_ok());
+    }
+
+    // REQ-3 (Story 2.1.3) — `send()` wires a `ModelUnsupported` classification
+    // into the cache's data-policy-vs-staleness invalidation.
+
+    #[tokio::test]
+    async fn observe_dispatch_error_should_record_not_found_for_model_unsupported() {
+        let provider = OpenrouterProvider::test_provider();
+        provider
+            .model_cache()
+            .seed_for_test(vec![free_entry("only/model:free")]);
+
+        let returned = provider.observe_dispatch_error(ProviderError::ModelUnsupported(
+            "only/model:free".to_string(),
+        ));
+
+        assert!(matches!(returned, ProviderError::ModelUnsupported(model) if model == "only/model:free"));
+        assert!(
+            provider.model_cache().snapshot().is_none(),
+            "a model-not-found error must invalidate the cache (single-model pool, Blocker 3)"
+        );
+    }
+
+    #[test]
+    fn observe_dispatch_error_should_ignore_non_model_unsupported_errors() {
+        let provider = OpenrouterProvider::test_provider();
+        provider
+            .model_cache()
+            .seed_for_test(vec![free_entry("only/model:free")]);
+
+        provider.observe_dispatch_error(ProviderError::RateLimited);
+
+        assert!(
+            provider.model_cache().snapshot().is_some(),
+            "a non-model-not-found error must not touch the cache"
+        );
+    }
+
+    // REQ-3 (Story 2.1.2, Task 2.1.2d) — background refresh task's weak-ref
+    // exit. Uses a broken `AuthMethod::Exec` (fails hermetically in
+    // `build_headers`, no network access needed) so `new()`'s eager refresh
+    // fails fast and deterministically, matching the "unreachable
+    // endpoint" acceptance criterion's *effect* (refresh fails, `new()`
+    // still returns `Ok` with a `None` snapshot) without depending on live
+    // network access.
+    #[tokio::test(start_paused = true)]
+    async fn background_refresh_task_should_exit_when_provider_is_dropped() {
+        let upstream = Upstream {
+            name: "test-openrouter-broken-auth".to_string(),
+            kind: crate::config::schema::UpstreamKind::Openrouter {},
+            auth: Some(crate::config::schema::AuthMethod::Exec {
+                command: "/nonexistent-binary-xyz-consolette-test".to_string(),
+                args: vec![],
+                cache_ttl_secs: 0,
+                timeout_secs: 1,
+            }),
+        };
+        let provider = OpenrouterProvider::new(
+            Arc::new(upstream),
+            Arc::new(crate::auth::SystemSecretResolver),
+            Arc::new(ExecCredentialCache::new()),
+            5,
+        )
+        .await
+        .expect("new() must return Ok even though the eager refresh fails");
+
+        assert!(
+            provider.model_cache().snapshot().is_none(),
+            "eager refresh should have failed against the broken auth method"
+        );
+
+        let weak_cache = Arc::downgrade(&provider.model_cache());
+        let weak_provider = Arc::downgrade(&provider);
+        drop(provider);
+
+        // No other strong references exist (the background task holds only
+        // `Weak`s per Story 2.1.2) — both should already be gone.
+        assert!(weak_cache.upgrade().is_none());
+        assert!(weak_provider.upgrade().is_none());
+
+        // Advance virtual time past one refresh tick so the background
+        // task's loop body actually runs its `Weak::upgrade()` calls and
+        // exits, proving it doesn't panic once its targets are gone.
+        tokio::time::advance(MODEL_LIST_REFRESH_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
     }
 }

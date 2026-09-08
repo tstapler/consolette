@@ -138,6 +138,55 @@ mod tests {
         ));
     }
 
+    // MODERATE finding (PR #16 Gate 2 review): `parse_retry_delay_seconds`'s
+    // fail-closed guard (rejects non-finite/negative `retryDelay` values)
+    // had no test exercising it — only "no retryDelay at all" was covered.
+    // A malformed-but-present value must fall back to the same 60s default
+    // as a missing one, never panic or propagate a nonsensical retry-after.
+    #[test]
+    fn classify_gemini_error_should_default_retry_after_when_429_retry_delay_is_negative() {
+        let body = error_body(json!({
+            "error": {
+                "code": 429,
+                "message": "Resource exhausted",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "-5s",
+                }],
+            }
+        }));
+
+        let err = classify_gemini_error(StatusCode::TOO_MANY_REQUESTS, &body);
+
+        assert!(matches!(
+            err,
+            ProviderError::RateLimitedWithRetry { retry_after: 60 }
+        ));
+    }
+
+    #[test]
+    fn classify_gemini_error_should_default_retry_after_when_429_retry_delay_is_non_numeric() {
+        let body = error_body(json!({
+            "error": {
+                "code": 429,
+                "message": "Resource exhausted",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "not-a-number-s",
+                }],
+            }
+        }));
+
+        let err = classify_gemini_error(StatusCode::TOO_MANY_REQUESTS, &body);
+
+        assert!(matches!(
+            err,
+            ProviderError::RateLimitedWithRetry { retry_after: 60 }
+        ));
+    }
+
     #[test]
     fn classify_gemini_error_should_return_auth_when_401_unauthenticated() {
         let body = error_body(json!({

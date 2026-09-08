@@ -27,7 +27,7 @@ use tracing::debug;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::SecretResolver;
 use crate::config::schema::{Upstream, UpstreamKind};
-use crate::routing::session_overrides::extract_session_id;
+use crate::session::extract_session_id;
 
 use super::anthropic::apply_auth_headers;
 use super::{ModelInfo, Provider, ProviderError, ProviderResponse};

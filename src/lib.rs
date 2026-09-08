@@ -22,5 +22,6 @@ pub mod providers;
 pub mod ratelimit;
 pub mod routing;
 pub mod service;
+pub mod session;
 pub mod session_compaction;
 pub mod system_prompt;

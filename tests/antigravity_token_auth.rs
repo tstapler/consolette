@@ -224,6 +224,44 @@ fn antigravity_token_auth_should_accept_real_nanosecond_precision_expiry_timesta
     );
 }
 
+// MODERATE finding (PR #16 Gate 2 review): the "unparseable expiry" branch
+// (references/bin/antigravity-token-auth.py:71-78) had no test — only the
+// valid-nanosecond-precision and "field missing entirely" (covered
+// implicitly by malformed-JSON/non-dict tests above) cases were exercised.
+// A genuinely unparseable `expiry` string (neither ISO nor a
+// nanosecond-precision variant) must hit the `datetime.fromisoformat`
+// `ValueError` branch and be reported distinctly, not misclassified as
+// "malformed token file" or crash uncaught.
+#[test]
+#[allow(clippy::expect_used)]
+fn antigravity_token_auth_should_exit_nonzero_with_unparseable_expiry_message_when_expiry_is_not_a_timestamp(
+) {
+    let token_json = r#"{"token":{"access_token":"ya29.abc123","token_type":"Bearer","refresh_token":"1//xyz","expiry":"not-a-timestamp"},"auth_method":"consumer"}"#;
+    let home = fake_home(Some(token_json));
+
+    let output = run_script(&home);
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for an unparseable expiry value"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "expected zero stdout on failure, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    assert!(
+        stderr.contains("unparseable expiry"),
+        "expected the distinct 'unparseable expiry' message, got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("not-a-timestamp"),
+        "expected the offending value to be named in the message, got: {stderr:?}"
+    );
+}
+
 #[test]
 #[allow(clippy::expect_used)] // assertion-adjacent parsing of the subprocess's own output — a
                               // parse failure here is itself a test failure, not a setup bug

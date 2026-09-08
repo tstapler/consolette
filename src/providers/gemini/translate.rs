@@ -276,6 +276,14 @@ pub(crate) fn translate_anthropic_request_to_gemini(
                 parts: vec![GeminiPart::text(s.to_string())],
             });
 
+    // TODO(gemini-provider plan.md Unresolved Questions, "Exact gemini-3-pro
+    // max-output-token ceiling"): GEMINI_3_PRO_OUTPUT_CEILING was never
+    // confirmed against a real `v1internal:fetchAvailableModels` response or
+    // Google's docs — plan.md explicitly says not to guess it — so
+    // `max_tokens` below is forwarded to `generationConfig.maxOutputTokens`
+    // unclamped. Resolve by reading a real fetchAvailableModels response
+    // (Story 1.3.4 already calls this endpoint for `list_models`) and add
+    // the clamp/validation here once confirmed.
     let generation_config = build_generation_config(anthropic);
     let tools = build_gemini_tools(anthropic)?;
 

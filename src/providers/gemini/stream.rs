@@ -248,8 +248,18 @@ where
                     this.close("end_turn", &usage_delta_json(None));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    warn!(error = %e, "gemini->anthropic stream translator: eventsource parse error");
-                    this.close("end_turn", &usage_delta_json(None));
+                    // Fail-closed (Epic 2.2, mirroring the malformed-data-line
+                    // branch below and bedrock.rs:719-735): a transport-level
+                    // error (dropped connection, read timeout, etc.) must not
+                    // be reported as a clean `end_turn` completion — that
+                    // would silently hand back a truncated answer as if it
+                    // were whole.
+                    warn!(error = %e, "gemini->anthropic stream translator: transport error");
+                    this.done = true;
+                    return Poll::Ready(Some(Err(ProviderError::ResponseShapeMismatch(format!(
+                        "gemini stream: transport error: {e}"
+                    ))
+                    .into())));
                 }
                 Poll::Ready(Some(Ok(event))) => {
                     let parsed = match serde_json::from_str::<Value>(&event.data) {
@@ -464,6 +474,55 @@ mod tests {
         let mut translator = GeminiToAnthropicStream::new(inner, "gemini-3-pro".to_string());
 
         // Drain the valid frames produced by the first, well-formed chunk.
+        let mut saw_ok_frame = false;
+        let err = loop {
+            match translator.next().await {
+                Some(Ok(_)) => saw_ok_frame = true,
+                Some(Err(e)) => break e,
+                None => panic!("stream ended before yielding the expected error"),
+            }
+        };
+        assert!(
+            saw_ok_frame,
+            "expected at least one Ok frame from the valid first chunk"
+        );
+
+        let provider_err = err
+            .downcast_ref::<ProviderError>()
+            .expect("expected the Err to wrap a ProviderError");
+        assert!(
+            matches!(provider_err, ProviderError::ResponseShapeMismatch(_)),
+            "expected ResponseShapeMismatch, got {provider_err:?}"
+        );
+
+        // No further items — not even from the well-formed third chunk still
+        // sitting in the inner stream.
+        assert!(translator.next().await.is_none());
+    }
+
+    // Fail-closed (Epic 2.2, MAJOR finding from PR #16 Gate 2 review): a
+    // transport-level error from the underlying byte stream (dropped
+    // connection, read timeout, etc.) — which `eventsource_stream` surfaces
+    // as `EventStreamError::Transport` — must end the stream with
+    // `ResponseShapeMismatch`, exactly like the malformed-data-line case
+    // above, never a silent `end_turn` completion that hides a truncated
+    // response as if it were whole.
+    #[tokio::test]
+    async fn gemini_to_anthropic_stream_should_end_stream_with_response_shape_mismatch_on_transport_error(
+    ) {
+        let inner = stream::iter(vec![
+            Ok(sse(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}}"#,
+            )),
+            Err(anyhow::anyhow!("connection reset by peer")),
+            // Still sitting in the inner stream's buffer after the error —
+            // must never be reached.
+            Ok(sse(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP"}]}}"#,
+            )),
+        ]);
+        let mut translator = GeminiToAnthropicStream::new(inner, "gemini-3-pro".to_string());
+
         let mut saw_ok_frame = false;
         let err = loop {
             match translator.next().await {

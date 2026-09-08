@@ -784,4 +784,30 @@ mod tests {
             );
         }
     }
+
+    // MAJOR finding (PR #16 Gate 2 review): the tests above only check that
+    // each class string appears *somewhere* in the ternary block, and that
+    // one condition's position precedes another's — never that a specific
+    // `lastKind` value maps to its *own* specific class. A swap of the two
+    // consequents (`'auth' ? 'status-schema-drift' : ... 'response_shape_mismatch'
+    // ? 'status-auth-required'`) would pass every test above. These two
+    // assert direct adjacency between condition and consequent instead.
+
+    #[test]
+    fn dashboard_js_should_map_auth_kind_to_auth_required_class_specifically() {
+        let block = extract_cls_block();
+        assert!(
+            block.contains("lastKind === 'auth' ? 'status-auth-required'"),
+            "lastKind === 'auth' must map directly to 'status-auth-required'"
+        );
+    }
+
+    #[test]
+    fn dashboard_js_should_map_response_shape_mismatch_kind_to_schema_drift_class_specifically() {
+        let block = extract_cls_block();
+        assert!(
+            block.contains("lastKind === 'response_shape_mismatch' ? 'status-schema-drift'"),
+            "lastKind === 'response_shape_mismatch' must map directly to 'status-schema-drift'"
+        );
+    }
 }

@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::providers::{ModelInfo, ProviderError};
 
 use super::cache::FreeModelEntry;
-use super::{classify_error_response, OpenrouterProvider, BASE_URL};
+use super::{classify_error_response, map_send_error, OpenrouterProvider, BASE_URL};
 
 /// Shared GET-and-parse-JSON helper for `{BASE_URL}/models` — both
 /// `list_models`/`list_free_models` call this so there's exactly one HTTP
@@ -42,16 +42,7 @@ async fn fetch_models_raw_at(
         .headers(headers)
         .send()
         .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Upstream {
-                    status: 0,
-                    body: e.to_string(),
-                }
-            }
-        })?;
+        .map_err(|e| map_send_error(&e))?;
 
     let status = response.status();
     if !status.is_success() {

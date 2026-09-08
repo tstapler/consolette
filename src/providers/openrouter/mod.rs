@@ -225,17 +225,10 @@ impl OpenrouterProvider {
     /// Returns a [`ProviderError`] if auth resolution, the HTTP request, or
     /// upstream error-status mapping fails.
     pub async fn send_request(&self, body: Value) -> Result<Value, ProviderError> {
-        let model_id = body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
+        let model_id = model_id_of(&body);
         let url = format!("{BASE_URL}/chat/completions");
         let headers = self.build_headers(&url).await?;
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Upstream {
-            status: 0,
-            body: e.to_string(),
-        })?;
+        let body_bytes = to_body_bytes(&body)?;
 
         debug!("OpenRouter non-stream POST {url}");
 
@@ -246,16 +239,7 @@ impl OpenrouterProvider {
             .body(body_bytes)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Upstream {
-                        status: 0,
-                        body: e.to_string(),
-                    }
-                }
-            })?;
+            .map_err(|e| map_send_error(&e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -282,19 +266,12 @@ impl OpenrouterProvider {
         &self,
         mut body: Value,
     ) -> Result<reqwest::Response, ProviderError> {
-        let model_id = body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
+        let model_id = model_id_of(&body);
         body["stream"] = Value::Bool(true);
 
         let url = format!("{BASE_URL}/chat/completions");
         let headers = self.build_headers(&url).await?;
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Upstream {
-            status: 0,
-            body: e.to_string(),
-        })?;
+        let body_bytes = to_body_bytes(&body)?;
 
         debug!("OpenRouter stream POST {url}");
 
@@ -305,16 +282,7 @@ impl OpenrouterProvider {
             .body(body_bytes)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Upstream {
-                        status: 0,
-                        body: e.to_string(),
-                    }
-                }
-            })?;
+            .map_err(|e| map_send_error(&e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -389,8 +357,8 @@ impl OpenrouterProvider {
         let Some(list) = self.model_cache.snapshot() else {
             warn!(
                 model,
-                "openrouter: dispatching model with no cache snapshot to verify price against \
-                 — price recheck bypassed"
+                "openrouter: dispatching session-pinned model with no cache snapshot to verify \
+                 price against — price recheck bypassed"
             );
             return Ok(());
         };
@@ -414,6 +382,43 @@ impl OpenrouterProvider {
             self.model_cache.record_not_found_and_maybe_invalidate(id);
         }
         err
+    }
+}
+
+/// Extracts the `model` field from an outgoing request body, defaulting to
+/// `"unknown"` — shared by `send_request`/`send_streaming_request` (both
+/// need it for error-classification/stream-translation before the request
+/// is sent).
+fn model_id_of(body: &Value) -> String {
+    body.get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Serializes `body` to the bytes `reqwest::RequestBuilder::body` wants,
+/// mapping a (practically unreachable, since `body` is always a `Value`
+/// built from valid JSON) serialization failure onto `ProviderError::Upstream`
+/// — shared by `send_request`/`send_streaming_request`.
+fn to_body_bytes(body: &Value) -> Result<Vec<u8>, ProviderError> {
+    serde_json::to_vec(body).map_err(|e| ProviderError::Upstream {
+        status: 0,
+        body: e.to_string(),
+    })
+}
+
+/// Maps a `reqwest::Error` from a `.send()` call onto `ProviderError`,
+/// distinguishing a timeout from every other transport failure — shared by
+/// `send_request`/`send_streaming_request` (this module) and
+/// `models::fetch_models_raw_at`.
+pub(super) fn map_send_error(e: &reqwest::Error) -> ProviderError {
+    if e.is_timeout() {
+        ProviderError::Timeout
+    } else {
+        ProviderError::Upstream {
+            status: 0,
+            body: e.to_string(),
+        }
     }
 }
 

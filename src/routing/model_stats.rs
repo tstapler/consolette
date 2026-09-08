@@ -68,18 +68,18 @@ impl RollingErrorRate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let in_window: Vec<bool> = samples
+        let (total, errors) = samples
             .iter()
             .filter(|(t, _)| *t >= cutoff)
-            .map(|(_, success)| *success)
-            .collect();
+            .fold((0usize, 0usize), |(total, errors), (_, success)| {
+                (total + 1, errors + usize::from(!*success))
+            });
 
-        if in_window.is_empty() {
+        if total == 0 {
             return None;
         }
 
-        let error_count = in_window.iter().filter(|success| !**success).count();
-        Some(error_count as f64 / in_window.len() as f64)
+        Some(errors as f64 / total as f64)
     }
 
     /// Count of samples currently in the rolling window.

@@ -48,7 +48,10 @@ pub trait RoutingStrategy: Send + Sync {
 
     /// Strategy-specific JSON blob for `/metrics`. Default: `None`.
     /// `OpenrouterScoringStrategy` returns model-list cache state plus
-    /// per-model score breakdowns.
+    /// per-model score breakdowns. Returning `serde_json::Value` here is a
+    /// deliberate, accepted exception to wire/domain type separation — this
+    /// method exists to emit heterogeneous, strategy-specific telemetry, for
+    /// which a shared domain type would be awkward.
     fn observability_snapshot(&self) -> Option<serde_json::Value> {
         None
     }

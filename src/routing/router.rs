@@ -274,6 +274,13 @@ impl Router {
         config: &Config,
         metrics: Arc<MetricsCollector>,
     ) -> anyhow::Result<Router> {
+        // Validate before any live network call/background-task spawn:
+        // `build_providers` eagerly fetches `/models` and spawns a
+        // background refresh task for every `openrouter`-kind upstream, so a
+        // misconfigured route should be rejected before either happens, not
+        // after.
+        validate_openrouter_strategy_pairing(config)?;
+
         let (providers, openrouter_providers) = build_providers(config).await?;
         let providers: Vec<Arc<dyn Provider>> = providers
             .into_iter()
@@ -293,8 +300,6 @@ impl Router {
         for idx in bedrock_indices {
             health.set_can_cooldown(idx, false);
         }
-
-        validate_openrouter_strategy_pairing(config)?;
 
         let route = config
             .routes
@@ -468,7 +473,7 @@ impl Router {
 
             match outcome {
                 Ok(response) => {
-                    self.record_outcomes(&chosen, attempt_started, Ok(()), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
                     #[allow(clippy::cast_precision_loss)]
                     let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
                     // First-byte time isn't separately measured here (see
@@ -486,11 +491,11 @@ impl Router {
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
-                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
                     return Err(e);
                 }
                 Err(e) if e.is_rate_limited() => {
-                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
                     let override_duration = e.retry_after_secs().map(Duration::from_secs);
                     self.health.trip(chosen.index, override_duration);
                     last_error = Some(e);
@@ -502,7 +507,7 @@ impl Router {
                     // using a longer override than the default so a
                     // permanently-broken Gemini endpoint isn't retried on
                     // every request forever.
-                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
                     self.health.trip(
                         chosen.index,
                         Some(Duration::from_secs(
@@ -512,7 +517,7 @@ impl Router {
                     last_error = Some(e);
                 }
                 Err(e) => {
-                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
                     last_error = Some(e);
                 }
             }
@@ -652,7 +657,7 @@ impl Router {
     /// together (Story 3.1.2, Task 3.1.2d), so this bundles them to avoid
     /// repeating the same outcome/duration plumbing at all 5 `dispatch`
     /// match arms.
-    fn record_outcomes(
+    fn record_dispatch_outcome(
         &self,
         chosen: &UpstreamRef,
         attempt_started: std::time::Instant,

@@ -17,6 +17,11 @@ use rand::Rng;
 use serde_json::json;
 use tracing::{debug, warn};
 
+// Routing reaching into `providers::openrouter` is a deliberate, ADR-justified
+// exception to routing/providers layering (ADR-001): sharing the concrete
+// `ModelListCache`/`FreeModelEntry` types directly avoids a `Provider::as_any()`
+// downcasting seam that would otherwise widen the `Provider` trait's blast
+// radius across all 4+ provider impls. Don't "fix" this without reading the ADR.
 use crate::providers::openrouter::{FreeModelEntry, ModelListCache};
 
 use super::bench_table::bench_score;
@@ -50,6 +55,11 @@ pub const RATE_LIMIT_SYNTHETIC_FAILURES: usize = 5;
 /// new/unranked model (never picked because it's assumed worst) and
 /// over-favoring one (assumed best) before any real signal exists.
 const NEUTRAL: f64 = 0.5;
+
+/// Readability alias for an `OpenRouter` model id — a transparent alias over
+/// `String` (not a validated newtype), used only to make the 4 model-id-keyed
+/// maps below self-documenting at their declaration.
+type ModelId = String;
 
 /// Per-model snapshot of the last-computed score, kept for `/metrics`
 /// auditability (ADR-003 Consequences; surfaced by Epic 5.1).
@@ -116,24 +126,24 @@ struct RawSignal {
 /// (`openrouter_index`) so `record_outcome`/`expand_candidates` only ever
 /// touch candidates that actually belong to it.
 pub struct OpenrouterScoringStrategy {
-    model_stats: DashMap<String, ModelStats>,
+    model_stats: DashMap<ModelId, ModelStats>,
     model_cache: Arc<ModelListCache>,
     openrouter_index: usize,
     /// Every candidate's last-computed score, keyed by model id — kept for
     /// `/metrics` auditability (ADR-003 Consequences), not just the
     /// winner's.
-    last_scores: DashMap<String, ScoreBreakdown>,
+    last_scores: DashMap<ModelId, ScoreBreakdown>,
     /// Pre-mortem P2 #2: the last selection's explore-vs-greedy outcome,
     /// keyed by the *chosen* model id. A `DashMap` (not a single
     /// `AtomicBool`) so concurrent dispatches to different models don't
     /// clobber each other's flag. Read back by `last_selection_was_exploration`
     /// (wired into `RequestDetail` and `observability_snapshot()`'s `models`
     /// block) and by `select()`'s own structured log line.
-    last_explore: DashMap<String, bool>,
+    last_explore: DashMap<ModelId, bool>,
     /// "Already warned" set (Task 4.2.1c) — an unranked model logs
     /// `tracing::warn!` exactly once per model id, not once per `select()`
     /// call.
-    warned_unranked: DashSet<String>,
+    warned_unranked: DashSet<ModelId>,
     /// Pre-mortem P2 #1's aggregate bench-table coverage-ratio log line:
     /// logged once, the first time `expand_candidates` sees a non-empty
     /// cache snapshot (see `maybe_log_bench_coverage`'s doc comment for the
@@ -349,7 +359,7 @@ impl OpenrouterScoringStrategy {
     /// re-derive the formula's fixed weights per plan.md's explicit
     /// instruction not to build a general configurable weighting system.
     fn maybe_log_bench_coverage(&self, snapshot: &[FreeModelEntry]) {
-        if snapshot.is_empty() || self.logged_bench_coverage.swap(true, Ordering::AcqRel) {
+        if snapshot.is_empty() || self.logged_bench_coverage.swap(true, Ordering::Relaxed) {
             return;
         }
         let total = snapshot.len();
@@ -435,6 +445,16 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
             let current_ids: HashSet<&str> = snapshot.iter().map(|e| e.id.as_str()).collect();
             self.model_stats
                 .retain(|id, _| current_ids.contains(id.as_str()));
+            // Same GC as `model_stats` above, extended to the other 3
+            // model-id-keyed maps (Phase 6 cheap-fix batch) — otherwise
+            // these grow unboundedly for the life of the process as
+            // OpenRouter's free-model lineup rotates.
+            self.last_scores
+                .retain(|id, _| current_ids.contains(id.as_str()));
+            self.last_explore
+                .retain(|id, _| current_ids.contains(id.as_str()));
+            self.warned_unranked
+                .retain(|id| current_ids.contains(id.as_str()));
             self.maybe_log_bench_coverage(snapshot);
         }
 

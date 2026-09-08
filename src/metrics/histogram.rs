@@ -89,6 +89,23 @@ impl DurationHistogram {
         (p(50.0), p(95.0), p(99.0))
     }
 
+    /// Count of samples currently in the rolling window.
+    ///
+    /// Distinguishes "0 real samples" (cold start) from "a real sample
+    /// whose value happens to be 0" — callers that need that distinction
+    /// (e.g. cold-start defaulting, ADR-003) should check this before
+    /// trusting `percentiles()`.
+    #[must_use]
+    pub fn sample_count(&self) -> usize {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
+        let samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        samples.iter().filter(|(t, _)| *t >= cutoff).count()
+    }
+
     /// Requests per minute over the last 60 seconds.
     #[must_use]
     // The sample count within a 60-second window is trivially small relative
@@ -176,5 +193,25 @@ impl DurationHistogram {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_count_should_return_zero_for_empty_histogram() {
+        let histogram = DurationHistogram::with_default_window();
+        assert_eq!(histogram.sample_count(), 0);
+    }
+
+    #[test]
+    fn sample_count_should_return_count_of_recorded_samples() {
+        let histogram = DurationHistogram::with_default_window();
+        histogram.record(10);
+        histogram.record(20);
+        histogram.record(30);
+        assert_eq!(histogram.sample_count(), 3);
     }
 }

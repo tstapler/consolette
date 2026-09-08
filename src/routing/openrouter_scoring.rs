@@ -537,7 +537,8 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
         let snapshot = self.model_cache.snapshot();
         let cached_model_count = snapshot.as_ref().map_or(0, |s| s.len());
         let last_refresh = self.model_cache.last_refresh();
-        let age_secs = last_refresh.map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds());
+        let age_secs =
+            last_refresh.map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds());
 
         let models: serde_json::Map<String, serde_json::Value> = self
             .last_scores

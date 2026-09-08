@@ -383,7 +383,8 @@ mod tests {
     #[allow(clippy::expect_used)]
     async fn get_metrics_should_omit_openrouter_scoring_key_for_fallback_strategy() {
         let health = Arc::new(HealthRegistry::new(300));
-        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysOkProvider { name: "primary" })];
+        let providers: Vec<Arc<dyn Provider>> =
+            vec![Arc::new(AlwaysOkProvider { name: "primary" })];
         let metrics = crate::metrics::MetricsCollector::new();
         let router = DispatchRouter::new(
             vec![upstream_ref(0, "primary")],
@@ -421,9 +422,9 @@ mod tests {
         use crate::routing::openrouter_scoring::OpenrouterScoringStrategy;
 
         let health = Arc::new(HealthRegistry::new(300));
-        let model_cache = Arc::new(ModelListCache::new_with_ttl(std::time::Duration::from_mins(
-            15,
-        )));
+        let model_cache = Arc::new(ModelListCache::new_with_ttl(
+            std::time::Duration::from_mins(15),
+        ));
         let strategy = Arc::new(OpenrouterScoringStrategy::new(Arc::clone(&model_cache), 0));
         let providers: Vec<Arc<dyn Provider>> =
             vec![Arc::new(AlwaysOkProvider { name: "openrouter" })];

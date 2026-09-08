@@ -17,7 +17,9 @@ use super::{classify_error_response, map_send_error, OpenrouterProvider, BASE_UR
 /// Shared GET-and-parse-JSON helper for `{BASE_URL}/models` — both
 /// `list_models`/`list_free_models` call this so there's exactly one HTTP
 /// GET implementation (Story 1.2.2's shared-fetch acceptance criterion).
-pub(super) async fn fetch_models_raw(provider: &OpenrouterProvider) -> Result<Value, ProviderError> {
+pub(super) async fn fetch_models_raw(
+    provider: &OpenrouterProvider,
+) -> Result<Value, ProviderError> {
     fetch_models_raw_at(provider, BASE_URL).await
 }
 

@@ -263,7 +263,10 @@ mod tests {
     // `UpstreamKind::Openrouter`.
     #[test]
     fn upstream_kind_label_should_return_openrouter_for_new_variant() {
-        assert_eq!(upstream_kind_label(&UpstreamKind::Openrouter {}), "openrouter");
+        assert_eq!(
+            upstream_kind_label(&UpstreamKind::Openrouter {}),
+            "openrouter"
+        );
     }
 
     #[tokio::test]

@@ -457,8 +457,8 @@ mod tests {
     // Blocker 3 (adversarial-review): `cached_count == 1` always invalidates.
 
     #[tokio::test]
-    async fn record_not_found_and_maybe_invalidate_should_always_invalidate_when_cached_count_is_one()
-    {
+    async fn record_not_found_and_maybe_invalidate_should_always_invalidate_when_cached_count_is_one(
+    ) {
         let cache = ModelListCache::new_with_ttl(MODEL_LIST_TTL);
         cache.seed_for_test(vec![entry("only/model:free")]);
 
@@ -475,7 +475,11 @@ mod tests {
     #[tokio::test]
     async fn record_not_found_and_maybe_invalidate_should_prune_stale_404_entries() {
         let cache = ModelListCache::new_with_ttl(MODEL_LIST_TTL);
-        cache.seed_for_test(vec![entry("a/b:free"), entry("c/d:free"), entry("e/f:free")]);
+        cache.seed_for_test(vec![
+            entry("a/b:free"),
+            entry("c/d:free"),
+            entry("e/f:free"),
+        ]);
         cache.recent_not_found.insert(
             "stale/model:free".to_string(),
             Instant::now()

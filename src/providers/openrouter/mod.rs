@@ -480,7 +480,9 @@ struct OpenrouterErrorDetail {
 fn looks_like_model_not_found(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("model")
-        && (lower.contains("not found") || lower.contains("not a valid") || lower.contains("no endpoints"))
+        && (lower.contains("not found")
+            || lower.contains("not a valid")
+            || lower.contains("no endpoints"))
 }
 
 /// Extracts a `Retry-After` header value (whole seconds) from a 429
@@ -877,7 +879,9 @@ mod tests {
     #[test]
     fn send_should_hard_invalidate_cache_on_nonzero_cost_for_free_model() {
         let provider = OpenrouterProvider::test_provider();
-        provider.model_cache().seed_for_test(vec![free_entry("a/b:free")]);
+        provider
+            .model_cache()
+            .seed_for_test(vec![free_entry("a/b:free")]);
 
         let response_with_nonzero_cost = serde_json::json!({
             "id": "gen-1",
@@ -899,7 +903,9 @@ mod tests {
     #[test]
     fn send_should_not_invalidate_cache_when_cost_is_zero_or_absent() {
         let provider = OpenrouterProvider::test_provider();
-        provider.model_cache().seed_for_test(vec![free_entry("a/b:free")]);
+        provider
+            .model_cache()
+            .seed_for_test(vec![free_entry("a/b:free")]);
 
         let ordinary_response = serde_json::json!({
             "id": "gen-2",
@@ -937,7 +943,9 @@ mod tests {
     #[test]
     fn check_cached_price_should_reject_model_absent_from_cache() {
         let provider = OpenrouterProvider::test_provider();
-        provider.model_cache().seed_for_test(vec![free_entry("a/b:free")]);
+        provider
+            .model_cache()
+            .seed_for_test(vec![free_entry("a/b:free")]);
 
         let err = provider
             .check_cached_price("not-in-list:free")
@@ -981,7 +989,9 @@ mod tests {
             "only/model:free".to_string(),
         ));
 
-        assert!(matches!(returned, ProviderError::ModelUnsupported(model) if model == "only/model:free"));
+        assert!(
+            matches!(returned, ProviderError::ModelUnsupported(model) if model == "only/model:free")
+        );
         assert!(
             provider.model_cache().snapshot().is_none(),
             "a model-not-found error must invalidate the cache (single-model pool, Blocker 3)"

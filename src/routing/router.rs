@@ -336,12 +336,9 @@ impl Router {
         let strategy: Arc<dyn RoutingStrategy> = match route.strategy {
             Strategy::Fallback => Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
             Strategy::Weighted => Arc::new(WeightedStrategy) as Arc<dyn RoutingStrategy>,
-            Strategy::OpenrouterScored => build_openrouter_scored_strategy(
-                route,
-                &candidates,
-                config,
-                &openrouter_providers,
-            )?,
+            Strategy::OpenrouterScored => {
+                build_openrouter_scored_strategy(route, &candidates, config, &openrouter_providers)?
+            }
         };
 
         let admission = Arc::new(RateLimiters::new(&config.ratelimit)) as Arc<dyn AdmissionControl>;
@@ -1707,7 +1704,11 @@ mod tests {
         use crate::config::schema::{Route, RouteUpstreamRef};
 
         let config = Config {
-            upstreams: vec![bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test")],
+            upstreams: vec![bearer_upstream(
+                "or",
+                UpstreamKind::Openrouter {},
+                "sk-or-v1-test",
+            )],
             routes: vec![Route {
                 name: "r1".to_string(),
                 strategy: Strategy::Fallback,
@@ -1725,7 +1726,10 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("r1"), "error must name the route, got: {msg}");
-        assert!(msg.contains("or"), "error must name the upstream, got: {msg}");
+        assert!(
+            msg.contains("or"),
+            "error must name the upstream, got: {msg}"
+        );
     }
 
     // Blocker 1 (architecture-review), `Weighted` direction — same as above.
@@ -1734,7 +1738,11 @@ mod tests {
         use crate::config::schema::{Route, RouteUpstreamRef};
 
         let config = Config {
-            upstreams: vec![bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test")],
+            upstreams: vec![bearer_upstream(
+                "or",
+                UpstreamKind::Openrouter {},
+                "sk-or-v1-test",
+            )],
             routes: vec![Route {
                 name: "r1".to_string(),
                 strategy: Strategy::Weighted,
@@ -1752,7 +1760,10 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("r1"), "error must name the route, got: {msg}");
-        assert!(msg.contains("or"), "error must name the upstream, got: {msg}");
+        assert!(
+            msg.contains("or"),
+            "error must name the upstream, got: {msg}"
+        );
     }
 
     // Blocker 1 (architecture-review), mixed-upstream direction: a
@@ -1798,7 +1809,10 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("r1"), "error must name the route, got: {msg}");
-        assert!(msg.contains("or"), "error must name the upstream, got: {msg}");
+        assert!(
+            msg.contains("or"),
+            "error must name the upstream, got: {msg}"
+        );
     }
 
     // Task 4.3.1g (adversarial-review Concern), reverse mixed-upstream

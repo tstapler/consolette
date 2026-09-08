@@ -176,8 +176,10 @@ impl Router {
         // still only handles `Strategy::Fallback`/`Strategy::Weighted`
         // below (Epic 4.3's job, not this epic's).
         let (providers, _openrouter_providers) = build_providers(config).await?;
-        let providers: Vec<Arc<dyn Provider>> =
-            providers.into_iter().map(|(_, provider)| provider).collect();
+        let providers: Vec<Arc<dyn Provider>> = providers
+            .into_iter()
+            .map(|(_, provider)| provider)
+            .collect();
         let bedrock_indices: Vec<usize> = config
             .upstreams
             .iter()
@@ -292,7 +294,7 @@ impl Router {
         stream: bool,
         est_tokens: u32,
     ) -> Result<ProviderResponse, ProviderError> {
-        let mut already_tried: HashSet<usize> = HashSet::new();
+        let mut already_tried: HashSet<(usize, Option<String>)> = HashSet::new();
         let mut last_error: Option<ProviderError> = None;
         let model = body
             .get("model")
@@ -302,6 +304,7 @@ impl Router {
 
         let session_id = extract_session_id(&body);
         let candidates = self.effective_candidates(session_id.as_deref());
+        let candidates = self.strategy.expand_candidates(candidates);
 
         let request_id = uuid::Uuid::new_v4().to_string();
         self.metrics
@@ -318,14 +321,17 @@ impl Router {
         loop {
             let healthy: Vec<UpstreamRef> = candidates
                 .iter()
-                .filter(|u| !already_tried.contains(&u.index) && self.health.is_available(u.index))
+                .filter(|u| {
+                    !already_tried.contains(&(u.index, u.model.clone()))
+                        && self.health.is_available(u.index)
+                })
                 .cloned()
                 .collect();
 
             let Some(chosen) = self.strategy.select(&healthy) else {
                 break;
             };
-            already_tried.insert(chosen.index);
+            already_tried.insert((chosen.index, chosen.model.clone()));
 
             // ADR-004: post-selection admission check, before the provider
             // call — a Shed re-selects from the remaining pool via the same
@@ -350,9 +356,11 @@ impl Router {
                 None => body.clone(),
             };
             let attempt_started = std::time::Instant::now();
-            match provider.send(request_body, headers.clone(), stream).await {
+            let outcome = provider.send(request_body, headers.clone(), stream).await;
+
+            match outcome {
                 Ok(response) => {
-                    self.record_attempt(&chosen.name, attempt_started, Ok(()), &model);
+                    self.record_outcomes(&chosen, attempt_started, Ok(()), &model);
                     #[allow(clippy::cast_precision_loss)]
                     let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
                     // First-byte time isn't separately measured here (see
@@ -370,11 +378,11 @@ impl Router {
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
                     return Err(e);
                 }
                 Err(e) if e.is_rate_limited() => {
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
                     let override_duration = e.retry_after_secs().map(Duration::from_secs);
                     self.health.trip(chosen.index, override_duration);
                     last_error = Some(e);
@@ -386,7 +394,7 @@ impl Router {
                     // using a longer override than the default so a
                     // permanently-broken Gemini endpoint isn't retried on
                     // every request forever.
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
                     self.health.trip(
                         chosen.index,
                         Some(Duration::from_secs(
@@ -396,7 +404,7 @@ impl Router {
                     last_error = Some(e);
                 }
                 Err(e) => {
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.record_outcomes(&chosen, attempt_started, Err(&e), &model);
                     last_error = Some(e);
                 }
             }
@@ -474,6 +482,29 @@ impl Router {
                     .push(&e.to_string(), upstream, model);
             }
         }
+    }
+
+    /// Records one dispatch attempt's outcome into both the `/metrics`
+    /// counters (`record_attempt`) and the selection strategy's own rolling
+    /// stats (`RoutingStrategy::record_outcome`) — the two are always called
+    /// together (Story 3.1.2, Task 3.1.2d), so this bundles them to avoid
+    /// repeating the same outcome/duration plumbing at all 5 `dispatch`
+    /// match arms.
+    fn record_outcomes(
+        &self,
+        chosen: &UpstreamRef,
+        attempt_started: std::time::Instant,
+        outcome: Result<(), &ProviderError>,
+        model: &str,
+    ) {
+        self.record_attempt(&chosen.name, attempt_started, outcome, model);
+        let duration_ms = u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (success, error_kind) = match outcome {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.kind_label())),
+        };
+        self.strategy
+            .record_outcome(chosen, duration_ms, success, error_kind);
     }
 }
 
@@ -1488,8 +1519,14 @@ mod tests {
 
         let snapshot = router.cooldown_snapshot();
 
-        assert_eq!(snapshot["anthropic"]["cooling_down"], serde_json::json!(false));
-        assert_eq!(snapshot["anthropic"]["remaining_seconds"], serde_json::json!(0));
+        assert_eq!(
+            snapshot["anthropic"]["cooling_down"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            snapshot["anthropic"]["remaining_seconds"],
+            serde_json::json!(0)
+        );
         assert_eq!(snapshot["gemini"]["cooling_down"], serde_json::json!(true));
         let remaining = snapshot["gemini"]["remaining_seconds"]
             .as_u64()
@@ -1522,5 +1559,288 @@ mod tests {
             snapshot["anthropic"],
             serde_json::json!({"cooling_down": false, "remaining_seconds": 0})
         );
+    }
+
+    /// A `Provider` test double that succeeds or fails per the request
+    /// body's `model` field — used to prove `already_tried`'s widened key
+    /// lets a sibling per-model candidate at the *same* upstream index stay
+    /// selectable after another model at that index fails.
+    struct ModelAwareProvider {
+        name: &'static str,
+        fail_model: &'static str,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ModelAwareProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        #[allow(clippy::unwrap_used)]
+        async fn send(
+            &self,
+            body: serde_json::Value,
+            _headers: HeaderMap,
+            _stream: bool,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let model = body["model"].as_str().unwrap_or("").to_string();
+            self.calls.lock().unwrap().push(model.clone());
+            if model == self.fail_model {
+                Err(ProviderError::ModelUnsupported(model))
+            } else {
+                Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+            }
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    // REQ-4 (Story 3.1.2, Task 3.1.2e): widening `already_tried` from
+    // `HashSet<usize>` to `HashSet<(usize, Option<String>)>` lets the
+    // dispatch loop retry a *different* free model sharing the same
+    // upstream index after one model's attempt fails, instead of wrongly
+    // declaring the whole pool exhausted.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_retry_different_model_after_one_model_failure() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(ModelAwareProvider {
+            name: "openrouter",
+            fail_model: "a/b:free",
+            calls: calls.clone(),
+        })];
+        let router = Router::new(
+            vec![
+                UpstreamRef {
+                    index: 2,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("a/b:free".to_string()),
+                },
+                UpstreamRef {
+                    index: 2,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("c/d:free".to_string()),
+                },
+            ],
+            vec![
+                Arc::new(AlwaysOkProvider {
+                    name: "unused-0",
+                    call_count: Arc::new(AtomicU32::new(0)),
+                }),
+                Arc::new(AlwaysOkProvider {
+                    name: "unused-1",
+                    call_count: Arc::new(AtomicU32::new(0)),
+                }),
+                providers[0].clone(),
+            ],
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(
+            res.is_ok(),
+            "must retry the sibling free model at the same index after the first fails"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["a/b:free".to_string(), "c/d:free".to_string()]);
+    }
+
+    // Task 3.1.2f (architecture-review Concern, `research/architecture.md`
+    // §3.4): the `already_tried` widening is a real, intentional, and
+    // disclosed behavior change for `Fallback`/`Weighted` routes too, not
+    // just an internal detail of the OpenRouter path — `RouteUpstreamRef.model`
+    // is a general config field usable under any `UpstreamKind`, and two
+    // route-upstream entries at the same index with different model pins are
+    // a legitimate existing config shape. This is *not* a regression:
+    // `FallbackStrategy::select`'s own logic is completely unmodified.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_not_poison_sibling_model_pin_at_same_index_for_fallback_strategy() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(ModelAwareProvider {
+            name: "primary",
+            fail_model: "model-a",
+            calls: calls.clone(),
+        })];
+        let router = Router::new(
+            vec![
+                UpstreamRef {
+                    index: 3,
+                    name: "primary".to_string(),
+                    weight: 1.0,
+                    model: Some("model-a".to_string()),
+                },
+                UpstreamRef {
+                    index: 3,
+                    name: "primary".to_string(),
+                    weight: 1.0,
+                    model: Some("model-b".to_string()),
+                },
+            ],
+            vec![
+                Arc::new(AlwaysOkProvider {
+                    name: "unused-0",
+                    call_count: Arc::new(AtomicU32::new(0)),
+                }),
+                Arc::new(AlwaysOkProvider {
+                    name: "unused-1",
+                    call_count: Arc::new(AtomicU32::new(0)),
+                }),
+                Arc::new(AlwaysOkProvider {
+                    name: "unused-2",
+                    call_count: Arc::new(AtomicU32::new(0)),
+                }),
+                providers[0].clone(),
+            ],
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(
+            res.is_ok(),
+            "model-a's failure must not poison model-b at the same index"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["model-a".to_string(), "model-b".to_string()]);
+    }
+
+    /// One recorded `record_outcome` call: `(upstream name, success, error_kind)`.
+    type RecordedOutcome = (String, bool, Option<&'static str>);
+
+    /// A `RoutingStrategy` test double recording every `record_outcome`
+    /// call, so `dispatch`'s wiring of the 3 new trait hooks can be verified
+    /// directly rather than only indirectly through selection behavior.
+    struct RecordingStrategy {
+        outcomes: Arc<std::sync::Mutex<Vec<RecordedOutcome>>>,
+    }
+
+    impl RoutingStrategy for RecordingStrategy {
+        fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef> {
+            healthy.first().cloned()
+        }
+
+        #[allow(clippy::unwrap_used)]
+        fn record_outcome(
+            &self,
+            candidate: &UpstreamRef,
+            _duration_ms: u64,
+            success: bool,
+            error_kind: Option<&'static str>,
+        ) {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .push((candidate.name.clone(), success, error_kind));
+        }
+    }
+
+    // REQ-4 (Story 3.1.2, Task 3.1.2e/d): `Router::dispatch` calls
+    // `strategy.record_outcome` once per attempt, after `provider.send()`
+    // resolves, with the right `success`/`error_kind` — here, a
+    // `ModelUnsupported` error's catch-all match arm.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_call_record_outcome_with_error_kind_on_model_unsupported() {
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+            name: "primary",
+            error: || ProviderError::ModelUnsupported("bad-model".to_string()),
+            call_count: Arc::new(AtomicU32::new(0)),
+        })];
+        let router = Router::new(
+            vec![upstream(0, "primary")],
+            providers,
+            Arc::new(RecordingStrategy {
+                outcomes: outcomes.clone(),
+            }),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_err());
+        let recorded = outcomes.lock().unwrap();
+        assert_eq!(
+            *recorded,
+            vec![("primary".to_string(), false, Some("model_unsupported"))]
+        );
+    }
+
+    // REQ-4 (Story 3.1.2, Task 3.1.2c): `expand_candidates` is called once,
+    // before the health filter — proven via a strategy whose
+    // `expand_candidates` fans one static candidate into two.
+    struct ExpandingStrategy;
+
+    impl RoutingStrategy for ExpandingStrategy {
+        fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef> {
+            healthy.first().cloned()
+        }
+
+        fn expand_candidates(&self, candidates: Vec<UpstreamRef>) -> Vec<UpstreamRef> {
+            candidates
+                .into_iter()
+                .flat_map(|c| {
+                    vec![
+                        UpstreamRef {
+                            model: Some("model-a".to_string()),
+                            ..c.clone()
+                        },
+                        UpstreamRef {
+                            model: Some("model-b".to_string()),
+                            ..c
+                        },
+                    ]
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_expand_candidates_before_the_health_filter() {
+        let received_body = Arc::new(std::sync::Mutex::new(None));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
+            name: "openrouter",
+            received_body: received_body.clone(),
+        })];
+        let router = Router::new(
+            vec![upstream(0, "openrouter")],
+            providers,
+            Arc::new(ExpandingStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_ok());
+        let body = received_body.lock().unwrap().clone().unwrap();
+        // `select` (via `FallbackStrategy`-style "first healthy") picks the
+        // first of the 2 expanded candidates.
+        assert_eq!(body["model"], serde_json::json!("model-a"));
     }
 }

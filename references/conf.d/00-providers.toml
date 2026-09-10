@@ -2,6 +2,22 @@
 # by side. Copy the block(s) you need into your own
 # ~/.config/consolette/conf.d/*.toml and fill in the placeholder values —
 # see README.md for the full conf.d layering rules.
+#
+# There's no dedicated OpenRouter provider — OpenRouter's API is OpenAI-
+# compatible (https://openrouter.ai/docs/api-reference/authentication), so it
+# just needs its own `kind = "openai"` block:
+#
+# [[upstreams]]
+# name = "openrouter"
+# kind = "openai"
+# base_url = "https://openrouter.ai/api"
+#
+# [upstreams.auth]
+# type = "bearer"
+#
+# [upstreams.auth.token]
+# source = "env"
+# var = "OPENROUTER_API_KEY"
 
 [[upstreams]]
 name = "anthropic"
@@ -24,13 +40,12 @@ max_retries = 3
 [[upstreams]]
 name = "openai"
 kind = "openai"
-base_url = "https://api.openai.com/v1"
+base_url = "https://api.openai.com"
 
 [upstreams.auth]
-type = "apikey"
-header = "Authorization"
+type = "bearer"
 
-[upstreams.auth.key]
+[upstreams.auth.token]
 source = "env"
 var = "OPENAI_API_KEY"
 

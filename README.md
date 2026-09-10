@@ -34,6 +34,32 @@ Point a client at it:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:47000
 ```
 
+Or, for a client that speaks the OpenAI Chat Completions API instead — e.g.
+[OpenCode](https://opencode.ai) — add a custom provider to `opencode.json`
+pointed at consolette's `/v1/chat/completions` (no `apiKey` is checked;
+consolette doesn't authenticate loopback requests):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "consolette": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Consolette",
+      "options": {
+        "baseURL": "http://127.0.0.1:47000/v1",
+        "apiKey": "unused"
+      },
+      "models": {
+        "claude-sonnet-4-5": {
+          "name": "Claude Sonnet 4.5 (via consolette)"
+        }
+      }
+    }
+  }
+}
+```
+
 ## Configuration
 
 Config lives in `~/.config/consolette/conf.d/*.toml`, merged in filename order (`00-`, `10-`, … — later files win). An empty `conf.d` still works: it reproduces the built-in Anthropic-primary/Bedrock-fallback default.

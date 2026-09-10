@@ -45,7 +45,7 @@ To add another upstream or change routing strategy, drop in a file like:
 [[upstreams]]
 name = "my-openai-upstream"
 kind = "openai"
-base_url = "https://api.example.com/v1"
+base_url = "https://api.example.com"
 
 [[routes]]
 name = "default"

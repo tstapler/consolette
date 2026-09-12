@@ -8,7 +8,7 @@
 //! exponential backoff) stay inside the provider — the router only fails
 //! over to a *different* upstream.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +16,8 @@ use http::HeaderMap;
 
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
-use crate::config::schema::{Config, Strategy, UpstreamKind};
-use crate::metrics::MetricsCollector;
+use crate::config::schema::{Config, FamilyMember, Strategy, UpstreamKind};
+use crate::metrics::{MemberRecordClass, MetricsCollector};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
@@ -25,8 +25,12 @@ use crate::providers::openai::OpenaiProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
 
+use super::family::{
+    decide_route, DecideCtx, FamilyReason, FamilyRouteDecision, FamilyTable,
+    DEFAULT_CONCURRENCY_CAP,
+};
 use super::health::{Availability, HealthRegistry};
-use super::session_overrides::{extract_session_id, SessionOverrideStore};
+use super::session_overrides::{extract_session_id, SessionOverrideStore, StickyPick};
 use super::strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef, WeightedStrategy};
 
 /// Owns the dispatch loop for one route: a fixed candidate list, a selection
@@ -45,6 +49,20 @@ pub struct Router {
     /// the *same* `Arc` across a route hot-swap via `with_session_overrides`
     /// so a pin isn't lost just because the global route changed.
     session_overrides: Arc<SessionOverrideStore>,
+    /// Immutable alias → member map rebuilt from config in `from_config`
+    /// (auto-model-family Epic 1). Empty by default via `Router::new`.
+    family_table: Arc<FamilyTable>,
+    /// The active route's opt-in `family` alias. Dispatch expands
+    /// `body["model"]` ONLY when it verbatim equals this alias — an
+    /// un-gated alias leaks through untouched per existing pin semantics,
+    /// which is also what makes route-swap rollback restore pins.
+    active_family: Option<String>,
+    /// Upstream name → position in `Config.upstreams` (== index into
+    /// `providers` and key domain of `HealthRegistry`). Family members
+    /// address upstreams by name and may name upstreams outside the route's
+    /// candidate list, so resolution maps through here (falling back to a
+    /// candidate-name search for test-built routers whose map is empty).
+    upstream_indices: HashMap<String, usize>,
 }
 
 /// Builds a live `Provider` for every configured upstream, keyed by its
@@ -108,6 +126,9 @@ impl Router {
             admission,
             metrics,
             session_overrides: Arc::new(SessionOverrideStore::new()),
+            family_table: FamilyTable::empty(),
+            active_family: None,
+            upstream_indices: HashMap::new(),
         }
     }
 
@@ -120,6 +141,94 @@ impl Router {
     pub fn with_session_overrides(mut self, session_overrides: Arc<SessionOverrideStore>) -> Self {
         self.session_overrides = session_overrides;
         self
+    }
+
+    /// Swaps in a config-built [`FamilyTable`] plus the active route's
+    /// opt-in family alias, replacing the empty-table default `Router::new`
+    /// / `from_config` starts with. `from_config` calls this itself, so
+    /// external callers only need it for test-injected tables.
+    #[must_use]
+    pub fn with_family_table(
+        mut self,
+        family_table: Arc<FamilyTable>,
+        active_family: Option<String>,
+    ) -> Self {
+        self.family_table = family_table;
+        self.active_family = active_family;
+        self
+    }
+
+    /// Swaps in the upstream name → provider-index map `from_config` builds.
+    /// Test-built routers skip this and resolve member upstreams through
+    /// their candidate list instead (see [`upstream_index`](Self::upstream_index)).
+    #[must_use]
+    pub fn with_upstream_indices(mut self, upstream_indices: HashMap<String, usize>) -> Self {
+        self.upstream_indices = upstream_indices;
+        self
+    }
+
+    /// Provider index for an upstream name: the config-built map first, then
+    /// the route's candidate list (covers test-built routers).
+    fn upstream_index(&self, upstream: &str) -> Option<usize> {
+        if let Some(index) = self.upstream_indices.get(upstream) {
+            return Some(*index);
+        }
+        self.candidates
+            .iter()
+            .find(|c| c.name == upstream)
+            .map(|c| c.index)
+    }
+
+    /// Epic 3 resolution seam: the ranked, exclusion-filtered member order
+    /// for `alias`, with the `ResolutionSnapshot` + counters published as a
+    /// side effect. `pub` so the perf-budget test times the real dispatch
+    /// seam (not a copy of it).
+    #[must_use]
+    pub fn resolve_family(&self, alias: &str) -> FamilyRouteDecision {
+        let health = &self.health;
+        let index_of = |upstream: &str| -> Option<usize> { self.upstream_index(upstream) };
+        let index_cooled = |upstream: &str| -> bool {
+            self.upstream_index(upstream)
+                .is_some_and(|index| !health.is_available(index))
+        };
+        let index_429_cooled = |upstream: &str| -> bool {
+            self.upstream_index(upstream)
+                .is_some_and(|index| health.is_backpressure_cooled(index))
+        };
+        let ctx = DecideCtx {
+            runtime: &self.metrics.family,
+            index_of: &index_of,
+            index_cooled: &index_cooled,
+            index_429_cooled: &index_429_cooled,
+        };
+        decide_route(&self.family_table, alias, &ctx)
+    }
+
+    /// Maps resolved members onto dispatchable candidates (provider index +
+    /// per-member model override). Members with no addressable upstream are
+    /// skipped with a WARN — validation guarantees mappability, so this is
+    /// belt-and-braces.
+    fn map_family_members(&self, ordered: &[FamilyMember], alias: &str) -> Vec<UpstreamRef> {
+        ordered
+            .iter()
+            .filter_map(|m| {
+                let Some(index) = self.upstream_index(&m.upstream) else {
+                    tracing::warn!(
+                        alias = %alias,
+                        upstream = %m.upstream,
+                        model = %m.model,
+                        "family member has no addressable upstream; skipping"
+                    );
+                    return None;
+                };
+                Some(UpstreamRef {
+                    index,
+                    name: m.upstream.clone(),
+                    weight: 1.0,
+                    model: Some(m.model.clone()),
+                })
+            })
+            .collect()
     }
 
     /// Assembles a fully dispatch-ready `Router` from a loaded [`Config`]:
@@ -202,9 +311,20 @@ impl Router {
             "router assembled from config"
         );
 
-        Ok(Router::new(
-            candidates, providers, strategy, health, admission, metrics,
-        ))
+        let family_table = Arc::new(FamilyTable::from_config(config));
+        let active_family = route.family.clone();
+        let upstream_indices: HashMap<String, usize> = config
+            .upstreams
+            .iter()
+            .enumerate()
+            .map(|(index, upstream)| (upstream.name.clone(), index))
+            .collect();
+
+        Ok(
+            Router::new(candidates, providers, strategy, health, admission, metrics)
+                .with_family_table(family_table, active_family)
+                .with_upstream_indices(upstream_indices),
+        )
     }
 
     /// This dispatch's candidate list: the route's normal `self.candidates`,
@@ -236,6 +356,63 @@ impl Router {
         }]
     }
 
+    /// Whether `session_id`'s explicit pin is live on this route: a pin that
+    /// maps into the current candidate list. Used by `dispatch` to assert
+    /// pins-first order (a live pin bypasses family expansion entirely).
+    fn session_pin_active(&self, session_id: Option<&str>) -> bool {
+        session_id
+            .and_then(|sid| self.session_overrides.get(sid))
+            .is_some_and(|over| self.candidates.iter().any(|c| c.name == over.upstream))
+    }
+
+    /// Whether a stuck pick must be abandoned: the member was denylisted,
+    /// personally backpressured, unmapped, or its upstream index cooled (any
+    /// cause — a cooled member is not servable sticky). Shared-upstream 429
+    /// nuance does not apply here: a 429 on the stuck member marks it
+    /// personally (`note_backpressure`), which already invalidates above.
+    fn sticky_pick_invalid(&self, stuck: &StickyPick) -> bool {
+        if self
+            .metrics
+            .family
+            .is_denylisted(&stuck.upstream, &stuck.model)
+            || self
+                .metrics
+                .family
+                .is_backpressured(&stuck.upstream, &stuck.model)
+        {
+            return true;
+        }
+        match self.upstream_index(&stuck.upstream) {
+            None => true,
+            Some(index) => !self.health.is_available(index),
+        }
+    }
+
+    /// Sticky serve pool: the stuck member first (it was validated by the
+    /// caller), then the alias's remaining table members in config order for
+    /// in-request failover — minus already-excluded members, so a transient
+    /// error on the stick never fails over onto a dead ID.
+    fn map_sticky_pool(&self, alias: &str, stuck: &StickyPick) -> Vec<UpstreamRef> {
+        let mut members = vec![FamilyMember {
+            upstream: stuck.upstream.clone(),
+            model: stuck.model.clone(),
+        }];
+        if let Some(all) = self.family_table.members(alias) {
+            for m in all {
+                if m.upstream == stuck.upstream && m.model == stuck.model {
+                    continue;
+                }
+                if self.metrics.family.is_denylisted(&m.upstream, &m.model)
+                    || self.metrics.family.is_backpressured(&m.upstream, &m.model)
+                {
+                    continue;
+                }
+                members.push(m.clone());
+            }
+        }
+        self.map_family_members(&members, alias)
+    }
+
     /// Dispatches a request, re-selecting a different upstream on rate-limit
     /// or transient failure until candidates are exhausted. `est_tokens` is
     /// the caller's estimate of this request's token cost, used for the
@@ -255,7 +432,12 @@ impl Router {
         stream: bool,
         est_tokens: u32,
     ) -> Result<ProviderResponse, ProviderError> {
-        let mut already_tried: HashSet<usize> = HashSet::new();
+        // Attempt tracking is per-(upstream index, model): two family members
+        // sharing one upstream are each addressable in a single request
+        // (Story 3.1 AC3) — the second same-index member is NOT filtered by
+        // the first's attempt. For non-family routes each candidate carries
+        // a fixed index+model, so this reduces to the old per-index set.
+        let mut already_tried: HashSet<(usize, String)> = HashSet::new();
         let mut last_error: Option<ProviderError> = None;
         let model = body
             .get("model")
@@ -278,17 +460,141 @@ impl Router {
         self.metrics
             .push_original_body(request_id.clone(), body.clone());
 
-        loop {
-            let healthy: Vec<UpstreamRef> = candidates
-                .iter()
-                .filter(|u| !already_tried.contains(&u.index) && self.health.is_available(u.index))
-                .cloned()
-                .collect();
+        // Family route-gate (auto-model-family Epic 3): expand the alias
+        // ONLY when the active route opts in via `family` AND the client
+        // sent exactly that alias. Un-gated aliases and unknown aliases
+        // (`UnknownAlias`) flow through untouched per existing pin semantics
+        // — which is also what makes hot-swap rollback restore pins while
+        // clients still send the alias.
+        //
+        // Resolution is the ranked Epic 3 path (`decide_route`: Epic 7's
+        // paid guard inside, then rank → pre-dispatch exclusion →
+        // hysteresis/probe/cap → snapshot publish, or the cooldown-scoped
+        // SafetyNetBypass). The pool is iterated directly in rank order
+        // (forced fallback — ranked order is meaningless under
+        // `WeightedStrategy` random sampling, which validation rejects for
+        // family routes).
+        let mut dispatch_body = body.clone();
+        let mut family_pool: Vec<UpstreamRef> = Vec::new();
+        let mut family_active = false;
+        let mut family_bypass = false;
+        // Pins-first (Epic 4 Story 4.1): a live session pin bypasses family
+        // expansion entirely — a pin means "use this," not "prefer this."
+        // `effective_candidates` above already narrowed to the pinned
+        // single-candidate path; the gate below must not re-expand the alias.
+        let pin_active = self.session_pin_active(session_id.as_deref());
+        if let Some(alias) = self.active_family.as_deref() {
+            let is_alias_request =
+                body.get("model").and_then(serde_json::Value::as_str) == Some(alias) && !pin_active;
+            if is_alias_request {
+                // Auto-stickiness (Epic 4 Story 4.2, STICKY-PER-SESSION): an
+                // unpinned session reuses its stuck pick until the K-window
+                // lapses (`served == sticky_every`) or the stuck member hits
+                // a cooldown/exclusion event. Sticky serves skip
+                // `resolve_family` — no snapshot/probe side effects — so an
+                // exploration probe can never yank a mid-conversation session
+                // off its model.
+                let mut sticky_served = false;
+                if let Some(sid) = session_id.as_deref() {
+                    if let Some(stuck) = self.session_overrides.sticky_lookup(sid, alias) {
+                        if stuck.served < self.session_overrides.sticky_every()
+                            && !self.sticky_pick_invalid(&stuck)
+                        {
+                            family_active = true;
+                            family_pool = self.map_sticky_pool(alias, &stuck);
+                            sticky_served = true;
+                            self.session_overrides.sticky_note_served(sid, alias);
+                        }
+                    }
+                }
+                if !sticky_served {
+                    match self.resolve_family(alias) {
+                        FamilyRouteDecision::UnknownAlias => {}
+                        FamilyRouteDecision::Serve {
+                            ordered, reason, ..
+                        } => {
+                            family_active = true;
+                            family_pool = self.map_family_members(&ordered, alias);
+                            // First family resolution for a session records
+                            // the pick; probes are never stuck to (a session
+                            // must not stick to a sampled member — the next
+                            // request re-resolves to the real pick).
+                            if reason != FamilyReason::Probe {
+                                if let (Some(sid), Some(first)) =
+                                    (session_id.as_deref(), ordered.first())
+                                {
+                                    self.session_overrides.sticky_record(
+                                        sid,
+                                        alias,
+                                        &first.upstream,
+                                        &first.model,
+                                    );
+                                }
+                            }
+                        }
+                        FamilyRouteDecision::Bypass { ordered } => {
+                            family_active = true;
+                            family_bypass = true;
+                            family_pool = self.map_family_members(&ordered, alias);
+                        }
+                        FamilyRouteDecision::Unavailable { all_denylisted } => {
+                            return Err(if all_denylisted {
+                                // The bypass must never mask 404/auth/validation:
+                                // every candidate is 404-denylisted (or nothing
+                                // is servable), so the validation error surfaces
+                                // instead of a fabricated success.
+                                ProviderError::Validation(
+                                    format!(
+                                        "family {alias}: all members excluded (404-denylisted)"
+                                    ),
+                                    404,
+                                )
+                            } else {
+                                // All members 429-walled: error without retrying
+                                // the rate-limited upstream (bypass declined).
+                                ProviderError::Exhausted
+                            });
+                        }
+                    }
+                }
+                if let Some(first) = family_pool.first() {
+                    dispatch_body["model"] = serde_json::Value::String(
+                        first.model.clone().unwrap_or_else(|| alias.to_string()),
+                    );
+                }
+            }
+        }
 
-            let Some(chosen) = self.strategy.select(&healthy) else {
+        loop {
+            // Family requests iterate the resolved pool directly in rank
+            // order. Deliberately NO `is_available` re-filter here:
+            // pre-dispatch exclusion already ran in `decide_route`, and a
+            // mid-request 429 trip on a shared upstream index must NOT block
+            // the same-upstream sibling later in this same pool (the sibling
+            // stays eligible; only the 429'd member is personally marked).
+            let chosen = if family_active {
+                family_pool
+                    .iter()
+                    .find(|u| {
+                        !already_tried.contains(&(u.index, u.model.clone().unwrap_or_default()))
+                    })
+                    .cloned()
+            } else {
+                let healthy: Vec<UpstreamRef> = candidates
+                    .iter()
+                    .filter(|u| {
+                        !already_tried.contains(&(u.index, u.model.clone().unwrap_or_default()))
+                            && self.health.is_available(u.index)
+                    })
+                    .cloned()
+                    .collect();
+
+                self.strategy.select(&healthy)
+            };
+            let Some(chosen) = chosen else {
                 break;
             };
-            already_tried.insert(chosen.index);
+            already_tried.insert((chosen.index, chosen.model.clone().unwrap_or_default()));
 
             // ADR-004: post-selection admission check, before the provider
             // call — a Shed re-selects from the remaining pool via the same
@@ -306,16 +612,59 @@ impl Router {
             let provider = &self.providers[chosen.index];
             let request_body = match &chosen.model {
                 Some(model) => {
-                    let mut b = body.clone();
+                    let mut b = dispatch_body.clone();
                     b["model"] = serde_json::Value::String(model.clone());
                     b
                 }
-                None => body.clone(),
+                None => dispatch_body.clone(),
+            };
+            // Epic 2 dual-write key: the model ID actually sent to this
+            // upstream (per-candidate override wins, else the dispatch body
+            // — which carries the family-resolved ID on family routes), so
+            // members sharing one upstream get separate stats buckets.
+            let resolved_model: String = match &chosen.model {
+                Some(m) => m.clone(),
+                None => dispatch_body
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(model.as_str())
+                    .to_string(),
             };
             let attempt_started = std::time::Instant::now();
-            match provider.send(request_body, headers.clone(), stream).await {
+            // Concurrency cap (family path only, never the bypass): admit
+            // one in-flight slot for this member just before sending — the
+            // resolve-time partition already preferred under-cap members, and
+            // this closes the race for concurrent bursts. A lost race skips
+            // to the sibling instead of exceeding the cap.
+            let member_slot: Option<(String, String)> = if family_active && !family_bypass {
+                chosen.model.clone().map(|m| (chosen.name.clone(), m))
+            } else {
+                None
+            };
+            if let Some((slot_upstream, slot_model)) = &member_slot {
+                if !self.metrics.family.try_acquire_inflight(
+                    slot_upstream,
+                    slot_model,
+                    DEFAULT_CONCURRENCY_CAP,
+                ) {
+                    continue;
+                }
+            }
+            let send_result = provider.send(request_body, headers.clone(), stream).await;
+            if let Some((slot_upstream, slot_model)) = &member_slot {
+                self.metrics
+                    .family
+                    .release_inflight(slot_upstream, slot_model);
+            }
+            match send_result {
                 Ok(response) => {
-                    self.record_attempt(&chosen.name, attempt_started, Ok(()), &model);
+                    self.record_attempt(
+                        &chosen.name,
+                        attempt_started,
+                        Ok(()),
+                        &model,
+                        &resolved_model,
+                    );
                     #[allow(clippy::cast_precision_loss)]
                     let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
                     // First-byte time isn't separately measured here (see
@@ -333,13 +682,43 @@ impl Router {
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    // Accepted limitation (Story 3.2): the first request
+                    // after a fresh delist still fails here — validation
+                    // returns immediately with no failover. The 404 writer in
+                    // `record_attempt` feeds the denylist below, so requests
+                    // N+1.. skip the dead ID pre-dispatch until the 1h TTL.
+                    self.record_attempt(
+                        &chosen.name,
+                        attempt_started,
+                        Err(&e),
+                        &model,
+                        &resolved_model,
+                    );
                     return Err(e);
                 }
                 Err(e) if e.is_rate_limited() => {
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.record_attempt(
+                        &chosen.name,
+                        attempt_started,
+                        Err(&e),
+                        &model,
+                        &resolved_model,
+                    );
                     let override_duration = e.retry_after_secs().map(Duration::from_secs);
-                    self.health.trip(chosen.index, override_duration);
+                    // 429 is backpressure, not quality: trip the shared index
+                    // AND mark this member personally (same TTL on both, so
+                    // index cool and personal mark agree on recovery). A
+                    // same-upstream sibling with no personal mark stays
+                    // eligible; the bypass never retries a 429-walled index.
+                    let until = self
+                        .health
+                        .trip_backpressure(chosen.index, override_duration)
+                        .unwrap_or_else(|| {
+                            std::time::Instant::now() + self.health.default_cooldown_duration()
+                        });
+                    self.metrics
+                        .family
+                        .note_backpressure(&chosen.name, &resolved_model, until);
                     last_error = Some(e);
                 }
                 Err(e) if e.is_response_shape_mismatch() => {
@@ -349,7 +728,13 @@ impl Router {
                     // using a longer override than the default so a
                     // permanently-broken Gemini endpoint isn't retried on
                     // every request forever.
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.record_attempt(
+                        &chosen.name,
+                        attempt_started,
+                        Err(&e),
+                        &model,
+                        &resolved_model,
+                    );
                     self.health.trip(
                         chosen.index,
                         Some(Duration::from_secs(ProviderError::DRIFT_COOLDOWN_SECS)),
@@ -357,7 +742,13 @@ impl Router {
                     last_error = Some(e);
                 }
                 Err(e) => {
-                    self.record_attempt(&chosen.name, attempt_started, Err(&e), &model);
+                    self.record_attempt(
+                        &chosen.name,
+                        attempt_started,
+                        Err(&e),
+                        &model,
+                        &resolved_model,
+                    );
                     last_error = Some(e);
                 }
             }
@@ -402,14 +793,22 @@ impl Router {
     /// time-to-headers only (`provider.send` returns once the stream is
     /// ready, not once it's fully consumed) — full stream duration would
     /// need a metrics-side tee analogous to `CostTrackingStream`.
+    ///
+    /// `model` is the request's model field (for the error tracker);
+    /// `resolved_model` is the ID actually sent to this upstream, dual-
+    /// written into the `FamilyRuntime` stats map keyed by
+    /// `(upstream_name, resolved_model)` (auto-model-family Epic 2) — the
+    /// existing per-upstream counters below are untouched by that seam.
     fn record_attempt(
         &self,
         upstream: &str,
         started: std::time::Instant,
         outcome: Result<(), &ProviderError>,
         model: &str,
+        resolved_model: &str,
     ) {
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let outcome_err = outcome.as_ref().err().copied();
         match outcome {
             Ok(()) => {
                 self.metrics
@@ -435,6 +834,40 @@ impl Router {
                     .push(&e.to_string(), upstream, model);
             }
         }
+        // Epic 2 dual-write: per-(upstream, resolved model) decayed stats
+        // for the family ranker. Classified per the write table inside
+        // `record_member` (429/auth/validation never touch the quality
+        // rate); the per-upstream counters above are byte-identical.
+        //
+        // Epic 3 denylist writer: the returned classification feeds 404-only
+        // exclusion — `Validation(_, 404)` (never 400: client errors must not
+        // quarantine a healthy member) and `ModelUnsupported` mark the
+        // member dead for the 1h TTL, so the NEXT request skips it
+        // pre-dispatch. The first request after a fresh delist still fails
+        // (validation returns immediately with no failover — documented
+        // accepted limitation).
+        let class =
+            self.metrics
+                .family
+                .record_member(upstream, resolved_model, outcome_err, duration_ms);
+        if class == MemberRecordClass::DenylistFeed
+            || matches!(outcome_err, Some(ProviderError::Validation(_, 404)))
+        {
+            self.metrics
+                .family
+                .denylist_insert(upstream, resolved_model);
+        }
+    }
+
+    /// Scope-clears `FamilyRuntime` stats/denylist entries whose
+    /// `(upstream, model)` left the rebuilt [`FamilyTable`] — the single
+    /// Epic 2 call on the `post_route` rebuild path (`api.rs`). The runtime
+    /// itself is owned by the shared `MetricsCollector`, so all other
+    /// learning survives the rebuild.
+    pub fn prune_family_runtime(&self) {
+        let live = self.metrics.family.member_keys();
+        let retained = self.family_table.drop_stale_keys(&live);
+        self.metrics.family.retain_members(&retained);
     }
 }
 
@@ -874,6 +1307,7 @@ mod tests {
                     weight: None,
                     model: None,
                 }],
+                family: None,
             }],
             ..Config::default()
         };
@@ -912,6 +1346,7 @@ mod tests {
                 weight: None,
                 model: None,
             }],
+            family: None,
         };
         config.routes = vec![route_a, route_b];
 
@@ -1080,6 +1515,88 @@ mod tests {
             1,
             "the primary's failure must be pushed into the error tracker"
         );
+    }
+
+    // Epic 2 (Story 2.2): dispatch dual-writes per-(upstream, resolved
+    // model) decayed stats alongside the untouched per-upstream counters.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_dual_write_member_stats_keyed_by_resolved_model() {
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "openrouter".to_string(),
+                weight: 1.0,
+                model: Some("model-a:free".to_string()),
+            }],
+            vec![Arc::new(AlwaysOkProvider {
+                name: "openrouter",
+                call_count: Arc::new(AtomicU32::new(0)),
+            })],
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics.clone(),
+        );
+
+        let res = router
+            .dispatch(
+                serde_json::json!({"model": "auto-coding"}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+        assert!(res.is_ok());
+
+        let view = metrics.family.member_view("openrouter", "model-a:free");
+        assert_eq!(view.samples, 1);
+        assert!(view.cold, "n=1 must still report cold (unknown ≠ perfect)");
+
+        let upstream = metrics.counters.upstreams.get("openrouter").unwrap();
+        assert_eq!(upstream.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(upstream.success.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_exclude_rate_limited_attempt_from_member_quality_rate() {
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "openrouter".to_string(),
+                weight: 1.0,
+                model: Some("model-a:free".to_string()),
+            }],
+            vec![Arc::new(AlwaysErrProvider {
+                name: "openrouter",
+                error: || ProviderError::RateLimited,
+                call_count: Arc::new(AtomicU32::new(0)),
+            })],
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics.clone(),
+        );
+
+        let res = router
+            .dispatch(
+                serde_json::json!({"model": "auto-coding"}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+        assert!(matches!(res, Err(ProviderError::RateLimited)));
+
+        // Backpressure cools the upstream but never blames member quality.
+        let view = metrics.family.member_view("openrouter", "model-a:free");
+        assert_eq!(view.samples, 0);
+        let upstream = metrics.counters.upstreams.get("openrouter").unwrap();
+        assert_eq!(upstream.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(upstream.errors.load(Ordering::Relaxed), 1);
     }
 
     // REQ-9 (Story 1.4.3, ADR-002) — focus area.
@@ -1438,6 +1955,118 @@ mod tests {
         assert_eq!(
             snapshot["anthropic"],
             serde_json::json!({"cooling_down": false, "remaining_seconds": 0})
+        );
+    }
+
+    // Epic 4 Story 4.1 (R6 unit row): a session pin beats family resolution.
+    // Pins-first order is asserted in `dispatch` (`session_pin_active`
+    // bypasses the family gate); this test pins `s1` to A while the ranked
+    // family pick is B and proves the outgoing model is still A.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn session_pin_should_win_over_family_resolution_when_pin_exists() {
+        use crate::config::schema::{FamilyMember, ModelFamily};
+        use crate::routing::family::FamilyTable;
+        use crate::routing::session_overrides::{SessionOverride, SessionOverrideStore};
+
+        let received_a = Arc::new(std::sync::Mutex::new(None));
+        let received_b = Arc::new(std::sync::Mutex::new(None));
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapturingProvider {
+                name: "mock-a",
+                received_body: received_a.clone(),
+            }),
+            Arc::new(CapturingProvider {
+                name: "mock-b",
+                received_body: received_b.clone(),
+            }),
+        ];
+        let metrics = MetricsCollector::new();
+        // Seed the ranked pick to B: A warm-bad (25 timeouts), B warm-good.
+        for _ in 0..25 {
+            let _ = metrics.family.record_member(
+                "mock-a",
+                "model-a:free",
+                Some(&ProviderError::Timeout),
+                5000,
+            );
+            let _ = metrics
+                .family
+                .record_member("mock-b", "model-b:free", None, 50);
+        }
+
+        let mut config = Config::default();
+        config.families = vec![ModelFamily {
+            alias: "auto-coding".to_string(),
+            members: vec![
+                FamilyMember {
+                    upstream: "mock-a".to_string(),
+                    model: "model-a:free".to_string(),
+                },
+                FamilyMember {
+                    upstream: "mock-b".to_string(),
+                    model: "model-b:free".to_string(),
+                },
+            ],
+            allow_paid: false,
+        }];
+        let table = Arc::new(FamilyTable::from_config(&config));
+
+        let session_overrides = Arc::new(SessionOverrideStore::new());
+        session_overrides.set(
+            "s1".to_string(),
+            SessionOverride {
+                upstream: "mock-a".to_string(),
+                model: Some("model-a:free".to_string()),
+            },
+        );
+        let router = Router::new(
+            vec![upstream(0, "mock-a"), upstream(1, "mock-b")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics,
+        )
+        .with_session_overrides(session_overrides)
+        .with_family_table(table, Some("auto-coding".to_string()));
+
+        // Control: unpinned `s2` resolves to the ranked pick B.
+        let res = router
+            .dispatch(
+                serde_json::json!({"model": "auto-coding", "metadata": {"user_id": "s2"}}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+        assert!(res.is_ok());
+        assert_eq!(
+            received_b
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("mock-b must serve s2")["model"],
+            serde_json::json!("model-b:free")
+        );
+
+        // Pinned `s1` serves A despite the family pick being B.
+        let res = router
+            .dispatch(
+                serde_json::json!({"model": "auto-coding", "metadata": {"user_id": "s1"}}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+        assert!(res.is_ok());
+        assert_eq!(
+            received_a
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("mock-a must serve s1")["model"],
+            serde_json::json!("model-a:free")
         );
     }
 }

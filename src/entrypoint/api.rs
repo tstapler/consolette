@@ -69,7 +69,14 @@ pub async fn get_models(
     Ok(Json(Value::Object(upstreams)))
 }
 
-/// The active route, as currently loaded from conf.d + runtime overrides.
+/// The active route, as currently loaded from conf.d + runtime overrides,
+/// enriched (additively) so family entries read unambiguously vs pinned
+/// ones (Epic 5a, Story 5.1 AC3): every existing `Route` field stays at the
+/// top level untouched, plus `entry_kind` (`"family"` when the route opts
+/// into an alias via `family`, else `"pinned"`) and `family_detail` (null
+/// for pinned routes; otherwise the alias, its configured members, the
+/// current pick from the `FamilyRuntime` snapshot — config-order first
+/// member when still cold — and `resolutions_total`).
 ///
 /// # Errors
 ///
@@ -77,12 +84,51 @@ pub async fn get_models(
 /// configured.
 pub async fn get_route(
     State(state): State<EntrypointState>,
-) -> Result<Json<Route>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let config = crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
-    config.routes.into_iter().next().map(Json).ok_or((
+    let route = config.routes.into_iter().next().ok_or((
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "no route configured" })),
-    ))
+    ))?;
+    let mut value = serde_json::to_value(&route).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to serialize route: {e}") })),
+        )
+    })?;
+    match route.family.as_deref() {
+        Some(alias) => {
+            value["entry_kind"] = json!("family");
+            value["family_detail"] =
+                config
+                    .families
+                    .iter()
+                    .find(|f| f.alias == alias)
+                    .map_or(Value::Null, |fam| {
+                        let current_pick = state
+                            .metrics
+                            .family
+                            .snapshot(alias)
+                            .map(|s| s.picked.model)
+                            .or_else(|| fam.members.first().map(|m| m.model.clone()));
+                        let (resolutions_total, _) = state.metrics.family.counter_snapshot(alias);
+                        json!({
+                            "alias": fam.alias,
+                            "members": fam.members.iter().map(|m| json!({
+                                "upstream": m.upstream,
+                                "model": m.model,
+                            })).collect::<Vec<_>>(),
+                            "current_pick": current_pick,
+                            "resolutions_total": resolutions_total,
+                        })
+                    });
+        }
+        None => {
+            value["entry_kind"] = json!("pinned");
+            value["family_detail"] = Value::Null;
+        }
+    }
+    Ok(Json(value))
 }
 
 /// Replaces the active route: validates the proposed route's upstream
@@ -98,13 +144,38 @@ pub async fn post_route(
     State(state): State<EntrypointState>,
     Json(route): Json<Route>,
 ) -> Result<Json<Route>, (StatusCode, Json<Value>)> {
-    let mut candidate =
-        crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
+    // Families ride the conf.d reload (NOT `RuntimeOverrides::apply`, which
+    // only replaces routes), so a conf.d family edit is validated here on
+    // the same path as the posted route: semantic config errors map to 400
+    // (mirroring `post_route_rejects_unknown_upstream`), load/IO failures
+    // stay 500. Nothing is persisted and the live router is untouched until
+    // every check below passes.
+    let mut candidate = crate::config::load(&state.config_dir).map_err(|e| match &e {
+        crate::config::ConfigError::PaidMemberInFreeFamily { .. }
+        | crate::config::ConfigError::UnknownUpstreamReference { .. }
+        | crate::config::ConfigError::WeightedFamilyRoute { .. } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+        _ => config_load_error(&e),
+    })?;
     let overrides = RuntimeOverrides {
         route: Some(route.clone()),
     };
     overrides.apply(&mut candidate);
     crate::config::validate_references(&candidate).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+    crate::config::validate_free_guard(&candidate).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+    crate::config::validate_family_strategy(&candidate).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),
@@ -127,6 +198,10 @@ pub async fn post_route(
             )
         })?
         .with_session_overrides(std::sync::Arc::clone(&state.session_overrides));
+    // Epic 2: the FamilyRuntime (stats/denylist) survives on the shared
+    // `MetricsCollector` — scope-clear only entries whose (upstream, model)
+    // left the rebuilt FamilyTable, so stale state never shadows a member.
+    new_router.prune_family_runtime();
     state.dispatch_router.store(std::sync::Arc::new(new_router));
 
     Ok(Json(route))
@@ -260,10 +335,12 @@ name = "anthropic"
         let state = state_for(dir.path()).await;
 
         let Json(route) = get_route(State(state)).await.unwrap();
-        assert_eq!(route.name, "default");
-        assert_eq!(route.strategy, Strategy::Fallback);
-        assert_eq!(route.upstreams.len(), 1);
-        assert_eq!(route.upstreams[0].name, "anthropic");
+        assert_eq!(route["name"], json!("default"));
+        assert_eq!(route["strategy"], json!("fallback"));
+        assert_eq!(route["upstreams"][0]["name"], json!("anthropic"));
+        // No `family` field on the route → unambiguously a pinned entry.
+        assert_eq!(route["entry_kind"], json!("pinned"));
+        assert_eq!(route["family_detail"], Value::Null);
     }
 
     #[tokio::test]
@@ -280,6 +357,7 @@ name = "anthropic"
                 weight: None,
                 model: None,
             }],
+            family: None,
         };
 
         let err = post_route(State(state), Json(bogus)).await.unwrap_err();
@@ -304,6 +382,7 @@ name = "anthropic"
                 weight: Some(1.0),
                 model: Some("pinned-model".to_string()),
             }],
+            family: None,
         };
 
         let Json(applied) = post_route(State(state.clone()), Json(new_route.clone()))
@@ -315,9 +394,13 @@ name = "anthropic"
         let persisted = RuntimeOverrides::load(dir.path()).unwrap();
         assert_eq!(persisted.route, Some(new_route.clone()));
 
-        // A subsequent GET (re-reading from disk) reflects the change.
+        // A subsequent GET (re-reading from disk) reflects the change; the
+        // enriched shape keeps every Route field at the top level.
         let Json(fetched) = get_route(State(state.clone())).await.unwrap();
-        assert_eq!(fetched, new_route);
+        assert_eq!(fetched["name"], json!("default"));
+        assert_eq!(fetched["strategy"], json!("weighted"));
+        assert_eq!(fetched["upstreams"][0]["name"], json!("bedrock"));
+        assert_eq!(fetched["entry_kind"], json!("pinned"));
 
         // The live router was hot-swapped, not just the on-disk config.
         let live = state.dispatch_router.load();

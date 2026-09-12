@@ -10,7 +10,7 @@ use figment::Figment;
 use super::plugins;
 use super::runtime_overrides::RuntimeOverrides;
 use super::schema::{Config, Upstream, UpstreamKind};
-use super::validate::validate_references;
+use super::validate::{validate_family_strategy, validate_free_guard, validate_references};
 use super::ConfigError;
 
 /// Env overrides are restricted to a small allowlist of top-level scalars —
@@ -54,6 +54,8 @@ pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
     overrides.apply(&mut config);
 
     validate_references(&config)?;
+    validate_free_guard(&config)?;
+    validate_family_strategy(&config)?;
     Ok(config)
 }
 
@@ -173,4 +175,91 @@ fn apply_legacy_env_shim(config: &mut Config) {
     // `SecretRef::Env { var: "CLAUDE_CODE_OAUTH_TOKEN" }` by name. Read it
     // anyway so its presence still surfaces the one-time deprecation warning.
     let _ = legacy_env("CLAUDE_CODE_OAUTH_TOKEN");
+}
+
+#[cfg(test)]
+mod tests {
+    /// `families: Vec` layers like `routes`/`upstreams`: figment
+    /// array-replace means the LAST file wins wholesale — a family split
+    /// across two fragments is clobbered, so the convention is one
+    /// `20-family.toml` fragment. This test pins that behavior so a future
+    /// figment upgrade changing array merge semantics fails loudly.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn conf_d_two_family_fragments_clobber_with_last_file_winning() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_d = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        std::fs::write(
+            conf_d.join("20-family.toml"),
+            r#"
+[[model_families]]
+alias = "auto-coding"
+
+[[model_families.members]]
+upstream = "anthropic"
+model = "first-model:free"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            conf_d.join("30-family.toml"),
+            r#"
+[[model_families]]
+alias = "auto-coding-paid"
+allow_paid = true
+
+[[model_families.members]]
+upstream = "anthropic"
+model = "gpt-4o"
+"#,
+        )
+        .unwrap();
+
+        let config = super::load(dir.path()).unwrap();
+
+        let aliases: Vec<&str> = config.families.iter().map(|f| f.alias.as_str()).collect();
+        assert_eq!(
+            aliases,
+            vec!["auto-coding-paid"],
+            "figment array-replace: the later fragment replaces [[model_families]] wholesale"
+        );
+        assert_eq!(config.families[0].members[0].model, "gpt-4o");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn conf_d_single_family_fragment_loads_members_in_declared_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_d = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        std::fs::write(
+            conf_d.join("20-family.toml"),
+            r#"
+[[model_families]]
+alias = "auto-coding"
+
+[[model_families.members]]
+upstream = "anthropic"
+model = "model-a:free"
+
+[[model_families.members]]
+upstream = "bedrock"
+model = "model-b:free"
+"#,
+        )
+        .unwrap();
+
+        let config = super::load(dir.path()).unwrap();
+
+        assert_eq!(config.families.len(), 1);
+        assert_eq!(config.families[0].alias, "auto-coding");
+        let models: Vec<&str> = config.families[0]
+            .members
+            .iter()
+            .map(|m| m.model.as_str())
+            .collect();
+        assert_eq!(models, vec!["model-a:free", "model-b:free"]);
+        assert!(!config.families[0].allow_paid);
+    }
 }

@@ -163,6 +163,38 @@ pub struct Route {
     pub name: String,
     pub strategy: Strategy,
     pub upstreams: Vec<RouteUpstreamRef>,
+    /// Opt-in family alias this route resolves (e.g. `auto-coding`).
+    /// Dispatch expands `body["model"]` to a ranked family member ONLY when
+    /// the active route names the alias here; absent field = zero behavior
+    /// change (pin semantics untouched, rollback = swap back to a route
+    /// without this field).
+    #[serde(default)]
+    pub family: Option<String>,
+}
+
+/// One resolvable candidate inside a [`ModelFamily`]: the upstream to send
+/// to paired with the real model ID to put on the outgoing body.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyMember {
+    pub upstream: String,
+    pub model: String,
+}
+
+/// A named pool of interchangeable models (`auto-coding` free-only,
+/// `auto-coding-paid` opt-in paid) resolved per-session to the best real
+/// model ID. Declared in conf.d (`20-family.toml` convention); config order
+/// is the cold-start default.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelFamily {
+    pub alias: String,
+    #[serde(default)]
+    pub members: Vec<FamilyMember>,
+    /// When false (default), [`crate::config::validate::validate_free_guard`]
+    /// rejects member IDs that are not verifiably free.
+    #[serde(default)]
+    pub allow_paid: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,6 +304,11 @@ pub struct Config {
     pub upstreams: Vec<Upstream>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// Synthetic family aliases (`[[model_families]]`, single-fragment
+    /// `20-family.toml` convention — figment array-replace clobbers split
+    /// fragments, same pre-existing footgun as `[[upstreams]]`).
+    #[serde(default, rename = "model_families")]
+    pub families: Vec<ModelFamily>,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
     #[serde(default)]
@@ -366,9 +403,11 @@ impl Default for Config {
                         model: None,
                     },
                 ],
+                family: None,
             }],
             ratelimit: RateLimitConfig::default(),
             cost_metrics: CostMetricsConfig::default(),
+            families: Vec::new(),
         }
     }
 }

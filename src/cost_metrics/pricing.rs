@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -115,6 +115,38 @@ impl PricingTable {
     pub fn price_for(&self, model: &str) -> Option<ModelPrice> {
         self.prices.get(model).copied()
     }
+}
+
+/// Process-wide cache of the static vendored default snapshot. Parsing the
+/// vendored JSON once (instead of per member per request on the family hot
+/// path) is safe because the vendored bytes are a compile-time constant —
+/// the live-refresh overlay (`refresh_once`'s `watch`-held table) is a
+/// separate `Arc<PricingTable>` and is never stored here.
+static VENDORED_DEFAULT_TABLE: OnceLock<PricingTable> = OnceLock::new();
+
+/// The cached static vendored default. Never the live overlay — callers
+/// that need live rates must read the `watch`-held table instead.
+#[must_use]
+pub fn vendored_default() -> &'static PricingTable {
+    VENDORED_DEFAULT_TABLE.get_or_init(PricingTable::load_default)
+}
+
+/// The single free-guard predicate: a `:free` suffix (fail-open for
+/// provider-side rotation) or a vendored pricing snapshot entry priced at
+/// exactly zero. Anything else (snapshot-listed paid IDs, pricing-unknown
+/// non-`:free` IDs) counts as paid / fail-closed.
+///
+/// Both [`crate::config::validate::validate_free_guard`] (load-time) and
+/// [`crate::routing::family::is_verifiably_free`] (runtime) delegate here,
+/// so the rule exists exactly once.
+#[must_use]
+pub(crate) fn is_free_model_id(model: &str, pricing: &PricingTable) -> bool {
+    if model.ends_with(":free") {
+        return true;
+    }
+    pricing
+        .price_for(model)
+        .is_some_and(|p| p.input_usd_per_token == 0.0 && p.output_usd_per_token == 0.0)
 }
 
 /// Process-wide count of pricing live-refresh fallback events
@@ -305,6 +337,22 @@ mod tests {
         let price = snapshot.models.get("no-cache-fields-model").unwrap();
         assert_eq!(price.cache_read_usd_per_token, 0.0);
         assert_eq!(price.cache_creation_usd_per_token, 0.0);
+    }
+
+    #[test]
+    fn is_free_model_id_should_match_suffix_or_zero_priced_snapshot_entry() {
+        let mut table = PricingTable::new();
+        table.insert("zero-model", tc_price(0.0, 0.0));
+        table.insert("paid-model", tc_price(0.000_003, 0.000_015));
+        // :free suffix wins even when pricing-unknown (fail-open rotation).
+        assert!(is_free_model_id("cohere/new-model:free", &table));
+        // Explicitly zero-priced snapshot entry counts as free.
+        assert!(is_free_model_id("zero-model", &table));
+        // Snapshot-listed paid and pricing-unknown non-:free IDs fail closed.
+        assert!(!is_free_model_id("paid-model", &table));
+        assert!(!is_free_model_id("anthropic/mystery-model", &table));
+        // The cached vendored default is the same table every call.
+        assert!(std::ptr::eq(vendored_default(), vendored_default()));
     }
 
     #[test]

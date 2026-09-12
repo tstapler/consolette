@@ -302,4 +302,40 @@ mod tests {
         assert!(text.contains("\"finish_reason\":\"stop\""));
         assert!(text.ends_with("data: [DONE]\n\n"));
     }
+
+    #[test]
+    fn chat_completions_should_carry_family_alias_into_dispatch_when_model_is_auto_coding() {
+        // Epic 6 AC2 (validation R2): the alias passes *through*
+        // `translate_openai_to_anthropic` into dispatch untouched — the
+        // overwrite with the resolved real ID happens downstream in
+        // `Router::dispatch` (proven by
+        // `chat_completions_should_overwrite_alias_with_resolved_id_when_family_route_active`
+        // in `tests/family_opencode_path.rs`), never by pre-translate
+        // interception here. Both OpenAI session-key shapes must survive
+        // alongside the alias so Epic 4 pins apply on the opencode path.
+        for openai in [
+            serde_json::json!({
+                "model": "auto-coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "user": "s1",
+            }),
+            serde_json::json!({
+                "model": "auto-coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "metadata": {"user_id": "s1"},
+            }),
+        ] {
+            let translated = translate_openai_to_anthropic(&openai);
+            assert_eq!(
+                translated["model"],
+                serde_json::json!("auto-coding"),
+                "translated body must still carry the alias into dispatch"
+            );
+            assert_eq!(
+                translated["metadata"]["user_id"],
+                serde_json::json!("s1"),
+                "session key must survive translation for pin lookup"
+            );
+        }
+    }
 }

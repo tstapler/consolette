@@ -4,6 +4,7 @@
 pub mod counters;
 pub mod error_tracker;
 pub mod histogram;
+pub mod member_stats;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,11 @@ use tokio::time::sleep;
 pub use counters::ProxyMetrics;
 pub use error_tracker::{AggregatedError, ErrorRecord, ErrorTracker};
 pub use histogram::DurationHistogram;
+pub use member_stats::{
+    classify_for_member_stats, confidently_better, wilson_interval, FamilyRuntime, MemberKey,
+    MemberRecordClass, MemberStats, MemberStatsMap, MemberView, PickedMember, ResolutionCounter,
+    ResolutionSnapshot, DENYLIST_TTL, MIN_SAMPLES, SMALL_N_BAND, SMALL_N_DELTA,
+};
 
 // Re-export so callers can use metrics::AggregatedError etc. without
 // specifying the sub-module path.
@@ -155,6 +161,12 @@ pub struct MetricsCollector {
     lag_samples: Mutex<VecDeque<LagSample>>,
     /// Most recent lag measurement in milliseconds.
     current_lag_ms: Mutex<f64>,
+    /// Mutable per-family runtime (decayed stats map, 1h-TTL denylist stub,
+    /// snapshots, counters, probe/hysteresis state), keyed by
+    /// `(upstream_name, model_id)`. Lives here — not on the `Router` — so
+    /// `post_route` rebuilds preserve learning while the immutable
+    /// `FamilyTable` is rebuilt from config (ADR-003).
+    pub family: FamilyRuntime,
 }
 
 impl MetricsCollector {
@@ -168,6 +180,7 @@ impl MetricsCollector {
             original_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
+            family: FamilyRuntime::new(),
         })
     }
 
@@ -335,6 +348,22 @@ impl MetricsCollector {
             .collect()
     }
 
+    // ── Family section read-out (Epic 5a, Story 5.1) ───────────────────────
+
+    /// Builds the `/metrics` `family` section (ux.md N2 shape) from the
+    /// `FamilyRuntime` snapshots/counters owned here. Read-only: stats keep
+    /// flowing through Epic 2/3's write paths (`record_member`,
+    /// `record_snapshot`, `record_fallback`, `record_paid_resolution`);
+    /// membership comes from the caller's config slice so zero-resolution
+    /// aliases still report `cold` instead of vanishing.
+    #[must_use]
+    pub fn family_section(
+        &self,
+        families: &[crate::config::schema::ModelFamily],
+    ) -> serde_json::Value {
+        self.family.family_section_json(families)
+    }
+
     // ── Full metrics JSON for GET /metrics ───────────────────────────────────
 
     /// Build the full `/metrics` JSON response (wire-compatible with the
@@ -403,6 +432,7 @@ impl Default for MetricsCollector {
             original_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
+            family: FamilyRuntime::new(),
         }
     }
 }

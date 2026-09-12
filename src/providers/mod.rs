@@ -264,6 +264,23 @@ pub fn translate_openai_to_anthropic(openai: &serde_json::Value) -> serde_json::
         body["temperature"] = temp;
     }
 
+    // Epic 4 session-key carry-through: session pins key off
+    // `metadata.user_id` (`extract_session_id`), but the OpenAI shape carries
+    // the session key as top-level `user` or `metadata`. Fold it into the
+    // Anthropic-valid `metadata.user_id` (never forward a bare OpenAI `user`
+    // field: it is not Anthropic-valid) so pins apply on the opencode path,
+    // not just `/v1/messages`. Anthropic documents only `metadata.user_id`
+    // (anything else 400s with no failover), so carry just that key and drop
+    // every other `metadata` entry.
+    let user_id = openai
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(Value::as_str)
+        .or_else(|| openai.get("user").and_then(Value::as_str));
+    if let Some(user_id) = user_id {
+        body["metadata"] = json!({ "user_id": user_id });
+    }
+
     body
 }
 
@@ -601,6 +618,93 @@ mod tests {
     use crate::cost_metrics::types::RequestId;
     use crate::session_compaction::tiered::CompactionTier;
     use crate::session_compaction::SessionKey;
+
+    // Epic 4 Story 4.1: the OpenAI adapter must carry the session key into
+    // dispatch (which keys pins off `metadata.user_id`) instead of dropping
+    // it — the alias itself still passes through untouched for dispatch to
+    // overwrite with the resolved real ID (Epic 6 AC2).
+    #[test]
+    fn translate_openai_to_anthropic_should_carry_session_key_for_pin_lookup() {
+        let openai = serde_json::json!({
+            "model": "auto-coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "s1",
+        });
+        let translated = translate_openai_to_anthropic(&openai);
+        assert_eq!(translated["model"], serde_json::json!("auto-coding"));
+        assert_eq!(
+            crate::routing::session_overrides::extract_session_id(&translated),
+            Some("s1".to_string())
+        );
+        assert!(
+            translated.get("user").is_none(),
+            "bare OpenAI `user` must not leak into the Anthropic body"
+        );
+
+        let with_metadata = serde_json::json!({
+            "model": "auto-coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "s2"},
+        });
+        let translated = translate_openai_to_anthropic(&with_metadata);
+        assert_eq!(
+            crate::routing::session_overrides::extract_session_id(&translated),
+            Some("s2".to_string())
+        );
+
+        let plain = serde_json::json!({
+            "model": "auto-coding",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let translated = translate_openai_to_anthropic(&plain);
+        assert_eq!(
+            crate::routing::session_overrides::extract_session_id(&translated),
+            None
+        );
+    }
+
+    #[test]
+    fn translate_openai_to_anthropic_should_forward_only_user_id_metadata() {
+        // Anthropic documents only metadata.user_id — any other key 400s
+        // with no failover, so the allowlist must drop everything else
+        // while still carrying the session key from either shape.
+        let openai = serde_json::json!({
+            "model": "auto-coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "s1",
+            "metadata": {"user_id": "s2", "extra": "drop-me", "org": "drop-too"},
+        });
+        let translated = translate_openai_to_anthropic(&openai);
+        assert_eq!(
+            translated["metadata"],
+            serde_json::json!({"user_id": "s2"}),
+            "metadata.user_id wins over top-level user, other keys dropped"
+        );
+
+        let user_only = serde_json::json!({
+            "model": "auto-coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "s1",
+            "metadata": {"extra": "drop-me"},
+        });
+        let translated = translate_openai_to_anthropic(&user_only);
+        assert_eq!(
+            translated["metadata"],
+            serde_json::json!({"user_id": "s1"}),
+            "top-level user backfills user_id, other keys dropped"
+        );
+
+        let no_key = serde_json::json!({
+            "model": "auto-coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"extra": "drop-me"},
+        });
+        let translated = translate_openai_to_anthropic(&no_key);
+        assert!(
+            translated.get("metadata").is_none(),
+            "metadata with no session key must not be forwarded at all"
+        );
+    }
 
     #[test]
     fn rate_limited_with_retry_reports_seconds() {

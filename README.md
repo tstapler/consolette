@@ -53,6 +53,9 @@ consolette doesn't authenticate loopback requests):
       "models": {
         "claude-sonnet-4-5": {
           "name": "Claude Sonnet 4.5 (via consolette)"
+        },
+        "auto-coding": {
+          "name": "auto-coding (free pool, least-errors first)"
         }
       }
     }
@@ -91,6 +94,43 @@ Once running, the same route can be inspected and changed live from the web cont
 - `GET /api/models` — every configured upstream's live model catalog
 - `GET /api/route` — the active route (strategy, upstream weights, model overrides)
 - `POST /api/route` — replace the active route; persists to `~/.config/consolette/runtime-overrides.toml` and applies immediately, no restart
+
+## Auto model families (`auto-coding`)
+
+consolette can expose a synthetic family alias — `auto-coding (free pool,
+least-errors first)` — that resolves to the healthiest real member model
+(lowest decayed error-rate, then lowest latency) instead of a pinned ID.
+Membership is declared in `conf.d` (`[[model_families]]`), and the alias
+expands only when the active route opts in via `family = "auto-coding"`.
+
+Opencode setup: list the alias in the `consolette` provider `models` map
+next to the pinned models (sample above — selecting the alias needs no
+opencode restart/reconfig when members change). The paid opt-in alias, when
+configured, is labeled distinctly (`auto-coding-paid — may spend`).
+
+- Sticky per session: the pick sticks per session and re-evaluates on a
+  member cooldown/exclusion event or every 50 family resolutions. Session
+  pins (`POST /api/sessions/{id}/route`) always win over family resolution.
+- First request after a delist still fails once: a fresh 404 maps to an
+  immediate validation error with no failover; that failure feeds the 1h
+  denylist, so repeat requests skip the dead ID. Plan for one failure per
+  rotation.
+- Rollback (copy-paste, no restart): hot-swap back to the pinned route while
+  clients still send the alias — pins take over again immediately:
+
+  ```bash
+  curl -X POST http://localhost:PORT/api/route -H 'Content-Type: application/json' -d '{"name":"default-pinned"}'
+  ```
+
+  Replace `PORT` with the port consolette listens on (`47000` by default);
+  `default-pinned` is the exact pinned route name.
+
+- Resolution overhead budget: p99 ≤ 1ms at family sizes ≤ 8 (measured
+  2026-09-12, dev profile: rank p99 ≈ 3.6µs, full dispatch-seam p99 ≈ 54µs
+  vs static-pin baseline ≈ 190ns — ~20× inside budget; see
+  `tests/family_perf.rs`). No Epic 5 rollout-note file exists yet, so the
+  budget and measured numbers live here until Epic 5b places the family
+  card.
 
 ## CLI reference
 

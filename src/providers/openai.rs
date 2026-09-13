@@ -224,6 +224,15 @@ impl OpenaiProvider {
     ) -> Result<reqwest::Response, ProviderError> {
         body["stream"] = Value::Bool(true);
 
+        if crate::providers::bodies_logged() {
+            tracing::info!(
+                target: "consolette::bodies",
+                upstream = %self.upstream.name,
+                body = %crate::providers::redact_bodies(&body),
+                "openai upstream stream request"
+            );
+        }
+
         let url = format!("{}/v1/chat/completions", self.base_url);
         let headers = self.build_headers(&url).await?;
         let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Upstream {

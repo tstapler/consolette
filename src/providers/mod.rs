@@ -568,6 +568,11 @@ fn anthropic_blocks_to_openai(role: &str, blocks: &[serde_json::Value]) -> Vec<s
 
 /// Map one `Anthropic` tool definition to `OpenAI` functions format.
 /// Returns `None` for definitions without a usable name.
+///
+/// `pattern` keywords that no common engine accepts (e.g. Python-style
+/// `(?P<name>...)` groups, which `Cohere`'s strict validator rejects with
+/// `invalid 'parameters' provided: pattern must be a valid regex`) are
+/// stripped recursively; valid patterns pass through untouched.
 fn translate_tool_definition(tool: &serde_json::Value) -> Option<serde_json::Value> {
     use serde_json::Value;
 
@@ -575,14 +580,87 @@ fn translate_tool_definition(tool: &serde_json::Value) -> Option<serde_json::Val
     if name.is_empty() {
         return None;
     }
+    let mut parameters = tool.get("input_schema").cloned().unwrap_or(json!({}));
+    sanitize_schema_patterns(&mut parameters);
     let mut function = json!({
         "name": name,
-        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+        "parameters": parameters
     });
     if let Some(desc) = tool.get("description").and_then(Value::as_str) {
         function["description"] = Value::String(desc.to_string());
     }
     Some(json!({"type": "function", "function": function}))
+}
+
+/// Remove schema keywords that strict upstreams reject, recursing through
+/// the schema:
+/// - `pattern` failing to compile as a regex (Cohere 400s the whole
+///   request: `invalid 'parameters' provided: pattern must be a valid
+///   regex`). Valid patterns pass through untouched.
+/// - `title` (display hint only; Fireworks 400s on it).
+/// - `default: null` (auto-emit that Fireworks rejects; non-null
+///   defaults are preserved).
+///
+/// A missing keyword only loses validation/display metadata the model never
+/// relied on for tool selection.
+fn sanitize_schema_patterns(schema: &mut serde_json::Value) {
+    use serde_json::Value;
+
+    match schema {
+        Value::Object(map) => {
+            let bad_pattern = match map.get("pattern") {
+                None => false,
+                Some(Value::String(s)) => regex::Regex::new(s).is_err(),
+                Some(_) => true,
+            };
+            if bad_pattern {
+                map.remove("pattern");
+            }
+            map.remove("title");
+            if map.get("default").is_some_and(Value::is_null) {
+                map.remove("default");
+            }
+            // Maps of name → subschema: recurse into each value.
+            for key in [
+                "properties",
+                "patternProperties",
+                "$defs",
+                "definitions",
+                "dependentSchemas",
+            ] {
+                if let Some(Value::Object(subs)) = map.get_mut(key) {
+                    for sub in subs.values_mut() {
+                        sanitize_schema_patterns(sub);
+                    }
+                }
+            }
+            // Single subschemas, or arrays of them: recurse directly.
+            for key in [
+                "items",
+                "additionalProperties",
+                "contains",
+                "propertyNames",
+                "not",
+                "if",
+                "then",
+                "else",
+                "allOf",
+                "anyOf",
+                "oneOf",
+                "prefixItems",
+            ] {
+                if let Some(sub) = map.get_mut(key) {
+                    sanitize_schema_patterns(sub);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for sub in arr.iter_mut() {
+                sanitize_schema_patterns(sub);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Map an `Anthropic` `tool_choice` to its `OpenAI` equivalent.
@@ -908,7 +986,7 @@ pub async fn translate_and_record(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::cost_metrics::pricing::PricingTable;
@@ -1480,6 +1558,49 @@ mod tests {
         assert_eq!(echoed["model"], json!("client-alias"));
         let fallback = translate_openai_response_to_anthropic(&openai, None);
         assert_eq!(fallback["model"], json!("served-by-upstream"));
+    }
+
+    #[test]
+    fn translate_tool_definition_drops_uncompilable_patterns() {
+        // Cohere's strict validator 400s the whole request on one bad
+        // `pattern`; valid patterns survive. (Rust's `regex` accepts
+        // `(?P<name>...)`, so the bad case here is a lookahead, which no
+        // common engine in this path supports.)
+        let tool = json!({
+            "name": "t",
+            "input_schema": {"type": "object", "properties": {
+                "ok": {"type": "string", "pattern": "^[a-z]+$"},
+                "bad": {"type": "string", "pattern": "(?=prefix-)[a-z]+"}
+            }}
+        });
+
+        let mapped = translate_tool_definition(&tool).expect("named tool maps");
+        let params = &mapped["function"]["parameters"];
+        assert_eq!(params["properties"]["ok"]["pattern"], json!("^[a-z]+$"));
+        assert!(
+            params["properties"]["bad"].get("pattern").is_none(),
+            "uncompilable pattern must be stripped: {params}"
+        );
+    }
+
+    #[test]
+    fn translate_tool_definition_strips_title_and_null_default() {
+        // LiteLLM #37453 parity: Fireworks-style strict providers 400 on
+        // `title` and `default: null` (Pydantic auto-emit); non-null
+        // defaults are preserved.
+        let tool = json!({
+            "name": "t",
+            "input_schema": {"type": "object", "properties": {
+                "a": {"type": "string", "title": "Label", "default": null},
+                "b": {"type": "integer", "default": 10}
+            }}
+        });
+
+        let mapped = translate_tool_definition(&tool).expect("named tool maps");
+        let props = &mapped["function"]["parameters"]["properties"];
+        assert!(props["a"].get("title").is_none());
+        assert!(props["a"].get("default").is_none());
+        assert_eq!(props["b"]["default"], json!(10));
     }
 
     #[test]

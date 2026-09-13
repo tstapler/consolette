@@ -309,6 +309,15 @@ impl AnthropicProvider {
 
         debug!("Anthropic stream POST {url}");
 
+        if crate::providers::bodies_logged() {
+            tracing::info!(
+                target: "consolette::bodies",
+                upstream = %self.upstream.name,
+                body = %crate::providers::redact_bodies(&body),
+                "anthropic upstream stream request"
+            );
+        }
+
         let response = self
             .stream_client
             .post(&url)

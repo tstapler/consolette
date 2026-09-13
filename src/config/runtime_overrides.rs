@@ -88,6 +88,7 @@ mod tests {
                 weight: Some(1.0),
                 model: Some("override-model".to_string()),
             }],
+            family: None,
         }
     }
 

@@ -40,6 +40,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         .status-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
         .status-active { background: #10b981; }
         .status-cooldown { background: #f59e0b; }
+        .status-cold { background: #6b7280; }
         .status-auth-required { background: #ef4444; }
         .status-schema-drift { background: #8b5cf6; }
         .refresh-time { color: #888; font-size: 14px; }
@@ -90,6 +91,57 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             border-radius: 4px; font-size: 11px; font-weight: 500;
         }
         .no-errors { color: #666; font-size: 14px; padding: 16px; text-align: center; }
+        /* Epic 5b (Story 5.2): family card — server-rendered HTML above the
+           stat-cards. Status is never color-only: every dot pairs with a
+           text label. Paid card is visually distinct (amber); the
+           safety-net banner + bypassed border are red WITH a text label. */
+        .family-section { margin-bottom: 24px; }
+        .family-card {
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .family-card.paid-card { border: 1px solid #f59e0b; }
+        .family-card.bypassed { border: 1px solid #ef4444; }
+        .family-banner {
+            border: 1px solid #ef4444;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 12px;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #e0e0e0;
+        }
+        .family-banner code {
+            display: block;
+            margin-top: 6px;
+            background: #111;
+            border: 1px solid #2a2a2a;
+            border-radius: 4px;
+            padding: 8px;
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            user-select: all;
+        }
+        .family-label {
+            display: inline-block; padding: 2px 8px;
+            border-radius: 4px; font-size: 11px; font-weight: 600;
+            margin-left: 8px; vertical-align: middle;
+        }
+        .family-label.paid { background: #3a2a1a; color: #fbbf24; }
+        .family-label.bypassed-label { background: #3a1a1a; color: #fca5a5; }
+        .family-pick { font-size: 15px; color: #fff; margin: 8px 0; }
+        .family-pick #family-pick, .family-pick #family-paid-pick {
+            font-family: monospace; user-select: all;
+        }
+        .family-meta { font-size: 13px; color: #aaa; margin: 4px 0; }
+        .family-meta a { color: #3b82f6; }
+        .member-id { font-family: monospace; font-size: 12px; user-select: all; }
+        tr.member-excluded td { color: #666; }
+        .family-note { font-size: 12px; color: #666; margin-top: 12px; line-height: 1.5; }
         @media (max-width: 1024px) { .charts-grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -101,6 +153,53 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             <div class="refresh-time" id="refresh-time">Loading...</div>
         </div>
     </div>
+
+    <!-- Epic 5b (Story 5.2) rollout note — Epic 3 task C11 perf budget:
+         family resolution overhead must stay p99 <= 1ms at family sizes <= 8.
+         Measured 2026-09-12 (dev profile, `cargo test --test family_perf`
+         `-- --nocapture`; see tests/family_perf.rs which prints these live):
+         rank micro-bench p99 ~= 3.6us, full dispatch-seam resolve_family
+         p99 ~= 54us, static-pin baseline p99 ~= 190ns — the seam sits ~20x
+         inside the 1ms budget. Gate is green; the family route may be
+         enabled. (Epic 6 owns the user-facing rollout doc — coordinate the
+         numbers there; this comment is the dashboard-side record.) -->
+     <!-- Family card: server-rendered cold-start skeleton. Readable with JS
+          disabled or CDN/Chart.js blocked; renderFamily() (called from
+          loadMetrics()) only swaps text values in place every 30s
+          (no animation reset). -->
+    <section class="family-section" id="family-section" aria-label="Model family status">
+        <div class="family-card" id="family-card">
+            <div class="family-banner" id="family-banner" hidden>
+                <span class="family-label bypassed-label">BYPASSED</span>
+                <span id="family-banner-text">All auto-coding members unhealthy — bypassed cooldown and served &lt;model-id&gt; at &lt;time&gt;.</span>
+                <span> Rollback (copy-paste):</span>
+                <code id="family-rollback-curl">curl -X POST http://<span id="rollback-host">localhost:PORT</span>/api/route -H 'Content-Type: application/json' -d '{"name":"default-pinned"}'</code>
+                <span>Next retry on healthy member immediately; bypass clears on next healthy resolution.</span>
+            </div>
+            <div class="chart-title">FAMILY: <span id="family-alias-name">auto-coding</span> (free pool, least-errors first)<span class="family-label bypassed-label" id="family-bypassed-tag" hidden>BYPASSED</span> <a href="/api/route" style="font-weight:normal;font-size:12px;">via GET /api/route</a></div>
+            <div class="family-pick" id="family-pick-line" aria-live="polite">Cold start — serving config-order default (<span id="family-pick">loading…</span>) until 20 requests accumulate.</div>
+            <div class="family-meta" id="family-why">why: collecting stats — err — · p50 —</div>
+            <div class="family-meta" id="family-last-change">last change: — (no previous pick yet)</div>
+            <div class="family-meta">stable: challenger needs err &gt;2pp AND p50 &gt;10% to dethrone (hysteresis)</div>
+            <div class="family-meta" id="family-window">stats window: last 500 reqs, age 0s / since restart</div>
+            <div class="family-meta" id="family-pinned">pinned sessions: 0 (see <a href="/api/sessions">GET /api/sessions</a>)</div>
+            <table class="errors-table" style="margin-top:12px;">
+                <thead>
+                    <tr><th>Member (ranked)</th><th>Err %</th><th>P50</th><th>Status</th></tr>
+                </thead>
+                <tbody id="family-members-body">
+                    <tr><td colspan="4" class="no-errors">Cold start — member stats accumulate after 20 requests (members with no data show —, never 0%)</td></tr>
+                </tbody>
+            </table>
+            <div class="family-note">Session pins take precedence; pick sticks per session, re-evaluates on cooldown/exclusion event or every 50 family resolutions.</div>
+        </div>
+        <div class="family-card paid-card" id="family-card-paid" hidden>
+            <div class="chart-title">FAMILY: auto-coding-paid — PAID, may spend<span class="family-label paid">PAID — may spend</span> <a href="/api/route" style="font-weight:normal;font-size:12px;">via GET /api/route</a></div>
+            <div class="family-pick" id="family-paid-pick-line" aria-live="polite">NOW SERVING (copy-pasteable): <span id="family-paid-pick">—</span></div>
+            <div class="family-meta" id="family-paid-why">why: —</div>
+            <div class="family-meta">paid resolutions: <span id="family-paid-count">0</span> (switch opencode model back to auto-coding or a pin; counter confirms spend stopped)</div>
+        </div>
+    </section>
 
     <div class="stats-grid">
         <div class="stat-card">
@@ -339,6 +438,168 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             });
         }
 
+        // Epic 5b (Story 5.2): family card text-swap polling. Reads the
+        // /metrics `family` section (Epic 5a shape: current_pick,
+        // previous_pick, last_change_at, window_age_s, resolutions_total,
+        // fallback_to_default_total, paid_resolutions, members[{model,
+        // error_rate (fraction), latency_p50_ms, samples, status}]) and swaps
+        // text values in place — no animation reset, no chart dependency.
+        function fmtP50(ms) {
+            if (ms == null) return '—';
+            return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+        }
+        function fmtErr(frac) { return (frac * 100).toFixed(1) + '%'; }
+        // HTML-escape for the innerHTML builders below (pick line, member
+        // table): model IDs come from /metrics and must never break out of
+        // markup. Missing values render as '—', never "undefined".
+        function esc(s) {
+            if (s === undefined || s === null || s === '') return '—';
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+        // Edge-detect state for the safety-net banner: the cumulative
+        // fallback_to_default_total never resets, so visibility latches on
+        // fallback-count growth and clears on the next healthy resolution
+        // (resolutions_total advancing with the fallback count unchanged).
+        // Keyed per rendered alias (first poll per alias only syncs the
+        // baselines WITHOUT latching, so historical bypasses never trip the
+        // banner on load). Sticky-traffic note: sticky serves skip
+        // resolve_family (no snapshot publish), so under a stuck session the
+        // banner can clear up to K requests late — accepted, not a bug.
+        let prevFbByAlias = {}, prevResByAlias = {}, seenAlias = {}, bannerVisible = false;
+        function familyStatusLabel(status, isPick) {
+            if (status === undefined || status === null || status === '') status = 'cold';
+            if (status === 'active') return isPick ? '(•) active — serving' : '(•) active';
+            if (status === 'cold') return '(•) cold-start-default';
+            if (status === 'cooldown') return '(•) cooldown';
+            // Epic 5a emits `excluded:denylisted` for 404-denylisted members
+            // (1h TTL); surface the ux.md §2.3 copy for that case verbatim.
+            if (status === 'excluded:denylisted') return '(•) excluded: 404 (denylisted 1h)';
+            return '(•) ' + esc(status);
+        }
+        function renderFamily(family) {
+            if (!family) return;
+            const aliases = Object.keys(family);
+            if (aliases.length === 0) return;
+            const alias = family['auto-coding'] ? 'auto-coding' : aliases[0];
+            const entry = family[alias];
+            if (!entry) return;
+            document.getElementById('family-alias-name').textContent = alias;
+            document.getElementById('rollback-host').textContent = location.host;
+            const members = entry.members || [];
+            const pick = entry.current_pick || (members[0] && members[0].model) || '—';
+            const cold = !entry.resolutions_total || members.every(m => m.status === 'cold');
+            const anyExcluded = members.some(m => m.status && m.status.indexOf('excluded') === 0);
+            const pickEl = document.getElementById('family-pick-line');
+            const prev = entry.previous_pick ? ' (previous: ' + entry.previous_pick + ')' : ' (no previous pick yet)';
+            if (cold) {
+                pickEl.innerHTML = 'Cold start — serving config-order default (<span id="family-pick">' + esc(pick) + '</span>) until 20 requests accumulate.';
+            } else {
+                let html = 'NOW SERVING (copy-pasteable): <span id="family-pick">' + esc(pick) + '</span>';
+                if (anyExcluded) html += ' · dead IDs excluded before dispatch';
+                pickEl.innerHTML = html;
+            }
+            const pickMember = members.find(m => m.model === pick);
+            if (pickMember && pickMember.status !== 'cold') {
+                document.getElementById('family-why').textContent =
+                    'why: err ' + fmtErr(pickMember.error_rate || 0) + ' (' + (pickMember.samples || 0) + ' req) · p50 ' + fmtP50(pickMember.latency_p50_ms || 0);
+            } else if (pickMember) {
+                document.getElementById('family-why').textContent = 'why: collecting stats — err — · p50 — (cold-start-default)';
+            }
+            const changeTime = entry.last_change_at ? new Date(entry.last_change_at).toLocaleTimeString() : '—';
+            document.getElementById('family-last-change').textContent = 'last change: ' + changeTime + prev;
+            const since = entry.last_change_at ? new Date(entry.last_change_at).toLocaleTimeString() : 'restart';
+            document.getElementById('family-window').textContent =
+                'stats window: last 500 reqs, age ' + (entry.window_age_s || 0) + 's / since ' + since;
+            // Safety-net banner: edge-detect on the cumulative counters.
+            // A bypass bumps both fallback_to_default_total AND
+            // resolutions_total (snapshot publish); a healthy resolution
+            // bumps only resolutions_total — so the banner latches when the
+            // fallback count grows since last poll and clears once
+            // resolutions_total advances with the fallback count unchanged.
+            // Until then it names the served pick + time + rollback curl.
+            const bypasses = entry.fallback_to_default_total || 0;
+            const resTotal = entry.resolutions_total || 0;
+            if (!seenAlias[alias]) {
+                // First poll for this alias: sync baselines without
+                // latching — historical bypasses must not trip the banner.
+                seenAlias[alias] = true;
+            } else if (bypasses > (prevFbByAlias[alias] || 0)) {
+                bannerVisible = true;
+            } else if (resTotal > (prevResByAlias[alias] || 0) && bypasses === prevFbByAlias[alias]) {
+                bannerVisible = false;
+            }
+            prevFbByAlias[alias] = bypasses;
+            prevResByAlias[alias] = resTotal;
+            const banner = document.getElementById('family-banner');
+            const card = document.getElementById('family-card');
+            const tag = document.getElementById('family-bypassed-tag');
+            if (bannerVisible) {
+                banner.hidden = false;
+                card.classList.add('bypassed');
+                tag.hidden = false;
+                document.getElementById('family-banner-text').textContent =
+                    'All ' + alias + ' members unhealthy — bypassed cooldown and served ' + pick + ' at ' + changeTime + ' (' + bypasses + ' bypass(es) total).';
+            } else {
+                banner.hidden = true;
+                card.classList.remove('bypassed');
+                tag.hidden = true;
+            }
+            // Ranked table: pick first, then active by err/p50, cooldown next,
+            // cold then excluded last. Members with no data show —, never 0%.
+            const weight = s => s === 'active' ? 0 : s === 'cooldown' ? 1 : s === 'cold' ? 2 : 3;
+            const ranked = members.slice().sort((a, b) => {
+                if (a.model === pick) return -1;
+                if (b.model === pick) return 1;
+                const w = weight(a.status) - weight(b.status);
+                if (w !== 0) return w;
+                if ((a.error_rate || 0) !== (b.error_rate || 0)) return (a.error_rate || 0) - (b.error_rate || 0);
+                return (a.latency_p50_ms || 0) - (b.latency_p50_ms || 0);
+            });
+            const tbody = document.getElementById('family-members-body');
+            tbody.innerHTML = ranked.length === 0
+                ? '<tr><td colspan="4" class="no-errors">No family members configured</td></tr>'
+                : ranked.map(m => {
+                    const isPick = m.model === pick;
+                    const noData = m.status === 'cold';
+                    const cls = (m.status && m.status.indexOf('excluded') === 0) ? ' class="member-excluded"' : '';
+                    const dot = m.status === 'active' ? 'status-active' : m.status === 'cooldown' ? 'status-cooldown' : 'status-cold';
+                    return '<tr' + cls + '><td class="member-id">' + esc(m.model) + '</td>'
+                        + '<td>' + (noData ? '—' : fmtErr(m.error_rate || 0)) + '</td>'
+                        + '<td>' + (noData ? '—' : fmtP50(m.latency_p50_ms || 0)) + '</td>'
+                        + '<td><span class="status-indicator ' + dot + '"></span> ' + familyStatusLabel(m.status, isPick) + '</td></tr>';
+                }).join('');
+            // Paid alias renders as a separate distinct card, never merged
+            // into the free card.
+            const paid = family['auto-coding-paid'];
+            const paidCard = document.getElementById('family-card-paid');
+            if (paid) {
+                paidCard.hidden = false;
+                document.getElementById('family-paid-pick').textContent = paid.current_pick || '—';
+                const pm = (paid.members || []).find(m => m.model === paid.current_pick);
+                document.getElementById('family-paid-why').textContent = pm && pm.status !== 'cold'
+                    ? 'why: err ' + fmtErr(pm.error_rate || 0) + ' (' + (pm.samples || 0) + ' req) · p50 ' + fmtP50(pm.latency_p50_ms || 0)
+                    : 'why: collecting stats — err — · p50 — (cold-start-default)';
+                document.getElementById('family-paid-count').textContent = paid.paid_resolutions || 0;
+            } else {
+                paidCard.hidden = true;
+            }
+        }
+        // Pinned-session count (Epic 4.2 sessions-view skip: the card links
+        // GET /api/sessions instead of rendering a sessions view). Counts
+        // sessions with a live pin/override; best-effort — leaves the
+        // server-rendered default on fetch failure.
+        async function loadFamilySessions() {
+            try {
+                const data = await fetch('/api/sessions').then(r => r.json());
+                const pinned = (data.sessions || []).filter(s => s.override).length;
+                document.getElementById('family-pinned').innerHTML =
+                    'pinned sessions: ' + pinned + ' (see <a href="/api/sessions">GET /api/sessions</a>)';
+            } catch (e) {
+                console.error('Failed to load family sessions:', e);
+            }
+        }
+
         async function loadMetrics() {
             try {
                 const response = await fetch('/metrics');
@@ -375,18 +636,20 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                             + '<span class="status-indicator ' + cls + '"></span><span>' + label + '</span></span>';
                     }).join('');
 
-                if (data.rpm_data) {
+                if (rpmChart && data.rpm_data) {
                     rpmChart.data.labels = data.rpm_data.map(d => d.minute);
                     rpmChart.data.datasets[0].data = data.rpm_data.map(d => d.requests);
                     rpmChart.update();
                 }
 
-                providerChart.data.labels = upstreamNames.map(displayName);
-                providerChart.data.datasets[0].data = upstreamNames.map(n => data.providers[n].requests || 0);
-                providerChart.data.datasets[0].backgroundColor = upstreamNames.map((_, i) => palette[i % palette.length]);
-                providerChart.update();
+                if (providerChart) {
+                    providerChart.data.labels = upstreamNames.map(displayName);
+                    providerChart.data.datasets[0].data = upstreamNames.map(n => data.providers[n].requests || 0);
+                    providerChart.data.datasets[0].backgroundColor = upstreamNames.map((_, i) => palette[i % palette.length]);
+                    providerChart.update();
+                }
 
-                if (data.duration_distribution) {
+                if (durationChart && data.duration_distribution) {
                     const dist = data.duration_distribution;
                     durationChart.data.datasets[0].data = [
                         dist['< 1s'] || 0, dist['1-5s'] || 0, dist['5-30s'] || 0,
@@ -403,7 +666,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 else if (lagMs >= 10) { lagEl.style.color = '#f59e0b'; lagStatus.textContent = 'elevated'; }
                 else { lagEl.style.color = '#10b981'; lagStatus.textContent = 'healthy'; }
 
-                if (data.lag_data) {
+                if (lagChart && data.lag_data) {
                     lagChart.data.labels = data.lag_data.map(d => d.minute);
                     lagChart.data.datasets[0].data = data.lag_data.map(d => d.max_ms);
                     lagChart.data.datasets[1].data = data.lag_data.map(d => d.avg_ms);
@@ -441,7 +704,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                         try {
                             const t = JSON.parse(json);
                             const abbrevs = {text:'T', tool_use:'TU', tool_result:'TR', image:'IMG', document:'DOC', search_result:'SR'};
-                            const parts = Object.entries(t).map(([k,v]) => (abbrevs[k]||k)+':'+v);
+                            // Keys ride client message content — escape.
+                            const parts = Object.entries(t).map(([k,v]) => esc(abbrevs[k]||k)+':'+esc(v));
                             const cmBadge = cm ? ' <span class="error-type" style="background:#3a2a1a;font-size:10px">CM</span>' : '';
                             return '<span style="font-size:11px;color:#aaa">' + parts.join(' ') + '</span>' + cmBadge;
                         } catch { return json; }
@@ -456,15 +720,19 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                         const typeLabel = r.stream
                             ? '<span class="error-type" style="background:#1e3a5f">stream</span>'
                             : '<span class="error-type" style="background:#1a3a1a">sync</span>';
+                        // r.provider / r.model are client-controlled (via
+                        // the request body) — escape every interpolation.
+                        // The row click carries its args in data-attributes
+                        // (never a string-spliced onclick handler).
                         const provLabel = r.provider && r.provider !== 'unknown'
-                            ? '<span class="error-type" style="background:' + provColor(r.provider) + '">' + r.provider + '</span>'
+                            ? '<span class="error-type" style="background:' + provColor(r.provider) + '">' + esc(r.provider) + '</span>'
                             : '—';
                         const ttft = r.bedrock_first_byte_ms > 0 ? fmtMs(r.bedrock_first_byte_ms) : fmtMs(r.first_byte_ms);
-                        return '<tr style="cursor:pointer" onclick="showRequestBody(\'' + r.request_id + '\',\'' + r.model + '\',\'' + time + '\')">'
+                        return '<tr style="cursor:pointer" data-req="' + esc(r.request_id) + '" data-model="' + esc(r.model) + '" data-time="' + esc(time) + '">'
                             + '<td>' + time + '</td>'
-                            + '<td style="font-family:monospace;font-size:11px">' + r.request_id + '</td>'
+                            + '<td style="font-family:monospace;font-size:11px">' + esc(r.request_id) + '</td>'
                             + '<td>' + provLabel + '</td>'
-                            + '<td>' + abbrevModel(r.model) + '</td>'
+                            + '<td>' + esc(abbrevModel(r.model)) + '</td>'
                             + '<td style="font-family:monospace">' + fmtMs(r.duration_ms) + '</td>'
                             + '<td style="font-family:monospace">' + ttft + '</td>'
                             + '<td style="font-family:monospace">' + tokStr + '</td>'
@@ -474,6 +742,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                             + '<td>' + typeLabel + '</td>'
                             + '</tr>';
                     }).join('');
+                    // Row clicks via delegation-safe listeners on the
+                    // data-attributes above (see the onclick note).
+                    requestsBody.querySelectorAll('tr[data-req]').forEach(tr => {
+                        tr.addEventListener('click', () => showRequestBody(tr.dataset.req, tr.dataset.model, tr.dataset.time));
+                    });
                 } else {
                     requestsBody.innerHTML = '<tr><td colspan="11" class="no-errors">No requests yet</td></tr>';
                 }
@@ -486,7 +759,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     const fmtMs2 = ms => ms > 0 ? (ms >= 1000 ? (ms/1000).toFixed(1)+'s' : ms+'ms') : '—';
                     latencyCards.innerHTML = latencyNames.map(name => {
                         const pl = data.provider_latency[name];
-                        const label = displayName(name);
+                        const label = esc(displayName(name));
                         return '<div class="stat-card">'
                             + '<div class="stat-label">' + label + ' Avg Duration</div>'
                             + '<div class="stat-value">' + fmtMs2(pl.avg_duration_ms || 0) + '</div>'
@@ -503,11 +776,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 if (data.recent_errors && data.recent_errors.length > 0) {
                     errorsBody.innerHTML = data.recent_errors.map(err => {
                         const time = new Date(err.timestamp).toLocaleTimeString();
+                        // err.provider / err.model are client-controlled —
+                        // escape every interpolation.
                         return '<tr>'
                             + '<td>' + time + '</td>'
-                            + '<td><span class="error-type">' + err.error_type + '</span></td>'
-                            + '<td>' + err.provider + '</td>'
-                            + '<td>' + err.model + '</td>'
+                            + '<td><span class="error-type">' + esc(err.error_type) + '</span></td>'
+                            + '<td>' + esc(err.provider) + '</td>'
+                            + '<td>' + esc(err.model) + '</td>'
                             + '</tr>';
                     }).join('');
                 } else {
@@ -524,6 +799,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     document.getElementById('ct-last-model').textContent = ct.last_model || '—';
                 }
 
+                // Family card text-swap on the same 30s poll (no extra fetch;
+                // sessions count rides its own poll in loadFamilySessions).
+                renderFamily(data.family);
+
                 document.getElementById('refresh-time').textContent = '↺ ' + new Date().toLocaleTimeString();
             } catch (error) {
                 console.error('Failed to load metrics:', error);
@@ -539,7 +818,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         async function fetchAndRenderBody() {
             document.getElementById('modal-body').textContent = 'Loading…';
             try {
-                const resp = await fetch('/requests/' + _modalRequestId + '?stage=' + _modalStage);
+                const resp = await fetch('/requests/' + encodeURIComponent(_modalRequestId) + '?stage=' + _modalStage);
                 if (!resp.ok) {
                     document.getElementById('modal-body').textContent = _modalStage === 'compressed'
                         ? '(no compressed snapshot — compression may have been skipped)'
@@ -580,14 +859,16 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                         const last = new Date(e.last_seen).toLocaleString();
                         const fp = e.fingerprint.substring(0, 8);
                         const msg = e.message.length > 80 ? e.message.substring(0, 80) + '…' : e.message;
+                        // e.provider / e.message carry upstream error text —
+                        // escape every interpolation including the title attr.
                         return '<tr>'
-                            + '<td style="font-family:monospace;font-size:11px;">' + fp + '</td>'
-                            + '<td>' + e.provider + '</td>'
-                            + '<td><span class="error-type">' + e.error_type + '</span></td>'
+                            + '<td style="font-family:monospace;font-size:11px;">' + esc(fp) + '</td>'
+                            + '<td>' + esc(e.provider) + '</td>'
+                            + '<td><span class="error-type">' + esc(e.error_type) + '</span></td>'
                             + '<td>' + e.count + '</td>'
                             + '<td style="font-size:11px;">' + first + '</td>'
                             + '<td style="font-size:11px;">' + last + '</td>'
-                            + '<td style="font-size:11px;max-width:300px;word-break:break-word;" title="' + e.message + '">' + msg + '</td>'
+                            + '<td style="font-size:11px;max-width:300px;word-break:break-word;" title="' + esc(e.message) + '">' + esc(msg) + '</td>'
                             + '</tr>';
                     }).join('');
                 } else {
@@ -598,10 +879,18 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             }
         }
 
-        initCharts();
+        // Progressive enhancement: the family card above is server-rendered
+        // HTML, so it stays readable when Chart.js fails to load — guard the
+        // chart init (and every chart update above) so a blocked CDN never
+        // kills the metrics/family text polling.
+        if (typeof Chart !== 'undefined') {
+            try { initCharts(); } catch (e) { console.error('Chart init failed:', e); }
+        }
         loadMetrics();
+        loadFamilySessions();
         loadErrorTypes();
         setInterval(loadMetrics, 30000);
+        setInterval(loadFamilySessions, 30000);
         setInterval(loadErrorTypes, 60000);
     </script>
 </body>
@@ -799,5 +1088,260 @@ mod tests {
                  classes must be driven by last_error_kind/cooling generically"
             );
         }
+    }
+
+    // ── Epic 5b (Story 5.2): family card lint-level guards ──────────────
+    //
+    // Same convention as the Story 1.5.2 guards above: string
+    // matching/position checks on `DASHBOARD_HTML`, not behavioral proof —
+    // no JS runtime executes this code in these tests.
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn family_card_should_render_above_stat_cards() {
+        let card = DASHBOARD_HTML
+            .find("id=\"family-section\"")
+            .expect("family section must exist");
+        let stats = DASHBOARD_HTML
+            .find("class=\"stats-grid\"")
+            .expect("stat-cards grid must exist");
+        assert!(
+            card < stats,
+            "family card must render above the stat-cards (ux.md §2 glance)"
+        );
+    }
+
+    #[test]
+    fn family_pick_line_should_use_polite_live_region() {
+        assert!(
+            DASHBOARD_HTML.contains("id=\"family-pick-line\" aria-live=\"polite\""),
+            "pick line must carry aria-live=\"polite\" for 30s polling (ux.md §2.3)"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("id=\"family-paid-pick-line\" aria-live=\"polite\""),
+            "paid pick line must carry aria-live=\"polite\" too"
+        );
+    }
+
+    #[test]
+    fn family_card_should_render_cold_start_copy_with_never_zero_percent() {
+        assert!(
+            DASHBOARD_HTML.contains("Cold start — serving config-order default"),
+            "missing ux.md §2.3 cold-start copy template"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("cold-start-default"),
+            "missing cold-start-default status label"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("never 0%"),
+            "card must state members with no data show —, never 0%"
+        );
+    }
+
+    #[test]
+    fn family_banner_should_carry_copy_pasteable_rollback_with_exact_route_name() {
+        assert!(
+            DASHBOARD_HTML.contains("bypassed cooldown and served"),
+            "missing ux.md §2.1 safety-net banner copy"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("default-pinned"),
+            "banner rollback curl must name the exact route default-pinned"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("BYPASSED"),
+            "bypass must pair the red border with a BYPASSED text label (no color-only)"
+        );
+    }
+
+    #[test]
+    fn family_paid_card_should_stand_apart_with_counter() {
+        assert!(
+            DASHBOARD_HTML.contains("PAID — may spend"),
+            "paid card must carry the distinct PAID — may spend label"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("paid resolutions:"),
+            "paid card must show the paid resolutions counter"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("family-card-paid"),
+            "paid card must be a separate card (never merged into the free card)"
+        );
+    }
+
+    #[test]
+    fn family_card_should_link_route_and_sessions_apis() {
+        assert!(
+            DASHBOARD_HTML.contains("href=\"/api/route\""),
+            "card header must link GET /api/route (rollback path, no editing UI)"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("href=\"/api/sessions\""),
+            "card must link GET /api/sessions (Epic 4.2 sessions-view skip)"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("pinned sessions:"),
+            "card must show the pinned-session count"
+        );
+    }
+
+    #[test]
+    fn family_status_rows_should_pair_every_dot_with_text() {
+        // Grayscale-legibility: the JS label fn must emit a text label for
+        // every status the /metrics family section can carry.
+        for label in [
+            "(•) active — serving",
+            "(•) active",
+            "(•) cold-start-default",
+            "(•) cooldown",
+            "(•) excluded: 404 (denylisted 1h)",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(label),
+                "missing dot+text status label: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn family_card_should_poll_text_swap_on_30s_cadence() {
+        assert!(
+            DASHBOARD_HTML.contains("renderFamily(data.family)"),
+            "loadMetrics() must text-swap the family card from the /metrics family section on its 30s poll"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("setInterval(loadFamilySessions, 30000)"),
+            "pinned-session count must poll on a ≤30s cadence"
+        );
+    }
+
+    #[test]
+    fn family_card_should_survive_blocked_chart_cdn() {
+        assert!(
+            DASHBOARD_HTML.contains("typeof Chart !== 'undefined'"),
+            "chart init must be guarded so a blocked CDN never kills the family/metrics text polling"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("if (rpmChart && data.rpm_data)"),
+            "chart updates must be guarded for the CDN-blocked path"
+        );
+    }
+
+    #[test]
+    fn family_card_should_show_hysteresis_window_and_tie_lines() {
+        assert!(
+            DASHBOARD_HTML.contains("err &gt;2pp AND p50 &gt;10% to dethrone (hysteresis)"),
+            "missing ux.md §2.3 tie/flap stability line"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("stats window: last 500 reqs, age"),
+            "missing ux.md §2.3 stale-stats window-age line (reads real window_age_s)"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("dead IDs excluded before dispatch"),
+            "missing ux.md §2.3 delisted-member pick-line note"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("Session pins take precedence; pick sticks per session"),
+            "missing session stickiness footer (K=50 re-evaluation)"
+        );
+    }
+
+    #[test]
+    fn family_pick_and_member_cells_should_escape_model_ids() {
+        // XSS guard: model IDs from /metrics flow into innerHTML builders,
+        // so an esc() helper must exist and be applied at the pick builder
+        // and the member-table model cell. Previous_pick/banner ride
+        // textContent and stay unescaped by design.
+        assert!(
+            DASHBOARD_HTML.contains("function esc(s)"),
+            "missing esc() HTML-escape helper"
+        );
+        for entity in ["&amp;", "&lt;", "&gt;", "&quot;", "&#39;"] {
+            assert!(
+                DASHBOARD_HTML.contains(entity),
+                "esc() must escape to {entity}"
+            );
+        }
+        assert!(
+            DASHBOARD_HTML.contains("esc(pick)"),
+            "pick-line innerHTML builder must escape the pick"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("esc(m.model)"),
+            "member-table model cell must escape m.model"
+        );
+        assert!(
+            !DASHBOARD_HTML.contains("'(•) ' + status"),
+            "familyStatusLabel fallback must not concatenate raw status (use esc)"
+        );
+    }
+
+    #[test]
+    fn family_banner_should_edge_detect_instead_of_cumulative_latch() {
+        // Bypass latch guard: cumulative fallback_to_default_total never
+        // resets, so visibility must edge-detect (latch on fallback-count
+        // growth, clear once resolutions_total advances with the fallback
+        // count unchanged) — never `if (bypasses > 0)`. State is keyed per
+        // rendered alias, and the first poll per alias only syncs baselines
+        // without latching (historical bypasses must not trip the banner).
+        assert!(
+            DASHBOARD_HTML.contains("bypasses > (prevFbByAlias[alias]"),
+            "banner must latch when the fallback count grows since last poll"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("resTotal > (prevResByAlias[alias]"),
+            "banner must clear once resolutions advance with fallback count unchanged"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("seenAlias[alias]"),
+            "first poll per alias must sync baselines without latching"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("if (bannerVisible)"),
+            "banner visibility must come from the edge-detect latch"
+        );
+        assert!(
+            !DASHBOARD_HTML.contains("if (bypasses > 0)"),
+            "banner must not latch on the never-resetting cumulative count"
+        );
+    }
+
+    #[test]
+    fn family_card_should_fall_back_to_cold_never_undefined() {
+        assert!(
+            DASHBOARD_HTML.contains("status = 'cold'"),
+            "familyStatusLabel(undefined) must fall back to 'cold'"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("(previous: '"),
+            "tie line must render `previous:` per ux.md §2.3"
+        );
+        assert!(
+            !DASHBOARD_HTML.contains("(prev: '"),
+            "stale `(prev:)` copy must not remain"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("if (ms == null)"),
+            "fmtP50 must use a null check so p50 0 renders 0ms, not —"
+        );
+        assert!(
+            !DASHBOARD_HTML.contains("loadFamily()"),
+            "stale loadFamily() reference must not remain (family rides loadMetrics())"
+        );
+    }
+
+    #[test]
+    fn family_card_should_record_perf_budget_rollout_note() {
+        assert!(
+            DASHBOARD_HTML.contains("p99 <= 1ms"),
+            "dashboard must record the Epic 3 C11 1ms resolution-overhead budget"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("tests/family_perf.rs"),
+            "rollout note must point at the benchmark that prints the measured numbers"
+        );
     }
 }

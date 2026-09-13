@@ -500,4 +500,51 @@ mod tests {
         let latency = json["provider_latency"].as_object().unwrap();
         assert_eq!(latency["anthropic"]["avg_duration_ms"], json!(100));
     }
+
+    // Epic 2 regression (Story 2.2, task 3): the per-model dimension lives
+    // in `FamilyRuntime`, never here — `ProxyMetrics::to_json` top-level
+    // sections stay byte-identical in shape (no `family` section leaks in,
+    // no per-model keys under `providers`/`provider_latency`).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn existing_counters_shape_unchanged() {
+        let m = ProxyMetrics::new();
+        m.record_request("openrouter", true, 80, 0);
+        m.record_request("openrouter", false, 90, 0);
+
+        let json = m.to_json();
+        let top: Vec<&str> = {
+            let mut keys: Vec<&str> = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(
+            top,
+            vec![
+                "cache",
+                "compression",
+                "count_tokens",
+                "duration_distribution",
+                "error_types",
+                "learn",
+                "memory",
+                "provider_latency",
+                "providers",
+                "summary",
+            ]
+        );
+        assert!(json.get("family").is_none());
+
+        let providers = json["providers"].as_object().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert!(providers.get("openrouter").is_some());
+        let latency = json["provider_latency"].as_object().unwrap();
+        assert_eq!(latency.len(), 1);
+        assert!(latency.get("openrouter").is_some());
+    }
 }

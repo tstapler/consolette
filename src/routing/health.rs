@@ -35,6 +35,14 @@ pub struct HealthRegistry {
     /// Upstreams that never enter cooldown (e.g. Bedrock — ADR-003: "Bedrock
     /// never cools down"). Defaults to allowed when unset.
     can_cooldown: DashMap<usize, bool>,
+    /// Indices currently in a 429-driven cool (Epic 3's shared-upstream
+    /// rule): a 429 trips the shared index via [`trip_backpressure`](Self::trip_backpressure),
+    /// which records the `until` instant here alongside the normal trip.
+    /// Family pre-dispatch exclusion consults this to keep a sibling member
+    /// on the same upstream eligible (the index cool alone would wrongly
+    /// exclude it), while the `SafetyNetBypass` consults it to NEVER retry a
+    /// rate-limited upstream. Entries lazy-expire on read.
+    backpressure_until: DashMap<usize, Instant>,
 }
 
 impl HealthRegistry {
@@ -44,6 +52,7 @@ impl HealthRegistry {
             state: DashMap::new(),
             cooldown_duration: Duration::from_secs(cooldown_secs),
             can_cooldown: DashMap::new(),
+            backpressure_until: DashMap::new(),
         }
     }
 
@@ -63,6 +72,58 @@ impl HealthRegistry {
         let duration = override_duration.unwrap_or(self.cooldown_duration);
         let until = Instant::now() + duration;
         self.state.insert(idx, ProviderState::Cooldown { until });
+    }
+
+    /// Trips `idx` into cooldown for a 429/backpressure outcome: the normal
+    /// index trip (so non-family traffic and `/metrics` still see the cool)
+    /// PLUS a 429-cause mark with the same `until` (so family exclusion can
+    /// tell "rate-limited, sibling stays eligible, bypass must not retry"
+    /// apart from a generic cool). Returns the `until` instant so the caller
+    /// can stamp the same TTL on the per-member backpressure mark — the
+    /// personal mark and the index cool then agree on recovery. A no-op
+    /// returning `None` if `idx` was marked `can_cooldown = false`.
+    #[must_use]
+    pub fn trip_backpressure(
+        &self,
+        idx: usize,
+        override_duration: Option<Duration>,
+    ) -> Option<Instant> {
+        let allowed = self.can_cooldown.get(&idx).is_none_or(|v| *v);
+        if !allowed {
+            return None;
+        }
+        let duration = override_duration.unwrap_or(self.cooldown_duration);
+        let until = Instant::now() + duration;
+        self.state.insert(idx, ProviderState::Cooldown { until });
+        self.backpressure_until.insert(idx, until);
+        Some(until)
+    }
+
+    /// Whether `idx` is currently in a 429-driven cool (`false` once
+    /// expired; expired marks lazy-evict here). Family exclusion keeps
+    /// unmarked siblings on such an index eligible; the bypass refuses to
+    /// serve from such an index at all.
+    #[must_use]
+    pub fn is_backpressure_cooled(&self, idx: usize) -> bool {
+        match self.backpressure_until.get(&idx) {
+            None => false,
+            Some(until) => {
+                if Instant::now() >= *until {
+                    drop(until);
+                    self.backpressure_until.remove(&idx);
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    /// The registry default cooldown — the dispatch loop stamps per-member
+    /// 429 marks with this when the error carries no `Retry-After`.
+    #[must_use]
+    pub fn default_cooldown_duration(&self) -> Duration {
+        self.cooldown_duration
     }
 
     /// Remaining cooldown in seconds (0 if not in cooldown) — used by

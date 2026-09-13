@@ -22,6 +22,15 @@ use super::EntrypointState;
 pub async fn get_metrics(State(state): State<EntrypointState>) -> impl IntoResponse {
     let mut result = state.metrics.to_metrics_json();
     result["cooldowns"] = state.dispatch_router.load().cooldown_snapshot();
+    // Epic 5a (Story 5.1): the `family` section reads `FamilyRuntime`
+    // snapshots/counters via `EntrypointState.metrics` — never the rebuilt
+    // Router — with membership from the on-disk config so zero-resolution
+    // aliases report `cold`. A config-load failure degrades to an empty
+    // section (observability must never 500 the whole `/metrics`).
+    result["family"] = crate::config::load(&state.config_dir)
+        .map_or(serde_json::json!({}), |config| {
+            state.metrics.family_section(&config.families)
+        });
     Json(result)
 }
 
@@ -366,5 +375,73 @@ mod tests {
             "is_auth() must never trip HealthRegistry — this is the exact gap Story 1.5.2 \
              exists to guard the JS against"
         );
+    }
+
+    // Epic 5a (Story 5.1 AC2, validation R3 error case): zero resolutions →
+    // the `family` section shows the configured alias with `cold` member
+    // status and zero counters — not an error, not a missing section.
+    #[allow(clippy::unwrap_used)]
+    fn family_conf_d(dir: &std::path::Path) {
+        let conf_d = dir.join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        std::fs::write(
+            conf_d.join("00-upstreams.toml"),
+            "[[upstreams]]\nname = \"mock\"\nkind = \"anthropic\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            conf_d.join("10-routing.toml"),
+            "[[routes]]\nname = \"default\"\nstrategy = \"fallback\"\nfamily = \"auto-coding\"\n\n[[routes.upstreams]]\nname = \"mock\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            conf_d.join("20-family.toml"),
+            "[[model_families]]\nalias = \"auto-coding\"\nallow_paid = false\n\n\
+             [[model_families.members]]\nupstream = \"mock\"\nmodel = \"model-a:free\"\n\n\
+             [[model_families.members]]\nupstream = \"mock\"\nmodel = \"model-b:free\"\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    #[allow(clippy::unwrap_used)]
+    async fn metrics_family_section_should_report_cold_status_when_no_resolutions_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        family_conf_d(dir.path());
+        let config = crate::config::load(dir.path()).expect("family conf.d must load");
+        let state = EntrypointState::build(&config, dir.path())
+            .await
+            .expect("state must build");
+
+        let response = get_metrics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
+
+        let family = &json["family"]["auto-coding"];
+        assert!(
+            family.is_object(),
+            "zero resolutions must still show the alias, not an error: {json}"
+        );
+        assert_eq!(family["resolutions_total"], serde_json::json!(0));
+        assert_eq!(family["fallback_to_default_total"], serde_json::json!(0));
+        // Cold default: the config-order first member is the serving pick.
+        assert_eq!(family["current_pick"], serde_json::json!("model-a:free"));
+        assert_eq!(family["previous_pick"], serde_json::Value::Null);
+        let members = family["members"]
+            .as_array()
+            .expect("members must be an array");
+        assert_eq!(members.len(), 2);
+        for member in members {
+            assert_eq!(
+                member["status"],
+                serde_json::json!("cold"),
+                "no samples yet → cold, never active/0%: {member}"
+            );
+            assert_eq!(member["samples"], serde_json::json!(0));
+        }
     }
 }

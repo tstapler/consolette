@@ -808,6 +808,7 @@ impl Default for FamilyRuntime {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     fn timeout() -> ProviderError {
@@ -1070,7 +1071,7 @@ mod tests {
                 model: "model-a:free".to_string(),
             }
         );
-        assert_eq!(first.error_rate, 0.0);
+        assert!((first.error_rate - 0.0).abs() < 1e-9);
         assert_eq!(first.latency_p50_ms, 0);
         assert_eq!(first.samples, 0);
         assert_eq!(first.previous_pick, None);
@@ -1091,7 +1092,7 @@ mod tests {
         ));
         let second = rt.snapshot("auto-coding").expect("snapshot must update");
         assert_eq!(second.picked.model, "model-b:free");
-        assert_eq!(second.error_rate, 0.0);
+        assert!((second.error_rate - 0.0).abs() < 1e-9);
         assert_eq!(second.latency_p50_ms, 1800);
         assert_eq!(second.samples, 30);
         assert_eq!(

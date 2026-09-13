@@ -32,7 +32,7 @@ struct CapturingProvider {
 
 #[async_trait::async_trait]
 impl Provider for CapturingProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -62,7 +62,7 @@ impl AdmissionControl for AlwaysAllow {
 
 /// Both-alias config (Story 7.1 Task 1): free pool + opt-in paid pool.
 /// `gpt-4o` is the vendored-snapshot paid fixture (proven paid by the
-/// FreeGuard tests); `:free`-suffixed IDs are verifiably free.
+/// `FreeGuard` tests); `:free`-suffixed IDs are verifiably free.
 fn both_alias_families() -> Vec<ModelFamily> {
     vec![
         ModelFamily {
@@ -148,8 +148,10 @@ async fn dispatch_should_keep_free_and_paid_stats_separate_when_both_aliases_res
     // Load-time isolation: the two-alias config passes FreeGuard (paid IDs
     // live only under allow_paid=true), while the same paid ID in the free
     // family fails closed.
-    let mut config = Config::default();
-    config.families = both_alias_families();
+    let config = Config {
+        families: both_alias_families(),
+        ..Config::default()
+    };
     assert!(
         validate_free_guard(&config).is_ok(),
         "paid alias config must load clean under allow_paid=true"
@@ -236,8 +238,10 @@ async fn dispatch_should_never_record_paid_resolution_for_free_alias() {
     // dispatch actually writes (not the `PerAliasCounters` stub): ranked
     // serve, bypass path, and a polluted table must all leave
     // `paid_resolutions("auto-coding") == 0`.
-    let mut config = Config::default();
-    config.families = both_alias_families();
+    let config = Config {
+        families: both_alias_families(),
+        ..Config::default()
+    };
     let table = Arc::new(FamilyTable::from_config(&config));
 
     // Ranked serve: the free alias serves its config-order default.

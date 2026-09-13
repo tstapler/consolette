@@ -89,7 +89,7 @@ pub fn validate_family_strategy(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// FreeGuard: a free family (`allow_paid = false`) only admits member IDs
+/// `FreeGuard`: a free family (`allow_paid = false`) only admits member IDs
 /// that are verifiably free — a `:free` suffix (fail-open so provider-side
 /// rotation minting new `:free` IDs keeps loading) or a vendored pricing
 /// snapshot entry priced at exactly zero. Anything else fails closed:
@@ -125,6 +125,7 @@ pub fn validate_free_guard(config: &Config) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::super::schema::{
         Config, FamilyMember, ModelFamily, Route, RouteUpstreamRef, Strategy,
     };
@@ -132,19 +133,20 @@ mod tests {
     use super::{validate_family_strategy, validate_free_guard, validate_references};
 
     fn free_family_config(alias: &str, allow_paid: bool, models: &[&str]) -> Config {
-        let mut config = Config::default();
-        config.families = vec![ModelFamily {
-            alias: alias.to_string(),
-            members: models
-                .iter()
-                .map(|m| FamilyMember {
-                    upstream: "anthropic".to_string(),
-                    model: (*m).to_string(),
-                })
-                .collect(),
-            allow_paid,
-        }];
-        config
+        Config {
+            families: vec![ModelFamily {
+                alias: alias.to_string(),
+                members: models
+                    .iter()
+                    .map(|m| FamilyMember {
+                        upstream: "anthropic".to_string(),
+                        model: (*m).to_string(),
+                    })
+                    .collect(),
+                allow_paid,
+            }],
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -197,15 +199,17 @@ mod tests {
 
     #[test]
     fn validate_references_should_reject_family_member_with_unknown_upstream() {
-        let mut config = Config::default();
-        config.families = vec![ModelFamily {
-            alias: "auto-coding".to_string(),
-            members: vec![FamilyMember {
-                upstream: "does-not-exist".to_string(),
-                model: "x-model:free".to_string(),
+        let config = Config {
+            families: vec![ModelFamily {
+                alias: "auto-coding".to_string(),
+                members: vec![FamilyMember {
+                    upstream: "does-not-exist".to_string(),
+                    model: "x-model:free".to_string(),
+                }],
+                allow_paid: false,
             }],
-            allow_paid: false,
-        }];
+            ..Config::default()
+        };
         let err = validate_references(&config).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -218,17 +222,19 @@ mod tests {
     fn validate_references_should_reject_route_with_unknown_family_alias() {
         // A route naming a nonexistent [[model_families]] alias must fail
         // load (never render as entry_kind "family" with null detail).
-        let mut config = Config::default();
-        config.routes = vec![Route {
-            name: "default".to_string(),
-            strategy: Strategy::Fallback,
-            upstreams: vec![RouteUpstreamRef {
-                name: "anthropic".to_string(),
-                weight: None,
-                model: None,
+        let config = Config {
+            routes: vec![Route {
+                name: "default".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "anthropic".to_string(),
+                    weight: None,
+                    model: None,
+                }],
+                family: Some("no-such-alias".to_string()),
             }],
-            family: Some("no-such-alias".to_string()),
-        }];
+            ..Config::default()
+        };
         match validate_references(&config) {
             Err(ConfigError::UnknownFamilyAlias { route, alias }) => {
                 assert_eq!(route, "default");
@@ -244,25 +250,27 @@ mod tests {
         }
 
         // A route naming a declared alias passes.
-        let mut config = Config::default();
-        config.families = vec![ModelFamily {
-            alias: "auto-coding".to_string(),
-            members: vec![FamilyMember {
-                upstream: "anthropic".to_string(),
-                model: "x-model:free".to_string(),
+        let config = Config {
+            families: vec![ModelFamily {
+                alias: "auto-coding".to_string(),
+                members: vec![FamilyMember {
+                    upstream: "anthropic".to_string(),
+                    model: "x-model:free".to_string(),
+                }],
+                allow_paid: false,
             }],
-            allow_paid: false,
-        }];
-        config.routes = vec![Route {
-            name: "default".to_string(),
-            strategy: Strategy::Fallback,
-            upstreams: vec![RouteUpstreamRef {
-                name: "anthropic".to_string(),
-                weight: None,
-                model: None,
+            routes: vec![Route {
+                name: "default".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "anthropic".to_string(),
+                    weight: None,
+                    model: None,
+                }],
+                family: Some("auto-coding".to_string()),
             }],
-            family: Some("auto-coding".to_string()),
-        }];
+            ..Config::default()
+        };
         assert!(validate_references(&config).is_ok());
     }
 

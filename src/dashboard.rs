@@ -1097,6 +1097,7 @@ mod tests {
     // no JS runtime executes this code in these tests.
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn family_card_should_render_above_stat_cards() {
         let card = DASHBOARD_HTML
             .find("id=\"family-section\"")

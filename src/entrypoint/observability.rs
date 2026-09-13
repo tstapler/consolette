@@ -405,6 +405,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::expect_used)]
+    #[allow(clippy::unwrap_used)]
     async fn metrics_family_section_should_report_cold_status_when_no_resolutions_yet() {
         let dir = tempfile::tempdir().unwrap();
         family_conf_d(dir.path());

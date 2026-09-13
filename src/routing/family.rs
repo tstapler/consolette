@@ -152,7 +152,7 @@ impl FamilyTable {
     /// `fallback_to_default_total`, and logs WARN. NEVER returns a paid ID:
     /// the filter applies regardless of `allow_paid`, so even a paid ID
     /// that leaked into the free alias (e.g. via a bad hot-swap past
-    /// FreeGuard) cannot be served from here, and the paid alias's pool is
+    /// `FreeGuard`) cannot be served from here, and the paid alias's pool is
     /// never consulted for a free-alias bypass.
     pub fn safety_net_resolve_free_only(
         &self,
@@ -763,6 +763,7 @@ fn log_resolution(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use std::collections::HashMap;
 
     use crate::config::schema::{Config, FamilyMember, ModelFamily};
@@ -776,45 +777,47 @@ mod tests {
 
     /// Paid-alias config from Story 7.1 Task 1: `auto-coding-paid` with
     /// `allow_paid = true`, a snapshot-listed paid ID (`gpt-4o`, proven paid
-    /// by the FreeGuard tests) plus a pricing-unknown ID (fail-closed in a
+    /// by the `FreeGuard` tests) plus a pricing-unknown ID (fail-closed in a
     /// free family, accepted here). No new schema field needed — Epic 1's
     /// `allow_paid` covers it (verified, not reworked).
     fn paid_alias_config() -> Config {
-        let mut config = Config::default();
-        config.families = vec![ModelFamily {
-            alias: "auto-coding-paid".to_string(),
-            members: vec![
-                FamilyMember {
-                    upstream: "anthropic".to_string(),
-                    model: "gpt-4o".to_string(),
-                },
-                FamilyMember {
-                    upstream: "anthropic".to_string(),
-                    model: "anthropic/claude-x".to_string(),
-                },
-            ],
-            allow_paid: true,
-        }];
-        config
+        Config {
+            families: vec![ModelFamily {
+                alias: "auto-coding-paid".to_string(),
+                members: vec![
+                    FamilyMember {
+                        upstream: "anthropic".to_string(),
+                        model: "gpt-4o".to_string(),
+                    },
+                    FamilyMember {
+                        upstream: "anthropic".to_string(),
+                        model: "anthropic/claude-x".to_string(),
+                    },
+                ],
+                allow_paid: true,
+            }],
+            ..Config::default()
+        }
     }
 
     fn free_alias_config() -> Config {
-        let mut config = Config::default();
-        config.families = vec![ModelFamily {
-            alias: "auto-coding".to_string(),
-            members: vec![
-                FamilyMember {
-                    upstream: "anthropic".to_string(),
-                    model: "model-a:free".to_string(),
-                },
-                FamilyMember {
-                    upstream: "anthropic".to_string(),
-                    model: "model-b:free".to_string(),
-                },
-            ],
-            allow_paid: false,
-        }];
-        config
+        Config {
+            families: vec![ModelFamily {
+                alias: "auto-coding".to_string(),
+                members: vec![
+                    FamilyMember {
+                        upstream: "anthropic".to_string(),
+                        model: "model-a:free".to_string(),
+                    },
+                    FamilyMember {
+                        upstream: "anthropic".to_string(),
+                        model: "model-b:free".to_string(),
+                    },
+                ],
+                allow_paid: false,
+            }],
+            ..Config::default()
+        }
     }
 
     #[test]

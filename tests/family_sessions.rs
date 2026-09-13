@@ -90,21 +90,23 @@ struct SessionHarness {
 }
 
 fn session_harness() -> SessionHarness {
-    let mut config = Config::default();
-    config.families = vec![ModelFamily {
-        alias: "auto-coding".to_string(),
-        members: vec![
-            FamilyMember {
-                upstream: "mock-a".to_string(),
-                model: "model-a:free".to_string(),
-            },
-            FamilyMember {
-                upstream: "mock-b".to_string(),
-                model: "model-b:free".to_string(),
-            },
-        ],
-        allow_paid: false,
-    }];
+    let config = Config {
+        families: vec![ModelFamily {
+            alias: "auto-coding".to_string(),
+            members: vec![
+                FamilyMember {
+                    upstream: "mock-a".to_string(),
+                    model: "model-a:free".to_string(),
+                },
+                FamilyMember {
+                    upstream: "mock-b".to_string(),
+                    model: "model-b:free".to_string(),
+                },
+            ],
+            allow_paid: false,
+        }],
+        ..Config::default()
+    };
     let table = Arc::new(FamilyTable::from_config(&config));
 
     let bodies_a = Arc::new(Mutex::new(Vec::new()));

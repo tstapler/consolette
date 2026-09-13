@@ -33,7 +33,7 @@ struct CapturingProvider {
 
 #[async_trait::async_trait]
 impl Provider for CapturingProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -62,22 +62,23 @@ impl AdmissionControl for AlwaysAllow {
 }
 
 fn family_config() -> Config {
-    let mut config = Config::default();
-    config.families = vec![ModelFamily {
-        alias: "auto-coding".to_string(),
-        members: vec![
-            FamilyMember {
-                upstream: "mock".to_string(),
-                model: "model-a:free".to_string(),
-            },
-            FamilyMember {
-                upstream: "mock".to_string(),
-                model: "model-b:free".to_string(),
-            },
-        ],
-        allow_paid: false,
-    }];
-    config
+    Config {
+        families: vec![ModelFamily {
+            alias: "auto-coding".to_string(),
+            members: vec![
+                FamilyMember {
+                    upstream: "mock".to_string(),
+                    model: "model-a:free".to_string(),
+                },
+                FamilyMember {
+                    upstream: "mock".to_string(),
+                    model: "model-b:free".to_string(),
+                },
+            ],
+            allow_paid: false,
+        }],
+        ..Config::default()
+    }
 }
 
 fn mock_router(

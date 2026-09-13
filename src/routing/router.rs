@@ -437,6 +437,10 @@ impl Router {
     ///
     /// Returns the last [`ProviderError`] encountered once every candidate
     /// upstream has been tried (or none were available/admitted).
+    // Longest cohesive dispatch loop in the router; splitting the family
+    // resolution step out (`resolve_family_step` extraction) is a logged
+    // follow-up — allowed here until that lands, per the cmdcrush precedent.
+    #[allow(clippy::too_many_lines)]
     pub async fn dispatch(
         &self,
         body: serde_json::Value,
@@ -1585,15 +1589,17 @@ mod tests {
         use crate::routing::family::FamilyTable;
 
         let metrics = MetricsCollector::new();
-        let mut config = Config::default();
-        config.families = vec![ModelFamily {
-            alias: "auto-coding".to_string(),
-            members: vec![FamilyMember {
-                upstream: "openrouter".to_string(),
-                model: "model-a:free".to_string(),
+        let config = Config {
+            families: vec![ModelFamily {
+                alias: "auto-coding".to_string(),
+                members: vec![FamilyMember {
+                    upstream: "openrouter".to_string(),
+                    model: "model-a:free".to_string(),
+                }],
+                allow_paid: false,
             }],
-            allow_paid: false,
-        }];
+            ..Config::default()
+        };
         let router = Router::new(
             vec![UpstreamRef {
                 index: 0,
@@ -1689,21 +1695,23 @@ mod tests {
         use crate::routing::family::FamilyTable;
 
         fn sticky_router(health: Arc<HealthRegistry>) -> Router {
-            let mut config = Config::default();
-            config.families = vec![ModelFamily {
-                alias: "auto-coding".to_string(),
-                members: vec![
-                    FamilyMember {
-                        upstream: "mock".to_string(),
-                        model: "model-a:free".to_string(),
-                    },
-                    FamilyMember {
-                        upstream: "mock".to_string(),
-                        model: "model-b:free".to_string(),
-                    },
-                ],
-                allow_paid: false,
-            }];
+            let config = Config {
+                families: vec![ModelFamily {
+                    alias: "auto-coding".to_string(),
+                    members: vec![
+                        FamilyMember {
+                            upstream: "mock".to_string(),
+                            model: "model-a:free".to_string(),
+                        },
+                        FamilyMember {
+                            upstream: "mock".to_string(),
+                            model: "model-b:free".to_string(),
+                        },
+                    ],
+                    allow_paid: false,
+                }],
+                ..Config::default()
+            };
             Router::new(
                 vec![upstream(0, "mock")],
                 Vec::<Arc<dyn Provider>>::new(),
@@ -2149,6 +2157,7 @@ mod tests {
     // family pick is B and proves the outgoing model is still A.
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
+    #[allow(clippy::expect_used)]
     async fn session_pin_should_win_over_family_resolution_when_pin_exists() {
         use crate::config::schema::{FamilyMember, ModelFamily};
         use crate::routing::family::FamilyTable;
@@ -2180,21 +2189,23 @@ mod tests {
                 .record_member("mock-b", "model-b:free", None, 50);
         }
 
-        let mut config = Config::default();
-        config.families = vec![ModelFamily {
-            alias: "auto-coding".to_string(),
-            members: vec![
-                FamilyMember {
-                    upstream: "mock-a".to_string(),
-                    model: "model-a:free".to_string(),
-                },
-                FamilyMember {
-                    upstream: "mock-b".to_string(),
-                    model: "model-b:free".to_string(),
-                },
-            ],
-            allow_paid: false,
-        }];
+        let config = Config {
+            families: vec![ModelFamily {
+                alias: "auto-coding".to_string(),
+                members: vec![
+                    FamilyMember {
+                        upstream: "mock-a".to_string(),
+                        model: "model-a:free".to_string(),
+                    },
+                    FamilyMember {
+                        upstream: "mock-b".to_string(),
+                        model: "model-b:free".to_string(),
+                    },
+                ],
+                allow_paid: false,
+            }],
+            ..Config::default()
+        };
         let table = Arc::new(FamilyTable::from_config(&config));
 
         let session_overrides = Arc::new(SessionOverrideStore::new());

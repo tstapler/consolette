@@ -110,6 +110,39 @@ async fn post_route_should_reject_paid_member_when_hot_swapped_into_free_family(
 }
 
 #[tokio::test]
+async fn post_route_should_reject_unknown_family_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    write_conf_d(dir.path(), FREE_FAMILY_TOML);
+    let state = state_for(dir.path()).await;
+
+    // The posted route opts into an alias with no [[model_families]]
+    // entry: 400 naming route + alias (never a live "family" route with
+    // null detail), persisting nothing and keeping the live router.
+    let mut route = valid_route();
+    route.name = "default".to_string();
+    route.family = Some("no-such-alias".to_string());
+
+    let err = post_route(State(state.clone()), Json(route))
+        .await
+        .unwrap_err();
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    let msg = err.1 .0["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("default") && msg.contains("no-such-alias"),
+        "rejection must name route + alias, got: {msg}"
+    );
+    assert!(
+        !RuntimeOverrides::path(dir.path()).exists(),
+        "a rejected hot-swap must not be persisted"
+    );
+    assert_eq!(
+        state.dispatch_router.load().candidate_names(),
+        vec!["anthropic".to_string()],
+        "the live router must keep serving the previous route"
+    );
+}
+
+#[tokio::test]
 async fn post_route_should_reject_family_member_with_unknown_upstream() {
     let dir = tempfile::tempdir().unwrap();
     write_conf_d(dir.path(), FREE_FAMILY_TOML);

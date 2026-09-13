@@ -461,7 +461,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         // fallback_to_default_total never resets, so visibility latches on
         // fallback-count growth and clears on the next healthy resolution
         // (resolutions_total advancing with the fallback count unchanged).
-        let prevFb = 0, prevRes = 0, bannerVisible = false;
+        // Keyed per rendered alias (first poll per alias only syncs the
+        // baselines WITHOUT latching, so historical bypasses never trip the
+        // banner on load). Sticky-traffic note: sticky serves skip
+        // resolve_family (no snapshot publish), so under a stuck session the
+        // banner can clear up to K requests late — accepted, not a bug.
+        let prevFbByAlias = {}, prevResByAlias = {}, seenAlias = {}, bannerVisible = false;
         function familyStatusLabel(status, isPick) {
             if (status === undefined || status === null || status === '') status = 'cold';
             if (status === 'active') return isPick ? '(•) active — serving' : '(•) active';
@@ -515,13 +520,17 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             // Until then it names the served pick + time + rollback curl.
             const bypasses = entry.fallback_to_default_total || 0;
             const resTotal = entry.resolutions_total || 0;
-            if (bypasses > prevFb) {
+            if (!seenAlias[alias]) {
+                // First poll for this alias: sync baselines without
+                // latching — historical bypasses must not trip the banner.
+                seenAlias[alias] = true;
+            } else if (bypasses > (prevFbByAlias[alias] || 0)) {
                 bannerVisible = true;
-            } else if (resTotal > prevRes && bypasses === prevFb) {
+            } else if (resTotal > (prevResByAlias[alias] || 0) && bypasses === prevFbByAlias[alias]) {
                 bannerVisible = false;
             }
-            prevFb = bypasses;
-            prevRes = resTotal;
+            prevFbByAlias[alias] = bypasses;
+            prevResByAlias[alias] = resTotal;
             const banner = document.getElementById('family-banner');
             const card = document.getElementById('family-card');
             const tag = document.getElementById('family-bypassed-tag');
@@ -695,7 +704,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                         try {
                             const t = JSON.parse(json);
                             const abbrevs = {text:'T', tool_use:'TU', tool_result:'TR', image:'IMG', document:'DOC', search_result:'SR'};
-                            const parts = Object.entries(t).map(([k,v]) => (abbrevs[k]||k)+':'+v);
+                            // Keys ride client message content — escape.
+                            const parts = Object.entries(t).map(([k,v]) => esc(abbrevs[k]||k)+':'+esc(v));
                             const cmBadge = cm ? ' <span class="error-type" style="background:#3a2a1a;font-size:10px">CM</span>' : '';
                             return '<span style="font-size:11px;color:#aaa">' + parts.join(' ') + '</span>' + cmBadge;
                         } catch { return json; }
@@ -710,15 +720,19 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                         const typeLabel = r.stream
                             ? '<span class="error-type" style="background:#1e3a5f">stream</span>'
                             : '<span class="error-type" style="background:#1a3a1a">sync</span>';
+                        // r.provider / r.model are client-controlled (via
+                        // the request body) — escape every interpolation.
+                        // The row click carries its args in data-attributes
+                        // (never a string-spliced onclick handler).
                         const provLabel = r.provider && r.provider !== 'unknown'
-                            ? '<span class="error-type" style="background:' + provColor(r.provider) + '">' + r.provider + '</span>'
+                            ? '<span class="error-type" style="background:' + provColor(r.provider) + '">' + esc(r.provider) + '</span>'
                             : '—';
                         const ttft = r.bedrock_first_byte_ms > 0 ? fmtMs(r.bedrock_first_byte_ms) : fmtMs(r.first_byte_ms);
-                        return '<tr style="cursor:pointer" onclick="showRequestBody(\'' + r.request_id + '\',\'' + r.model + '\',\'' + time + '\')">'
+                        return '<tr style="cursor:pointer" data-req="' + esc(r.request_id) + '" data-model="' + esc(r.model) + '" data-time="' + esc(time) + '">'
                             + '<td>' + time + '</td>'
-                            + '<td style="font-family:monospace;font-size:11px">' + r.request_id + '</td>'
+                            + '<td style="font-family:monospace;font-size:11px">' + esc(r.request_id) + '</td>'
                             + '<td>' + provLabel + '</td>'
-                            + '<td>' + abbrevModel(r.model) + '</td>'
+                            + '<td>' + esc(abbrevModel(r.model)) + '</td>'
                             + '<td style="font-family:monospace">' + fmtMs(r.duration_ms) + '</td>'
                             + '<td style="font-family:monospace">' + ttft + '</td>'
                             + '<td style="font-family:monospace">' + tokStr + '</td>'
@@ -728,6 +742,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                             + '<td>' + typeLabel + '</td>'
                             + '</tr>';
                     }).join('');
+                    // Row clicks via delegation-safe listeners on the
+                    // data-attributes above (see the onclick note).
+                    requestsBody.querySelectorAll('tr[data-req]').forEach(tr => {
+                        tr.addEventListener('click', () => showRequestBody(tr.dataset.req, tr.dataset.model, tr.dataset.time));
+                    });
                 } else {
                     requestsBody.innerHTML = '<tr><td colspan="11" class="no-errors">No requests yet</td></tr>';
                 }
@@ -740,7 +759,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     const fmtMs2 = ms => ms > 0 ? (ms >= 1000 ? (ms/1000).toFixed(1)+'s' : ms+'ms') : '—';
                     latencyCards.innerHTML = latencyNames.map(name => {
                         const pl = data.provider_latency[name];
-                        const label = displayName(name);
+                        const label = esc(displayName(name));
                         return '<div class="stat-card">'
                             + '<div class="stat-label">' + label + ' Avg Duration</div>'
                             + '<div class="stat-value">' + fmtMs2(pl.avg_duration_ms || 0) + '</div>'
@@ -757,11 +776,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 if (data.recent_errors && data.recent_errors.length > 0) {
                     errorsBody.innerHTML = data.recent_errors.map(err => {
                         const time = new Date(err.timestamp).toLocaleTimeString();
+                        // err.provider / err.model are client-controlled —
+                        // escape every interpolation.
                         return '<tr>'
                             + '<td>' + time + '</td>'
-                            + '<td><span class="error-type">' + err.error_type + '</span></td>'
-                            + '<td>' + err.provider + '</td>'
-                            + '<td>' + err.model + '</td>'
+                            + '<td><span class="error-type">' + esc(err.error_type) + '</span></td>'
+                            + '<td>' + esc(err.provider) + '</td>'
+                            + '<td>' + esc(err.model) + '</td>'
                             + '</tr>';
                     }).join('');
                 } else {
@@ -797,7 +818,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         async function fetchAndRenderBody() {
             document.getElementById('modal-body').textContent = 'Loading…';
             try {
-                const resp = await fetch('/requests/' + _modalRequestId + '?stage=' + _modalStage);
+                const resp = await fetch('/requests/' + encodeURIComponent(_modalRequestId) + '?stage=' + _modalStage);
                 if (!resp.ok) {
                     document.getElementById('modal-body').textContent = _modalStage === 'compressed'
                         ? '(no compressed snapshot — compression may have been skipped)'
@@ -838,14 +859,16 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                         const last = new Date(e.last_seen).toLocaleString();
                         const fp = e.fingerprint.substring(0, 8);
                         const msg = e.message.length > 80 ? e.message.substring(0, 80) + '…' : e.message;
+                        // e.provider / e.message carry upstream error text —
+                        // escape every interpolation including the title attr.
                         return '<tr>'
-                            + '<td style="font-family:monospace;font-size:11px;">' + fp + '</td>'
-                            + '<td>' + e.provider + '</td>'
-                            + '<td><span class="error-type">' + e.error_type + '</span></td>'
+                            + '<td style="font-family:monospace;font-size:11px;">' + esc(fp) + '</td>'
+                            + '<td>' + esc(e.provider) + '</td>'
+                            + '<td><span class="error-type">' + esc(e.error_type) + '</span></td>'
                             + '<td>' + e.count + '</td>'
                             + '<td style="font-size:11px;">' + first + '</td>'
                             + '<td style="font-size:11px;">' + last + '</td>'
-                            + '<td style="font-size:11px;max-width:300px;word-break:break-word;" title="' + e.message + '">' + msg + '</td>'
+                            + '<td style="font-size:11px;max-width:300px;word-break:break-word;" title="' + esc(e.message) + '">' + esc(msg) + '</td>'
                             + '</tr>';
                     }).join('');
                 } else {
@@ -1260,14 +1283,20 @@ mod tests {
         // Bypass latch guard: cumulative fallback_to_default_total never
         // resets, so visibility must edge-detect (latch on fallback-count
         // growth, clear once resolutions_total advances with the fallback
-        // count unchanged) — never `if (bypasses > 0)`.
+        // count unchanged) — never `if (bypasses > 0)`. State is keyed per
+        // rendered alias, and the first poll per alias only syncs baselines
+        // without latching (historical bypasses must not trip the banner).
         assert!(
-            DASHBOARD_HTML.contains("bypasses > prevFb"),
+            DASHBOARD_HTML.contains("bypasses > (prevFbByAlias[alias]"),
             "banner must latch when the fallback count grows since last poll"
         );
         assert!(
-            DASHBOARD_HTML.contains("resTotal > prevRes"),
+            DASHBOARD_HTML.contains("resTotal > (prevResByAlias[alias]"),
             "banner must clear once resolutions advance with fallback count unchanged"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("seenAlias[alias]"),
+            "first poll per alias must sync baselines without latching"
         );
         assert!(
             DASHBOARD_HTML.contains("if (bannerVisible)"),

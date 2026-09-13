@@ -69,6 +69,19 @@ impl FamilyTable {
         self.entries.get(alias).map(|e| e.members.as_slice())
     }
 
+    /// Whether `(upstream, model)` is a member of ANY configured alias.
+    /// Dispatch gates the `MemberStats` dual-write on this so non-family
+    /// routes (and junk client model IDs) can't grow the stats map without
+    /// bound — per-upstream counters are untouched by that gate.
+    #[must_use]
+    pub fn is_member(&self, upstream: &str, model: &str) -> bool {
+        self.entries.values().any(|e| {
+            e.members
+                .iter()
+                .any(|m| m.upstream == upstream && m.model == model)
+        })
+    }
+
     /// Epic 1 resolution stub: the config-order first member (Epic 3's
     /// ranker will pick lowest-error then lowest-latency among healthy).
     /// Unknown alias or empty member list → `None` (no expansion).

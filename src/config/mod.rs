@@ -16,6 +16,8 @@ pub enum ConfigError {
     Figment(#[from] Box<figment::Error>),
     #[error("{route} references unknown upstream {upstream:?}")]
     UnknownUpstreamReference { route: String, upstream: String },
+    #[error("route {route:?} names unknown family {alias:?}")]
+    UnknownFamilyAlias { route: String, alias: String },
     #[error("family {alias:?} forbids paid model {member:?} (allow_paid = false)")]
     PaidMemberInFreeFamily { alias: String, member: String },
     #[error("route {route:?} names family {alias:?} but uses weighted strategy (family resolution requires fallback ordering)")]

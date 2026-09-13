@@ -97,7 +97,7 @@ pub async fn get_route(
         )
     })?;
     match route.family.as_deref() {
-        Some(alias) => {
+        Some(alias) if config.families.iter().any(|f| f.alias == alias) => {
             value["entry_kind"] = json!("family");
             value["family_detail"] =
                 config
@@ -123,7 +123,12 @@ pub async fn get_route(
                         })
                     });
         }
-        None => {
+        None | Some(_) => {
+            // `None` is a pinned route; `Some` with no matching
+            // [[model_families]] entry is a stale/unknown alias (load-time
+            // validation rejects it, but a hand-edited conf.d can still
+            // produce it) — never render entry_kind "family" with null
+            // detail as if rolled back; read it as pinned instead.
             value["entry_kind"] = json!("pinned");
             value["family_detail"] = Value::Null;
         }
@@ -153,6 +158,7 @@ pub async fn post_route(
     let mut candidate = crate::config::load(&state.config_dir).map_err(|e| match &e {
         crate::config::ConfigError::PaidMemberInFreeFamily { .. }
         | crate::config::ConfigError::UnknownUpstreamReference { .. }
+        | crate::config::ConfigError::UnknownFamilyAlias { .. }
         | crate::config::ConfigError::WeightedFamilyRoute { .. } => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),

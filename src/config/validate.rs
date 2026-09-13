@@ -7,17 +7,20 @@ use super::schema::{Config, Strategy};
 use super::ConfigError;
 
 /// Every route's upstream references must resolve to a declared upstream
-/// name, every `ratelimit` key must reference a declared upstream, and every
-/// family member's upstream must resolve too (unknown member upstreams fail
-/// with the upstream name in the error).
+/// name, every route's `family` alias must name a declared
+/// `[[model_families]]` alias, every `ratelimit` key must reference a
+/// declared upstream, and every family member's upstream must resolve too
+/// (unknown member upstreams fail with the upstream name in the error).
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::UnknownUpstreamReference`] if a route, a
 /// `ratelimit` entry, or a family member names an upstream not present in
-/// `config.upstreams`.
+/// `config.upstreams`, or [`ConfigError::UnknownFamilyAlias`] if a route's
+/// `family` names an alias with no `[[model_families]]` entry.
 pub fn validate_references(config: &Config) -> Result<(), ConfigError> {
     let known: HashSet<&str> = config.upstreams.iter().map(|u| u.name.as_str()).collect();
+    let aliases: HashSet<&str> = config.families.iter().map(|f| f.alias.as_str()).collect();
 
     for route in &config.routes {
         for reference in &route.upstreams {
@@ -25,6 +28,14 @@ pub fn validate_references(config: &Config) -> Result<(), ConfigError> {
                 return Err(ConfigError::UnknownUpstreamReference {
                     route: route.name.clone(),
                     upstream: reference.name.clone(),
+                });
+            }
+        }
+        if let Some(alias) = route.family.as_deref() {
+            if !aliases.contains(alias) {
+                return Err(ConfigError::UnknownFamilyAlias {
+                    route: route.name.clone(),
+                    alias: alias.to_string(),
                 });
             }
         }
@@ -201,6 +212,58 @@ mod tests {
             msg.contains("does-not-exist"),
             "error must name the unknown upstream, got: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_references_should_reject_route_with_unknown_family_alias() {
+        // A route naming a nonexistent [[model_families]] alias must fail
+        // load (never render as entry_kind "family" with null detail).
+        let mut config = Config::default();
+        config.routes = vec![Route {
+            name: "default".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "anthropic".to_string(),
+                weight: None,
+                model: None,
+            }],
+            family: Some("no-such-alias".to_string()),
+        }];
+        match validate_references(&config) {
+            Err(ConfigError::UnknownFamilyAlias { route, alias }) => {
+                assert_eq!(route, "default");
+                assert_eq!(alias, "no-such-alias");
+                let msg = ConfigError::UnknownFamilyAlias { route, alias }.to_string();
+                assert!(
+                    msg.contains("default") && msg.contains("no-such-alias"),
+                    "error must name route + alias, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected UnknownFamilyAlias, got {other:?}"),
+            Ok(()) => panic!("unknown family alias must be rejected"),
+        }
+
+        // A route naming a declared alias passes.
+        let mut config = Config::default();
+        config.families = vec![ModelFamily {
+            alias: "auto-coding".to_string(),
+            members: vec![FamilyMember {
+                upstream: "anthropic".to_string(),
+                model: "x-model:free".to_string(),
+            }],
+            allow_paid: false,
+        }];
+        config.routes = vec![Route {
+            name: "default".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "anthropic".to_string(),
+                weight: None,
+                model: None,
+            }],
+            family: Some("auto-coding".to_string()),
+        }];
+        assert!(validate_references(&config).is_ok());
     }
 
     fn family_route_with(strategy: Strategy) -> Config {

@@ -93,11 +93,28 @@ fn both_alias_families() -> Vec<ModelFamily> {
 fn mock_router(
     table: Arc<FamilyTable>,
     active_family: &str,
-) -> (Router, Arc<std::sync::Mutex<Option<serde_json::Value>>>) {
+) -> (
+    Router,
+    Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    Arc<MetricsCollector>,
+) {
+    mock_router_with_health(table, active_family, Arc::new(HealthRegistry::new(300)))
+}
+
+fn mock_router_with_health(
+    table: Arc<FamilyTable>,
+    active_family: &str,
+    health: Arc<HealthRegistry>,
+) -> (
+    Router,
+    Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    Arc<MetricsCollector>,
+) {
     let received_body = Arc::new(std::sync::Mutex::new(None));
     let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
         received_body: received_body.clone(),
     })];
+    let metrics = MetricsCollector::new();
     let router = Router::new(
         vec![UpstreamRef {
             index: 0,
@@ -107,12 +124,12 @@ fn mock_router(
         }],
         providers,
         Arc::new(FallbackStrategy),
-        Arc::new(HealthRegistry::new(300)),
+        health,
         Arc::new(AlwaysAllow),
-        MetricsCollector::new(),
+        metrics.clone(),
     )
     .with_family_table(table, Some(active_family.to_string()));
-    (router, received_body)
+    (router, received_body, metrics)
 }
 
 fn seen_model(received_body: &Arc<std::sync::Mutex<Option<serde_json::Value>>>) -> String {
@@ -152,7 +169,7 @@ async fn dispatch_should_keep_free_and_paid_stats_separate_when_both_aliases_res
     let table = Arc::new(FamilyTable::from_config(&config));
     let mut counters = PerAliasCounters::new();
 
-    let (free_router, free_seen) = mock_router(table.clone(), "auto-coding");
+    let (free_router, free_seen, _) = mock_router(table.clone(), "auto-coding");
     free_router
         .dispatch(json!({"model": "auto-coding"}), HeaderMap::new(), false, 0)
         .await
@@ -162,7 +179,7 @@ async fn dispatch_should_keep_free_and_paid_stats_separate_when_both_aliases_res
     assert!(is_verifiably_free(&free_served));
     counters.record_resolution("auto-coding", !is_verifiably_free(&free_served));
 
-    let (paid_router, paid_seen) = mock_router(table.clone(), "auto-coding-paid");
+    let (paid_router, paid_seen, _) = mock_router(table.clone(), "auto-coding-paid");
     paid_router
         .dispatch(
             json!({"model": "auto-coding-paid"}),
@@ -211,4 +228,78 @@ async fn dispatch_should_keep_free_and_paid_stats_separate_when_both_aliases_res
             "paid stats key {key:?} must not collide with any free stats key"
         );
     }
+}
+
+#[tokio::test]
+async fn dispatch_should_never_record_paid_resolution_for_free_alias() {
+    // Dispatch-level paid-leak audit against the `FamilyRuntime` counters
+    // dispatch actually writes (not the `PerAliasCounters` stub): ranked
+    // serve, bypass path, and a polluted table must all leave
+    // `paid_resolutions("auto-coding") == 0`.
+    let mut config = Config::default();
+    config.families = both_alias_families();
+    let table = Arc::new(FamilyTable::from_config(&config));
+
+    // Ranked serve: the free alias serves its config-order default.
+    let (free_router, free_seen, free_metrics) = mock_router(table.clone(), "auto-coding");
+    free_router
+        .dispatch(json!({"model": "auto-coding"}), HeaderMap::new(), false, 0)
+        .await
+        .expect("free alias dispatch must succeed");
+    assert_eq!(seen_model(&free_seen), "model-a:free");
+    assert_eq!(
+        free_metrics.family.paid_resolutions("auto-coding"),
+        0,
+        "ranked free serve must not record a paid resolution"
+    );
+
+    // Bypass path: cool the shared index (non-429) so the ranked pool is
+    // empty and the safety net serves the least-bad free member.
+    let health = Arc::new(HealthRegistry::new(300));
+    health.trip(0, None);
+    let (bypass_router, bypass_seen, bypass_metrics) =
+        mock_router_with_health(table.clone(), "auto-coding", health);
+    bypass_router
+        .dispatch(json!({"model": "auto-coding"}), HeaderMap::new(), false, 0)
+        .await
+        .expect("bypass must serve a free member past the cool");
+    let bypass_served = seen_model(&bypass_seen);
+    assert!(
+        is_verifiably_free(&bypass_served),
+        "bypass must never serve paid from a free alias, served {bypass_served}"
+    );
+    assert_eq!(
+        bypass_metrics.family.paid_resolutions("auto-coding"),
+        0,
+        "bypass serve must not record a paid resolution"
+    );
+    assert_eq!(
+        bypass_metrics.family.counter_snapshot("auto-coding").1,
+        1,
+        "bypass path must record exactly one fallback"
+    );
+
+    // Polluted table: a paid ID injected into the free alias (past
+    // FreeGuard, as a bad hot-swap could) is stripped at dispatch.
+    let mut polluted = config.clone();
+    polluted.families[0].members.push(FamilyMember {
+        upstream: "mock".to_string(),
+        model: "gpt-4o".to_string(),
+    });
+    let polluted_table = Arc::new(FamilyTable::from_config(&polluted));
+    let (router, seen, metrics) = mock_router(polluted_table, "auto-coding");
+    router
+        .dispatch(json!({"model": "auto-coding"}), HeaderMap::new(), false, 0)
+        .await
+        .expect("polluted free alias dispatch must succeed");
+    assert_eq!(
+        seen_model(&seen),
+        "model-a:free",
+        "the injected paid ID must never be served from the free alias"
+    );
+    assert_eq!(
+        metrics.family.paid_resolutions("auto-coding"),
+        0,
+        "polluted-table serve must not record a paid resolution"
+    );
 }

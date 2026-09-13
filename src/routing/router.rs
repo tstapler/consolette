@@ -391,7 +391,10 @@ impl Router {
     /// Sticky serve pool: the stuck member first (it was validated by the
     /// caller), then the alias's remaining table members in config order for
     /// in-request failover — minus already-excluded members, so a transient
-    /// error on the stick never fails over onto a dead ID.
+    /// error on the stick never fails over onto a dead ID. Sibling exclusion
+    /// mirrors `eligible_pool`: denylisted, personally-backpressured, and
+    /// non-429-index-cooled members are out, while an unmarked sibling on a
+    /// 429-cooled shared upstream stays eligible.
     fn map_sticky_pool(&self, alias: &str, stuck: &StickyPick) -> Vec<UpstreamRef> {
         let mut members = vec![FamilyMember {
             upstream: stuck.upstream.clone(),
@@ -405,6 +408,15 @@ impl Router {
                 if self.metrics.family.is_denylisted(&m.upstream, &m.model)
                     || self.metrics.family.is_backpressured(&m.upstream, &m.model)
                 {
+                    continue;
+                }
+                let index_cooled = self
+                    .upstream_index(&m.upstream)
+                    .is_some_and(|index| !self.health.is_available(index));
+                let index_429_cooled = self
+                    .upstream_index(&m.upstream)
+                    .is_some_and(|index| self.health.is_backpressure_cooled(index));
+                if index_cooled && !index_429_cooled {
                     continue;
                 }
                 members.push(m.clone());
@@ -478,6 +490,9 @@ impl Router {
         let mut family_pool: Vec<UpstreamRef> = Vec::new();
         let mut family_active = false;
         let mut family_bypass = false;
+        // The alias being served this request, if any — the success arm
+        // uses it for the sticky failover correction below.
+        let mut sticky_alias: Option<String> = None;
         // Pins-first (Epic 4 Story 4.1): a live session pin bypasses family
         // expansion entirely — a pin means "use this," not "prefer this."
         // `effective_candidates` above already narrowed to the pinned
@@ -487,6 +502,7 @@ impl Router {
             let is_alias_request =
                 body.get("model").and_then(serde_json::Value::as_str) == Some(alias) && !pin_active;
             if is_alias_request {
+                sticky_alias = Some(alias.to_string());
                 // Auto-stickiness (Epic 4 Story 4.2, STICKY-PER-SESSION): an
                 // unpinned session reuses its stuck pick until the K-window
                 // lapses (`served == sticky_every`) or the stuck member hits
@@ -500,10 +516,17 @@ impl Router {
                         if stuck.served < self.session_overrides.sticky_every()
                             && !self.sticky_pick_invalid(&stuck)
                         {
-                            family_active = true;
-                            family_pool = self.map_sticky_pool(alias, &stuck);
-                            sticky_served = true;
-                            self.session_overrides.sticky_note_served(sid, alias);
+                            // Single-lock check-and-increment: the lookup
+                            // above is only a hint (window + health
+                            // pre-check); `try_sticky_serve` re-checks the
+                            // K-window and bumps `served` under one lock
+                            // hold so concurrent requests can't overshoot K.
+                            if let Some(stuck) = self.session_overrides.try_sticky_serve(sid, alias)
+                            {
+                                family_active = true;
+                                family_pool = self.map_sticky_pool(alias, &stuck);
+                                sticky_served = true;
+                            }
                         }
                     }
                 }
@@ -665,6 +688,36 @@ impl Router {
                         &model,
                         &resolved_model,
                     );
+                    // Sticky failover correction: the resolve-time record
+                    // pinned the pool head, but failover may have served a
+                    // sibling — re-record the member that actually returned
+                    // Ok so the session sticks to the working member, not
+                    // the errored head. Re-record resets the K-window serve
+                    // count (the new pick restarts at 1). Gated on an
+                    // existing stick so exploration probes (never recorded)
+                    // still never stick a session.
+                    if family_active && !family_bypass {
+                        if let (Some(sid), Some(stick_alias)) =
+                            (session_id.as_deref(), sticky_alias.as_deref())
+                        {
+                            if self
+                                .session_overrides
+                                .sticky_lookup(sid, stick_alias)
+                                .is_some()
+                                && family_pool.first().is_some_and(|head| {
+                                    head.name != chosen.name
+                                        || head.model.clone().unwrap_or_default() != resolved_model
+                                })
+                            {
+                                self.session_overrides.sticky_record(
+                                    sid,
+                                    stick_alias,
+                                    &chosen.name,
+                                    &resolved_model,
+                                );
+                            }
+                        }
+                    }
                     #[allow(clippy::cast_precision_loss)]
                     let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
                     // First-byte time isn't separately measured here (see
@@ -839,23 +892,27 @@ impl Router {
         // `record_member` (429/auth/validation never touch the quality
         // rate); the per-upstream counters above are byte-identical.
         //
-        // Epic 3 denylist writer: the returned classification feeds 404-only
-        // exclusion — `Validation(_, 404)` (never 400: client errors must not
-        // quarantine a healthy member) and `ModelUnsupported` mark the
-        // member dead for the 1h TTL, so the NEXT request skips it
-        // pre-dispatch. The first request after a fresh delist still fails
-        // (validation returns immediately with no failover — documented
-        // accepted limitation).
-        let class =
-            self.metrics
-                .family
-                .record_member(upstream, resolved_model, outcome_err, duration_ms);
-        if class == MemberRecordClass::DenylistFeed
-            || matches!(outcome_err, Some(ProviderError::Validation(_, 404)))
-        {
-            self.metrics
-                .family
-                .denylist_insert(upstream, resolved_model);
+        // Boundedness gate: only members of a configured family dual-write.
+        // Non-family routes fall back to the raw client `body["model"]`
+        // string for `resolved_model`, so an attacker-controlled model ID
+        // would otherwise mint a fresh stats bucket per distinct value.
+        // Non-members skip the write (and the denylist feed — exclusion is
+        // a family-members-only concept); per-upstream counters are
+        // untouched.
+        if self.family_table.is_member(upstream, resolved_model) {
+            let class = self.metrics.family.record_member(
+                upstream,
+                resolved_model,
+                outcome_err,
+                duration_ms,
+            );
+            if class == MemberRecordClass::DenylistFeed
+                || matches!(outcome_err, Some(ProviderError::Validation(_, 404)))
+            {
+                self.metrics
+                    .family
+                    .denylist_insert(upstream, resolved_model);
+            }
         }
     }
 
@@ -1518,11 +1575,25 @@ mod tests {
     }
 
     // Epic 2 (Story 2.2): dispatch dual-writes per-(upstream, resolved
-    // model) decayed stats alongside the untouched per-upstream counters.
+    // model) decayed stats alongside the untouched per-upstream counters —
+    // but ONLY for members of a configured family (boundedness gate: junk
+    // client model IDs on non-family routes must not mint stats buckets).
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn dispatch_should_dual_write_member_stats_keyed_by_resolved_model() {
+        use crate::config::schema::{FamilyMember, ModelFamily};
+        use crate::routing::family::FamilyTable;
+
         let metrics = MetricsCollector::new();
+        let mut config = Config::default();
+        config.families = vec![ModelFamily {
+            alias: "auto-coding".to_string(),
+            members: vec![FamilyMember {
+                upstream: "openrouter".to_string(),
+                model: "model-a:free".to_string(),
+            }],
+            allow_paid: false,
+        }];
         let router = Router::new(
             vec![UpstreamRef {
                 index: 0,
@@ -1538,7 +1609,8 @@ mod tests {
             Arc::new(HealthRegistry::new(300)),
             Arc::new(AlwaysAllow),
             metrics.clone(),
-        );
+        )
+        .with_family_table(Arc::new(FamilyTable::from_config(&config)), None);
 
         let res = router
             .dispatch(
@@ -1557,6 +1629,119 @@ mod tests {
         let upstream = metrics.counters.upstreams.get("openrouter").unwrap();
         assert_eq!(upstream.requests.load(Ordering::Relaxed), 1);
         assert_eq!(upstream.success.load(Ordering::Relaxed), 1);
+    }
+
+    // Boundedness gate: N dispatches with distinct junk client model IDs on
+    // a non-family route must leave the MemberStats map empty (no per-junk
+    // bucket is ever minted) while per-upstream counters still record every
+    // attempt.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_not_dual_write_member_stats_for_non_family_models() {
+        let metrics = MetricsCollector::new();
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "openrouter".to_string(),
+                weight: 1.0,
+                model: None,
+            }],
+            vec![Arc::new(AlwaysOkProvider {
+                name: "openrouter",
+                call_count: Arc::new(AtomicU32::new(0)),
+            })],
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            metrics.clone(),
+        );
+
+        for i in 0..25 {
+            let res = router
+                .dispatch(
+                    serde_json::json!({"model": format!("junk-model-{i}")}),
+                    HeaderMap::new(),
+                    false,
+                    0,
+                )
+                .await;
+            assert!(res.is_ok());
+        }
+
+        assert!(
+            metrics.family.stats.is_empty(),
+            "junk client model IDs must not mint MemberStats buckets"
+        );
+        let upstream = metrics.counters.upstreams.get("openrouter").unwrap();
+        assert_eq!(
+            upstream.requests.load(Ordering::Relaxed),
+            25,
+            "per-upstream counters are untouched by the gate"
+        );
+    }
+
+    // Sticky failover pool applies the same index-cool exclusion as
+    // `eligible_pool`: a non-429-cooled sibling is excluded, while an
+    // unmarked sibling on a 429-cooled shared upstream stays eligible.
+    #[test]
+    fn sticky_pool_should_exclude_index_cooled_sibling_but_keep_429_sibling() {
+        use crate::config::schema::{FamilyMember, ModelFamily};
+        use crate::routing::family::FamilyTable;
+
+        fn sticky_router(health: Arc<HealthRegistry>) -> Router {
+            let mut config = Config::default();
+            config.families = vec![ModelFamily {
+                alias: "auto-coding".to_string(),
+                members: vec![
+                    FamilyMember {
+                        upstream: "mock".to_string(),
+                        model: "model-a:free".to_string(),
+                    },
+                    FamilyMember {
+                        upstream: "mock".to_string(),
+                        model: "model-b:free".to_string(),
+                    },
+                ],
+                allow_paid: false,
+            }];
+            Router::new(
+                vec![upstream(0, "mock")],
+                Vec::<Arc<dyn Provider>>::new(),
+                Arc::new(FallbackStrategy),
+                health,
+                Arc::new(AlwaysAllow),
+                MetricsCollector::new(),
+            )
+            .with_family_table(
+                Arc::new(FamilyTable::from_config(&config)),
+                Some("auto-coding".to_string()),
+            )
+        }
+
+        let stuck = StickyPick {
+            upstream: "mock".to_string(),
+            model: "model-a:free".to_string(),
+            served: 1,
+        };
+
+        let health = Arc::new(HealthRegistry::new(300));
+        health.trip(0, None);
+        let pool = sticky_router(health).map_sticky_pool("auto-coding", &stuck);
+        assert_eq!(
+            pool.len(),
+            1,
+            "index-cooled (non-429) sibling must be excluded from sticky failover"
+        );
+        assert_eq!(pool[0].model.as_deref(), Some("model-a:free"));
+
+        let health = Arc::new(HealthRegistry::new(300));
+        let _ = health.trip_backpressure(0, None);
+        let pool = sticky_router(health).map_sticky_pool("auto-coding", &stuck);
+        assert_eq!(
+            pool.len(),
+            2,
+            "429-cooled shared-upstream sibling must stay eligible"
+        );
     }
 
     #[tokio::test]

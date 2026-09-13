@@ -288,7 +288,11 @@ fn openai_content_to_anthropic(content: serde_json::Value) -> serde_json::Value 
 }
 
 /// Extract plain text from an Anthropic-format content array.
-fn extract_text_from_content(content: &serde_json::Value) -> String {
+/// Extract plain text from an OpenAI-style `content` value (string or array
+/// of parts) or an OpenRouter-style `reasoning` value of the same shapes.
+/// Shared by the request translator and both response translators so all
+/// three agree on what "text" means.
+pub(crate) fn extract_text_from_content(content: &serde_json::Value) -> String {
     use serde_json::Value;
 
     match content {
@@ -299,6 +303,63 @@ fn extract_text_from_content(content: &serde_json::Value) -> String {
             .join("\n"),
         Value::String(s) => s.clone(),
         _ => String::new(),
+    }
+}
+
+/// Whether full message-body logging is enabled via `CONSOLETTE_LOG_BODIES=1`.
+/// Read per call (not cached) so the toggle takes effect without a restart
+/// of anything except the running daemon process picking up the env change
+/// on its next restart — no config reload plumbing required.
+#[must_use]
+pub(crate) fn bodies_logged() -> bool {
+    matches!(
+        std::env::var("CONSOLETTE_LOG_BODIES").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
+}
+
+/// Keys whose string values are secrets and must never hit the logs.
+/// Compared case-insensitively against the exact key and common variants
+/// (`api_key`, `api-key`, `x-api-key` all match via substring rules below).
+fn is_secret_key(key: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "cookie",
+        "set-cookie",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+    ];
+    let lower = key.to_ascii_lowercase();
+    EXACT.iter().any(|k| lower == *k) || lower.contains("api-key") || lower.contains("secret")
+}
+
+/// Clone `value` with secret string fields replaced by `"[redacted]"`.
+/// Object keys recurse; arrays recurse; everything else clones as-is.
+/// Auth headers are never logged at all (only bodies pass through here).
+#[must_use]
+pub(crate) fn redact_bodies(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let redacted = if is_secret_key(k) && v.is_string() {
+                        Value::String("[redacted]".to_string())
+                    } else {
+                        redact_bodies(v)
+                    };
+                    (k.clone(), redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_bodies).collect()),
+        _ => value.clone(),
     }
 }
 
@@ -420,7 +481,12 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
 /// Translate an `OpenAI` Chat Completions response body to Anthropic Messages format.
 ///
 /// Mapping:
-/// - `choices[0].message.content` → `content: [{"type":"text","text":...}]`
+/// - `choices[0].message.content` (string or array of parts) →
+///   `content: [{"type":"text","text":...}]`
+/// - when `content` is empty/absent, `reasoning_content`/`reasoning` text is
+///   surfaced instead (reasoning models on OpenRouter-style gateways spend
+///   the token budget on reasoning; without this the client sees empty text
+///   with a `length` stop)
 /// - `choices[0].finish_reason` → `stop_reason` (`"length"`→`"max_tokens"`,
 ///   `"tool_calls"`→`"tool_use"`, everything else→`"end_turn"`)
 /// - `usage.{prompt,completion}_tokens` → `usage.{input,output}_tokens`
@@ -444,12 +510,18 @@ pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> ser
         .and_then(Value::as_array)
         .and_then(|c| c.first());
 
-    let content_text = choice
-        .and_then(|c| c.get("message"))
+    let message = choice.and_then(|c| c.get("message"));
+
+    let mut content_text = message
         .and_then(|m| m.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .map(extract_text_from_content)
+        .unwrap_or_default();
+    if content_text.is_empty() {
+        content_text = message
+            .and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning")))
+            .map(extract_text_from_content)
+            .unwrap_or_default();
+    }
 
     let finish_reason = choice
         .and_then(|c| c.get("finish_reason"))
@@ -949,6 +1021,108 @@ mod tests {
         assert_eq!(anthropic["stop_reason"], json!("end_turn"));
         assert_eq!(anthropic["usage"]["input_tokens"], json!(10));
         assert_eq!(anthropic["usage"]["output_tokens"], json!(4));
+    }
+
+    #[test]
+    fn translate_openai_response_concatenates_array_content_parts() {
+        // OpenRouter-style gateways may return content as an array of parts;
+        // previously `as_str` collapsed this to "" (empty client text).
+        let openai = json!({
+            "id": "chatcmpl-2",
+            "model": "cohere/north-mini-code:free",
+            "choices": [{
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": "world"}
+                ]},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+        });
+
+        let anthropic = translate_openai_response_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["content"],
+            json!([{"type": "text", "text": "hello\nworld"}])
+        );
+    }
+
+    #[test]
+    fn translate_openai_response_falls_back_to_reasoning_when_content_empty() {
+        // Reasoning models spend the budget on reasoning: content "" with a
+        // `length` stop and nonzero usage. Surface the reasoning text rather
+        // than handing the client an empty message.
+        let openai = json!({
+            "id": "gen-1",
+            "model": "cohere/north-mini-code:free",
+            "choices": [{
+                "message": {"role": "assistant", "content": "", "reasoning_content": "thinking out loud"},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 20}
+        });
+
+        let anthropic = translate_openai_response_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["content"],
+            json!([{"type": "text", "text": "thinking out loud"}])
+        );
+        assert_eq!(anthropic["stop_reason"], json!("max_tokens"));
+    }
+
+    #[test]
+    fn translate_openai_response_prefers_content_over_reasoning() {
+        let openai = json!({
+            "id": "gen-2",
+            "model": "m",
+            "choices": [{
+                "message": {"role": "assistant", "content": "answer", "reasoning": "scratch"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+
+        let anthropic = translate_openai_response_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["content"],
+            json!([{"type": "text", "text": "answer"}])
+        );
+    }
+
+    #[test]
+    fn redact_bodies_masks_secrets_recursively() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "auth": {"token": "sk-live", "type": "bearer"},
+            "headers": {"Authorization": "Bearer sk-live", "Content-Type": "application/json"},
+            "nested": [{"api_key": "k", "safe": 1}]
+        });
+
+        let redacted = redact_bodies(&body);
+
+        assert_eq!(redacted["model"], json!("m"));
+        assert_eq!(redacted["auth"]["token"], json!("[redacted]"));
+        assert_eq!(redacted["headers"]["Authorization"], json!("[redacted]"));
+        assert_eq!(
+            redacted["headers"]["Content-Type"],
+            json!("application/json")
+        );
+        assert_eq!(redacted["nested"][0]["api_key"], json!("[redacted]"));
+        assert_eq!(redacted["nested"][0]["safe"], json!(1));
+    }
+
+    #[test]
+    fn bodies_logged_follows_env_switch() {
+        std::env::remove_var("CONSOLETTE_LOG_BODIES");
+        assert!(!bodies_logged());
+        std::env::set_var("CONSOLETTE_LOG_BODIES", "1");
+        assert!(bodies_logged());
+        std::env::remove_var("CONSOLETTE_LOG_BODIES");
+        assert!(!bodies_logged());
     }
 
     #[test]

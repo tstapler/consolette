@@ -136,6 +136,15 @@ impl OpenaiProvider {
 
         debug!("OpenAI non-stream POST {url}");
 
+        if crate::providers::bodies_logged() {
+            tracing::info!(
+                target: "consolette::bodies",
+                upstream = %self.upstream.name,
+                body = %crate::providers::redact_bodies(&body),
+                "openai upstream request"
+            );
+        }
+
         let response = self
             .client
             .post(&url)
@@ -155,7 +164,19 @@ impl OpenaiProvider {
             })?;
 
         let status = response.status();
-        map_error_status(status, response).await
+        let out = map_error_status(status, response).await;
+        if crate::providers::bodies_logged() {
+            if let Ok(ref ok) = out {
+                tracing::info!(
+                    target: "consolette::bodies",
+                    upstream = %self.upstream.name,
+                    status = %status,
+                    body = %crate::providers::redact_bodies(ok),
+                    "openai upstream response"
+                );
+            }
+        }
+        out
     }
 
     /// Fetch the list of models from `GET /v1/models`.
@@ -503,6 +524,14 @@ where
                         this.close("end_turn");
                         continue;
                     }
+                    if crate::providers::bodies_logged() {
+                        tracing::info!(
+                            target: "consolette::bodies",
+                            model = %this.model,
+                            chunk = %event.data,
+                            "openai upstream stream chunk"
+                        );
+                    }
                     let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
                         continue;
                     };
@@ -512,14 +541,25 @@ where
                         .and_then(Value::as_array)
                         .and_then(|a| a.first());
 
-                    if let Some(text) = choice
-                        .and_then(|c| c.get("delta"))
+                    // Delta content arrives as a string on most gateways,
+                    // but OpenRouter-style responses may send an array of
+                    // parts or put tokens in `reasoning_content`/`reasoning`
+                    // (reasoning models). Either shape collapsing to ""
+                    // is what produced empty client text with nonzero
+                    // usage, so extract text from all of them.
+                    let delta = choice.and_then(|c| c.get("delta"));
+                    let mut text = delta
                         .and_then(|d| d.get("content"))
-                        .and_then(Value::as_str)
-                    {
-                        if !text.is_empty() {
-                            this.push_delta(text);
-                        }
+                        .map(crate::providers::extract_text_from_content)
+                        .unwrap_or_default();
+                    if text.is_empty() {
+                        text = delta
+                            .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+                            .map(crate::providers::extract_text_from_content)
+                            .unwrap_or_default();
+                    }
+                    if !text.is_empty() {
+                        this.push_delta(&text);
                     }
 
                     if let Some(reason) = choice
@@ -653,6 +693,33 @@ mod tests {
 
             let (_, message_delta_data) = parse_event(&out[4]);
             assert_eq!(message_delta_data["delta"]["stop_reason"], "max_tokens");
+        }
+
+        #[tokio::test]
+        async fn array_and_reasoning_deltas_produce_text() {
+            // Gateway may send delta content as parts or put tokens in
+            // `reasoning_content`; both must surface as text deltas rather
+            // than vanishing (the empty-stream symptom).
+            let inner = stream::iter(vec![
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"content":[{"type":"text","text":"A"}]},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"reasoning_content":"th"},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)),
+                Ok(sse("[DONE]")),
+            ]);
+            let translator = OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string());
+            let out = drain(translator).await;
+
+            let texts: Vec<String> = out
+                .iter()
+                .map(parse_event)
+                .filter(|(e, _)| e == "content_block_delta")
+                .map(|(_, d)| d["delta"]["text"].as_str().unwrap_or("").to_string())
+                .collect();
+            assert_eq!(texts, vec!["A".to_string(), "th".to_string()]);
         }
 
         #[tokio::test]

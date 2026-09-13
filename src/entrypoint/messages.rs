@@ -93,6 +93,74 @@ pub async fn post_v1_messages(
     }
 }
 
+/// `GET /v1/models`: the Anthropic Models API surface over the configured
+/// routes, so clients that validate model IDs (Claude Code session restore,
+/// `/model` pickers) recognize the IDs this proxy actually serves.
+///
+/// Lists the active route's pinned model IDs (route upstream `model`
+/// overrides); unpinned upstreams contribute nothing since their served ID
+/// is whatever the client requested. Served from config — no upstream
+/// calls, never 404s on dead upstreams. (Family aliases join this list
+/// with the auto-model-family feature.)
+///
+/// # Errors
+///
+/// Returns 500 if the on-disk config fails to load.
+pub async fn get_v1_models(
+    State(state): State<EntrypointState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use serde_json::json;
+
+    let config = crate::config::load(&state.config_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(Json(v1_models_from_config(&config)))
+}
+
+/// Build the `GET /v1/models` response body from a loaded config (pure,
+/// unit-testable): the active route's pinned model IDs, deduplicated and
+/// sorted.
+fn v1_models_from_config(config: &crate::config::schema::Config) -> serde_json::Value {
+    use serde_json::{json, Value};
+
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(route) = config.routes.first() {
+        for u in &route.upstreams {
+            if let Some(model) = u.model.as_deref() {
+                if !ids.iter().any(|id| id == model) {
+                    ids.push(model.to_string());
+                }
+            }
+        }
+    }
+    ids.sort();
+
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let data: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "type": "model",
+                "id": id,
+                "display_name": id,
+                "created_at": now
+            })
+        })
+        .collect();
+    let first_id = ids.first().cloned().unwrap_or_default();
+    let last_id = ids.last().cloned().unwrap_or_default();
+    json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -324,5 +392,30 @@ mod tests {
         expected.extend_from_slice(&frame1);
         expected.extend_from_slice(&frame2);
         assert_eq!(body.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn v1_models_lists_pinned_ids_deduped() {
+        let config: crate::config::schema::Config = serde_json::from_value(serde_json::json!({
+            "routes": [{
+                "name": "default", "strategy": "fallback",
+                "upstreams": [
+                    {"name": "a", "model": "m1"},
+                    {"name": "b", "model": "m1"},
+                    {"name": "c"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let v = v1_models_from_config(&config);
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["m1"]);
+        assert_eq!(v["has_more"], serde_json::json!(false));
+        assert_eq!(v["data"][0]["type"], serde_json::json!("model"));
     }
 }

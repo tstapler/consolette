@@ -353,7 +353,10 @@ impl Provider for OpenaiProvider {
             Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
             let value = self.send_request(openai_body).await?;
-            let anthropic_value = super::translate_openai_response_to_anthropic(&value);
+            let anthropic_value = super::translate_openai_response_to_anthropic(
+                &value,
+                body.get("model").and_then(Value::as_str),
+            );
             Ok(ProviderResponse::Full(anthropic_value))
         }
     }

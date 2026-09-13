@@ -621,8 +621,16 @@ fn translate_tool_choice(choice: &serde_json::Value) -> Option<serde_json::Value
 /// - `choices[0].finish_reason` → `stop_reason` (`"length"`→`"max_tokens"`,
 ///   `"tool_calls"`→`"tool_use"`, everything else→`"end_turn"`)
 /// - `usage.{prompt,completion}_tokens` → `usage.{input,output}_tokens`
+/// - `model`: the *requested* model when the caller supplies it, else the
+///   upstream's ID. Echoing the request keeps the client's session model
+///   stable: Claude Code restores sessions from the last assistant
+///   message's `model`, so an upstream-rotated ID would poison the next
+///   restore with an ID the client never chose.
 #[must_use]
-pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> serde_json::Value {
+pub fn translate_openai_response_to_anthropic(
+    openai: &serde_json::Value,
+    request_model: Option<&str>,
+) -> serde_json::Value {
     use serde_json::Value;
 
     let id = openai
@@ -630,11 +638,15 @@ pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> ser
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let model = openai
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
+    let model = request_model
+        .map(str::to_string)
+        .or_else(|| {
+            openai
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
 
     let choice = openai
         .get("choices")
@@ -644,24 +656,7 @@ pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> ser
     let message = choice.and_then(|c| c.get("message"));
 
     // Thinking blocks first (Anthropic requires thinking before text).
-    // Only signed material becomes a thinking block: a null/fabricated
-    // signature would 400 on replay against a real Anthropic upstream.
-    let mut blocks: Vec<Value> = Vec::new();
-    if let Some(details) = message
-        .and_then(|m| m.get("reasoning_details"))
-        .and_then(Value::as_array)
-    {
-        for d in details {
-            let text = d.get("text").and_then(Value::as_str).unwrap_or("");
-            if let Some(sig) = d.get("signature").and_then(Value::as_str) {
-                blocks.push(json!({
-                    "type": "thinking",
-                    "thinking": text,
-                    "signature": sig
-                }));
-            }
-        }
-    }
+    let mut blocks: Vec<Value> = collect_thinking_blocks(message);
 
     let mut content_text = message
         .and_then(|m| m.get("content"))
@@ -739,6 +734,34 @@ pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> ser
             "output_tokens": completion_tokens
         }
     })
+}
+
+/// Collect native `thinking` blocks from `reasoning_details` entries that
+/// carry a signature (forwarded verbatim, never fabricated). Entries
+/// without a signature — including empty unsigned ones — are dropped here;
+/// their text is covered by the text fallback instead. Signature-only
+/// entries are kept: the client needs the signature for replay even with
+/// empty text.
+fn collect_thinking_blocks(message: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    use serde_json::Value;
+
+    let mut blocks = Vec::new();
+    if let Some(details) = message
+        .and_then(|m| m.get("reasoning_details"))
+        .and_then(Value::as_array)
+    {
+        for d in details {
+            let text = d.get("text").and_then(Value::as_str).unwrap_or("");
+            if let Some(sig) = d.get("signature").and_then(Value::as_str) {
+                blocks.push(json!({
+                    "type": "thinking",
+                    "thinking": text,
+                    "signature": sig
+                }));
+            }
+        }
+    }
+    blocks
 }
 
 /// Map an `OpenAI` `tool_calls` array to `Anthropic` `tool_use` blocks.
@@ -1239,7 +1262,7 @@ mod tests {
             "usage": {"prompt_tokens": 10, "completion_tokens": 4}
         });
 
-        let anthropic = translate_openai_response_to_anthropic(&openai);
+        let anthropic = translate_openai_response_to_anthropic(&openai, None);
 
         assert_eq!(anthropic["id"], json!("chatcmpl-1"));
         assert_eq!(
@@ -1268,7 +1291,7 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 2}
         });
 
-        let anthropic = translate_openai_response_to_anthropic(&openai);
+        let anthropic = translate_openai_response_to_anthropic(&openai, None);
 
         assert_eq!(
             anthropic["content"],
@@ -1291,7 +1314,7 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 20}
         });
 
-        let anthropic = translate_openai_response_to_anthropic(&openai);
+        let anthropic = translate_openai_response_to_anthropic(&openai, None);
 
         assert_eq!(
             anthropic["content"],
@@ -1312,7 +1335,7 @@ mod tests {
             "usage": {"prompt_tokens": 1, "completion_tokens": 2}
         });
 
-        let anthropic = translate_openai_response_to_anthropic(&openai);
+        let anthropic = translate_openai_response_to_anthropic(&openai, None);
 
         assert_eq!(
             anthropic["content"],
@@ -1342,7 +1365,7 @@ mod tests {
             "usage": {"prompt_tokens": 3, "completion_tokens": 9}
         });
 
-        let anthropic = translate_openai_response_to_anthropic(&openai);
+        let anthropic = translate_openai_response_to_anthropic(&openai, None);
 
         assert_eq!(
             anthropic["content"],
@@ -1371,7 +1394,7 @@ mod tests {
             "usage": {"prompt_tokens": 1, "completion_tokens": 2}
         });
 
-        let anthropic = translate_openai_response_to_anthropic(&openai);
+        let anthropic = translate_openai_response_to_anthropic(&openai, None);
 
         assert_eq!(
             anthropic["content"][0],
@@ -1400,7 +1423,7 @@ mod tests {
             "usage": {"prompt_tokens": 1, "completion_tokens": 4}
         });
 
-        let anthropic = translate_openai_response_to_anthropic(&openai);
+        let anthropic = translate_openai_response_to_anthropic(&openai, None);
 
         assert_eq!(
             anthropic["content"],
@@ -1439,6 +1462,24 @@ mod tests {
         assert!(bodies_logged());
         std::env::remove_var("CONSOLETTE_LOG_BODIES");
         assert!(!bodies_logged());
+    }
+
+    #[test]
+    fn translate_openai_response_prefers_request_model_over_upstream() {
+        let openai = json!({
+            "id": "gen-6",
+            "model": "served-by-upstream",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+
+        let echoed = translate_openai_response_to_anthropic(&openai, Some("client-alias"));
+        assert_eq!(echoed["model"], json!("client-alias"));
+        let fallback = translate_openai_response_to_anthropic(&openai, None);
+        assert_eq!(fallback["model"], json!("served-by-upstream"));
     }
 
     #[test]

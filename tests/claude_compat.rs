@@ -84,7 +84,7 @@ fn plain_completion_stays_wellformed() {
         "usage": {"prompt_tokens": 5, "completion_tokens": 2}
     });
 
-    let out = translate_openai_response_to_anthropic(&openai);
+    let out = translate_openai_response_to_anthropic(&openai, None);
     assert_message_invariants(&out);
     assert_eq!(out["stop_reason"], json!("end_turn"));
 }
@@ -108,7 +108,7 @@ fn tool_calls_become_tool_use_blocks() {
         "usage": {"prompt_tokens": 50, "completion_tokens": 12}
     });
 
-    let out = translate_openai_response_to_anthropic(&openai);
+    let out = translate_openai_response_to_anthropic(&openai, None);
     assert_message_invariants(&out);
     assert_eq!(out["stop_reason"], json!("tool_use"));
     assert_eq!(
@@ -136,7 +136,7 @@ fn text_and_tool_calls_coexist() {
         "usage": {"prompt_tokens": 50, "completion_tokens": 12}
     });
 
-    let out = translate_openai_response_to_anthropic(&openai);
+    let out = translate_openai_response_to_anthropic(&openai, None);
     assert_message_invariants(&out);
     assert_eq!(out["content"][0]["type"], json!("text"));
     assert_eq!(out["content"][1]["type"], json!("tool_use"));
@@ -162,7 +162,7 @@ fn malformed_tool_arguments_become_empty_object() {
         "usage": {"prompt_tokens": 50, "completion_tokens": 8}
     });
 
-    let out = translate_openai_response_to_anthropic(&openai);
+    let out = translate_openai_response_to_anthropic(&openai, None);
     assert_message_invariants(&out);
     assert_eq!(out["content"][0]["input"], json!({}));
 }

@@ -130,6 +130,31 @@ cargo test --workspace
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution workflow, and [RELEASE.md](RELEASE.md) for how versions are cut and published.
 
+## Troubleshooting Claude Code sessions
+
+**"Session model ... could not be restored (not a model this version recognizes)"** —
+Claude Code restores sessions from the last assistant message's `model` and
+falls back when it doesn't recognize the ID. consolette helps two ways:
+`GET /v1/models` lists every pinned model ID the active route serves (so
+pickers/validators see them), and translated responses echo the *requested*
+model so the session model stays what you launched with. Sessions poisoned
+before this fix need a fresh start (or one `/model` re-select).
+
+**Sessions ending early on third-party models** — recent Claude Code builds
+assume a 200,000-token window for unrecognized IDs and compact aggressively.
+If a session dies around compaction, either declare the real window with
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, or restore the old wait-for-the-API
+behavior with `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`.
+
+**Seeing empty replies?** — enable redacted payload logging to capture the
+raw upstream shape:
+```bash
+echo 'CONSOLETTE_LOG_BODIES=1' >> ~/.config/consolette/env   # RUST_LOG=info also required
+systemctl --user restart consolette
+journalctl --user -u consolette -f | grep consolette::bodies
+```
+Turn it off afterward; it logs full message text (secrets stay masked).
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) to report a vulnerability.

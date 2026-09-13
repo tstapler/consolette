@@ -138,6 +138,10 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             axum::routing::post(crate::entrypoint::messages::post_v1_messages),
         )
         .route(
+            "/v1/models",
+            axum::routing::get(crate::entrypoint::messages::get_v1_models),
+        )
+        .route(
             "/v1/chat/completions",
             axum::routing::post(crate::entrypoint::chat_completions::post_v1_chat_completions),
         )

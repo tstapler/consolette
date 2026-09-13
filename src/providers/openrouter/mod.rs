@@ -619,7 +619,10 @@ impl Provider for OpenrouterProvider {
                 .send_request(openai_body)
                 .await
                 .map_err(|e| self.observe_dispatch_error(e))?;
-            let anthropic_value = super::translate_openai_response_to_anthropic(&value);
+            let anthropic_value = super::translate_openai_response_to_anthropic(
+                &value,
+                body.get("model").and_then(Value::as_str),
+            );
             Ok(ProviderResponse::Full(anthropic_value))
         }
     }

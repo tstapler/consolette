@@ -17,9 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use eventsource_stream::Eventsource;
-use futures_core::Stream;
 use futures_util::StreamExt;
 use http::HeaderMap;
 use reqwest::{Client, StatusCode};
@@ -32,7 +29,7 @@ use crate::auth::SecretResolver;
 use crate::config::schema::Upstream;
 
 use super::anthropic::apply_auth_headers;
-use super::{map_openai_finish_reason, ModelInfo, Provider, ProviderError, ProviderResponse};
+use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
 
 pub use cache::{FreeModelEntry, ModelListCache};
 
@@ -615,7 +612,7 @@ impl Provider for OpenrouterProvider {
             let byte_stream = response
                 .bytes_stream()
                 .map(|r| r.map_err(anyhow::Error::from));
-            let translated = OpenrouterToAnthropicStream::new(byte_stream, model);
+            let translated = super::openai::OpenaiToAnthropicStream::new(byte_stream, model);
             Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
             let value = self
@@ -633,180 +630,9 @@ impl Provider for OpenrouterProvider {
     }
 }
 
-/// Translates an `OpenRouter` (OpenAI-shaped) `chat.completion.chunk` SSE byte
-/// stream into an Anthropic Messages SSE event stream. Deliberately a
-/// near-verbatim duplicate of `openai::OpenaiToAnthropicStream` — that
-/// struct is private to `openai.rs`, and `openai.rs` isn't one of this
-/// epic's files (see plan.md's Files list for Story 1.2.1), so sharing it
-/// would widen this epic's blast radius rather than shrink it. A follow-up
-/// epic touching both providers could extract a shared translator if this
-/// duplication becomes a maintenance burden.
-struct OpenrouterToAnthropicStream<S> {
-    inner: eventsource_stream::EventStream<S>,
-    id: String,
-    model: String,
-    started: bool,
-    finished: bool,
-    done: bool,
-    pending: std::collections::VecDeque<Bytes>,
-}
-
-impl<S> OpenrouterToAnthropicStream<S>
-where
-    S: Stream<Item = Result<Bytes, anyhow::Error>>,
-{
-    fn new(inner: S, model: String) -> Self {
-        Self {
-            inner: inner.eventsource(),
-            id: format!("msg_{}", uuid::Uuid::new_v4()),
-            model,
-            started: false,
-            finished: false,
-            done: false,
-            pending: std::collections::VecDeque::new(),
-        }
-    }
-
-    fn frame(event: &str, data: &Value) -> Bytes {
-        Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
-    }
-
-    fn ensure_started(&mut self) {
-        if self.started {
-            return;
-        }
-        self.started = true;
-        self.pending.push_back(Self::frame(
-            "message_start",
-            &serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": self.id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": self.model,
-                    "stop_reason": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
-                }
-            }),
-        ));
-        self.pending.push_back(Self::frame(
-            "content_block_start",
-            &serde_json::json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""}
-            }),
-        ));
-    }
-
-    fn push_delta(&mut self, text: &str) {
-        self.ensure_started();
-        self.pending.push_back(Self::frame(
-            "content_block_delta",
-            &serde_json::json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text}
-            }),
-        ));
-    }
-
-    fn close(&mut self, stop_reason: &str) {
-        if self.finished {
-            return;
-        }
-        self.ensure_started();
-        self.finished = true;
-        self.pending.push_back(Self::frame(
-            "content_block_stop",
-            &serde_json::json!({"type": "content_block_stop", "index": 0}),
-        ));
-        self.pending.push_back(Self::frame(
-            "message_delta",
-            &serde_json::json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason},
-                "usage": {"output_tokens": 0}
-            }),
-        ));
-        self.pending.push_back(Self::frame(
-            "message_stop",
-            &serde_json::json!({"type": "message_stop"}),
-        ));
-    }
-}
-
-impl<S> Stream for OpenrouterToAnthropicStream<S>
-where
-    S: Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
-{
-    type Item = Result<Bytes, anyhow::Error>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        loop {
-            if let Some(frame) = this.pending.pop_front() {
-                return std::task::Poll::Ready(Some(Ok(frame)));
-            }
-            if this.done {
-                return std::task::Poll::Ready(None);
-            }
-            if this.finished {
-                this.done = true;
-                continue;
-            }
-
-            match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-                std::task::Poll::Ready(None) => {
-                    this.close("end_turn");
-                }
-                std::task::Poll::Ready(Some(Err(e))) => {
-                    warn!(error = %e, "openrouter->anthropic stream translator: eventsource parse error");
-                    this.close("end_turn");
-                }
-                std::task::Poll::Ready(Some(Ok(event))) => {
-                    if event.data == "[DONE]" {
-                        this.close("end_turn");
-                        continue;
-                    }
-                    let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
-                        continue;
-                    };
-
-                    let choice = parsed
-                        .get("choices")
-                        .and_then(Value::as_array)
-                        .and_then(|a| a.first());
-
-                    if let Some(text) = choice
-                        .and_then(|c| c.get("delta"))
-                        .and_then(|d| d.get("content"))
-                        .and_then(Value::as_str)
-                    {
-                        if !text.is_empty() {
-                            this.push_delta(text);
-                        }
-                    }
-
-                    if let Some(reason) = choice
-                        .and_then(|c| c.get("finish_reason"))
-                        .and_then(Value::as_str)
-                    {
-                        this.close(map_openai_finish_reason(Some(reason)));
-                    }
-                }
-            }
-        }
-    }
-}
-
+// Stream translation is shared with `super::openai::OpenaiToAnthropicStream`:
+// one translator, one behavior, one test suite for both OpenAI-shaped
+// providers (the tool-call SSE block discipline lives there).
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

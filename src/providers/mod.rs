@@ -429,6 +429,13 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
 /// Mapping:
 /// - top-level `system` string → a leading `{"role":"system",...}` message
 /// - `messages[].content` (Anthropic content-block array or string) → flattened plain-text string
+/// - assistant `tool_use` blocks → `tool_calls`; user `tool_result` blocks →
+///   separate `{role:"tool",...}` messages (multi-turn continuity: without
+///   this the model loses tool context after the first call)
+/// - `thinking`/`redacted_thinking` blocks are dropped: they carry signatures
+///   for the model that generated them, meaningless to a different upstream
+/// - `tools[]` (`name`/`description`/`input_schema`) → `OpenAI` functions format;
+///   `tool_choice` (`auto/any/tool`) mapped; unknown shapes omitted
 /// - `model`, `max_tokens`, `temperature`, `stream` → forwarded as-is
 #[must_use]
 pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> serde_json::Value {
@@ -457,8 +464,12 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
         for msg in anthropic_messages {
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
             let content = msg.get("content").cloned().unwrap_or(Value::Null);
-            let text = extract_text_from_content(&content);
-            messages.push(json!({"role": role, "content": text}));
+            if let Value::Array(blocks) = content {
+                messages.extend(anthropic_blocks_to_openai(role, &blocks));
+            } else {
+                let text = extract_text_from_content(&content);
+                messages.push(json!({"role": role, "content": text}));
+            }
         }
     }
 
@@ -474,8 +485,121 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
     if let Some(temp) = temperature {
         body["temperature"] = temp;
     }
+    if let Some(tools) = anthropic.get("tools").and_then(Value::as_array) {
+        let mapped: Vec<Value> = tools.iter().filter_map(translate_tool_definition).collect();
+        if !mapped.is_empty() {
+            body["tools"] = Value::Array(mapped);
+        }
+    }
+    if let Some(choice) = anthropic.get("tool_choice").and_then(translate_tool_choice) {
+        body["tool_choice"] = choice;
+    }
 
     body
+}
+
+/// Convert one `Anthropic` message's content blocks to `OpenAI` messages.
+/// Returns 1+ messages: assistant turns keep their role with collected
+/// `tool_calls`; each user `tool_result` becomes its own `{role:"tool"}`
+/// message; a user turn already fully expressed as tool message(s) yields
+/// nothing more (avoids a duplicate empty user message).
+fn anthropic_blocks_to_openai(role: &str, blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    use serde_json::Value;
+
+    let mut out = Vec::new();
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    text_parts.push(t);
+                }
+            }
+            Some("tool_use") => {
+                let id = b
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call_unknown");
+                let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                let input = b.get("input").cloned().unwrap_or(Value::Null);
+                tool_calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": input.to_string()
+                    }
+                }));
+            }
+            Some("tool_result") => {
+                let call_id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                let text = b
+                    .get("content")
+                    .map(extract_text_from_content)
+                    .unwrap_or_default();
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": text
+                }));
+            }
+            // thinking/redacted_thinking/image/etc: not representable for
+            // a foreign upstream; dropped.
+            _ => {}
+        }
+    }
+    let all_tool_results = role == "user"
+        && !blocks.is_empty()
+        && blocks
+            .iter()
+            .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"));
+    if !tool_calls.is_empty() {
+        out.push(json!({
+            "role": role,
+            "content": text_parts.join("\n"),
+            "tool_calls": tool_calls
+        }));
+    } else if !all_tool_results {
+        out.push(json!({"role": role, "content": text_parts.join("\n")}));
+    }
+    out
+}
+
+/// Map one `Anthropic` tool definition to `OpenAI` functions format.
+/// Returns `None` for definitions without a usable name.
+fn translate_tool_definition(tool: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::Value;
+
+    let name = tool.get("name").and_then(Value::as_str)?;
+    if name.is_empty() {
+        return None;
+    }
+    let mut function = json!({
+        "name": name,
+        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+    });
+    if let Some(desc) = tool.get("description").and_then(Value::as_str) {
+        function["description"] = Value::String(desc.to_string());
+    }
+    Some(json!({"type": "function", "function": function}))
+}
+
+/// Map an `Anthropic` `tool_choice` to its `OpenAI` equivalent.
+/// `{"type":"tool","name"}` → function call; `any` → required; unknown → omit.
+fn translate_tool_choice(choice: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::Value;
+
+    match choice.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(Value::String("auto".to_string())),
+        Some("any") => Some(Value::String("required".to_string())),
+        Some("none") => Some(Value::String("none".to_string())),
+        Some("tool") => choice
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| json!({"type": "function", "function": {"name": name}})),
+        _ => None,
+    }
 }
 
 /// Translate an `OpenAI` Chat Completions response body to Anthropic Messages format.
@@ -483,10 +607,17 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
 /// Mapping:
 /// - `choices[0].message.content` (string or array of parts) →
 ///   `content: [{"type":"text","text":...}]`
-/// - when `content` is empty/absent, `reasoning_content`/`reasoning` text is
-///   surfaced instead (reasoning models on OpenRouter-style gateways spend
-///   the token budget on reasoning; without this the client sees empty text
-///   with a `length` stop)
+/// - `reasoning_details` entries carrying a `signature` become native
+///   `thinking` blocks (signature forwarded verbatim, never fabricated) so
+///   thinking-aware clients (Claude Code) can replay them; unsigned or empty
+///   reasoning stays out of `thinking` and is covered by the text fallback.
+///   Signature-only entries are kept (the client needs the signature even
+///   with empty text); empty unsigned entries are dropped.
+/// - when `content` is empty/absent, `reasoning_content`/`reasoning` text
+///   (then `reasoning_details` text) is surfaced as the text block instead
+///   (reasoning models on OpenRouter-style gateways spend the token budget
+///   on reasoning; without this the client sees empty text with a `length`
+///   stop)
 /// - `choices[0].finish_reason` → `stop_reason` (`"length"`→`"max_tokens"`,
 ///   `"tool_calls"`→`"tool_use"`, everything else→`"end_turn"`)
 /// - `usage.{prompt,completion}_tokens` → `usage.{input,output}_tokens`
@@ -512,6 +643,26 @@ pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> ser
 
     let message = choice.and_then(|c| c.get("message"));
 
+    // Thinking blocks first (Anthropic requires thinking before text).
+    // Only signed material becomes a thinking block: a null/fabricated
+    // signature would 400 on replay against a real Anthropic upstream.
+    let mut blocks: Vec<Value> = Vec::new();
+    if let Some(details) = message
+        .and_then(|m| m.get("reasoning_details"))
+        .and_then(Value::as_array)
+    {
+        for d in details {
+            let text = d.get("text").and_then(Value::as_str).unwrap_or("");
+            if let Some(sig) = d.get("signature").and_then(Value::as_str) {
+                blocks.push(json!({
+                    "type": "thinking",
+                    "thinking": text,
+                    "signature": sig
+                }));
+            }
+        }
+    }
+
     let mut content_text = message
         .and_then(|m| m.get("content"))
         .map(extract_text_from_content)
@@ -522,11 +673,48 @@ pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> ser
             .map(extract_text_from_content)
             .unwrap_or_default();
     }
+    if content_text.is_empty() {
+        content_text = message
+            .and_then(|m| m.get("reasoning_details"))
+            .and_then(Value::as_array)
+            .map(|details| {
+                details
+                    .iter()
+                    .filter_map(|d| d.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+    }
+    if !content_text.is_empty() {
+        blocks.push(json!({"type": "text", "text": content_text}));
+    }
+
+    // Tool calls become native tool_use blocks (see
+    // `openai_tool_calls_to_blocks`); the stop reason follows below.
+    let (tool_blocks, saw_tool_calls) = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(Value::as_array)
+        .map(|calls| openai_tool_calls_to_blocks(calls))
+        .unwrap_or_default();
+    blocks.extend(tool_blocks);
+    if blocks.is_empty() {
+        // No content, no reasoning, no usable tool calls: emit an empty
+        // text block so the shape stays well-formed rather than failing.
+        blocks.push(json!({"type": "text", "text": ""}));
+    }
 
     let finish_reason = choice
         .and_then(|c| c.get("finish_reason"))
         .and_then(Value::as_str);
-    let stop_reason = map_openai_finish_reason(finish_reason);
+    // Tool calls on the wire win over the finish reason: emitting tool_use
+    // blocks with any other stop reason stalls clients waiting on the
+    // tool_use contract (blocks present ⇔ stop_reason == "tool_use").
+    let stop_reason = if saw_tool_calls {
+        "tool_use"
+    } else {
+        map_openai_finish_reason(finish_reason)
+    };
 
     let prompt_tokens = openai
         .get("usage")
@@ -544,13 +732,53 @@ pub fn translate_openai_response_to_anthropic(openai: &serde_json::Value) -> ser
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": content_text}],
+        "content": Value::Array(blocks),
         "stop_reason": stop_reason,
         "usage": {
             "input_tokens": prompt_tokens,
             "output_tokens": completion_tokens
         }
     })
+}
+
+/// Map an `OpenAI` `tool_calls` array to `Anthropic` `tool_use` blocks.
+/// Returns the blocks plus whether any usable call was found (drives the
+/// `tool_use` stop reason). Malformed/truncated arguments degrade to `{}`
+/// (a well-formed block the client answers with a tool error) rather than
+/// a dropped call — dropping is what stalls agentic loops with
+/// `stop_reason=tool_use` and zero blocks. Nameless calls are skipped.
+fn openai_tool_calls_to_blocks(calls: &[serde_json::Value]) -> (Vec<serde_json::Value>, bool) {
+    use serde_json::Value;
+
+    let mut blocks = Vec::new();
+    for (i, call) in calls.iter().enumerate() {
+        let function = call.get("function");
+        let name = function
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .map_or_else(|| format!("call_{i}"), str::to_string);
+        let input = function
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .filter(Value::is_object)
+            .unwrap_or(json!({}));
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input
+        }));
+    }
+    let saw = !blocks.is_empty();
+    (blocks, saw)
 }
 
 /// Map an `OpenAI` `finish_reason` to an Anthropic `stop_reason`.
@@ -1089,6 +1317,94 @@ mod tests {
         assert_eq!(
             anthropic["content"],
             json!([{"type": "text", "text": "answer"}])
+        );
+    }
+
+    #[test]
+    fn translate_openai_response_emits_signed_thinking_before_text() {
+        // reasoning_details with a verbatim signature become a native
+        // thinking block ahead of the text block; unsigned text stays out
+        // of thinking and is covered by the text fallback instead.
+        let openai = json!({
+            "id": "gen-3",
+            "model": "anthropic/claude-x",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "plan", "signature": "sig-abc"},
+                        {"type": "reasoning.text", "text": "unsigned note"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 9}
+        });
+
+        let anthropic = translate_openai_response_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["content"],
+            json!([
+                {"type": "thinking", "thinking": "plan", "signature": "sig-abc"},
+                {"type": "text", "text": "done"}
+            ])
+        );
+    }
+
+    #[test]
+    fn translate_openai_response_keeps_signature_only_thinking_block() {
+        let openai = json!({
+            "id": "gen-4",
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "", "signature": "sig-only"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+
+        let anthropic = translate_openai_response_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["content"][0],
+            json!({"type": "thinking", "thinking": "", "signature": "sig-only"})
+        );
+    }
+
+    #[test]
+    fn translate_openai_response_falls_back_to_details_text_without_signature() {
+        // Unsigned reasoning_details text with empty content surfaces via
+        // the text fallback — never as a thinking block (a fabricated
+        // signature would 400 on replay; a null one is equally unusable).
+        let openai = json!({
+            "id": "gen-5",
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "quiet plan"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 4}
+        });
+
+        let anthropic = translate_openai_response_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["content"],
+            json!([{"type": "text", "text": "quiet plan"}])
         );
     }
 

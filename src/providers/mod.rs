@@ -193,6 +193,16 @@ use serde_json::json;
 /// Mapping:
 /// - `messages[].role` "system" → top-level `system` string; user/assistant → Anthropic messages
 /// - `messages[].content` string → `[{"type":"text","text":"..."}]`
+/// - assistant `tool_calls[]` → `tool_use` blocks; `role:"tool"` messages →
+///   `role:"user"` with `tool_result` blocks (multi-turn tool continuity,
+///   mirroring `translate_anthropic_request_to_openai` in reverse)
+/// - `tools[]` (`type:"function"`, `function.{name,description,parameters}`)
+///   → Anthropic tool definitions; entries without a usable name omitted
+/// - `tool_choice` (`"auto"`/`"required"`/`"none"`,
+///   `{"type":"function","function":{"name"}}`) → Anthropic
+///   (`auto`/`any`/`none`, `{"type":"tool","name"}`); unknown shapes omitted
+/// - `parallel_tool_calls: false` with no explicit (or an `auto`) choice →
+///   `{"type":"auto","disable_parallel_tool_use":true}`
 /// - `model`, `max_tokens` (default 1024), `temperature`, `stream` → forwarded as-is
 #[must_use]
 pub fn translate_openai_to_anthropic(openai: &serde_json::Value) -> serde_json::Value {
@@ -222,6 +232,23 @@ pub fn translate_openai_to_anthropic(openai: &serde_json::Value) -> serde_json::
     if let Some(openai_messages) = openai.get("messages").and_then(Value::as_array) {
         for msg in openai_messages {
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+
+            // Assistant turns may carry `tool_calls` alongside or instead of
+            // text; surface both as content blocks.
+            if role == "assistant" {
+                if let Some(blocks) = openai_assistant_history_to_blocks(msg) {
+                    messages.push(json!({"role": "assistant", "content": blocks}));
+                    continue;
+                }
+            }
+
+            // Anthropic has no `tool` role: results become user turns
+            // carrying `tool_result` blocks.
+            if role == "tool" {
+                messages.push(openai_tool_message_to_block(msg));
+                continue;
+            }
+
             let content =
                 openai_content_to_anthropic(msg.get("content").cloned().unwrap_or(Value::Null));
 
@@ -256,7 +283,132 @@ pub fn translate_openai_to_anthropic(openai: &serde_json::Value) -> serde_json::
         body["temperature"] = temp;
     }
 
+    if let Some(tools) = openai.get("tools").and_then(Value::as_array) {
+        let mapped = openai_tools_to_anthropic(tools);
+        if !mapped.is_empty() {
+            body["tools"] = Value::Array(mapped);
+        }
+    }
+
+    let choice = openai
+        .get("tool_choice")
+        .and_then(openai_tool_choice_to_anthropic);
+    let choice_is_auto = choice
+        .as_ref()
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        == Some("auto");
+    let parallel_off = openai.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false);
+    if parallel_off && (choice.is_none() || choice_is_auto) {
+        body["tool_choice"] = json!({"type": "auto", "disable_parallel_tool_use": true});
+    } else if let Some(choice) = choice {
+        body["tool_choice"] = choice;
+    }
+
     body
+}
+
+/// Map one `OpenAI` assistant message's `tool_calls` (plus any adjacent
+/// text) to Anthropic content blocks. Returns `None` when the message
+/// carries neither, letting the caller fall through to plain-text handling.
+/// Unparseable `arguments` become `{}` and id-less calls fall back to
+/// `call_unknown` (mirroring the reverse direction) rather than failing
+/// the whole request.
+fn openai_assistant_history_to_blocks(msg: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    use serde_json::Value;
+
+    let calls = msg.get("tool_calls").and_then(Value::as_array)?;
+    let mut blocks: Vec<Value> = Vec::new();
+    let text = extract_text_from_content(&msg.get("content").cloned().unwrap_or(Value::Null));
+    if !text.is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    for call in calls {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("call_unknown");
+        let function = call.get("function");
+        let name = function
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let input = function
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(json!({}));
+        blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(blocks)
+}
+
+/// Map one `OpenAI` `role:"tool"` message to a `role:"user"` message
+/// carrying a `tool_result` block.
+fn openai_tool_message_to_block(msg: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let call_id = msg
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let text = extract_text_from_content(&msg.get("content").cloned().unwrap_or(Value::Null));
+    json!({
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": call_id, "content": text}]
+    })
+}
+
+/// Map `OpenAI` function tool definitions to Anthropic tool definitions.
+/// Entries without a usable name are omitted; `strict` has no Anthropic
+/// equivalent and is dropped. Parameter schemas pass through
+/// `sanitize_schema_patterns` (the same guard the reverse direction
+/// applies before forwarding).
+fn openai_tools_to_anthropic(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    use serde_json::Value;
+
+    tools
+        .iter()
+        .filter_map(|t| {
+            let function = t.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            if name.is_empty() {
+                return None;
+            }
+            let mut input_schema = function.get("parameters").cloned().unwrap_or(json!({}));
+            sanitize_schema_patterns(&mut input_schema);
+            let mut tool = json!({"name": name, "input_schema": input_schema});
+            if let Some(desc) = function.get("description").and_then(Value::as_str) {
+                tool["description"] = Value::String(desc.to_string());
+            }
+            Some(tool)
+        })
+        .collect()
+}
+
+/// Map an `OpenAI` `tool_choice` to its Anthropic equivalent.
+/// `"auto"`/`"required"`/`"none"` → `auto`/`any`/`none`;
+/// `{"type":"function","function":{"name"}}` → `{"type":"tool","name"}`;
+/// unknown shapes omitted (Anthropic defaults to `auto`).
+fn openai_tool_choice_to_anthropic(choice: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::Value;
+
+    match choice {
+        Value::String(s) => match s.as_str() {
+            "auto" => Some(json!({"type": "auto"})),
+            "required" => Some(json!({"type": "any"})),
+            "none" => Some(json!({"type": "none"})),
+            _ => None,
+        },
+        Value::Object(_) => {
+            let name = choice.get("function")?.get("name")?.as_str()?;
+            Some(json!({"type": "tool", "name": name}))
+        }
+        _ => None,
+    }
 }
 
 /// Convert `OpenAI` message content (string or array) to Anthropic content array.
@@ -1522,6 +1674,170 @@ mod tests {
         assert_eq!(
             anthropic["content"],
             json!([{"type": "text", "text": "hello\nworld"}])
+        );
+    }
+
+    #[test]
+    fn translate_openai_request_maps_tools_and_choice() {
+        let openai = json!({
+            "model": "consolette:free",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                }
+            }],
+            "tool_choice": "auto"
+        });
+
+        let anthropic = translate_openai_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["tools"],
+            json!([{
+                "name": "read",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "description": "Read a file"
+            }])
+        );
+        assert_eq!(anthropic["tool_choice"], json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn translate_openai_request_omits_nameless_tools_and_unknown_choice() {
+        let openai = json!({
+            "model": "consolette:free",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"parameters": {}}},
+                {"type": "function", "function": {"name": "", "parameters": {}}}
+            ],
+            "tool_choice": "sometimes"
+        });
+
+        let anthropic = translate_openai_to_anthropic(&openai);
+
+        assert!(anthropic.get("tools").is_none());
+        assert!(anthropic.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn translate_openai_request_maps_named_choice_and_parallel_off() {
+        let named = json!({
+            "model": "m",
+            "messages": [],
+            "tool_choice": {"type": "function", "function": {"name": "read"}}
+        });
+        assert_eq!(
+            translate_openai_to_anthropic(&named)["tool_choice"],
+            json!({"type": "tool", "name": "read"})
+        );
+
+        let serial = json!({
+            "model": "m",
+            "messages": [],
+            "parallel_tool_calls": false
+        });
+        assert_eq!(
+            translate_openai_to_anthropic(&serial)["tool_choice"],
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+
+        // An explicit non-auto choice takes precedence over the parallel flag.
+        let required_serial = json!({
+            "model": "m",
+            "messages": [],
+            "tool_choice": "required",
+            "parallel_tool_calls": false
+        });
+        assert_eq!(
+            translate_openai_to_anthropic(&required_serial)["tool_choice"],
+            json!({"type": "any"})
+        );
+    }
+
+    #[test]
+    fn translate_openai_request_preserves_tool_history() {
+        let openai = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "what time is it"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_time", "arguments": "{\"zone\":\"utc\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "12:00"},
+                {"role": "user", "content": "thanks"}
+            ]
+        });
+
+        let anthropic = translate_openai_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["messages"][1],
+            json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_1", "name": "get_time", "input": {"zone": "utc"}}]
+            })
+        );
+        assert_eq!(
+            anthropic["messages"][2],
+            json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"}]
+            })
+        );
+    }
+
+    #[test]
+    fn translate_openai_request_tolerates_malformed_tool_calls() {
+        // Unparseable arguments become `{}` and id-less calls fall back to
+        // `call_unknown` (mirroring the reverse direction) rather than
+        // failing the whole request.
+        let openai = json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": "read", "arguments": "not-json{"}},
+                    {"type": "function", "function": {"name": "ls"}}
+                ]
+            }]
+        });
+
+        let anthropic = translate_openai_to_anthropic(&openai);
+
+        assert_eq!(
+            anthropic["messages"][0]["content"],
+            json!([
+                {"type": "tool_use", "id": "call_unknown", "name": "read", "input": {}},
+                {"type": "tool_use", "id": "call_unknown", "name": "ls", "input": {}}
+            ])
+        );
+    }
+
+    #[test]
+    fn translate_openai_request_without_tools_is_unchanged() {
+        let openai = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+
+        let anthropic = translate_openai_to_anthropic(&openai);
+
+        assert!(anthropic.get("tools").is_none());
+        assert!(anthropic.get("tool_choice").is_none());
+        assert_eq!(anthropic["model"], json!("m"));
+        assert_eq!(
+            anthropic["messages"],
+            json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
         );
     }
 

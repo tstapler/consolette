@@ -454,6 +454,12 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
         .unwrap_or(false);
     let temperature = anthropic.get("temperature").cloned();
 
+    // Cohere-backed models validate tool schemas against a strict JSON
+    // Schema subset (no `^$` anchors or lookarounds in `pattern`, whitelisted
+    // `format`s, no `allOf`/`oneOf`/ranges — see `sanitize_schema_cohere_subset`).
+    // Gate on the effective model id so tolerant backends keep full schemas.
+    let cohere_subset = model.to_lowercase().contains("cohere");
+
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(system) = anthropic.get("system").and_then(Value::as_str) {
@@ -486,7 +492,10 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
         body["temperature"] = temp;
     }
     if let Some(tools) = anthropic.get("tools").and_then(Value::as_array) {
-        let mapped: Vec<Value> = tools.iter().filter_map(translate_tool_definition).collect();
+        let mapped: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| translate_tool_definition(t, cohere_subset))
+            .collect();
         if !mapped.is_empty() {
             body["tools"] = Value::Array(mapped);
         }
@@ -573,7 +582,14 @@ fn anthropic_blocks_to_openai(role: &str, blocks: &[serde_json::Value]) -> Vec<s
 /// `(?P<name>...)` groups, which `Cohere`'s strict validator rejects with
 /// `invalid 'parameters' provided: pattern must be a valid regex`) are
 /// stripped recursively; valid patterns pass through untouched.
-fn translate_tool_definition(tool: &serde_json::Value) -> Option<serde_json::Value> {
+///
+/// When `cohere_subset` is set (the effective model id names Cohere), the
+/// parameters additionally pass through `sanitize_schema_cohere_subset`,
+/// which enforces Cohere's documented Structured Outputs subset.
+fn translate_tool_definition(
+    tool: &serde_json::Value,
+    cohere_subset: bool,
+) -> Option<serde_json::Value> {
     use serde_json::Value;
 
     let name = tool.get("name").and_then(Value::as_str)?;
@@ -582,6 +598,26 @@ fn translate_tool_definition(tool: &serde_json::Value) -> Option<serde_json::Val
     }
     let mut parameters = tool.get("input_schema").cloned().unwrap_or(json!({}));
     sanitize_schema_patterns(&mut parameters);
+    if cohere_subset {
+        sanitize_schema_cohere_subset(&mut parameters);
+    }
+    // Cohere 400s the whole request when a function has neither description
+    // nor parameters (`invalid request: the 'web_search' tool must have at
+    // least a description, input, or output`). Anthropic server tools
+    // (web_search with no input_schema) arrive here as exactly that shape,
+    // so drop them for Cohere-bound requests rather than failing the call.
+    // Tolerant backends keep the empty function (valid OpenAI).
+    if cohere_subset
+        && tool
+            .get("description")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        && parameters
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        return None;
+    }
     let mut function = json!({
         "name": name,
         "parameters": parameters
@@ -657,6 +693,118 @@ fn sanitize_schema_patterns(schema: &mut serde_json::Value) {
         Value::Array(arr) => {
             for sub in arr.iter_mut() {
                 sanitize_schema_patterns(sub);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Strip schema keywords Cohere rejects, recursing through the schema.
+/// Runs after `sanitize_schema_patterns` on Cohere-bound requests only
+/// (gated by the model id in `translate_anthropic_request_to_openai`).
+///
+/// Enforces the documented Structured Outputs subset
+/// (`https://docs.cohere.com/docs/structured-outputs`):
+/// - `pattern` containing `^`/`$` anchors, lookarounds (`?=`, `?!` and by
+///   extension lookbehinds), or Python-only constructs (`(?P<..>)`, `\A`,
+///   `\Z`) — Cohere's grammar compiler rejects these with
+///   `invalid 'parameters' provided: pattern must be a valid regex`.
+///   Anchor-free ECMA-style patterns (e.g. `[A-Z]{3}[0-9]{4}`) pass through.
+/// - `format` outside `date-time`/`uuid`/`date`/`time`.
+/// - `$schema`, `allOf`/`oneOf`/`not`, numeric/string/array ranges
+///   (`minimum`/`maximum`, `minLength`/`maxLength`, `minItems`/`maxItems`,
+///   `uniqueItems`).
+///
+/// Like `sanitize_schema_patterns`, dropping a keyword only loses
+/// validation/display metadata the model never relied on for tool selection.
+/// `additionalProperties`, `anyOf`, `$ref`/`$defs`, `enum`, and `const` are
+/// supported by Cohere and preserved verbatim.
+fn sanitize_schema_cohere_subset(schema: &mut serde_json::Value) {
+    use serde_json::Value;
+
+    const BANNED_PATTERN_MARKERS: [&str; 7] = ["(?=", "(?!", "(?<=", "(?<!", "(?P<", "\\A", "\\Z"];
+    const COHERE_FORMATS: [&str; 4] = ["date-time", "uuid", "date", "time"];
+    const COHERE_BANNED_KEYS: [&str; 14] = [
+        "$schema",
+        "allOf",
+        "oneOf",
+        "not",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "uniqueItems",
+    ];
+
+    match schema {
+        Value::Object(map) => {
+            let bad_pattern = match map.get("pattern") {
+                None => false,
+                Some(Value::String(s)) => {
+                    // Anchors are already implied (full-string match) in
+                    // Cohere's compiler; a leading `^` or trailing `$` (the
+                    // shape Claude Code emits, e.g. `^[A-Za-z0-9_=-]{1,4096}$`)
+                    // fails validation. A `^` inside a `[^..]` negated class
+                    // does not sit at either edge, so it is left alone.
+                    s.starts_with('^')
+                        || s.ends_with('$')
+                        || BANNED_PATTERN_MARKERS.iter().any(|m| s.contains(m))
+                }
+                Some(_) => true,
+            };
+            if bad_pattern {
+                map.remove("pattern");
+            }
+            let bad_format = match map.get("format") {
+                None => false,
+                Some(Value::String(f)) => !COHERE_FORMATS.contains(&f.as_str()),
+                Some(_) => true,
+            };
+            if bad_format {
+                map.remove("format");
+            }
+            for key in COHERE_BANNED_KEYS {
+                map.remove(key);
+            }
+            // Maps of name → subschema: recurse into each value.
+            for key in [
+                "properties",
+                "patternProperties",
+                "$defs",
+                "definitions",
+                "dependentSchemas",
+            ] {
+                if let Some(Value::Object(subs)) = map.get_mut(key) {
+                    for sub in subs.values_mut() {
+                        sanitize_schema_cohere_subset(sub);
+                    }
+                }
+            }
+            // Single subschemas, or arrays of them: recurse directly.
+            for key in [
+                "items",
+                "additionalProperties",
+                "contains",
+                "propertyNames",
+                "if",
+                "then",
+                "else",
+                "anyOf",
+                "prefixItems",
+            ] {
+                if let Some(sub) = map.get_mut(key) {
+                    sanitize_schema_cohere_subset(sub);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for sub in arr.iter_mut() {
+                sanitize_schema_cohere_subset(sub);
             }
         }
         _ => {}
@@ -1574,7 +1722,7 @@ mod tests {
             }}
         });
 
-        let mapped = translate_tool_definition(&tool).expect("named tool maps");
+        let mapped = translate_tool_definition(&tool, false).expect("named tool maps");
         let params = &mapped["function"]["parameters"];
         assert_eq!(params["properties"]["ok"]["pattern"], json!("^[a-z]+$"));
         assert!(
@@ -1596,11 +1744,119 @@ mod tests {
             }}
         });
 
-        let mapped = translate_tool_definition(&tool).expect("named tool maps");
+        let mapped = translate_tool_definition(&tool, false).expect("named tool maps");
         let props = &mapped["function"]["parameters"]["properties"];
         assert!(props["a"].get("title").is_none());
         assert!(props["a"].get("default").is_none());
         assert_eq!(props["b"]["default"], json!(10));
+    }
+
+    #[test]
+    fn translate_tool_definition_cohere_subset_strips_anchors_and_unsupported_keywords() {
+        // Live regression: Claude Code's `Artifact` tool carries
+        // `^[A-Za-z0-9_=-]{1,4096}$`-style anchored patterns that Rust's
+        // `regex` accepts (so `sanitize_schema_patterns` keeps them) but
+        // Cohere's grammar compiler rejects with `pattern must be a valid
+        // regex`. Anchor-free patterns survive.
+        let tool = json!({
+            "name": "t",
+            "input_schema": {"type": "object", "properties": {
+                "anchored": {"type": "string", "pattern": "^[A-Za-z0-9_=-]{1,4096}$"},
+                "lookahead": {"type": "string", "pattern": "^(?!\\.\\.?)[A-Za-z]+$"},
+                "bare": {"type": "string", "pattern": "[A-Z]{3}[0-9]{4}"},
+                "negated": {"type": "string", "pattern": "[^\\n\\r]+"},
+                "bad_format": {"type": "string", "format": "email"},
+                "good_format": {"type": "string", "format": "date"},
+                "ranged": {"type": "integer", "minimum": 1, "maximum": 10},
+                "composed": {"allOf": [{"type": "string"}], "type": "string"},
+                "kept": {"type": "string", "enum": ["a", "b"]}
+            }}
+        });
+
+        let mapped = translate_tool_definition(&tool, true).expect("named tool maps");
+        let props = &mapped["function"]["parameters"]["properties"];
+        assert!(
+            props["anchored"].get("pattern").is_none(),
+            "anchored pattern must be stripped for Cohere: {props}"
+        );
+        assert!(
+            props["lookahead"].get("pattern").is_none(),
+            "lookahead pattern must be stripped for Cohere: {props}"
+        );
+        assert_eq!(
+            props["bare"]["pattern"],
+            json!("[A-Z]{3}[0-9]{4}"),
+            "bare ECMA-style pattern is Cohere's documented shape: {props}"
+        );
+        assert!(
+            props["negated"].get("pattern").is_some(),
+            "negated-class `^` is not an anchor and must survive: {props}"
+        );
+        assert!(props["bad_format"].get("format").is_none());
+        assert_eq!(props["good_format"]["format"], json!("date"));
+        assert!(props["ranged"].get("minimum").is_none());
+        assert!(props["ranged"].get("maximum").is_none());
+        assert!(props["composed"].get("allOf").is_none());
+        assert!(props["kept"].get("enum").is_some());
+    }
+
+    #[test]
+    fn translate_tool_definition_drops_descriptionless_empty_tool_for_cohere_only() {
+        // Live regression (audit 2026-09-13, fingerprint 0154385e): Cohere
+        // 400s the whole request when a function has neither description nor
+        // parameters. Anthropic server tools (web_search, no input_schema)
+        // arrive as exactly that shape.
+        let tool = json!({"name": "web_search"});
+
+        assert!(
+            translate_tool_definition(&tool, true).is_none(),
+            "Cohere-bound request must drop the empty web_search tool"
+        );
+        assert!(
+            translate_tool_definition(&tool, false).is_some(),
+            "tolerant backends keep the empty function (valid OpenAI)"
+        );
+
+        // A described tool with empty parameters stays (callable no-arg
+        // function); a described empty tool is not the rejected shape.
+        let described = json!({"name": "web_search", "description": "search the web"});
+        assert!(
+            translate_tool_definition(&described, true).is_some(),
+            "described tools must survive even with empty parameters"
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_openai_applies_cohere_subset_by_model_id() {
+        // The same tool schema keeps its anchored pattern for tolerant
+        // backends (Laguna) but loses it for Cohere-bound models.
+        let request = |model: &str| {
+            json!({
+                "model": model,
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "name": "t",
+                    "input_schema": {"type": "object", "properties": {
+                        "v": {"type": "string", "pattern": "^[a-z]+$"}
+                    }}
+                }]
+            })
+        };
+
+        let cohere = translate_anthropic_request_to_openai(&request("cohere/north-mini-code:free"));
+        assert!(
+            cohere["tools"][0]["function"]["parameters"]["properties"]["v"]
+                .get("pattern")
+                .is_none(),
+            "Cohere-bound request must drop anchored patterns"
+        );
+
+        let laguna = translate_anthropic_request_to_openai(&request("poolside/laguna-s-2.1:free"));
+        assert_eq!(
+            laguna["tools"][0]["function"]["parameters"]["properties"]["v"]["pattern"],
+            json!("^[a-z]+$")
+        );
     }
 
     #[test]

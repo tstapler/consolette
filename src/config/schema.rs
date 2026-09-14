@@ -279,6 +279,11 @@ pub struct Config {
     pub ratelimit: RateLimitConfig,
     #[serde(default)]
     pub cost_metrics: CostMetricsConfig,
+    /// Server-tool emulation knobs (all optional; missing table ⇒ safe
+    /// defaults). Carries no secrets: only a backend binary path, iteration
+    /// bounds, and timeouts.
+    #[serde(default)]
+    pub server_tools: crate::server_tools::ServerToolsConfig,
 }
 
 /// `serve-cost`'s config-file surface (Epic 2.3, Story 2.3.1): the
@@ -372,6 +377,7 @@ impl Default for Config {
             }],
             ratelimit: RateLimitConfig::default(),
             cost_metrics: CostMetricsConfig::default(),
+            server_tools: crate::server_tools::ServerToolsConfig::default(),
         }
     }
 }

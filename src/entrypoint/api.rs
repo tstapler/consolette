@@ -126,8 +126,17 @@ pub async fn post_route(
                 Json(json!({ "error": format!("failed to rebuild router: {e}") })),
             )
         })?
-        .with_session_overrides(std::sync::Arc::clone(&state.session_overrides));
+        .with_session_overrides(std::sync::Arc::clone(&state.session_overrides))
+        .with_capability(std::sync::Arc::clone(&state.capability));
     state.dispatch_router.store(std::sync::Arc::new(new_router));
+
+    // Re-evaluate admission against the new pins without blocking the
+    // response: a newly pinned model that cannot emit tool calls is
+    // excluded from dispatch within about a minute.
+    let router_for_eval = state.dispatch_router.load_full();
+    tokio::spawn(async move {
+        crate::routing::capability::evaluate_round(&router_for_eval).await;
+    });
 
     Ok(Json(route))
 }

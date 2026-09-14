@@ -197,6 +197,13 @@ mod tests {
             session_overrides: Arc::new(
                 crate::routing::session_overrides::SessionOverrideStore::new(),
             ),
+            capability: crate::routing::capability::CapabilityCache::new(
+                std::time::Duration::from_secs(crate::routing::capability::EVAL_TTL_SECS),
+            ),
+            server_tools: Arc::new(crate::server_tools::ServerToolsRuntime::default()),
+            search_pool: Arc::new(crate::server_tools::McpSearchPool::new(
+                crate::server_tools::ServerToolsConfig::default().pool_config(),
+            )),
         };
         let _ = Config::default;
         (state, calls)

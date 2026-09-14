@@ -74,6 +74,14 @@ pub struct ProxyMetrics {
     pub count_tokens_total: AtomicU64,
     pub count_tokens_failures: AtomicU64,
 
+    // ---- Server-tool emulation counters (plan: server-tool-emulation) ----
+    pub server_tool_searches_total: AtomicU64,
+    pub server_tool_searches_ok: AtomicU64,
+    pub server_tool_search_failures: AtomicU64,
+    pub server_tool_iterations_total: AtomicU64,
+    /// Per-backend hits, keyed `"brave"` / `"browser"` (D4 dashboard label).
+    pub server_tool_backend_hits: DashMap<String, AtomicU64>,
+
     // ---- Duration bucket counters ----
     pub duration_lt1s: AtomicU64,
     pub duration_1_5s: AtomicU64,
@@ -117,6 +125,12 @@ impl ProxyMetrics {
 
             count_tokens_total: AtomicU64::new(0),
             count_tokens_failures: AtomicU64::new(0),
+
+            server_tool_searches_total: AtomicU64::new(0),
+            server_tool_searches_ok: AtomicU64::new(0),
+            server_tool_search_failures: AtomicU64::new(0),
+            server_tool_iterations_total: AtomicU64::new(0),
+            server_tool_backend_hits: DashMap::new(),
 
             duration_lt1s: AtomicU64::new(0),
             duration_1_5s: AtomicU64::new(0),
@@ -197,6 +211,29 @@ impl ProxyMetrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = kind;
     }
 
+    /// Record one emulated search against a backend (`"brave"`/`"browser"`),
+    /// updating totals, the outcome split, and the per-backend breakdown.
+    pub fn record_server_tool_search(&self, backend: &str, ok: bool) {
+        self.server_tool_searches_total
+            .fetch_add(1, Ordering::Relaxed);
+        if ok {
+            self.server_tool_searches_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.server_tool_search_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.server_tool_backend_hits
+            .entry(backend.to_string())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record loop iterations for one emulated request.
+    pub fn record_server_tool_iterations(&self, iterations: u64) {
+        self.server_tool_iterations_total
+            .fetch_add(iterations, Ordering::Relaxed);
+    }
+
     /// Classify a dispatch failure into the `error_types` breakdown
     /// (`timeout`/`auth`/`rate_limit`/`validation`) shown in `/metrics`.
     pub fn record_error_kind(&self, err: &crate::providers::ProviderError) {
@@ -212,6 +249,28 @@ impl ProxyMetrics {
         if err.is_validation() {
             self.err_validation.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Snapshot the server-tool emulation counters, including the
+    /// per-backend (`brave`/`browser`) breakdown for the D4 dashboard.
+    fn server_tools_json(&self) -> Value {
+        let backends: serde_json::Map<String, Value> = self
+            .server_tool_backend_hits
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    json!(entry.value().load(Ordering::Relaxed)),
+                )
+            })
+            .collect();
+        json!({
+            "searches_total": self.server_tool_searches_total.load(Ordering::Relaxed),
+            "searches_ok": self.server_tool_searches_ok.load(Ordering::Relaxed),
+            "search_failures": self.server_tool_search_failures.load(Ordering::Relaxed),
+            "iterations_total": self.server_tool_iterations_total.load(Ordering::Relaxed),
+            "by_backend": backends
+        })
     }
 
     /// Builds the `providers` and `provider_latency` sections of `/metrics`
@@ -369,7 +428,8 @@ impl ProxyMetrics {
                 "auth": self.err_auth.load(Ordering::Relaxed),
                 "rate_limit": self.err_rate_limit.load(Ordering::Relaxed),
                 "validation": self.err_validation.load(Ordering::Relaxed)
-            }
+            },
+            "server_tools": self.server_tools_json()
         })
     }
 }
@@ -511,5 +571,26 @@ mod tests {
 
         let latency = json["provider_latency"].as_object().unwrap();
         assert_eq!(latency["anthropic"]["avg_duration_ms"], json!(100));
+    }
+
+    #[test]
+    fn record_server_tool_search_should_label_backends_separately() {
+        let m = ProxyMetrics::new();
+        m.record_server_tool_search("brave", true);
+        m.record_server_tool_search("brave", true);
+        m.record_server_tool_search("browser", true);
+        m.record_server_tool_search("unserved", false);
+        m.record_server_tool_iterations(3);
+
+        assert_eq!(m.server_tool_searches_total.load(Ordering::Relaxed), 4);
+        assert_eq!(m.server_tool_searches_ok.load(Ordering::Relaxed), 3);
+        assert_eq!(m.server_tool_search_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(m.server_tool_iterations_total.load(Ordering::Relaxed), 3);
+
+        let json = m.to_json();
+        assert_eq!(json["server_tools"]["searches_total"], json!(4));
+        assert_eq!(json["server_tools"]["by_backend"]["brave"], json!(2));
+        assert_eq!(json["server_tools"]["by_backend"]["browser"], json!(1));
+        assert_eq!(json["server_tools"]["by_backend"]["unserved"], json!(1));
     }
 }

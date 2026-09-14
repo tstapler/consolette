@@ -22,6 +22,7 @@ use super::EntrypointState;
 pub async fn get_metrics(State(state): State<EntrypointState>) -> impl IntoResponse {
     let mut result = state.metrics.to_metrics_json();
     result["cooldowns"] = state.dispatch_router.load().cooldown_snapshot();
+    result["capability"] = state.dispatch_router.load().capability_snapshot();
     // Story 5.1.2: present only for a route whose strategy overrides
     // `observability_snapshot()` (currently just `OpenrouterScoringStrategy`)
     // — omitted entirely (not `null`) otherwise.
@@ -227,6 +228,13 @@ mod tests {
             session_overrides: Arc::new(
                 crate::routing::session_overrides::SessionOverrideStore::new(),
             ),
+            capability: crate::routing::capability::CapabilityCache::new(
+                std::time::Duration::from_secs(crate::routing::capability::EVAL_TTL_SECS),
+            ),
+            server_tools: Arc::new(crate::server_tools::ServerToolsRuntime::default()),
+            search_pool: Arc::new(crate::server_tools::McpSearchPool::new(
+                crate::server_tools::ServerToolsConfig::default().pool_config(),
+            )),
         }
     }
 

@@ -7,10 +7,20 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use std::pin::Pin;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use futures_core::Stream;
+
+use crate::cost_metrics::record_actual_usage_from_anthropic_response;
+use crate::cost_metrics::types::RequestId;
 use crate::entrypoint::cost_tee::{begin_cost_tracking, CostTrackingStream};
 use crate::entrypoint::errors::map_provider_error_anthropic;
 use crate::entrypoint::EntrypointState;
-use crate::providers::ProviderResponse;
+use crate::providers::{ProviderError, ProviderResponse};
+use crate::server_tools::{run_loop, synthesize_sse};
+use crate::session_compaction::SessionKey;
 
 /// Rough char-count heuristic for estimating input tokens ahead of
 /// dispatch, since no tokenizer dependency is in scope for this feature.
@@ -42,6 +52,24 @@ pub async fn post_v1_messages(
     let est_tokens = estimate_tokens(&body);
 
     let (session_key, request_id) = begin_cost_tracking(&state.cost_tracker).await;
+
+    // Server-tool emulation (D1): requests carrying a server web_search def
+    // on an eligible route run the proxy-internal loop instead of the
+    // single-shot path. Requests without server defs fall through to
+    // today's path byte-identically (S-3).
+    if state.server_tools.should_emulate(&body) {
+        return handle_emulated_search(
+            state,
+            body,
+            headers,
+            model,
+            session_key,
+            request_id,
+            est_tokens,
+            stream,
+        )
+        .await;
+    }
 
     match state
         .dispatch_router
@@ -93,6 +121,158 @@ pub async fn post_v1_messages(
     }
 }
 
+/// Emulated `POST /v1/messages` path: rewrite → bounded loop over the
+/// snapshotted router → faithful server-shape turn (Full), or the same turn
+/// re-serialized as buffered SSE (Stream, V1).
+///
+/// Cost is recorded once under the same `(session_key, request_id)` created
+/// above (idempotent replace; final == sum of parts). On the Stream path the
+/// `CostTrackingStream` tee re-records the identical total parsed from the
+/// synthesized `message_delta` usage — single-count by construction (C4).
+#[allow(clippy::too_many_arguments)]
+async fn handle_emulated_search(
+    state: EntrypointState,
+    body: serde_json::Value,
+    headers: HeaderMap,
+    model: String,
+    session_key: SessionKey,
+    request_id: RequestId,
+    est_tokens: u32,
+    stream: bool,
+) -> Response {
+    // C1: snapshot the router Arc once — every loop iteration dispatches
+    // under the same route view even if `POST /api/route` hot-swaps mid-loop.
+    // C3 (known limitation): `est_tokens` is measured pre-loop and ignores
+    // search-augmented turns, so admission control may under-count long
+    // search sessions. Documented, not gated in V1.
+    let router = state.dispatch_router.load_full();
+    let dispatch = |next: serde_json::Value| {
+        let router = Arc::clone(&router);
+        let headers = headers.clone();
+        async move {
+            match router.dispatch(next, headers, false, est_tokens).await {
+                Ok(ProviderResponse::Full(json)) => Ok(json),
+                Ok(ProviderResponse::Stream(_)) => Err(ProviderError::ResponseShapeMismatch(
+                    "emulation loop dispatched with stream=false but got a stream".to_string(),
+                )),
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    let limits = state.server_tools.config.loop_limits();
+    let outcome = match run_loop(&body, &dispatch, &*state.search_pool, &limits).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            state
+                .cost_tracker
+                .record_request_failed(&session_key, request_id)
+                .await;
+            let (status, retry_after, error_body) = map_provider_error_anthropic(&e);
+            return error_response(retry_after, status, error_body);
+        }
+    };
+
+    record_actual_usage_from_anthropic_response(
+        &state.cost_tracker,
+        &session_key,
+        request_id,
+        &model,
+        &outcome.message,
+    )
+    .await;
+
+    for _ in 0..outcome.searches_brave {
+        state
+            .metrics
+            .counters
+            .record_server_tool_search("brave", true);
+    }
+    for _ in 0..outcome.searches_browser {
+        state
+            .metrics
+            .counters
+            .record_server_tool_search("browser", true);
+    }
+    for _ in 0..outcome.searches_failed {
+        state
+            .metrics
+            .counters
+            .record_server_tool_search("unserved", false);
+    }
+    state
+        .metrics
+        .counters
+        .record_server_tool_iterations(u64::from(outcome.iterations));
+
+    // Pre-mortem failure 5: V1 does not implement server-side domain /
+    // location filtering — one log line per affected request.
+    if outcome.filters_ignored {
+        tracing::info!(
+            "server-tool emulation ignored domain/location filters (V1 logs-and-ignores)"
+        );
+    }
+    if outcome.degraded {
+        tracing::debug!(
+            searches = outcome.searches_executed,
+            iterations = outcome.iterations,
+            "server-tool emulation degraded to best answer"
+        );
+    }
+
+    if stream {
+        // Buffered V1 (pre-mortem failure 3): time-to-first-byte degrades to
+        // time-to-final-answer for search turns only. Non-search streams are
+        // untouched (they never enter this branch).
+        let frames = synthesize_sse(&outcome.message);
+        let iter = frames
+            .into_iter()
+            .map(|frame| Ok::<_, anyhow::Error>(Bytes::from(frame)));
+        let boxed: Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send>> =
+            Box::pin(futures_util::stream::iter(iter));
+        let tee = CostTrackingStream::new(
+            boxed,
+            Arc::clone(&state.cost_tracker),
+            session_key,
+            request_id,
+            model,
+        );
+        sse_response(tee)
+    } else {
+        (StatusCode::OK, Json(outcome.message)).into_response()
+    }
+}
+
+/// Shared SSE response framing for the streaming paths.
+fn sse_response<S>(tee: CostTrackingStream<S>) -> Response
+where
+    S: Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin + 'static,
+{
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .header(CACHE_CONTROL, "no-cache")
+        .header(CONNECTION, "keep-alive")
+        .body(Body::from_stream(tee))
+        // Static valid literals + a stream body: infallible in practice;
+        // see `post_v1_messages`' panic documentation.
+        .unwrap_or_else(|_| (StatusCode::OK, Json(serde_json::json!({}))).into_response())
+}
+
+/// Shared provider-error mapping for the Full paths.
+fn error_response(
+    retry_after: Option<u64>,
+    status: StatusCode,
+    error_body: serde_json::Value,
+) -> Response {
+    let mut response = (status, Json(error_body)).into_response();
+    if let Some(retry_after) = retry_after {
+        if let Ok(value) = retry_after.to_string().parse() {
+            response.headers_mut().insert(RETRY_AFTER, value);
+        }
+    }
+    response
+}
 /// `GET /v1/models`: the Anthropic Models API surface over the configured
 /// routes, so clients that validate model IDs (Claude Code session restore,
 /// `/model` pickers) recognize the IDs this proxy actually serves.
@@ -263,6 +443,13 @@ mod tests {
             session_overrides: Arc::new(
                 crate::routing::session_overrides::SessionOverrideStore::new(),
             ),
+            capability: crate::routing::capability::CapabilityCache::new(
+                std::time::Duration::from_secs(crate::routing::capability::EVAL_TTL_SECS),
+            ),
+            server_tools: Arc::new(crate::server_tools::ServerToolsRuntime::default()),
+            search_pool: Arc::new(crate::server_tools::McpSearchPool::new(
+                crate::server_tools::ServerToolsConfig::default().pool_config(),
+            )),
         };
         (state, calls)
     }

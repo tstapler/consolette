@@ -228,44 +228,22 @@ pub fn translate_openai_to_anthropic(openai: &serde_json::Value) -> serde_json::
 
     let mut system_text: Option<String> = None;
     let mut messages: Vec<Value> = Vec::new();
+    // Consecutive `role:"tool"` messages accumulate here and flush as ONE
+    // user turn carrying all `tool_result` blocks. Anthropic requires
+    // alternating user/assistant roles, so emitting one user message per
+    // tool result 400s parallel-tool turns after the first loop iteration.
+    let mut pending_tool_results: Vec<Value> = Vec::new();
 
     if let Some(openai_messages) = openai.get("messages").and_then(Value::as_array) {
         for msg in openai_messages {
-            let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-
-            // Assistant turns may carry `tool_calls` alongside or instead of
-            // text; surface both as content blocks.
-            if role == "assistant" {
-                if let Some(blocks) = openai_assistant_history_to_blocks(msg) {
-                    messages.push(json!({"role": "assistant", "content": blocks}));
-                    continue;
-                }
-            }
-
-            // Anthropic has no `tool` role: results become user turns
-            // carrying `tool_result` blocks.
-            if role == "tool" {
-                messages.push(openai_tool_message_to_block(msg));
-                continue;
-            }
-
-            let content =
-                openai_content_to_anthropic(msg.get("content").cloned().unwrap_or(Value::Null));
-
-            if role == "system" {
-                // Accumulate system messages into a single string
-                let text = extract_text_from_content(&content);
-                match system_text.as_mut() {
-                    Some(s) => {
-                        s.push('\n');
-                        s.push_str(&text);
-                    }
-                    None => system_text = Some(text),
-                }
-            } else {
-                messages.push(json!({"role": role, "content": content}));
-            }
+            push_openai_message(
+                &mut messages,
+                &mut pending_tool_results,
+                &mut system_text,
+                msg,
+            );
         }
+        flush_tool_results(&mut messages, &mut pending_tool_results);
     }
 
     let mut body = json!({
@@ -308,6 +286,78 @@ pub fn translate_openai_to_anthropic(openai: &serde_json::Value) -> serde_json::
     body
 }
 
+/// Flush batched `tool_result` blocks as one user turn (no-op when empty).
+fn flush_tool_results(messages: &mut Vec<serde_json::Value>, pending: &mut Vec<serde_json::Value>) {
+    if !pending.is_empty() {
+        messages.push(json!({"role": "user", "content": std::mem::take(pending)}));
+    }
+}
+
+/// Fold one `OpenAI` message into the Anthropic `messages` accumulator.
+/// `pending_tool_results` batches consecutive `role:"tool"` messages so
+/// they flush as a single user turn (Anthropic requires alternating
+/// roles); a user text turn arriving while results are pending joins them
+/// instead of opening a second user turn.
+fn push_openai_message(
+    messages: &mut Vec<serde_json::Value>,
+    pending_tool_results: &mut Vec<serde_json::Value>,
+    system_text: &mut Option<String>,
+    msg: &serde_json::Value,
+) {
+    use serde_json::Value;
+
+    let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+
+    // Assistant turns may carry `tool_calls` alongside or instead of
+    // text; surface both as content blocks.
+    if role == "assistant" {
+        if let Some(blocks) = openai_assistant_history_to_blocks(msg) {
+            flush_tool_results(messages, pending_tool_results);
+            messages.push(json!({"role": "assistant", "content": blocks}));
+            return;
+        }
+    }
+
+    // Anthropic has no `tool` role: results batch up for the next flush.
+    if role == "tool" {
+        pending_tool_results.push(openai_tool_result_block(msg));
+        return;
+    }
+
+    let content = openai_content_to_anthropic(msg.get("content").cloned().unwrap_or(Value::Null));
+
+    // Accumulate system messages into a single string.
+    if role == "system" {
+        let text = extract_text_from_content(&content);
+        match system_text.as_mut() {
+            Some(s) => {
+                s.push('\n');
+                s.push_str(&text);
+            }
+            None => *system_text = Some(text),
+        }
+        return;
+    }
+
+    // A user text turn answering pending tool calls joins them in ONE
+    // user message — separate messages would break role alternation.
+    if role == "user" {
+        if let Value::Array(text_blocks) = content {
+            if pending_tool_results.is_empty() {
+                messages.push(json!({"role": role, "content": Value::Array(text_blocks)}));
+            } else {
+                let mut combined = std::mem::take(pending_tool_results);
+                combined.extend(text_blocks);
+                messages.push(json!({"role": "user", "content": combined}));
+            }
+            return;
+        }
+    }
+
+    flush_tool_results(messages, pending_tool_results);
+    messages.push(json!({"role": role, "content": content}));
+}
+
 /// Map one `OpenAI` assistant message's `tool_calls` (plus any adjacent
 /// text) to Anthropic content blocks. Returns `None` when the message
 /// carries neither, letting the caller fall through to plain-text handling.
@@ -346,9 +396,10 @@ fn openai_assistant_history_to_blocks(msg: &serde_json::Value) -> Option<Vec<ser
     Some(blocks)
 }
 
-/// Map one `OpenAI` `role:"tool"` message to a `role:"user"` message
-/// carrying a `tool_result` block.
-fn openai_tool_message_to_block(msg: &serde_json::Value) -> serde_json::Value {
+/// Map one `OpenAI` `role:"tool"` message to a `tool_result` block. The
+/// caller batches consecutive blocks into a single `role:"user"` turn (see
+/// `translate_openai_to_anthropic`).
+fn openai_tool_result_block(msg: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
 
     let call_id = msg
@@ -356,10 +407,7 @@ fn openai_tool_message_to_block(msg: &serde_json::Value) -> serde_json::Value {
         .and_then(Value::as_str)
         .unwrap_or("");
     let text = extract_text_from_content(&msg.get("content").cloned().unwrap_or(Value::Null));
-    json!({
-        "role": "user",
-        "content": [{"type": "tool_result", "tool_use_id": call_id, "content": text}]
-    })
+    json!({"type": "tool_result", "tool_use_id": call_id, "content": text})
 }
 
 /// Map `OpenAI` function tool definitions to Anthropic tool definitions.
@@ -517,25 +565,66 @@ pub(crate) fn redact_bodies(value: &serde_json::Value) -> serde_json::Value {
 
 /// Translate an Anthropic Messages response to `OpenAI` Chat Completions format.
 ///
-/// Output shape: `choices[0].message.{role,content}`, `usage.*`, `finish_reason`.
+/// Output shape: `choices[0].message.{role,content,tool_calls?}`, `usage.*`,
+/// `finish_reason`. `tool_use` blocks become `message.tool_calls` (arguments
+/// serialized to a JSON string) with `finish_reason: "tool_calls"` — without
+/// this, agentic clients never see tool calls and the loop stalls after one
+/// turn. `stop_reason` maps to `OpenAI` vocabulary (`end_turn`→`stop`,
+/// `max_tokens`→`length`, `tool_use`→`tool_calls`).
 #[must_use]
 pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
 
-    let content_text = anthropic
+    let blocks: &[Value] = anthropic
         .get("content")
         .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(|block| block.get("text"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .map_or(&[], Vec::as_slice);
 
-    let finish_reason = anthropic
-        .get("stop_reason")
-        .and_then(Value::as_str)
-        .unwrap_or("stop")
-        .to_string();
+    let content_text = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let tool_calls: Vec<Value> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter(|b| {
+            b.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty())
+        })
+        .map(|b| {
+            let id = b
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_unknown");
+            let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+            let arguments = b.get("input").map_or_else(
+                || "{}".to_string(),
+                |v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
+            );
+            json!({
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments}
+            })
+        })
+        .collect();
+
+    // Tool calls on the wire win over the stop reason: a client that sees
+    // `tool_use` blocks with any other finish reason will not execute them.
+    let finish_reason = if tool_calls.is_empty() {
+        match anthropic.get("stop_reason").and_then(Value::as_str) {
+            Some("tool_use") => "tool_calls".to_string(),
+            Some("max_tokens") => "length".to_string(),
+            Some("end_turn" | "stop_sequence" | "stop") | None => "stop".to_string(),
+            Some(other) => other.to_string(),
+        }
+    } else {
+        "tool_calls".to_string()
+    };
 
     let model = anthropic
         .get("model")
@@ -546,16 +635,27 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
     let usage = extract_usage(anthropic).unwrap_or_default();
     let (prompt_tokens, completion_tokens) = (usage.input_tokens, usage.output_tokens);
 
+    // OpenAI convention: `content` is null when the turn is tool-calls-only.
+    let content = if content_text.is_empty() && !tool_calls.is_empty() {
+        Value::Null
+    } else {
+        Value::String(content_text)
+    };
+    let mut message = json!({
+        "role": "assistant",
+        "content": content
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
     json!({
         "id": anthropic.get("id").and_then(Value::as_str).unwrap_or(""),
         "object": "chat.completion",
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content_text
-            },
+            "message": message,
             "finish_reason": finish_reason
         }],
         "usage": {
@@ -1194,15 +1294,11 @@ pub(crate) fn map_openai_finish_reason(finish_reason: Option<&str>) -> &'static 
 
 // ────────────────────────────────────────────────────────────────────────────
 // cost_metrics Epic 2.2, Story 2.2.1: `usage.*` extraction and the
-// (currently uncalled) actual-usage reporting wrapper.
+// actual-usage reporting wrapper.
 //
-// `translate_anthropic_to_openai` has no production caller in this codebase
-// as of this story (verified via `grep -rn "translate_anthropic_to_openai"
-// src`, which returns only this definition and its own unit test) — neither
-// does `translate_and_record` below. Both are unit-tested directly rather
-// than end-to-end, because no live provider-dispatch path exists yet to
-// exercise them through. See plan.md's Epic 2.2 for the full reachability
-// statement.
+// `translate_and_record` is live: `entrypoint::chat_completions` calls it on
+// every non-streaming `/v1/chat/completions` response (translate to OpenAI
+// shape + record actual usage in one step).
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The four `usage.*` fields an Anthropic Messages API response (or a
@@ -1788,9 +1884,129 @@ mod tests {
             anthropic["messages"][2],
             json!({
                 "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"}]
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"},
+                    {"type": "text", "text": "thanks"}
+                ]
             })
         );
+    }
+
+    #[test]
+    fn translate_openai_request_merges_parallel_tool_results_into_one_turn() {
+        // Two `role:"tool"` messages in a row must become ONE user turn:
+        // Anthropic requires alternating roles, so one message per result
+        // 400s parallel-tool turns after the first loop iteration.
+        let openai = json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}},
+                    {"id": "call_2", "type": "function",
+                     "function": {"name": "read", "arguments": "{\"path\":\"b\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "contents-a"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "contents-b"},
+                {"role": "user", "content": "thanks"}
+            ]
+        });
+
+        let anthropic = translate_openai_to_anthropic(&openai);
+
+        // Both results AND the follow-up text land in one user turn.
+        assert_eq!(
+            anthropic["messages"][1],
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "contents-a"},
+                    {"type": "tool_result", "tool_use_id": "call_2", "content": "contents-b"},
+                    {"type": "text", "text": "thanks"}
+                ]
+            })
+        );
+        // Roles strictly alternate across the whole history.
+        let roles: Vec<&str> = anthropic["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["assistant", "user"]);
+    }
+
+    #[test]
+    fn translate_anthropic_to_openai_maps_tool_use_to_tool_calls() {
+        // The agentic-loop contract: `tool_use` blocks must surface as
+        // `message.tool_calls` with `finish_reason: "tool_calls"`, or the
+        // client never executes them and the loop stalls after one turn.
+        let anthropic = json!({
+            "id": "msg_1",
+            "model": "claude-sonnet-5",
+            "content": [
+                {"type": "text", "text": "reading both"},
+                {"type": "tool_use", "id": "toolu_1", "name": "read",
+                 "input": {"path": "a"}},
+                {"type": "tool_use", "id": "toolu_2", "name": "read",
+                 "input": {"path": "b"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let openai = translate_anthropic_to_openai(&anthropic);
+
+        assert_eq!(openai["choices"][0]["finish_reason"], json!("tool_calls"));
+        assert_eq!(
+            openai["choices"][0]["message"]["tool_calls"],
+            json!([
+                {"id": "toolu_1", "type": "function",
+                 "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}},
+                {"id": "toolu_2", "type": "function",
+                 "function": {"name": "read", "arguments": "{\"path\":\"b\"}"}}
+            ])
+        );
+        assert_eq!(
+            openai["choices"][0]["message"]["content"],
+            json!("reading both")
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_to_openai_maps_stop_reasons_to_openai_vocabulary() {
+        let end_turn = json!({
+            "id": "m", "model": "m",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        assert_eq!(
+            translate_anthropic_to_openai(&end_turn)["choices"][0]["finish_reason"],
+            json!("stop")
+        );
+
+        let max_tokens = json!({
+            "id": "m", "model": "m",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        assert_eq!(
+            translate_anthropic_to_openai(&max_tokens)["choices"][0]["finish_reason"],
+            json!("length")
+        );
+
+        // Tool calls on the wire win even if the stop reason disagrees.
+        let mismatch = json!({
+            "id": "m", "model": "m",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let out = translate_anthropic_to_openai(&mismatch);
+        assert_eq!(out["choices"][0]["finish_reason"], json!("tool_calls"));
+        assert!(out["choices"][0]["message"]["content"].is_null());
     }
 
     #[test]

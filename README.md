@@ -92,6 +92,42 @@ Once running, the same route can be inspected and changed live from the web cont
 - `GET /api/route` — the active route (strategy, upstream weights, model overrides)
 - `POST /api/route` — replace the active route; persists to `~/.config/consolette/runtime-overrides.toml` and applies immediately, no restart
 
+### Server-tool emulation (`web_search`)
+
+Claude Code's `web_search` server tool is emulated inside the proxy on
+non-Anthropic routes: the server def is rewritten to a callable function,
+searches execute through the `stapler-mcp` daemon over MCP stdio, and the
+final turn is mapped back to `server_tool_use` + `web_search_tool_result`.
+All knobs are optional (shown with defaults):
+
+```toml
+# ~/.config/consolette/conf.d/20-server-tools.toml
+[server_tools]
+enabled = true
+backend_path = "stapler-mcp"   # binary on PATH, or an absolute path
+max_iterations = 5              # per-request search rounds (hard ceiling 10)
+per_search_timeout_ms = 15000
+total_timeout_ms = 120000
+browser_timeout_ms = 30000      # fallback path (below) is slower than Brave
+max_results = 5                 # mapped to the Brave `count` argument
+pool_size = 2                   # persistent stdio children
+```
+
+Operational notes:
+
+- `BRAVE_API_KEY` stays in the daemon's environment — it never appears in
+  consolette config, logs, or error bodies.
+- Without a Brave key, searches fall back to stapler-mcp-side browser
+  search (`browser_web_search`, once shipped —
+  [stapler-mcp#46](https://github.com/tstapler/stapler-mcp/issues/46)),
+  then degrade to today's drop behavior. No system Chrome on the daemon
+  host means the browser path fails fast: Chrome lives with the daemon,
+  never with the proxy.
+- Streaming search turns are buffered: time-to-first-byte waits for the
+  final answer. Non-search streams are untouched.
+- `allowed_domains` / `blocked_domains` / `user_location` hints are V1
+  logged-and-ignored (one log line per affected request).
+
 ## CLI reference
 
 | Command | Purpose |

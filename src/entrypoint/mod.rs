@@ -26,8 +26,10 @@ use crate::config::schema::{Config, UpstreamKind};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::metrics::MetricsCollector;
+use crate::routing::capability::{CapabilityCache, EVAL_TTL_SECS};
 use crate::routing::router::Router as DispatchRouter;
 use crate::routing::session_overrides::SessionOverrideStore;
+use crate::server_tools::{McpSearchPool, ServerToolsRuntime};
 
 /// One upstream's name and kind, for display on the landing page
 /// (`GET /`) — never used for dispatch, which goes through `DispatchRouter`.
@@ -70,6 +72,19 @@ pub struct EntrypointState {
     /// which `api::post_route` re-attaches to every rebuilt `Router` so a
     /// pin survives a route hot-swap.
     pub session_overrides: Arc<SessionOverrideStore>,
+    /// The single, canonical capability-verdict cache for this process.
+    /// Same carry-across discipline as `session_overrides` (via
+    /// `Router::with_capability`), plus a background eval loop that keeps
+    /// verdicts fresh as the free lineup rotates.
+    pub capability: Arc<CapabilityCache>,
+    /// Server-tool emulation snapshot: tuning config plus route eligibility
+    /// (D1), computed once at build.
+    pub server_tools: Arc<ServerToolsRuntime>,
+    /// Shared bounded pool of stapler-mcp stdio children (seam A). Held
+    /// here — not per request — so children persist across searches and the
+    /// circuit breaker sees process-wide failures. Lazy start: constructing
+    /// the pool spawns nothing.
+    pub search_pool: Arc<McpSearchPool>,
 }
 
 impl EntrypointState {
@@ -87,12 +102,34 @@ impl EntrypointState {
         let metrics = MetricsCollector::new();
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
         let session_overrides = Arc::new(SessionOverrideStore::new());
+        let capability = CapabilityCache::new(std::time::Duration::from_secs(EVAL_TTL_SECS));
         let dispatch_router = Arc::new(ArcSwap::from_pointee(
             DispatchRouter::from_config(config, Arc::clone(&metrics))
                 .await?
-                .with_session_overrides(Arc::clone(&session_overrides)),
+                .with_session_overrides(Arc::clone(&session_overrides))
+                .with_capability(Arc::clone(&capability)),
         ));
+        tokio::spawn(crate::routing::capability::run_eval_loop(Arc::clone(
+            &dispatch_router,
+        )));
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
+        let server_tools = Arc::new(ServerToolsRuntime {
+            config: config.server_tools.clone(),
+            route_eligible: ServerToolsRuntime::route_eligible_from_config(config),
+        });
+        let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
+        // Pre-mortem failure 2: one boot log line stating whether emulation
+        // is armed and whether the backend binary resolves, so "silently
+        // degraded since restart" is visible in logs. No child is spawned
+        // here (lazy pool start on first search).
+        tracing::info!(
+            enabled = server_tools.config.enabled,
+            route_eligible = server_tools.route_eligible,
+            backend_path = %server_tools.config.backend_path,
+            backend_reachable =
+                crate::server_tools::backend_reachable(&server_tools.config.backend_path),
+            "server-tool emulation configured"
+        );
         let route = config.routes.first();
         let server_info = Arc::new(ServerInfo {
             port: config.port,
@@ -114,6 +151,9 @@ impl EntrypointState {
             server_info,
             config_dir: Arc::new(config_dir.to_path_buf()),
             session_overrides,
+            capability,
+            server_tools,
+            search_pool,
         })
     }
 }

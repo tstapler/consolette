@@ -27,6 +27,7 @@ use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
 
+use super::capability::CapabilityCache;
 use super::health::{Availability, HealthRegistry};
 use super::openrouter_scoring::OpenrouterScoringStrategy;
 use super::session_overrides::{extract_session_id, SessionOverrideStore};
@@ -48,6 +49,11 @@ pub struct Router {
     /// the *same* `Arc` across a route hot-swap via `with_session_overrides`
     /// so a pin isn't lost just because the global route changed.
     session_overrides: Arc<SessionOverrideStore>,
+    /// Capability admission verdicts, consulted alongside health on every
+    /// dispatch (see `dispatch`'s doc comment). Same carry-across discipline
+    /// as `session_overrides` via `with_capability`, so learned verdicts
+    /// survive a route hot-swap.
+    capability: Arc<CapabilityCache>,
 }
 
 /// Builds a live `Provider` for every configured upstream, keyed by its
@@ -259,7 +265,28 @@ impl Router {
             admission,
             metrics,
             session_overrides: Arc::new(SessionOverrideStore::new()),
+            capability: CapabilityCache::new(Duration::from_secs(
+                crate::routing::capability::EVAL_TTL_SECS,
+            )),
         }
+    }
+
+    /// Swaps in a shared capability-verdict cache, replacing the empty one
+    /// `Router::new`/`from_config` starts with. Same carry-across contract
+    /// as `with_session_overrides`: `api::post_route` passes the
+    /// `EntrypointState`'s existing `Arc<CapabilityCache>` so learned
+    /// verdicts survive a route rebuild.
+    #[must_use]
+    pub fn with_capability(mut self, capability: Arc<CapabilityCache>) -> Self {
+        self.capability = capability;
+        self
+    }
+
+    /// The shared admission-verdict cache (used by the background
+    /// evaluator and `/metrics`).
+    #[must_use]
+    pub fn capability(&self) -> Arc<CapabilityCache> {
+        Arc::clone(&self.capability)
     }
 
     /// Swaps in a shared session-override store, replacing the empty one
@@ -402,6 +429,40 @@ impl Router {
         }]
     }
 
+    /// Healthy candidates not yet tried for this request, minus
+    /// capability-exiled models. When admission would refuse every healthy
+    /// candidate, fails open (loudly) rather than refusing all traffic — a
+    /// stale `Fail` must never cause a wider outage than the degraded model
+    /// it describes.
+    fn admitted_candidates(
+        &self,
+        candidates: &[UpstreamRef],
+        already_tried: &HashSet<(usize, Option<String>)>,
+    ) -> Vec<UpstreamRef> {
+        let healthy: Vec<UpstreamRef> = candidates
+            .iter()
+            .filter(|u| {
+                !already_tried.contains(&(u.index, u.model.clone()))
+                    && self.health.is_available(u.index)
+            })
+            .cloned()
+            .collect();
+
+        // Capability admission: skip candidates whose pinned model freshly
+        // failed its tool-call eval.
+        let admitted: Vec<UpstreamRef> = healthy
+            .iter()
+            .filter(|u| self.capability.is_admitted(&u.model))
+            .cloned()
+            .collect();
+        if admitted.is_empty() && !healthy.is_empty() {
+            tracing::warn!("capability admission excluded all healthy candidates; failing open");
+            healthy
+        } else {
+            admitted
+        }
+    }
+
     /// Dispatches a request, re-selecting a different upstream on rate-limit
     /// or transient failure until candidates are exhausted. `est_tokens` is
     /// the caller's estimate of this request's token cost, used for the
@@ -446,14 +507,7 @@ impl Router {
             .push_original_body(request_id.clone(), body.clone());
 
         loop {
-            let healthy: Vec<UpstreamRef> = candidates
-                .iter()
-                .filter(|u| {
-                    !already_tried.contains(&(u.index, u.model.clone()))
-                        && self.health.is_available(u.index)
-                })
-                .cloned()
-                .collect();
+            let healthy = self.admitted_candidates(&candidates, &already_tried);
 
             let Some(chosen) = self.strategy.select(&healthy) else {
                 break;
@@ -627,6 +681,53 @@ impl Router {
             );
         }
         serde_json::Value::Object(result)
+    }
+
+    /// Route candidates eligible for capability evaluation: pinned model
+    /// ids ending in `:free`. The suffix doubles as the paid guard —
+    /// subscription/paid pins are never probed (probes cost real money)
+    /// and stay admitted exactly as today. Deduped by (index, model).
+    #[must_use]
+    pub fn eval_targets(&self) -> Vec<(usize, String)> {
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for candidate in &self.candidates {
+            if let Some(model) = candidate.model.clone() {
+                if model.ends_with(":free") && seen.insert((candidate.index, model.clone())) {
+                    targets.push((candidate.index, model));
+                }
+            }
+        }
+        targets
+    }
+
+    /// Sends one body straight to a single upstream, bypassing
+    /// metrics/stats/health/session-pins. Capability probes use this so
+    /// eval traffic never moves production signals or trips cooldowns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's error, or a validation error for an
+    /// out-of-range index (unreachable via [`Router::eval_targets`]).
+    pub async fn probe_upstream(
+        &self,
+        index: usize,
+        body: serde_json::Value,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let Some(provider) = self.providers.get(index) else {
+            return Err(ProviderError::Validation(
+                format!("capability probe for unknown upstream index {index}"),
+                500,
+            ));
+        };
+        provider.send(body, HeaderMap::new(), false).await
+    }
+
+    /// The admission-verdict cache's `/metrics`-facing snapshot (mirrors
+    /// `cooldown_snapshot`).
+    #[must_use]
+    pub fn capability_snapshot(&self) -> serde_json::Value {
+        self.capability.snapshot()
     }
 
     /// The active strategy's `/metrics`-facing observability blob (Story

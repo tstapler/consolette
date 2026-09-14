@@ -223,6 +223,24 @@ fn build_openrouter_scored_strategy(
     )) as Arc<dyn RoutingStrategy>)
 }
 
+/// Per-model (e.g. `OpenRouter` free-pool) 429s must not cool down the whole
+/// shared upstream index while untried sibling models remain — otherwise one
+/// model's rate limit exhausts the entire pool after a single attempt. Defers
+/// the whole-index trip until the last sibling has also been tried, so a
+/// single dispatch walks the full free-model pool before giving up.
+/// Model-less (traditional) candidates keep immediate-trip behavior: tripping
+/// their index can't block a different-index fallback.
+fn should_defer_rate_limit_trip(
+    candidates: &[UpstreamRef],
+    already_tried: &HashSet<(usize, Option<String>)>,
+    chosen: &UpstreamRef,
+) -> bool {
+    chosen.model.is_some()
+        && candidates.iter().any(|u| {
+            u.index == chosen.index && !already_tried.contains(&(u.index, u.model.clone()))
+        })
+}
+
 impl Router {
     #[must_use]
     pub fn new(
@@ -493,8 +511,7 @@ impl Router {
                 }
                 Err(e) if e.is_rate_limited() => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
-                    let override_duration = e.retry_after_secs().map(Duration::from_secs);
-                    self.health.trip(chosen.index, override_duration);
+                    self.maybe_trip_rate_limit(&candidates, &already_tried, &chosen, &e);
                     last_error = Some(e);
                 }
                 Err(e) if e.is_response_shape_mismatch() => {
@@ -543,6 +560,24 @@ impl Router {
             .and_then(|m| self.strategy.last_selection_was_exploration(m));
         self.metrics
             .set_selected_model_was_exploration(request_id, was_exploration);
+    }
+
+    /// Trips the whole-upstream cooldown for a rate-limited attempt, unless
+    /// it is a per-model 429 with untried siblings at the same index (see
+    /// `should_defer_rate_limit_trip`) — in that case the pool still has
+    /// models worth trying, so the trip waits for the last sibling.
+    fn maybe_trip_rate_limit(
+        &self,
+        candidates: &[UpstreamRef],
+        already_tried: &HashSet<(usize, Option<String>)>,
+        chosen: &UpstreamRef,
+        error: &ProviderError,
+    ) {
+        if should_defer_rate_limit_trip(candidates, already_tried, chosen) {
+            return;
+        }
+        let override_duration = error.retry_after_secs().map(Duration::from_secs);
+        self.health.trip(chosen.index, override_duration);
     }
 
     /// REQ-6 (Task 4.3.1f, design/ux.md §6): a full-pool exhaustion reached
@@ -2303,12 +2338,11 @@ mod tests {
         assert_eq!(body["model"], serde_json::json!("model-a"));
     }
 
-    // REQ-4 (Story 4.2.3, Task 4.2.3c, ADR-002): a 429 from one per-model
-    // `OpenrouterScoringStrategy` candidate trips `HealthRegistry` for the
-    // *shared* upstream index those candidates all share, making every
-    // other per-model candidate at that index unavailable too — proving
-    // ADR-002's claim that the existing whole-upstream cooldown already
-    // delivers `Retry-After` fidelity without a sibling per-model registry.
+    // Per-model 429 failover: a 429 from one per-model candidate must NOT
+    // cool down the shared upstream index while untried siblings remain —
+    // a single dispatch walks the full free-model pool before giving up.
+    // The whole-index trip is deferred until the last sibling also fails,
+    // so the next dispatch still backs off (account-wide-limit case).
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn record_outcome_rate_limited_should_trip_health_registry_for_shared_index() {
@@ -2356,12 +2390,100 @@ mod tests {
         assert!(matches!(res, Err(ProviderError::RateLimited)));
         assert!(
             !health.is_available(0),
-            "the shared upstream index must be cooling down after one per-model 429"
+            "the shared upstream index must be cooling down after every per-model candidate 429s"
         );
         assert_eq!(
             call_count.load(Ordering::SeqCst),
-            1,
-            "the sibling per-model candidate must never be attempted once the shared index cools down"
+            2,
+            "both per-model candidates must be attempted before giving up on rate limiting"
+        );
+    }
+
+    // A per-model 429 must fail over to the next sibling model in the same
+    // dispatch, not return immediately: first model rate-limited, second
+    // succeeds → Ok, and the pool stays available (no whole-index trip)
+    // since exhaustion never happened.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_retry_sibling_free_model_after_per_model_rate_limit() {
+        struct FailOnceThenOk {
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for FailOnceThenOk {
+            fn name(&self) -> &'static str {
+                "openrouter"
+            }
+
+            async fn send(
+                &self,
+                body: serde_json::Value,
+                _headers: HeaderMap,
+                _stream: bool,
+            ) -> Result<ProviderResponse, ProviderError> {
+                let model = body["model"].as_str().unwrap_or("").to_string();
+                self.calls.lock().unwrap().push(model.clone());
+                if model == "a/b:free" {
+                    Err(ProviderError::RateLimited)
+                } else {
+                    Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+                }
+            }
+
+            async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(FailOnceThenOk {
+            calls: Arc::clone(&calls),
+        })];
+        let health = Arc::new(HealthRegistry::new(300));
+        let model_cache = Arc::new(
+            crate::providers::openrouter::cache::ModelListCache::new_with_ttl(Duration::from_mins(
+                15,
+            )),
+        );
+        let strategy = Arc::new(
+            crate::routing::openrouter_scoring::OpenrouterScoringStrategy::new(model_cache, 0),
+        );
+        let router = Router::new(
+            vec![
+                UpstreamRef {
+                    index: 0,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("a/b:free".to_string()),
+                },
+                UpstreamRef {
+                    index: 0,
+                    name: "openrouter".to_string(),
+                    weight: 1.0,
+                    model: Some("c/d:free".to_string()),
+                },
+            ],
+            providers,
+            strategy,
+            Arc::clone(&health),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(
+            res.is_ok(),
+            "a per-model 429 must fail over to the sibling free model"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "both free models must be attempted");
+        assert!(
+            health.is_available(0),
+            "a recovered pool (sibling succeeded) must not be left cooling down"
         );
     }
 

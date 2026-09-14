@@ -225,6 +225,11 @@ pub async fn evaluate_model(
     index: usize,
     model_id: &str,
 ) -> CapabilityVerdict {
+    // A round with no model answer at all (every probe rate-limited,
+    // timed out, or otherwise inconclusive) is `Unknown`, not `Fail`:
+    // exiling a model for quota noise would punish it for the network,
+    // not for its tool behavior.
+    let mut saw_answer = false;
     for attempt in 0..EVAL_PROBES_PER_ROUND {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(EVAL_PROBE_SPACING_SECS)).await;
@@ -240,6 +245,7 @@ pub async fn evaluate_model(
         match router.probe_upstream(index, attempt_body).await {
             Ok(response) if probe_passed(&response) => return CapabilityVerdict::Pass,
             Ok(_) => {
+                saw_answer = true;
                 // A clean answer with no call is signal, not noise — but a
                 // single miss could be sampling luck, so later attempts in
                 // this round may still rescue the verdict.
@@ -256,6 +262,9 @@ pub async fn evaluate_model(
                 );
             }
         }
+    }
+    if !saw_answer {
+        return CapabilityVerdict::Unknown;
     }
     CapabilityVerdict::Fail {
         reason: "model answered without emitting a tool call".to_string(),
@@ -305,6 +314,103 @@ pub async fn run_eval_loop(dispatch_router: Arc<arc_swap::ArcSwap<super::router:
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Scripted provider for `evaluate_model` tests: replays queued
+    /// `Full` bodies or errors in order.
+    struct ScriptedProvider {
+        script: Mutex<VecDeque<Result<serde_json::Value, ProviderError>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for ScriptedProvider {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        async fn send(
+            &self,
+            _body: serde_json::Value,
+            _headers: http::HeaderMap,
+            _stream: bool,
+        ) -> Result<ProviderResponse, ProviderError> {
+            self.script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .expect("script exhausted")
+                .map(ProviderResponse::Full)
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn tool_use_body() -> serde_json::Value {
+        serde_json::json!({
+            "content": [{"type": "tool_use", "id": "call_1", "name": EVAL_TOOL_NAME, "input": {"zone": "utc"}}]
+        })
+    }
+
+    fn text_body() -> serde_json::Value {
+        serde_json::json!({"content": [{"type": "text", "text": "the time is noon"}]})
+    }
+
+    fn eval_router(
+        script: Vec<Result<serde_json::Value, ProviderError>>,
+    ) -> super::super::router::Router {
+        use std::sync::Arc;
+
+        super::super::router::Router::new(
+            vec![],
+            vec![Arc::new(ScriptedProvider {
+                script: Mutex::new(script.into()),
+            })],
+            Arc::new(super::super::strategy::FallbackStrategy),
+            Arc::new(super::super::health::HealthRegistry::new(300)),
+            Arc::new(crate::ratelimit::RateLimiters::new(
+                &crate::config::schema::RateLimitConfig::default(),
+            )),
+            crate::metrics::MetricsCollector::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn evaluate_model_passes_on_an_emitted_tool_call() {
+        let router = eval_router(vec![Ok(tool_use_body())]);
+
+        assert_eq!(
+            evaluate_model(&router, 0, "m:free").await,
+            CapabilityVerdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_model_fails_clean_answers_without_calls() {
+        let router = eval_router(vec![Ok(text_body()), Ok(text_body())]);
+
+        assert!(matches!(
+            evaluate_model(&router, 0, "m:free").await,
+            CapabilityVerdict::Fail { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn evaluate_model_stays_undecided_when_no_probe_answered() {
+        // Regression: all-inconclusive rounds (e.g. every probe rate
+        // limited) must not exile a model for quota noise.
+        let router = eval_router(vec![
+            Err(ProviderError::RateLimited),
+            Err(ProviderError::Timeout),
+        ]);
+
+        assert_eq!(
+            evaluate_model(&router, 0, "m:free").await,
+            CapabilityVerdict::Unknown
+        );
+    }
 
     #[test]
     fn probe_request_is_a_non_streaming_tool_call_test() {

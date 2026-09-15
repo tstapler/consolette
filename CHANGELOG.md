@@ -3,6 +3,67 @@
 
 ### Bug Fixes
 
+- Retry launchctl bootstrap after bootout races (cac3a4d)
+
+- Remove hardcoded anthropic/bedrock assumptions (41996c9)
+
+- Surface array and reasoning content in OpenAI translations (84ec94a)
+
+- Forward tools and translate tool_calls for Claude Code (5660a21)
+
+- Claude Code session restore via /v1/models and model echo (16a7d1e)
+
+- Sanitize tool schemas, log stream requests, model catalog (b951d2f)
+
+- Walk the full free-model pool before giving up on 429s (fb2efcd)
+
+- Sanitize tool schemas for Cohere-bound requests (47f9bdd)
+
+- Map tools/tool_choice in OpenAI-to-Anthropic translation (285fc62)
+
+- Keep coding-agent tool loops alive across translators (1c970b3)
+
+- Capability eval stays undecided when no probe answered (92f5d67)
+
+
+### Features
+
+- Add list_models to Provider trait, implement for all upstreams (3edc092)
+
+- Add RouteUpstreamRef.model per-upstream request override (ec3f32b)
+
+- Add discoverability landing page at GET / (44a56a0)
+
+- Add `consolette install` for the macOS LaunchAgent (7ccd29d)
+
+- Begin Story 6.2 with dashboard/metrics port (ebb2ac8)
+
+- Generalize per-upstream request attribution (Task 3.4.5) (c53f18a)
+
+- Web control panel for model override and route strategy (ef6f052)
+
+- Populate the Recent Requests ring buffer (43ab977)
+
+- Wire up request-body inspector endpoint (0de0ce7)
+
+- Per-session model/upstream steering (dc73046)
+
+- Add Gemini and OpenRouter upstreams with quality-based free-model routing (#16) (f28c197)
+
+
+### Build
+
+- Re-sign cargo-installed binaries to fix macOS SIGKILL (aae574f)
+
+
+### Merge
+
+- Sync local main with origin/main after PR #16 squash-merge (61affcd)
+
+
+
+### Bug Fixes
+
 - Add missing [profile.dist] to Cargo.toml (082aaf6)
 
 

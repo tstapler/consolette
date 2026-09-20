@@ -8,7 +8,7 @@
 //! method here that resolves a bare `content_id`.
 
 use anyhow::{anyhow, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -109,9 +109,10 @@ impl OmissionCache {
     /// assigned `content_id` (`"omitted-{n:03}"`, `n` = 1 + the number of
     /// rows already cached for `session_id`).
     ///
-    /// The count-then-insert sequence runs inside a single `rusqlite`
-    /// transaction so concurrent inserts for the same `session_id` can't
-    /// race on the count (ADR-009).
+    /// Uses [`TransactionBehavior::Immediate`] write locks alongside a monotonic
+    /// suffix retry loop (`omitted-001_1`, `omitted-001_2`, ...) upon primary key
+    /// `(session_id, content_id)` collision, eliminating primary key collisions
+    /// across concurrent process handles in compliance with `ADR-002`.
     ///
     /// # Errors
     ///
@@ -122,21 +123,52 @@ impl OmissionCache {
             .conn
             .lock()
             .map_err(|_| anyhow!("omission cache connection lock poisoned"))?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM omitted_content WHERE session_id = ?1",
             params![session_id],
             |row| row.get(0),
         )?;
-        let content_id = format!("omitted-{:03}", count + 1);
+        let base_num = count + 1;
         let created_at = chrono::Utc::now().to_rfc3339();
 
-        tx.execute(
-            "INSERT INTO omitted_content (session_id, content_id, content, tool_name, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, content_id, content, tool_name, created_at],
-        )?;
+        let mut suffix = 0usize;
+        let content_id = loop {
+            let candidate = if suffix == 0 {
+                format!("omitted-{base_num:03}")
+            } else {
+                format!("omitted-{base_num:03}_{suffix}")
+            };
+
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM omitted_content WHERE session_id = ?1 AND content_id = ?2)",
+                params![session_id, &candidate],
+                |row| row.get(0),
+            )?;
+
+            if !exists {
+                match tx.execute(
+                    "INSERT INTO omitted_content (session_id, content_id, content, tool_name, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![session_id, &candidate, content, tool_name, created_at],
+                ) {
+                    Ok(_) => break candidate,
+                    Err(err) => {
+                        if suffix >= 1000 {
+                            return Err(anyhow!("too many collisions inserting content_id: {err}"));
+                        }
+                    }
+                }
+            }
+            suffix += 1;
+            if suffix >= 1000 {
+                return Err(anyhow!(
+                    "exceeded max retry iterations for content_id collision"
+                ));
+            }
+        };
+
         tx.commit()?;
 
         Ok(content_id)
@@ -168,6 +200,28 @@ impl OmissionCache {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(anyhow!("omission cache lookup failed: {error}")),
         }
+    }
+
+    /// Returns the total count of omission cache entries, optionally filtered by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache's internal lock is poisoned or the SQL query fails.
+    pub fn count_entries(&self, session_id: Option<&str>) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("omission cache connection lock poisoned"))?;
+        let count: i64 = if let Some(sid) = session_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM omitted_content WHERE session_id = ?1",
+                params![sid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row("SELECT COUNT(*) FROM omitted_content", [], |row| row.get(0))?
+        };
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     /// `~/.claude/consolette/omission-cache.sqlite`.
@@ -261,5 +315,70 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(busy_timeout, 5000);
+    }
+
+    #[test]
+    fn omission_cache_should_handle_primary_key_collisions_with_monotonic_suffix_retry_loop() {
+        // UT-CACHE-002: Primary key collision retry loop
+        let dir = TempDir::new().unwrap();
+        let cache_path = temp_cache_path(&dir);
+        let cache = OmissionCache::open(&cache_path).unwrap();
+
+        // Pre-insert omitted-002 directly into SQLite (with 1 row total, so count + 1 = 2, colliding with omitted-002)
+        {
+            let raw = Connection::open(&cache_path).unwrap();
+            raw.execute(
+                "INSERT INTO omitted_content (session_id, content_id, content, tool_name, created_at) \
+                 VALUES ('session-1', 'omitted-002', 'pre-existing', 'Bash', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Call insert: count is 1, candidate base is omitted-002, which collides with pre-seeded omitted-002.
+        let id1 = cache.insert("session-1", "Bash", "new content 1").unwrap();
+        assert_eq!(id1, "omitted-002_1");
+
+        // Insert again: count is 2 (rows omitted-002 and omitted-002_1). base_num = 3 -> omitted-003.
+        let id2 = cache.insert("session-1", "Bash", "new content 2").unwrap();
+        assert_eq!(id2, "omitted-003");
+        let val1 = cache.get("session-1", &id1).unwrap();
+        assert_eq!(val1, Some("new content 1".to_string()));
+    }
+
+    #[test]
+    fn omission_cache_should_support_multithreaded_concurrent_insertions() {
+        // IT-CACHE-004: Multi-threaded concurrent insertion stress test
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(OmissionCache::open(&temp_cache_path(&dir)).unwrap());
+        let mut handles = Vec::new();
+
+        for t in 0..8 {
+            let cache_clone = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for i in 0..10 {
+                    let text = format!("thread {t} item {i}");
+                    let id = cache_clone
+                        .insert("concurrent-session", "Bash", &text)
+                        .unwrap();
+                    ids.push((id, text));
+                }
+                ids
+            }));
+        }
+
+        let mut all_ids = std::collections::HashSet::new();
+        for handle in handles {
+            let ids = handle.join().unwrap();
+            for (id, text) in ids {
+                assert!(all_ids.insert(id.clone()), "content_id {id} must be unique");
+                let retrieved = cache.get("concurrent-session", &id).unwrap();
+                assert_eq!(retrieved, Some(text));
+            }
+        }
+        assert_eq!(all_ids.len(), 80);
     }
 }

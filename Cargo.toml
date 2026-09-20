@@ -98,6 +98,7 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
 tree-sitter = "0.26"

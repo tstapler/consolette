@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
+use crate::claude_code_session::omission_cache::OmissionCache;
+use crate::claude_code_session::prune_policy::PruningPolicyStore;
 use crate::config::schema::{Config, UpstreamKind};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
@@ -85,6 +87,10 @@ pub struct EntrypointState {
     /// circuit breaker sees process-wide failures. Lazy start: constructing
     /// the pool spawns nothing.
     pub search_pool: Arc<McpSearchPool>,
+    /// Thread-safe store for global and session-specific transcript memory pruning policies.
+    pub pruning_policy_store: Arc<PruningPolicyStore>,
+    /// Long-lived SQLite cache for tool output pruned during compaction passes.
+    pub omission_cache: Arc<OmissionCache>,
 }
 
 impl EntrypointState {
@@ -118,6 +124,8 @@ impl EntrypointState {
             route_eligible: ServerToolsRuntime::route_eligible_from_config(config),
         });
         let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
+        let pruning_policy_store = Arc::new(PruningPolicyStore::default());
+        let omission_cache = Arc::new(OmissionCache::open(&OmissionCache::default_cache_path())?);
         // Pre-mortem failure 2: one boot log line stating whether emulation
         // is armed and whether the backend binary resolves, so "silently
         // degraded since restart" is visible in logs. No child is spawned
@@ -154,6 +162,8 @@ impl EntrypointState {
             capability,
             server_tools,
             search_pool,
+            pruning_policy_store,
+            omission_cache,
         })
     }
 }
@@ -209,6 +219,18 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             axum::routing::get(api::get_session_route)
                 .post(api::post_session_route)
                 .delete(api::delete_session_route),
+        )
+        .route(
+            "/session/prune",
+            axum::routing::post(api::post_session_prune),
+        )
+        .route(
+            "/session/policy",
+            axum::routing::get(api::get_session_policy).post(api::post_session_policy),
+        )
+        .route(
+            "/session/prune/stats",
+            axum::routing::get(api::get_session_prune_stats),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)

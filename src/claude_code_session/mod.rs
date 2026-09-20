@@ -11,6 +11,7 @@ pub mod mcp_server;
 pub mod native_compaction;
 pub mod omission_cache;
 pub mod prune;
+pub mod prune_policy;
 pub mod session_bi;
 pub mod summarize;
 pub mod transcript;

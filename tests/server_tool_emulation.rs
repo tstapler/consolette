@@ -323,6 +323,15 @@ async fn state_with_response(
         search_pool: Arc::new(McpSearchPool::new(
             consolette::server_tools::ServerToolsConfig::default().pool_config(),
         )),
+        pruning_policy_store: Arc::new(
+            consolette::claude_code_session::prune_policy::PruningPolicyStore::default(),
+        ),
+        omission_cache: Arc::new(
+            consolette::claude_code_session::omission_cache::OmissionCache::open(
+                &tempfile::tempdir().unwrap().path().join("cache.sqlite"),
+            )
+            .unwrap(),
+        ),
     };
     (state, calls)
 }

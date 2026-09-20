@@ -450,6 +450,15 @@ mod tests {
             search_pool: Arc::new(crate::server_tools::McpSearchPool::new(
                 crate::server_tools::ServerToolsConfig::default().pool_config(),
             )),
+            pruning_policy_store: Arc::new(
+                crate::claude_code_session::prune_policy::PruningPolicyStore::default(),
+            ),
+            omission_cache: Arc::new(
+                crate::claude_code_session::omission_cache::OmissionCache::open(
+                    &tempfile::tempdir().unwrap().path().join("cache.sqlite"),
+                )
+                .unwrap(),
+            ),
         };
         (state, calls)
     }

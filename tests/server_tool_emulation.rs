@@ -285,6 +285,7 @@ async fn state_with_response(
         name: "test".to_string(),
         weight: 1.0,
         model: None,
+        model_family: None,
     }];
     let router = consolette::routing::router::Router::new(
         candidates,

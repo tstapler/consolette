@@ -134,7 +134,6 @@ impl PushMetricExporter for SqliteMetricsExporter {
     // implementation is a synchronous local SQLite write with no need to
     // await anything, and its multiple early `?`-returns aren't worth a
     // std::future::ready rewrite for a purely mechanical lint fix.
-    #[allow(clippy::unused_async_trait_impl)]
     async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
         let conn = self
             .conn

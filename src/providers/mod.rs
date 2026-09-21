@@ -31,7 +31,7 @@ pub enum ProviderResponse {
 
 /// Errors any provider implementation can return. Classification methods
 /// below are what the router's dispatch loop branches on.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     #[error("rate limited")]
     RateLimited,

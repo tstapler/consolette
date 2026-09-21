@@ -55,7 +55,16 @@ pub async fn get_models(
     State(state): State<EntrypointState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let config = crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
-    let (providers, _) = build_providers(&config).await.map_err(|e| {
+    // A throwaway `ProxyMetrics` instance: this listing-only path never
+    // dispatches a real request (only `list_models()`), so it never touches
+    // Epic 5.1's resolution counters — no need to thread the live
+    // `Router`/`MetricsCollector` in just for this.
+    let (providers, _) = build_providers(
+        &config,
+        std::sync::Arc::new(crate::metrics::ProxyMetrics::new()),
+    )
+    .await
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -99,8 +108,9 @@ pub async fn get_route(
 ///
 /// # Errors
 ///
-/// Returns 400 if the route references an unknown upstream, 500 if the
-/// config can't be (re)loaded, the override can't be saved, or the new
+/// Returns 400 if the route references an unknown upstream or violates the
+/// `model`/`model_family` selector rules (Story 1.2.2), 500 if the config
+/// can't be (re)loaded, the override can't be saved, or the new
 /// `DispatchRouter` can't be built (e.g. a provider fails to initialize).
 pub async fn post_route(
     State(state): State<EntrypointState>,
@@ -113,6 +123,12 @@ pub async fn post_route(
     };
     overrides.apply(&mut candidate);
     crate::config::validate_references(&candidate).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+    crate::config::validate_model_selectors(&candidate).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),
@@ -578,6 +594,7 @@ name = "anthropic"
                 name: "does-not-exist".to_string(),
                 weight: None,
                 model: None,
+                model_family: None,
             }],
         };
 
@@ -586,6 +603,77 @@ name = "anthropic"
         assert!(
             !RuntimeOverrides::path(dir.path()).exists(),
             "an invalid route must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn post_route_rejects_conflicting_model_selectors() {
+        let dir = sample_config_dir();
+        write_conf_d(
+            dir.path(),
+            r#"
+[[upstreams]]
+name = "anthropic"
+kind = "anthropic"
+
+[[upstreams]]
+name = "model-gateway-openai"
+kind = "openai"
+base_url = "https://example.invalid"
+"#,
+            r#"
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "anthropic"
+"#,
+        );
+        let state = state_for(dir.path()).await;
+
+        let bad = Route {
+            name: "default".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "model-gateway-openai".to_string(),
+                weight: None,
+                model: Some("gpt-5.1".to_string()),
+                model_family: Some("gpt-5".to_string()),
+            }],
+        };
+
+        let err = post_route(State(state), Json(bad)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            !RuntimeOverrides::path(dir.path()).exists(),
+            "a route violating model selector rules must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn post_route_rejects_model_family_on_non_openai_upstream() {
+        let dir = sample_config_dir();
+        let state = state_for(dir.path()).await;
+
+        let bad = Route {
+            name: "default".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "anthropic".to_string(),
+                weight: None,
+                model: None,
+                model_family: Some("gpt-5".to_string()),
+            }],
+        };
+
+        let err = post_route(State(state), Json(bad)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            !RuntimeOverrides::path(dir.path()).exists(),
+            "a route leaking model_family onto a non-openai upstream must not be persisted"
         );
     }
 
@@ -602,6 +690,7 @@ name = "anthropic"
                 name: "bedrock".to_string(),
                 weight: Some(1.0),
                 model: Some("pinned-model".to_string()),
+                model_family: None,
             }],
         };
 

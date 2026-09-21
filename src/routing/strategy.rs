@@ -19,6 +19,10 @@ pub struct UpstreamRef {
     pub name: String,
     pub weight: f64,
     pub model: Option<String>,
+    /// Mirrors `RouteUpstreamRef.model_family` (Epic 1.2) — carried per-dispatch
+    /// the same way `model` is, so `Router::dispatch` can hand it to
+    /// `OpenaiProvider` via the internal body key (Epic 1.3, ADR-001).
+    pub model_family: Option<String>,
 }
 
 /// Pure selection over an already health-filtered candidate slice.
@@ -112,6 +116,7 @@ mod tests {
             name: name.to_string(),
             weight,
             model: None,
+            model_family: None,
         }
     }
 

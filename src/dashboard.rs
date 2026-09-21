@@ -42,6 +42,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         .status-cooldown { background: #f59e0b; }
         .status-auth-required { background: #ef4444; }
         .status-schema-drift { background: #8b5cf6; }
+        .status-resolution-exhausted { background: #ef4444; }
         .refresh-time { color: #888; font-size: 14px; }
         .stats-grid {
             display: grid;
@@ -361,13 +362,18 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     : upstreamNames.map(name => {
                         const cd = (data.cooldowns && data.cooldowns[name]) || {};
                         const cooling = cd.cooling_down && cd.remaining_seconds > 0;
-                        const lastKind = (data.providers[name] || {}).last_error_kind;
+                        const provider = data.providers[name] || {};
+                        const lastKind = provider.last_error_kind;
+                        const resolutionState = provider.resolution_state;
                         const cls = lastKind === 'auth' ? 'status-auth-required'
                             : lastKind === 'response_shape_mismatch' ? 'status-schema-drift'
+                            : resolutionState === 'exhausted' ? 'status-resolution-exhausted'
                             : cooling ? 'status-cooldown'
                             : 'status-active';
                         const suffix = cls === 'status-auth-required' ? ' (needs re-auth)'
                             : cls === 'status-schema-drift' ? ' (schema drift — code fix needed)'
+                            : cls === 'status-resolution-exhausted' ? ' (all candidates failed — check ' + provider.resolution_family + ' family)'
+                            : resolutionState === 'fallback' ? ' (using ' + provider.resolved_model + ', newest unavailable)'
                             : cooling ? ' (' + cd.remaining_seconds + 's)'
                             : '';
                         const label = displayName(name) + suffix;
@@ -688,12 +694,31 @@ mod tests {
         );
     }
 
+    /// Story 5.2.2 (Task 5.2.2a/b): `resolution_state === "exhausted"` gets
+    /// a distinguishable, sticky red — same hex as `status-auth-required`
+    /// (both are "needs a human, won't self-heal" conditions).
+    #[test]
+    fn dashboard_html_should_render_status_resolution_exhausted_class_and_css_rule() {
+        assert!(
+            DASHBOARD_HTML.contains(".status-resolution-exhausted { background: #ef4444; }"),
+            "missing .status-resolution-exhausted CSS rule"
+        );
+        assert!(
+            extract_cls_block().contains("'status-resolution-exhausted'"),
+            "cls ternary must be able to produce 'status-resolution-exhausted'"
+        );
+    }
+
     /// Regression guard (REQ-12, adversarial-review finding): the design
     /// correction in plan.md Story 1.5.2 requires `last_error_kind` to be
     /// checked BEFORE `cooling`, since a real auth failure never trips
     /// `cooling_down`. If a future edit re-introduces the
     /// `cooling ? ... : 'status-active'` binary and gates the new classes
-    /// behind it, this must fail loudly.
+    /// behind it, this must fail loudly. Extended by Story 5.2.2 (Task
+    /// 5.2.2c) to also pin `resolution_state === 'exhausted'` into that same
+    /// precedence chain — checked before `cooling` too, since an exhausted
+    /// family is a "no model resolves" condition, not a self-healing
+    /// cooldown, and must not be masked by the cooldown fallback.
     #[test]
     #[allow(clippy::expect_used)]
     fn dashboard_js_status_logic_should_check_last_error_kind_before_cooling() {
@@ -701,6 +726,9 @@ mod tests {
         let auth_pos = block
             .find("lastKind === 'auth' ?")
             .expect("cls ternary must check lastKind === 'auth' first");
+        let exhausted_pos = block
+            .find("resolutionState === 'exhausted' ?")
+            .expect("cls ternary must check resolution_state === 'exhausted'");
         let cooling_pos = block
             .find("cooling ?")
             .expect("cls ternary must still fall back to a cooling check");
@@ -710,10 +738,21 @@ mod tests {
              cooling_down, so gating status-auth-required behind `cooling` would silently \
              hide it (see plan.md Story 1.5.2's design-correction note)"
         );
+        assert!(
+            exhausted_pos < cooling_pos,
+            "resolution_state === 'exhausted' must be checked BEFORE cooling — an exhausted \
+             family isn't a self-healing cooldown, so gating status-resolution-exhausted \
+             behind `cooling` would silently hide it (plan.md Story 5.2.2, Task 5.2.2c)"
+        );
     }
 
     /// Cold-start non-regression (UX §5 item 7): no `last_error_kind` key
     /// and `cooling: false` must never render anything but `status-active`.
+    /// Extended by Story 5.2.2 (Task 5.2.2d): a static-pin upstream — no
+    /// `resolution_state` key at all, since it never ran a resolution walk
+    /// — must render identically to today, i.e. `resolutionState` is
+    /// `undefined` and so matches neither the new `'exhausted'` nor
+    /// `'fallback'` branches.
     #[test]
     fn dashboard_js_should_render_status_active_on_cold_start_with_no_last_error_kind_and_not_cooling(
     ) {
@@ -724,9 +763,21 @@ mod tests {
              case and cooling is falsy) must be 'status-active'"
         );
         assert!(
-            DASHBOARD_HTML.contains("(data.providers[name] || {}).last_error_kind"),
+            DASHBOARD_HTML.contains("const provider = data.providers[name] || {};")
+                && DASHBOARD_HTML.contains("provider.last_error_kind"),
             "missing-provider-entry lookup must be guarded so a cold-start upstream with no \
              /metrics data never throws or misclassifies"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("const resolutionState = provider.resolution_state;"),
+            "resolution_state must be read off the same guarded `provider` lookup as \
+             last_error_kind, so a static-pin upstream (no resolution_state key at all) \
+             gets `undefined`, not a throw"
+        );
+        assert!(
+            block.contains("resolutionState === 'exhausted' ? 'status-resolution-exhausted'"),
+            "a static-pin upstream's undefined resolutionState must not accidentally match \
+             the new exhausted branch"
         );
     }
 
@@ -761,6 +812,41 @@ mod tests {
             !"(needs re-auth)".contains("(schema drift — code fix needed)")
                 && !"(schema drift — code fix needed)".contains("(needs re-auth)"),
             "the two suffixes must be non-overlapping (UX §5 item 2)"
+        );
+    }
+
+    /// Story 5.2.2 (Task 5.2.2b-1 / plan.md acceptance criteria): the
+    /// exhausted label must name the family so an operator has a next
+    /// action — not a generic "exhausted"/"error" label.
+    #[test]
+    fn dashboard_js_exhausted_label_suffix_should_contain_resolution_family() {
+        assert!(
+            DASHBOARD_HTML.contains(
+                "' (all candidates failed — check ' + provider.resolution_family + ' family)'"
+            ),
+            "status-resolution-exhausted's suffix must interpolate provider.resolution_family, \
+             per ux.md Surface 2's \"Model-gateway (all candidates failed — check gpt-5-codex \
+             family)\" example"
+        );
+    }
+
+    /// Story 5.2.2 (plan.md acceptance criteria): a `resolution_state ===
+    /// "fallback"` upstream doesn't change `cls` but gets a low-noise
+    /// suffix naming the model actually in use, matching the existing
+    /// `status-cooldown` suffix pattern.
+    #[test]
+    fn dashboard_js_fallback_state_should_not_change_cls_but_should_add_a_low_noise_suffix() {
+        assert!(
+            DASHBOARD_HTML.contains(
+                "resolutionState === 'fallback' ? ' (using ' + provider.resolved_model + ', newest unavailable)'"
+            ),
+            "resolution_state === 'fallback' must add a suffix naming provider.resolved_model, \
+             without introducing its own cls branch (plan.md Story 5.2.2)"
+        );
+        assert!(
+            !extract_cls_block().contains("resolutionState === 'fallback'"),
+            "'fallback' must not gain its own cls branch — it stays status-active/status-cooldown \
+             per existing precedence, per plan.md's acceptance criteria"
         );
     }
 

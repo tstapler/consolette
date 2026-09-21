@@ -51,7 +51,7 @@ pub const MISSING_KEY_MESSAGE: &str = "BRAVE_API_KEY is not set";
 /// until the cooldown elapses).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// How long an open circuit stays open before a trial search is allowed.
-const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(60);
+const CIRCUIT_COOLDOWN: Duration = Duration::from_mins(1);
 
 /// One search hit in the uniform shape both backends share.
 #[derive(Debug, Clone, PartialEq, Eq)]

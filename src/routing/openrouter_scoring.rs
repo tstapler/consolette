@@ -599,6 +599,7 @@ mod tests {
             name: "openrouter".to_string(),
             weight: 1.0,
             model: model.map(str::to_string),
+            model_family: None,
         }
     }
 

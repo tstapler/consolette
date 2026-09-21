@@ -92,6 +92,56 @@ Once running, the same route can be inspected and changed live from the web cont
 - `GET /api/route` — the active route (strategy, upstream weights, model overrides)
 - `POST /api/route` — replace the active route; persists to `~/.config/consolette/runtime-overrides.toml` and applies immediately, no restart
 
+### Dynamic model-family resolution (`model_family`)
+
+A `routes.upstreams` entry can pin a fixed `model` (overrides the request's
+`model` field with that exact string) or, for a `kind = "openai"` upstream
+only, opt into `model_family` instead:
+
+```toml
+[[routes.upstreams]]
+name = "openai"
+model_family = "gpt-5"
+```
+
+`model_family` is a **prefix match** against the upstream's live `/v1/models`
+catalog: `"gpt-5"` matches `gpt-5.1-codex-max`, `gpt-5.2-codex`,
+`gpt-5.3-codex`, etc., but not `gpt-4-turbo`. Consolette orders matching
+candidates newest-first and tries them via real requests until one succeeds;
+the working choice is cached per upstream and re-resolved when a real request
+against it fails with a `Deprecated` classification. As a secondary safety
+net, a cache entry also expires after an internal `RESOLUTION_TTL` (currently
+1 hour) and is re-resolved on next access even without an observed failure —
+this catches cases like a `WrongEndpoint` misclassification surviving into
+steady state, or a model silently un-deprecated or newly available.
+
+- **Opt-in, additive**: `model_family` is unset by default, and existing
+  `model`-pinned upstreams are unaffected.
+- **Mutually exclusive with `model`**: exactly one of `model`/`model_family`
+  may be set on a `kind = "openai"` route upstream — setting both, or neither,
+  is a config validation error.
+- **`kind = "openai"` only**: setting `model_family` on any other upstream
+  kind is also a validation error.
+
+**First-request latency**: resolving a cold cache costs real time on the one
+request that triggers it — after a pinned model deprecates, or on first use
+of a new `model_family` route. Worst case (5 candidates, the default 60s
+`request_timeout`) is ~62s, per the
+`walk_worst_case_duration_should_stay_under_client_timeout_budget` test in
+`src/providers/openai/resolution.rs`, which checks that budget against
+Claude Code's own client-side request timeout
+([anthropics/claude-code#39906](https://github.com/anthropics/claude-code/issues/39906)).
+Every subsequent request for that family hits the warm cache and pays no
+extra latency. A gated, real-gateway integration test for this path lives in
+`tests/openai_gateway_live_probe.rs` (`cargo test --test
+openai_gateway_live_probe -- --ignored`); it needs VPN/internal network
+access and does not run in CI.
+
+Adopting `model_family` in an internal OpenAI-compatible gateway plugin's config (the
+`conf.d/50-model-gateway.toml` fragment that currently pins
+`gpt-5.1-codex-max`) is tracked as a follow-up PR in the separate `ndotfiles`
+repo, not part of this repo.
+
 ### Server-tool emulation (`web_search`)
 
 Claude Code's `web_search` server tool is emulated inside the proxy on

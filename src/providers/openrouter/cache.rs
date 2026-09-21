@@ -35,7 +35,7 @@ pub(crate) const MODEL_LIST_TTL: Duration = Duration::from_mins(15);
 /// models genuinely 404ing (staleness) from every cached model 404ing at
 /// once (an account-wide data-policy toggle) — see
 /// `record_not_found_and_maybe_invalidate`.
-const NOT_FOUND_WINDOW: Duration = Duration::from_secs(60);
+const NOT_FOUND_WINDOW: Duration = Duration::from_mins(1);
 
 /// One entry of the cached free-model list — carries price forward (not
 /// just the bare id) so `OpenrouterProvider::send()`'s per-dispatch recheck

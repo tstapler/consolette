@@ -18,11 +18,11 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
-use crate::metrics::MetricsCollector;
+use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
-use crate::providers::openai::OpenaiProvider;
+use crate::providers::openai::{OpenaiProvider, MODEL_FAMILY_BODY_KEY};
 use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
@@ -74,6 +74,7 @@ pub struct Router {
 /// Returns `Err` if any upstream fails to construct its `Provider`.
 pub async fn build_providers(
     config: &Config,
+    metrics: Arc<ProxyMetrics>,
 ) -> anyhow::Result<(
     Vec<(String, Arc<dyn Provider>)>,
     HashMap<usize, Arc<OpenrouterProvider>>,
@@ -100,6 +101,7 @@ pub async fn build_providers(
                 Arc::clone(&resolver),
                 Arc::clone(&exec_cache),
                 config.request_timeout,
+                Arc::clone(&metrics),
             )?),
             UpstreamKind::Gemini { .. } => Arc::new(GeminiProvider::new(
                 Arc::new(upstream.clone()),
@@ -326,7 +328,8 @@ impl Router {
         // after.
         validate_openrouter_strategy_pairing(config)?;
 
-        let (providers, openrouter_providers) = build_providers(config).await?;
+        let (providers, openrouter_providers) =
+            build_providers(config, Arc::clone(&metrics.counters)).await?;
         let providers: Vec<Arc<dyn Provider>> = providers
             .into_iter()
             .map(|(_, provider)| provider)
@@ -375,6 +378,7 @@ impl Router {
                 name: route_upstream.name.clone(),
                 weight: route_upstream.weight.unwrap_or(1.0),
                 model: route_upstream.model.clone(),
+                model_family: route_upstream.model_family.clone(),
             });
         }
 
@@ -426,6 +430,7 @@ impl Router {
             name: pinned.name.clone(),
             weight: pinned.weight,
             model: over.model.clone().or_else(|| pinned.model.clone()),
+            model_family: pinned.model_family.clone(),
         }]
     }
 
@@ -529,7 +534,7 @@ impl Router {
             }
 
             let provider = &self.providers[chosen.index];
-            let request_body = match &chosen.model {
+            let mut request_body = match &chosen.model {
                 Some(model) => {
                     let mut b = body.clone();
                     b["model"] = serde_json::Value::String(model.clone());
@@ -537,6 +542,9 @@ impl Router {
                 }
                 None => body.clone(),
             };
+            if let Some(family) = &chosen.model_family {
+                request_body[MODEL_FAMILY_BODY_KEY] = serde_json::Value::String(family.clone());
+            }
             let attempt_started = std::time::Instant::now();
             let outcome = provider.send(request_body, headers.clone(), stream).await;
 
@@ -874,6 +882,7 @@ mod tests {
             name: name.to_string(),
             weight: 1.0,
             model: None,
+            model_family: None,
         }
     }
 
@@ -1194,12 +1203,14 @@ mod tests {
                     name: "a".to_string(),
                     weight: 0.7,
                     model: None,
+                    model_family: None,
                 },
                 UpstreamRef {
                     index: 1,
                     name: "b".to_string(),
                     weight: 0.3,
                     model: None,
+                    model_family: None,
                 },
             ],
             providers,
@@ -1263,6 +1274,7 @@ mod tests {
                     name: "my-openai-upstream".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 }],
             }],
             ..Config::default()
@@ -1274,6 +1286,76 @@ mod tests {
             .expect("Openai-kind upstream must build a Provider");
         assert_eq!(router.candidates[0].name, "my-openai-upstream");
         assert_eq!(router.providers[0].name(), "openai");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn from_config_should_populate_upstream_ref_model_family_when_route_upstream_sets_it() {
+        use crate::config::schema::{Route, RouteUpstreamRef, Upstream, UpstreamKind};
+
+        let config = Config {
+            upstreams: vec![Upstream {
+                name: "my-openai-upstream".to_string(),
+                kind: UpstreamKind::Openai {
+                    base_url: "https://example.invalid".to_string(),
+                },
+                auth: None,
+            }],
+            routes: vec![Route {
+                name: "default".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "my-openai-upstream".to_string(),
+                    weight: None,
+                    model: None,
+                    model_family: Some("gpt-5".to_string()),
+                }],
+            }],
+            ..Config::default()
+        };
+
+        let router = Router::from_config(&config, MetricsCollector::new())
+            .await
+            .expect("model_family-only route upstream must build a Router");
+        assert_eq!(router.candidates[0].model_family, Some("gpt-5".to_string()));
+        assert_eq!(router.candidates[0].model, None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn from_config_should_leave_upstream_ref_model_family_none_when_route_upstream_sets_model_only(
+    ) {
+        use crate::config::schema::{Route, RouteUpstreamRef, Upstream, UpstreamKind};
+
+        let config = Config {
+            upstreams: vec![Upstream {
+                name: "my-openai-upstream".to_string(),
+                kind: UpstreamKind::Openai {
+                    base_url: "https://example.invalid".to_string(),
+                },
+                auth: None,
+            }],
+            routes: vec![Route {
+                name: "default".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: vec![RouteUpstreamRef {
+                    name: "my-openai-upstream".to_string(),
+                    weight: None,
+                    model: Some("gpt-5.1-codex-max".to_string()),
+                    model_family: None,
+                }],
+            }],
+            ..Config::default()
+        };
+
+        let router = Router::from_config(&config, MetricsCollector::new())
+            .await
+            .expect("model-only route upstream must build a Router");
+        assert_eq!(
+            router.candidates[0].model,
+            Some("gpt-5.1-codex-max".to_string())
+        );
+        assert_eq!(router.candidates[0].model_family, None);
     }
 
     #[tokio::test]
@@ -1301,6 +1383,7 @@ mod tests {
                 name: "bedrock".to_string(),
                 weight: None,
                 model: None,
+                model_family: None,
             }],
         };
         config.routes = vec![route_a, route_b];
@@ -1356,6 +1439,7 @@ mod tests {
                 name: "pinned".to_string(),
                 weight: 1.0,
                 model: Some("gpt-5.1-codex-max".to_string()),
+                model_family: None,
             }],
             providers,
             Arc::new(FallbackStrategy),
@@ -1419,6 +1503,86 @@ mod tests {
             .clone()
             .expect("provider must have been called");
         assert_eq!(body["model"], serde_json::json!("claude-sonnet-4-5"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn dispatch_should_inject_internal_model_family_body_key_when_chosen_candidate_has_model_family(
+    ) {
+        let received_body = Arc::new(std::sync::Mutex::new(None));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
+            name: "family",
+            received_body: received_body.clone(),
+        })];
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "family".to_string(),
+                weight: 1.0,
+                model: None,
+                model_family: Some("gpt-5".to_string()),
+            }],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let res = router
+            .dispatch(
+                serde_json::json!({"model": "claude-sonnet-4-5"}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+
+        assert!(res.is_ok());
+        let body = received_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+        assert_eq!(
+            body[crate::providers::openai::MODEL_FAMILY_BODY_KEY],
+            serde_json::json!("gpt-5")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn dispatch_should_leave_request_body_unchanged_when_chosen_candidate_has_no_model_family(
+    ) {
+        let received_body = Arc::new(std::sync::Mutex::new(None));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
+            name: "no-family",
+            received_body: received_body.clone(),
+        })];
+        let router = Router::new(
+            vec![upstream(0, "no-family")],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::new(HealthRegistry::new(300)),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let sent = serde_json::json!({"model": "claude-sonnet-4-5"});
+        let res = router
+            .dispatch(sent.clone(), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(res.is_ok());
+        let body = received_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+        assert_eq!(body, sent);
+        assert!(body
+            .get(crate::providers::openai::MODEL_FAMILY_BODY_KEY)
+            .is_none());
     }
 
     #[tokio::test]
@@ -1667,7 +1831,10 @@ mod tests {
             ..Config::default()
         };
 
-        let (providers, openrouter_providers) = build_providers(&config).await.unwrap();
+        let (providers, openrouter_providers) =
+            build_providers(&config, Arc::new(ProxyMetrics::new()))
+                .await
+                .unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].0, "gemini");
@@ -1715,7 +1882,10 @@ mod tests {
             ..Config::default()
         };
 
-        let (providers, openrouter_providers) = build_providers(&config).await.unwrap();
+        let (providers, openrouter_providers) =
+            build_providers(&config, Arc::new(ProxyMetrics::new()))
+                .await
+                .unwrap();
 
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[1].0, "openrouter");
@@ -1745,6 +1915,7 @@ mod tests {
                     name: "anthropic".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 }],
             }],
             ..Config::default()
@@ -1793,6 +1964,7 @@ mod tests {
                     name: "openrouter".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 }],
             }],
             ..Config::default()
@@ -1852,6 +2024,7 @@ mod tests {
                     name: "or".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 }],
             }],
             ..Config::default()
@@ -1886,6 +2059,7 @@ mod tests {
                     name: "or".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 }],
             }],
             ..Config::default()
@@ -1926,11 +2100,13 @@ mod tests {
                         name: "anthropic".to_string(),
                         weight: None,
                         model: None,
+                        model_family: None,
                     },
                     RouteUpstreamRef {
                         name: "or".to_string(),
                         weight: None,
                         model: None,
+                        model_family: None,
                     },
                 ],
             }],
@@ -1975,11 +2151,13 @@ mod tests {
                         name: "or".to_string(),
                         weight: None,
                         model: None,
+                        model_family: None,
                     },
                     RouteUpstreamRef {
                         name: "paid-anthropic".to_string(),
                         weight: None,
                         model: None,
+                        model_family: None,
                     },
                 ],
             }],
@@ -2214,12 +2392,14 @@ mod tests {
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("a/b:free".to_string()),
+                    model_family: None,
                 },
                 UpstreamRef {
                     index: 2,
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("c/d:free".to_string()),
+                    model_family: None,
                 },
             ],
             vec![
@@ -2275,12 +2455,14 @@ mod tests {
                     name: "primary".to_string(),
                     weight: 1.0,
                     model: Some("model-a".to_string()),
+                    model_family: None,
                 },
                 UpstreamRef {
                     index: 3,
                     name: "primary".to_string(),
                     weight: 1.0,
                     model: Some("model-b".to_string()),
+                    model_family: None,
                 },
             ],
             vec![
@@ -2469,12 +2651,14 @@ mod tests {
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("a/b:free".to_string()),
+                    model_family: None,
                 },
                 UpstreamRef {
                     index: 0,
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("c/d:free".to_string()),
+                    model_family: None,
                 },
             ],
             providers,
@@ -2557,12 +2741,14 @@ mod tests {
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("a/b:free".to_string()),
+                    model_family: None,
                 },
                 UpstreamRef {
                     index: 0,
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("c/d:free".to_string()),
+                    model_family: None,
                 },
             ],
             providers,
@@ -2608,6 +2794,7 @@ mod tests {
                 name: "openrouter".to_string(),
                 weight: 1.0,
                 model: Some("a/b:free".to_string()),
+                model_family: None,
             }],
             providers,
             Arc::new(FallbackStrategy),
@@ -2703,18 +2890,21 @@ mod tests {
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("a/b:free".to_string()),
+                    model_family: None,
                 },
                 UpstreamRef {
                     index: 0,
                     name: "openrouter".to_string(),
                     weight: 1.0,
                     model: Some("c/d:free".to_string()),
+                    model_family: None,
                 },
                 UpstreamRef {
                     index: 1,
                     name: "paid".to_string(),
                     weight: 1.0,
                     model: None,
+                    model_family: None,
                 },
             ],
             providers,
@@ -2796,6 +2986,79 @@ mod tests {
         );
     }
 
+    // ── Story 2.3.4 (openai-model-resolution plan.md): resolution
+    // exhaustion must never trip `HealthRegistry` state beyond what an
+    // ordinary `Upstream{..}` error already does today (pitfalls.md's "the
+    // single most important thing to guard"). This test is a verification
+    // gate, not a feature — plan.md: "This test failing blocks Phase 2
+    // completion." ──
+
+    // *Given* a route with a single upstream whose provider returns the same
+    // `ProviderError::Upstream{status: 0, ..}` shape `OpenaiProvider`'s
+    // resolution walk returns on exhaustion (Epic 2.3's
+    // `walk_candidates`/Story 2.3.2b), *when* `Router::dispatch` handles it,
+    // *then* `HealthRegistry`'s per-upstream state (`is_available`,
+    // `remaining_secs`) is unchanged from before the dispatch — the
+    // catch-all `Err(e) => { .. }` arm in `dispatch` (no `health.trip()`
+    // call) already treats it exactly like any other `Upstream{..}` error,
+    // with no special-casing for resolution exhaustion.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn dispatch_should_leave_health_registry_state_unchanged_when_model_family_resolution_exhausts(
+    ) {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+            name: "openai",
+            error: || ProviderError::Upstream {
+                status: 0,
+                body: "all candidates in family \"gpt-5\" exhausted".to_string(),
+            },
+            call_count: Arc::clone(&call_count),
+        })];
+        let health = Arc::new(HealthRegistry::new(300));
+        let router = Router::new(
+            vec![UpstreamRef {
+                index: 0,
+                name: "openai".to_string(),
+                weight: 1.0,
+                model: None,
+                model_family: Some("gpt-5".to_string()),
+            }],
+            providers,
+            Arc::new(FallbackStrategy),
+            Arc::clone(&health),
+            Arc::new(AlwaysAllow),
+            MetricsCollector::new(),
+        );
+
+        let before_available = health.is_available(0);
+        let before_remaining = health.remaining_secs(0);
+
+        let res = router
+            .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+            .await;
+
+        assert!(
+            matches!(res, Err(ProviderError::Upstream { status: 0, .. })),
+            "expected the resolution-exhaustion-shaped Upstream error to propagate"
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            health.is_available(0),
+            before_available,
+            "resolution exhaustion must not change HealthRegistry availability"
+        );
+        assert_eq!(
+            health.remaining_secs(0),
+            before_remaining,
+            "resolution exhaustion must not trip a cooldown"
+        );
+        assert!(
+            health.is_available(0),
+            "an ordinary Upstream{{..}} error must never trip cooldown on its own"
+        );
+    }
+
     // ── Pre-mortem P2 #2: `explore` flag reaches `RequestDetail`. ──
 
     // *Given* a dispatch whose selection is forced onto the greedy branch
@@ -2823,6 +3086,7 @@ mod tests {
                 name: "openrouter".to_string(),
                 weight: 1.0,
                 model: Some("only/model:free".to_string()),
+                model_family: None,
             }],
             providers,
             strategy,

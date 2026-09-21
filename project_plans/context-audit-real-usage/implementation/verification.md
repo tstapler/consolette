@@ -46,3 +46,14 @@ master (5 + a pre-existing Pi-session test) and 7 on the D1 branch.
 Nit, not edited (AC says no edit needed): `actual_total_tokens` sums output tokens too (:185), and the docs call it
 "current context window size"; the sum also accepts Pi-style key names (`input`, `cacheWrite`, ...) that the
 docs don't mention.
+
+## Review round 1 fix (verdict FAIL: test path)
+
+Reviewer required the literal `scripts/tests/` path. Done on dotfiles branch
+`test/context-audit-usageless-turn`, commit `fb2db1d` (test file moved via `git mv` with a `sys.path`
+shim; SKILL.md test-run line changed to `python3 -m unittest discover -s scripts/tests -v`; no production change).
+
+- AC command, from the dotfiles repo root: `python3 -m unittest discover -s .claude/skills/context-audit/scripts/tests` -> `Ran 7 tests ... OK`.
+- SKILL.md command, from the skill dir: `python3 -m unittest discover -s scripts/tests` -> `Ran 7 tests ... OK`.
+- AC 4 count: 7 tests, not 5 (5 required behaviors + pre-existing Pi test + the D1 test). This supersedes the earlier D0 path deviation; only the count differs.
+- `git diff --stat HEAD~2 -- .../context_audit.py` on the branch is empty (AC 6 holds).

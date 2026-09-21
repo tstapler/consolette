@@ -24,6 +24,44 @@ pub struct UpstreamRef {
 /// Pure selection over an already health-filtered candidate slice.
 pub trait RoutingStrategy: Send + Sync {
     fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef>;
+
+    /// Runs once per `Router::dispatch` call, before the health filter,
+    /// transforming the static candidate list. Default: identity.
+    /// `OpenrouterScoringStrategy` overrides this to fan the one static
+    /// "openrouter" `UpstreamRef` out into one per currently-cached free
+    /// model.
+    fn expand_candidates(&self, candidates: Vec<UpstreamRef>) -> Vec<UpstreamRef> {
+        candidates
+    }
+
+    /// Called by `Router::dispatch` once per attempt, after `provider.send()`'s
+    /// `.await` resolves. Default: no-op. `OpenrouterScoringStrategy`
+    /// overrides this to feed its per-model rolling stats.
+    fn record_outcome(
+        &self,
+        _candidate: &UpstreamRef,
+        _duration_ms: u64,
+        _success: bool,
+        _error_kind: Option<&'static str>,
+    ) {
+    }
+
+    /// Strategy-specific JSON blob for `/metrics`. Default: `None`.
+    /// `OpenrouterScoringStrategy` returns model-list cache state plus
+    /// per-model score breakdowns. Returning `serde_json::Value` here is a
+    /// deliberate, accepted exception to wire/domain type separation — this
+    /// method exists to emit heterogeneous, strategy-specific telemetry, for
+    /// which a shared domain type would be awkward.
+    fn observability_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Pre-mortem P2 #2: was the last selection of `model_id` an
+    /// epsilon-greedy exploration pick rather than a greedy one? Default:
+    /// `None` (no strategy but `OpenrouterScoringStrategy` tracks this).
+    fn last_selection_was_exploration(&self, _model_id: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// Ordered fallback: first healthy candidate wins. Candidates arrive in
@@ -107,5 +145,15 @@ mod tests {
     fn weighted_handles_all_zero_weights() {
         let candidates = vec![upstream(0, "a", 0.0), upstream(1, "b", 0.0)];
         assert!(WeightedStrategy.select(&candidates).is_some());
+    }
+
+    // REQ-4 (Story 3.1.1, Task 3.1.1b): `expand_candidates`'s default is the
+    // identity function — proven directly against `FallbackStrategy`, which
+    // doesn't override it.
+    #[test]
+    fn expand_candidates_should_return_unchanged_candidates_by_default() {
+        let candidates = vec![upstream(0, "a", 1.0), upstream(1, "b", 1.0)];
+        let expanded = FallbackStrategy.expand_candidates(candidates.clone());
+        assert_eq!(expanded, candidates);
     }
 }

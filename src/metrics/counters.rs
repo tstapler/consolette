@@ -21,6 +21,13 @@ pub struct UpstreamCounters {
     pub duration_count: AtomicU64,
     pub first_byte_sum_ms: AtomicU64,
     pub first_byte_count: AtomicU64,
+    /// The most recent *typed* `ProviderError::kind_label()` classification
+    /// for this upstream — `None` after a successful request (Story 1.4.4:
+    /// root-cause fix so the dashboard self-heals instead of pinning a
+    /// stale error state forever after one past failure). Set via
+    /// `ProxyMetrics::set_last_error_kind`, never derived by re-guessing
+    /// keywords out of an error's `Display` text.
+    pub last_error_kind: std::sync::Mutex<Option<&'static str>>,
 }
 
 /// All proxy metrics as atomic counters.
@@ -67,6 +74,14 @@ pub struct ProxyMetrics {
     pub count_tokens_total: AtomicU64,
     pub count_tokens_failures: AtomicU64,
 
+    // ---- Server-tool emulation counters (plan: server-tool-emulation) ----
+    pub server_tool_searches_total: AtomicU64,
+    pub server_tool_searches_ok: AtomicU64,
+    pub server_tool_search_failures: AtomicU64,
+    pub server_tool_iterations_total: AtomicU64,
+    /// Per-backend hits, keyed `"brave"` / `"browser"` (D4 dashboard label).
+    pub server_tool_backend_hits: DashMap<String, AtomicU64>,
+
     // ---- Duration bucket counters ----
     pub duration_lt1s: AtomicU64,
     pub duration_1_5s: AtomicU64,
@@ -110,6 +125,12 @@ impl ProxyMetrics {
 
             count_tokens_total: AtomicU64::new(0),
             count_tokens_failures: AtomicU64::new(0),
+
+            server_tool_searches_total: AtomicU64::new(0),
+            server_tool_searches_ok: AtomicU64::new(0),
+            server_tool_search_failures: AtomicU64::new(0),
+            server_tool_iterations_total: AtomicU64::new(0),
+            server_tool_backend_hits: DashMap::new(),
 
             duration_lt1s: AtomicU64::new(0),
             duration_1_5s: AtomicU64::new(0),
@@ -177,6 +198,42 @@ impl ProxyMetrics {
         }
     }
 
+    /// Sets (or, with `None`, clears) the given upstream's most recent
+    /// typed error classification (Story 1.4.4). Called with `Some(kind)`
+    /// on a failed dispatch attempt and `None` on a successful one, so a
+    /// past failure never permanently pins the dashboard's status class
+    /// after the upstream recovers.
+    pub fn set_last_error_kind(&self, upstream: &str, kind: Option<&'static str>) {
+        let entry = self.upstreams.entry(upstream.to_string()).or_default();
+        *entry
+            .last_error_kind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = kind;
+    }
+
+    /// Record one emulated search against a backend (`"brave"`/`"browser"`),
+    /// updating totals, the outcome split, and the per-backend breakdown.
+    pub fn record_server_tool_search(&self, backend: &str, ok: bool) {
+        self.server_tool_searches_total
+            .fetch_add(1, Ordering::Relaxed);
+        if ok {
+            self.server_tool_searches_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.server_tool_search_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.server_tool_backend_hits
+            .entry(backend.to_string())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record loop iterations for one emulated request.
+    pub fn record_server_tool_iterations(&self, iterations: u64) {
+        self.server_tool_iterations_total
+            .fetch_add(iterations, Ordering::Relaxed);
+    }
+
     /// Classify a dispatch failure into the `error_types` breakdown
     /// (`timeout`/`auth`/`rate_limit`/`validation`) shown in `/metrics`.
     pub fn record_error_kind(&self, err: &crate::providers::ProviderError) {
@@ -194,6 +251,28 @@ impl ProxyMetrics {
         }
     }
 
+    /// Snapshot the server-tool emulation counters, including the
+    /// per-backend (`brave`/`browser`) breakdown for the D4 dashboard.
+    fn server_tools_json(&self) -> Value {
+        let backends: serde_json::Map<String, Value> = self
+            .server_tool_backend_hits
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    json!(entry.value().load(Ordering::Relaxed)),
+                )
+            })
+            .collect();
+        json!({
+            "searches_total": self.server_tool_searches_total.load(Ordering::Relaxed),
+            "searches_ok": self.server_tool_searches_ok.load(Ordering::Relaxed),
+            "search_failures": self.server_tool_search_failures.load(Ordering::Relaxed),
+            "iterations_total": self.server_tool_iterations_total.load(Ordering::Relaxed),
+            "by_backend": backends
+        })
+    }
+
     /// Builds the `providers` and `provider_latency` sections of `/metrics`
     /// from the per-upstream `DashMap`, one entry per upstream actually
     /// dispatched to at least once.
@@ -206,12 +285,17 @@ impl ProxyMetrics {
             let name = entry.key().clone();
             let c = entry.value();
 
+            let last_error_kind = *c
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             providers.insert(
                 name.clone(),
                 json!({
                     "requests": c.requests.load(Ordering::Relaxed),
                     "success": c.success.load(Ordering::Relaxed),
                     "errors": c.errors.load(Ordering::Relaxed),
+                    "last_error_kind": last_error_kind,
                 }),
             );
 
@@ -297,6 +381,14 @@ impl ProxyMetrics {
             },
             "providers": providers,
             "provider_latency": provider_latency,
+            // compression/memory/learn/count_tokens below: counters carried
+            // over from the legacy proxy's metrics schema for features that
+            // were never ported into `Router::dispatch()` (prompt
+            // compression, memory dedup, pattern learning, a real
+            // `count_tokens` call). Nothing writes to these atomics, so
+            // they're permanently zero — the dashboard cards they feed
+            // render but never move. Wiring one up is a new feature, not a
+            // metrics fix; see git history/ADRs before reviving one.
             "compression": {
                 "total_tokens_before": tokens_before,
                 "total_tokens_after": tokens_after,
@@ -336,7 +428,8 @@ impl ProxyMetrics {
                 "auth": self.err_auth.load(Ordering::Relaxed),
                 "rate_limit": self.err_rate_limit.load(Ordering::Relaxed),
                 "validation": self.err_validation.load(Ordering::Relaxed)
-            }
+            },
+            "server_tools": self.server_tools_json()
         })
     }
 }
@@ -396,6 +489,73 @@ mod tests {
         assert!(m.upstreams.get("anthropic").is_none());
     }
 
+    // REQ-10 (Story 1.4.4b/c) — focus area.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_last_error_kind_should_set_to_auth_when_gemini_auth_error_recorded() {
+        let m = ProxyMetrics::new();
+        m.set_last_error_kind("gemini", Some("auth"));
+
+        let entry = m.upstreams.get("gemini").unwrap();
+        assert_eq!(
+            *entry
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("auth")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_last_error_kind_should_overwrite_not_coexist_with_stale_prior_kind() {
+        let m = ProxyMetrics::new();
+        m.set_last_error_kind("gemini", Some("auth"));
+        m.set_last_error_kind("gemini", Some("response_shape_mismatch"));
+
+        let entry = m.upstreams.get("gemini").unwrap();
+        assert_eq!(
+            *entry
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("response_shape_mismatch")
+        );
+    }
+
+    // REQ-10 — the self-healing clear-on-success case (Story 1.4.4
+    // acceptance criterion).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_last_error_kind_should_reset_to_none_after_subsequent_success() {
+        let m = ProxyMetrics::new();
+        m.set_last_error_kind("gemini", Some("auth"));
+        m.set_last_error_kind("gemini", None);
+
+        let entry = m.upstreams.get("gemini").unwrap();
+        assert_eq!(
+            *entry
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn to_json_should_expose_last_error_kind_per_upstream() {
+        let m = ProxyMetrics::new();
+        m.record_request("gemini", false, 100, 0);
+        m.set_last_error_kind("gemini", Some("response_shape_mismatch"));
+
+        let json = m.to_json();
+        assert_eq!(
+            json["providers"]["gemini"]["last_error_kind"],
+            json!("response_shape_mismatch")
+        );
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn to_json_reports_one_providers_entry_per_upstream_seen() {
@@ -411,5 +571,26 @@ mod tests {
 
         let latency = json["provider_latency"].as_object().unwrap();
         assert_eq!(latency["anthropic"]["avg_duration_ms"], json!(100));
+    }
+
+    #[test]
+    fn record_server_tool_search_should_label_backends_separately() {
+        let m = ProxyMetrics::new();
+        m.record_server_tool_search("brave", true);
+        m.record_server_tool_search("brave", true);
+        m.record_server_tool_search("browser", true);
+        m.record_server_tool_search("unserved", false);
+        m.record_server_tool_iterations(3);
+
+        assert_eq!(m.server_tool_searches_total.load(Ordering::Relaxed), 4);
+        assert_eq!(m.server_tool_searches_ok.load(Ordering::Relaxed), 3);
+        assert_eq!(m.server_tool_search_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(m.server_tool_iterations_total.load(Ordering::Relaxed), 3);
+
+        let json = m.to_json();
+        assert_eq!(json["server_tools"]["searches_total"], json!(4));
+        assert_eq!(json["server_tools"]["by_backend"]["brave"], json!(2));
+        assert_eq!(json["server_tools"]["by_backend"]["browser"], json!(1));
+        assert_eq!(json["server_tools"]["by_backend"]["unserved"], json!(1));
     }
 }

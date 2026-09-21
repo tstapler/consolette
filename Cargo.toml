@@ -1,9 +1,9 @@
 [package]
 name = "consolette"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "consolette — CLI / MCP tool"
+description = "Provider-agnostic LLM router: proxies Anthropic/Bedrock/OpenAI-compatible upstreams with fallback, weighted routing, and rate limiting"
 repository = "https://github.com/tstapler/consolette"
 
 # Rust 1.74+ lints — set once here instead of per-module boilerplate.
@@ -28,6 +28,10 @@ path = "src/bin/mcp-proxy/main.rs"
 [[bin]]
 name = "cmdcrush"
 path = "src/bin/cmdcrush/main.rs"
+
+[[bin]]
+name = "readme-check"
+path = "src/bin/readme-check/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -79,7 +83,7 @@ aws-sdk-bedrockruntime = "1"
 aws-sdk-bedrock = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 tokio-retry = "0.3"
 backoff = { version = "0.4", features = ["tokio"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -94,6 +98,7 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
 tree-sitter = "0.26"
@@ -110,6 +115,11 @@ arc-swap = "1.9.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Additive feature on top of [dependencies]' tokio — enables `start_paused`/
+# `tokio::time::advance` for Epic 2.1's background-refresh-task weak-ref
+# exit test (`src/providers/openrouter/mod.rs`), so it can fast-forward
+# past `MODEL_LIST_REFRESH_INTERVAL` (5 minutes) without a real sleep.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.dist]
 inherits = "release"

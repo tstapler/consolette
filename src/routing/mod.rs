@@ -11,13 +11,22 @@
 //! provider implementations. `allow(dead_code)` is temporary until then.
 #![allow(dead_code)]
 
+pub mod bench_table;
+pub mod capability;
 pub mod health;
+pub mod model_stats;
+pub mod openrouter_scoring;
 pub mod router;
+pub mod session_overrides;
 pub mod strategy;
 
+#[allow(unused_imports)]
+pub use capability::{CapabilityCache, CapabilityVerdict};
 #[allow(unused_imports)]
 pub use health::{Availability, HealthRegistry};
 #[allow(unused_imports)]
 pub use router::Router;
+#[allow(unused_imports)]
+pub use session_overrides::{SessionOverride, SessionOverrideStore};
 #[allow(unused_imports)]
 pub use strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef, WeightedStrategy};

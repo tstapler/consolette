@@ -54,6 +54,12 @@ const HTTP_ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         method: "GET",
+        path: "/requests/{id}",
+        description:
+            "A cached request body, for the dashboard's inspector (?stage=original|compressed).",
+    },
+    Endpoint {
+        method: "GET",
         path: "/api/models",
         description: "Live model catalog per configured upstream.",
     },
@@ -226,6 +232,11 @@ fn escape(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::items_after_statements
+)]
 mod tests {
     use super::*;
     use crate::entrypoint::UpstreamSummary;
@@ -263,6 +274,25 @@ mod tests {
                 upstreams,
             }),
             config_dir: std::sync::Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
+            session_overrides: std::sync::Arc::new(
+                crate::routing::session_overrides::SessionOverrideStore::new(),
+            ),
+            capability: crate::routing::capability::CapabilityCache::new(
+                std::time::Duration::from_secs(crate::routing::capability::EVAL_TTL_SECS),
+            ),
+            server_tools: std::sync::Arc::new(crate::server_tools::ServerToolsRuntime::default()),
+            search_pool: std::sync::Arc::new(crate::server_tools::McpSearchPool::new(
+                crate::server_tools::ServerToolsConfig::default().pool_config(),
+            )),
+            pruning_policy_store: std::sync::Arc::new(
+                crate::claude_code_session::prune_policy::PruningPolicyStore::default(),
+            ),
+            omission_cache: std::sync::Arc::new(
+                crate::claude_code_session::omission_cache::OmissionCache::open(
+                    &tempfile::tempdir().unwrap().path().join("cache.sqlite"),
+                )
+                .unwrap(),
+            ),
         }
     }
 

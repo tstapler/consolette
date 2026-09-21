@@ -136,6 +136,15 @@ impl OpenaiProvider {
 
         debug!("OpenAI non-stream POST {url}");
 
+        if crate::providers::bodies_logged() {
+            tracing::info!(
+                target: "consolette::bodies",
+                upstream = %self.upstream.name,
+                body = %crate::providers::redact_bodies(&body),
+                "openai upstream request"
+            );
+        }
+
         let response = self
             .client
             .post(&url)
@@ -155,7 +164,19 @@ impl OpenaiProvider {
             })?;
 
         let status = response.status();
-        map_error_status(status, response).await
+        let out = map_error_status(status, response).await;
+        if crate::providers::bodies_logged() {
+            if let Ok(ref ok) = out {
+                tracing::info!(
+                    target: "consolette::bodies",
+                    upstream = %self.upstream.name,
+                    status = %status,
+                    body = %crate::providers::redact_bodies(ok),
+                    "openai upstream response"
+                );
+            }
+        }
+        out
     }
 
     /// Fetch the list of models from `GET /v1/models`.
@@ -202,6 +223,15 @@ impl OpenaiProvider {
         mut body: Value,
     ) -> Result<reqwest::Response, ProviderError> {
         body["stream"] = Value::Bool(true);
+
+        if crate::providers::bodies_logged() {
+            tracing::info!(
+                target: "consolette::bodies",
+                upstream = %self.upstream.name,
+                body = %crate::providers::redact_bodies(&body),
+                "openai upstream stream request"
+            );
+        }
 
         let url = format!("{}/v1/chat/completions", self.base_url);
         let headers = self.build_headers(&url).await?;
@@ -332,7 +362,10 @@ impl Provider for OpenaiProvider {
             Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
             let value = self.send_request(openai_body).await?;
-            let anthropic_value = super::translate_openai_response_to_anthropic(&value);
+            let anthropic_value = super::translate_openai_response_to_anthropic(
+                &value,
+                body.get("model").and_then(Value::as_str),
+            );
             Ok(ProviderResponse::Full(anthropic_value))
         }
     }
@@ -366,7 +399,16 @@ impl Provider for OpenaiProvider {
 /// `message_stop`) that `OpenAI`'s flatter chunk stream has no equivalent
 /// for, so a single inbound chunk can produce more than one outbound frame;
 /// `pending` buffers those extras between polls.
-struct OpenaiToAnthropicStream<S> {
+///
+/// Block layout: text is always block 0 (possibly empty); tool calls become
+/// blocks 1..n in order of first appearance. Tool argument fragments
+/// accumulate per `OpenAI` wire `index` and stream out as `input_json_delta`
+/// events, so chunked arguments reassemble into one valid JSON object.
+/// Four independent lifecycle flags (`started`/`finished`/`done` for the
+/// overall stream plus `text_started` for block 0); splitting them into a
+/// state machine would obscure the one-way pipeline, hence the allow.
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct OpenaiToAnthropicStream<S> {
     inner: eventsource_stream::EventStream<S>,
     id: String,
     model: String,
@@ -374,13 +416,29 @@ struct OpenaiToAnthropicStream<S> {
     finished: bool,
     done: bool,
     pending: VecDeque<Bytes>,
+    text_started: bool,
+    tools: Vec<ToolSlot>,
+}
+
+/// One in-progress tool call block: arguments accumulate here until the
+/// closing stop, so split fragments reassemble into valid JSON.
+struct ToolSlot {
+    /// `OpenAI` wire `index` from the chunk (need not be dense).
+    oi_index: usize,
+    /// Block index on the Anthropic face (1-based; 0 is text).
+    block_index: usize,
+    id: String,
+    name: String,
+    args: String,
+    started: bool,
+    stopped: bool,
 }
 
 impl<S> OpenaiToAnthropicStream<S>
 where
     S: Stream<Item = Result<Bytes, anyhow::Error>>,
 {
-    fn new(inner: S, model: String) -> Self {
+    pub(crate) fn new(inner: S, model: String) -> Self {
         Self {
             inner: inner.eventsource(),
             id: format!("msg_{}", uuid::Uuid::new_v4()),
@@ -389,6 +447,8 @@ where
             finished: false,
             done: false,
             pending: VecDeque::new(),
+            text_started: false,
+            tools: Vec::new(),
         }
     }
 
@@ -396,10 +456,10 @@ where
         Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
     }
 
-    /// Push the synthetic `message_start`/`content_block_start` pair, if not
-    /// already emitted, so every stream opens with a well-formed Anthropic
-    /// preamble even if the first `OpenAI` chunk carries no text.
-    fn ensure_started(&mut self) {
+    /// Push the synthetic `message_start`, so every stream opens with a
+    /// well-formed Anthropic preamble even if the first `OpenAI` chunk
+    /// carries no text.
+    fn ensure_message_started(&mut self) {
         if self.started {
             return;
         }
@@ -419,6 +479,16 @@ where
                 }
             }),
         ));
+    }
+
+    /// Push the text `content_block_start` (index 0). Text always owns block
+    /// 0 — possibly empty — so tool blocks can take stable indices 1..n.
+    fn ensure_text_started(&mut self) {
+        self.ensure_message_started();
+        if self.text_started {
+            return;
+        }
+        self.text_started = true;
         self.pending.push_back(Self::frame(
             "content_block_start",
             &json!({
@@ -430,7 +500,7 @@ where
     }
 
     fn push_delta(&mut self, text: &str) {
-        self.ensure_started();
+        self.ensure_text_started();
         self.pending.push_back(Self::frame(
             "content_block_delta",
             &json!({
@@ -441,14 +511,115 @@ where
         ));
     }
 
-    /// Emit the closing `content_block_stop`/`message_delta`/`message_stop`
-    /// sequence and mark the stream finished. Idempotent.
+    /// Fold one `OpenAI` tool-call delta entry into its Anthropic block:
+    /// accumulate id/name/arguments by wire `index`, open the block once
+    /// id and name are known, and stream argument fragments as
+    /// `input_json_delta` events.
+    fn push_tool_delta(
+        &mut self,
+        oi_index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        args_frag: &str,
+    ) {
+        self.ensure_message_started();
+        let pos = if let Some(pos) = self.tools.iter().position(|t| t.oi_index == oi_index) {
+            pos
+        } else {
+            // OpenAI indices need not be dense; Anthropic block indices
+            // must be, so slots take 1-based positions in appearance
+            // order regardless of the wire index.
+            self.tools.push(ToolSlot {
+                oi_index,
+                block_index: self.tools.len() + 1,
+                id: String::new(),
+                name: String::new(),
+                args: String::new(),
+                started: false,
+                stopped: false,
+            });
+            self.tools.len() - 1
+        };
+        // NOTE: position-by-wire-index assumes the gateway reuses one wire
+        // index per call; a gateway renumbering mid-stream would split one
+        // call into two blocks (fail-closed, still well-formed).
+        let slot = &mut self.tools[pos];
+        if slot.id.is_empty() {
+            if let Some(id) = id {
+                slot.id = id.to_string();
+            }
+        }
+        if slot.name.is_empty() {
+            if let Some(name) = name {
+                slot.name = name.to_string();
+            }
+        }
+        slot.args.push_str(args_frag);
+        if !slot.started && !slot.id.is_empty() && !slot.name.is_empty() {
+            slot.started = true;
+            let (block_index, id, name, args) = (
+                slot.block_index,
+                slot.id.clone(),
+                slot.name.clone(),
+                slot.args.clone(),
+            );
+            self.pending.push_back(Self::frame(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use", "id": id, "name": name, "input": {}
+                    }
+                }),
+            ));
+            if !args.is_empty() {
+                self.pending.push_back(Self::frame(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "input_json_delta", "partial_json": args}
+                    }),
+                ));
+            }
+        } else if slot.started && !args_frag.is_empty() {
+            let block_index = slot.block_index;
+            self.pending.push_back(Self::frame(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "input_json_delta", "partial_json": args_frag}
+                }),
+            ));
+        }
+    }
+
+    /// Emit the closing stops for every open block plus the
+    /// `message_delta`/`message_stop` sequence. Idempotent. A stream that
+    /// opened any tool block always closes `tool_use` (mirroring the
+    /// non-streaming rule: blocks present ⇔ matching stop reason).
     fn close(&mut self, stop_reason: &str) {
         if self.finished {
             return;
         }
-        self.ensure_started();
+        self.ensure_text_started();
         self.finished = true;
+        let mut stop_reason = stop_reason.to_string();
+        for slot in &mut self.tools {
+            if slot.started && !slot.stopped {
+                slot.stopped = true;
+                let block_index = slot.block_index;
+                self.pending.push_back(Self::frame(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": block_index}),
+                ));
+            }
+        }
+        if self.tools.iter().any(|t| t.started) {
+            stop_reason = "tool_use".to_string();
+        }
         self.pending.push_back(Self::frame(
             "content_block_stop",
             &json!({"type": "content_block_stop", "index": 0}),
@@ -503,6 +674,14 @@ where
                         this.close("end_turn");
                         continue;
                     }
+                    if crate::providers::bodies_logged() {
+                        tracing::info!(
+                            target: "consolette::bodies",
+                            model = %this.model,
+                            chunk = %event.data,
+                            "openai upstream stream chunk"
+                        );
+                    }
                     let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
                         continue;
                     };
@@ -512,13 +691,46 @@ where
                         .and_then(Value::as_array)
                         .and_then(|a| a.first());
 
-                    if let Some(text) = choice
-                        .and_then(|c| c.get("delta"))
+                    // Delta content arrives as a string on most gateways,
+                    // but OpenRouter-style responses may send an array of
+                    // parts or put tokens in `reasoning_content`/`reasoning`
+                    // (reasoning models). Either shape collapsing to ""
+                    // is what produced empty client text with nonzero
+                    // usage, so extract text from all of them.
+                    let delta = choice.and_then(|c| c.get("delta"));
+                    let mut text = delta
                         .and_then(|d| d.get("content"))
-                        .and_then(Value::as_str)
+                        .map(crate::providers::extract_text_from_content)
+                        .unwrap_or_default();
+                    if text.is_empty() {
+                        text = delta
+                            .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+                            .map(crate::providers::extract_text_from_content)
+                            .unwrap_or_default();
+                    }
+                    if !text.is_empty() {
+                        this.push_delta(&text);
+                    }
+
+                    if let Some(calls) = delta
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(Value::as_array)
                     {
-                        if !text.is_empty() {
-                            this.push_delta(text);
+                        for (pos, call) in calls.iter().enumerate() {
+                            let oi_index = call
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .map_or(pos, |i| usize::try_from(i).unwrap_or(pos));
+                            let function = call.get("function");
+                            this.push_tool_delta(
+                                oi_index,
+                                call.get("id").and_then(Value::as_str),
+                                function.and_then(|f| f.get("name")).and_then(Value::as_str),
+                                function
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(""),
+                            );
                         }
                     }
 
@@ -653,6 +865,104 @@ mod tests {
 
             let (_, message_delta_data) = parse_event(&out[4]);
             assert_eq!(message_delta_data["delta"]["stop_reason"], "max_tokens");
+        }
+
+        #[tokio::test]
+        async fn array_and_reasoning_deltas_produce_text() {
+            // Gateway may send delta content as parts or put tokens in
+            // `reasoning_content`; both must surface as text deltas rather
+            // than vanishing (the empty-stream symptom).
+            let inner = stream::iter(vec![
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"content":[{"type":"text","text":"A"}]},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"reasoning_content":"th"},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)),
+                Ok(sse("[DONE]")),
+            ]);
+            let translator = OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string());
+            let out = drain(translator).await;
+
+            let texts: Vec<String> = out
+                .iter()
+                .map(parse_event)
+                .filter(|(e, _)| e == "content_block_delta")
+                .map(|(_, d)| d["delta"]["text"].as_str().unwrap_or("").to_string())
+                .collect();
+            assert_eq!(texts, vec!["A".to_string(), "th".to_string()]);
+        }
+
+        #[tokio::test]
+        #[allow(clippy::expect_used)]
+        async fn chunked_tool_call_accumulates_into_one_tool_use_block() {
+            // Arguments split across chunks must reassemble: block indices
+            // stable, partial_json concatenates to valid JSON, stop is
+            // tool_use. This is the streaming half of the premature-stop
+            // repro (Claude Code streams).
+            let inner = stream::iter(vec![
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_time","arguments":""}}]},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"zone\":"}}]},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"utc\"}"}}]},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(
+                    r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                )),
+                Ok(sse("[DONE]")),
+            ]);
+            let translator = OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string());
+            let out = drain(translator).await;
+            let events: Vec<(String, Value)> = out.iter().map(parse_event).collect();
+            let kinds: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
+
+            // Text block 0 opens (possibly empty), tool block takes index 1.
+            let tool_start = events
+                .iter()
+                .find(|(e, d)| {
+                    e == "content_block_start" && d["content_block"]["type"] == "tool_use"
+                })
+                .expect("tool_use content_block_start");
+            assert_eq!(tool_start.1["index"], 1);
+            assert_eq!(tool_start.1["content_block"]["id"], "call_1");
+            assert_eq!(tool_start.1["content_block"]["name"], "get_time");
+
+            let partials: String = events
+                .iter()
+                .filter(|(e, d)| {
+                    e == "content_block_delta" && d["delta"]["type"] == "input_json_delta"
+                })
+                .map(|(_, d)| {
+                    d["delta"]["partial_json"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(partials, "{\"zone\":\"utc\"}");
+            serde_json::from_str::<Value>(&partials).expect("reassembled args parse");
+
+            // Every start has a matching stop on the same index.
+            for idx in [0, 1] {
+                let starts = events
+                    .iter()
+                    .filter(|(e, d)| e == "content_block_start" && d["index"] == idx)
+                    .count();
+                let stops = events
+                    .iter()
+                    .filter(|(e, d)| e == "content_block_stop" && d["index"] == idx)
+                    .count();
+                assert_eq!((starts, stops), (1, 1), "bracket mismatch at {idx}");
+            }
+
+            let (_, message_delta_data) = parse_event(&out[out.len() - 2]);
+            assert_eq!(message_delta_data["delta"]["stop_reason"], "tool_use");
+            assert_eq!(kinds.last(), Some(&"message_stop"));
         }
 
         #[tokio::test]

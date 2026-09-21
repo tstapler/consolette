@@ -22,11 +22,16 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
+use crate::claude_code_session::omission_cache::OmissionCache;
+use crate::claude_code_session::prune_policy::PruningPolicyStore;
 use crate::config::schema::{Config, UpstreamKind};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::metrics::MetricsCollector;
+use crate::routing::capability::{CapabilityCache, EVAL_TTL_SECS};
 use crate::routing::router::Router as DispatchRouter;
+use crate::routing::session_overrides::SessionOverrideStore;
+use crate::server_tools::{McpSearchPool, ServerToolsRuntime};
 
 /// One upstream's name and kind, for display on the landing page
 /// (`GET /`) — never used for dispatch, which goes through `DispatchRouter`.
@@ -64,6 +69,28 @@ pub struct EntrypointState {
     pub metrics: Arc<MetricsCollector>,
     pub server_info: Arc<ServerInfo>,
     pub config_dir: Arc<std::path::PathBuf>,
+    /// The single, canonical session-override store for this process.
+    /// `dispatch_router` reads it via `Router::with_session_overrides`,
+    /// which `api::post_route` re-attaches to every rebuilt `Router` so a
+    /// pin survives a route hot-swap.
+    pub session_overrides: Arc<SessionOverrideStore>,
+    /// The single, canonical capability-verdict cache for this process.
+    /// Same carry-across discipline as `session_overrides` (via
+    /// `Router::with_capability`), plus a background eval loop that keeps
+    /// verdicts fresh as the free lineup rotates.
+    pub capability: Arc<CapabilityCache>,
+    /// Server-tool emulation snapshot: tuning config plus route eligibility
+    /// (D1), computed once at build.
+    pub server_tools: Arc<ServerToolsRuntime>,
+    /// Shared bounded pool of stapler-mcp stdio children (seam A). Held
+    /// here — not per request — so children persist across searches and the
+    /// circuit breaker sees process-wide failures. Lazy start: constructing
+    /// the pool spawns nothing.
+    pub search_pool: Arc<McpSearchPool>,
+    /// Thread-safe store for global and session-specific transcript memory pruning policies.
+    pub pruning_policy_store: Arc<PruningPolicyStore>,
+    /// Long-lived SQLite cache for tool output pruned during compaction passes.
+    pub omission_cache: Arc<OmissionCache>,
 }
 
 impl EntrypointState {
@@ -80,10 +107,37 @@ impl EntrypointState {
     pub async fn build(config: &Config, config_dir: &std::path::Path) -> anyhow::Result<Self> {
         let metrics = MetricsCollector::new();
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
+        let session_overrides = Arc::new(SessionOverrideStore::new());
+        let capability = CapabilityCache::new(std::time::Duration::from_secs(EVAL_TTL_SECS));
         let dispatch_router = Arc::new(ArcSwap::from_pointee(
-            DispatchRouter::from_config(config, Arc::clone(&metrics)).await?,
+            DispatchRouter::from_config(config, Arc::clone(&metrics))
+                .await?
+                .with_session_overrides(Arc::clone(&session_overrides))
+                .with_capability(Arc::clone(&capability)),
         ));
+        tokio::spawn(crate::routing::capability::run_eval_loop(Arc::clone(
+            &dispatch_router,
+        )));
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
+        let server_tools = Arc::new(ServerToolsRuntime {
+            config: config.server_tools.clone(),
+            route_eligible: ServerToolsRuntime::route_eligible_from_config(config),
+        });
+        let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
+        let pruning_policy_store = Arc::new(PruningPolicyStore::default());
+        let omission_cache = Arc::new(OmissionCache::open(&OmissionCache::default_cache_path())?);
+        // Pre-mortem failure 2: one boot log line stating whether emulation
+        // is armed and whether the backend binary resolves, so "silently
+        // degraded since restart" is visible in logs. No child is spawned
+        // here (lazy pool start on first search).
+        tracing::info!(
+            enabled = server_tools.config.enabled,
+            route_eligible = server_tools.route_eligible,
+            backend_path = %server_tools.config.backend_path,
+            backend_reachable =
+                crate::server_tools::backend_reachable(&server_tools.config.backend_path),
+            "server-tool emulation configured"
+        );
         let route = config.routes.first();
         let server_info = Arc::new(ServerInfo {
             port: config.port,
@@ -104,6 +158,12 @@ impl EntrypointState {
             metrics,
             server_info,
             config_dir: Arc::new(config_dir.to_path_buf()),
+            session_overrides,
+            capability,
+            server_tools,
+            search_pool,
+            pruning_policy_store,
+            omission_cache,
         })
     }
 }
@@ -113,6 +173,8 @@ fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
         UpstreamKind::Anthropic => "anthropic",
         UpstreamKind::Bedrock { .. } => "bedrock",
         UpstreamKind::Openai { .. } => "openai",
+        UpstreamKind::Gemini { .. } => "gemini",
+        UpstreamKind::Openrouter {} => "openrouter",
     }
 }
 
@@ -124,6 +186,10 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
         .route(
             "/v1/messages",
             axum::routing::post(crate::entrypoint::messages::post_v1_messages),
+        )
+        .route(
+            "/v1/models",
+            axum::routing::get(crate::entrypoint::messages::get_v1_models),
         )
         .route(
             "/v1/chat/completions",
@@ -138,10 +204,33 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             "/errors/summary",
             axum::routing::get(observability::get_errors_summary),
         )
+        .route(
+            "/requests/{id}",
+            axum::routing::get(observability::get_request_body),
+        )
         .route("/api/models", axum::routing::get(api::get_models))
         .route(
             "/api/route",
             axum::routing::get(api::get_route).post(api::post_route),
+        )
+        .route("/api/sessions", axum::routing::get(api::get_sessions))
+        .route(
+            "/api/sessions/{id}/route",
+            axum::routing::get(api::get_session_route)
+                .post(api::post_session_route)
+                .delete(api::delete_session_route),
+        )
+        .route(
+            "/session/prune",
+            axum::routing::post(api::post_session_prune),
+        )
+        .route(
+            "/session/policy",
+            axum::routing::get(api::get_session_policy).post(api::post_session_policy),
+        )
+        .route(
+            "/session/prune/stats",
+            axum::routing::get(api::get_session_prune_stats),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
@@ -224,6 +313,26 @@ mod tests {
         )
         .await;
         assert!(state.is_ok());
+    }
+
+    // REQ-2 (Story 1.1.2): `upstream_kind_label` accepts `UpstreamKind::Gemini`.
+    #[test]
+    fn upstream_kind_label_should_return_gemini_for_new_variant() {
+        let kind = UpstreamKind::Gemini {
+            project_id: "p1".to_string(),
+        };
+
+        assert_eq!(upstream_kind_label(&kind), "gemini");
+    }
+
+    // REQ-1 (Story 1.2.3, Task 1.2.3d): `upstream_kind_label` accepts
+    // `UpstreamKind::Openrouter`.
+    #[test]
+    fn upstream_kind_label_should_return_openrouter_for_new_variant() {
+        assert_eq!(
+            upstream_kind_label(&UpstreamKind::Openrouter {}),
+            "openrouter"
+        );
     }
 
     #[tokio::test]

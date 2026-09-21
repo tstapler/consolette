@@ -38,6 +38,10 @@ pub struct RequestDetail {
     pub tokens_after: u64,
     pub compressed: bool,
     pub stream: bool,
+    /// JSON-encoded `{content-block-type: count}` map (e.g.
+    /// `{"text":2,"tool_use":1}`) — the dashboard's `fmtTypes()` does its
+    /// own `JSON.parse` on this, so it must stay a JSON object string, not
+    /// a display string.
     pub msg_types: String,
     pub has_context_management: bool,
     pub message_count: u32,
@@ -45,6 +49,95 @@ pub struct RequestDetail {
     pub first_byte_ms: f64,
     pub bedrock_invocation_ms: u64,
     pub bedrock_first_byte_ms: u64,
+    /// The request's `metadata.user_id` verbatim, if present — the session
+    /// key `routing::session_overrides` pins against. `None` for a request
+    /// with no `metadata.user_id` (can't be session-pinned either).
+    pub session_id: Option<String>,
+    /// The specific per-model candidate dispatch actually selected (e.g.
+    /// `"deepseek/deepseek-chat-v3.1:free"`), populated post-selection via
+    /// [`MetricsCollector::set_selected_model`] (Story 5.1.3). `None` at
+    /// construction and for every non-model-pinned route
+    /// (`FallbackStrategy`/`WeightedStrategy` candidates always carry
+    /// `model: None`).
+    pub selected_model: Option<String>,
+    /// Whether `selected_model`'s pick was an epsilon-greedy exploration
+    /// choice rather than the greedy argmax one (Pre-mortem P2 #2),
+    /// populated post-selection via
+    /// [`MetricsCollector::set_selected_model_was_exploration`]. `None` at
+    /// construction, for every non-model-pinned route, and for a strategy
+    /// that doesn't track the distinction — same nullability convention as
+    /// `selected_model`.
+    pub selected_model_was_exploration: Option<bool>,
+}
+
+impl RequestDetail {
+    /// Builds the initial ring-buffer entry for an incoming request, before
+    /// dispatch has picked an upstream: `provider` starts empty and timing
+    /// fields start at zero, filled in later via
+    /// [`MetricsCollector::update_request_timing`] once dispatch resolves.
+    /// `message_count`/`msg_types`/`has_context_management` are derived from
+    /// the Anthropic-shaped request `body` (already true for both
+    /// `/v1/messages` and `/v1/chat/completions`, since the latter is
+    /// translated to Anthropic's wire format before `Router::dispatch`).
+    #[must_use]
+    pub fn from_body(
+        request_id: String,
+        stream: bool,
+        tokens_before: u64,
+        body: &serde_json::Value,
+        session_id: Option<String>,
+    ) -> Self {
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let messages = body.get("messages").and_then(serde_json::Value::as_array);
+        let message_count = messages.map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX));
+
+        let mut type_counts: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
+        for message in messages.into_iter().flatten() {
+            match message.get("content") {
+                Some(serde_json::Value::String(_)) => {
+                    *type_counts.entry("text".to_string()).or_insert(0) += 1;
+                }
+                Some(serde_json::Value::Array(blocks)) => {
+                    for block in blocks {
+                        let block_type = block
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        *type_counts.entry(block_type.to_string()).or_insert(0) += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let msg_types = serde_json::to_string(&type_counts).unwrap_or_else(|_| "{}".to_string());
+
+        Self {
+            request_id,
+            timestamp: Utc::now().to_rfc3339(),
+            model,
+            provider: String::new(),
+            tokens_before,
+            tokens_after: 0,
+            compressed: false,
+            stream,
+            msg_types,
+            has_context_management: body.get("context_management").is_some(),
+            message_count,
+            duration_ms: 0.0,
+            first_byte_ms: 0.0,
+            bedrock_invocation_ms: 0,
+            bedrock_first_byte_ms: 0,
+            session_id,
+            selected_model: None,
+            selected_model_was_exploration: None,
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -69,6 +162,12 @@ pub struct MetricsCollector {
     pub error_tracker: Arc<ErrorTracker>,
     /// Ring buffer: last 100 requests (newest first).
     recent_requests: Mutex<VecDeque<RequestDetail>>,
+    /// Ring buffer of `(request_id, original request body)`, capped and
+    /// evicted in lockstep with `recent_requests` — backs the dashboard's
+    /// `GET /requests/{id}?stage=original` body inspector. There is no
+    /// `compressed` counterpart yet: that stage needs the `compression`
+    /// module wired into dispatch, which isn't in scope here.
+    original_bodies: Mutex<VecDeque<(String, serde_json::Value)>>,
     /// Rolling event-loop lag samples (15-min window).
     lag_samples: Mutex<VecDeque<LagSample>>,
     /// Most recent lag measurement in milliseconds.
@@ -83,6 +182,7 @@ impl MetricsCollector {
             histogram: Arc::new(DurationHistogram::with_default_window()),
             error_tracker: Arc::new(ErrorTracker::new()),
             recent_requests: Mutex::new(VecDeque::new()),
+            original_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
         })
@@ -102,6 +202,19 @@ impl MetricsCollector {
         buf.push_front(detail);
     }
 
+    /// Shared in-place-mutate-by-id pattern behind `update_request_timing`,
+    /// `set_selected_model`, and `set_selected_model_was_exploration`: a
+    /// no-op once the request has aged out of the 100-entry ring buffer.
+    fn mutate_request(&self, request_id: &str, f: impl FnOnce(&mut RequestDetail)) {
+        let mut buf = self
+            .recent_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(r) = buf.iter_mut().find(|r| r.request_id == request_id) {
+            f(r);
+        }
+    }
+
     /// Update timing fields on an existing request by ID.
     pub fn update_request_timing(
         &self,
@@ -112,20 +225,61 @@ impl MetricsCollector {
         bedrock_invocation_ms: u64,
         bedrock_first_byte_ms: u64,
     ) {
+        self.mutate_request(request_id, |r| {
+            r.provider = provider.to_string();
+            r.duration_ms = (duration_ms * 10.0).round() / 10.0;
+            r.first_byte_ms = (first_byte_ms * 10.0).round() / 10.0;
+            r.bedrock_invocation_ms = bedrock_invocation_ms;
+            r.bedrock_first_byte_ms = bedrock_first_byte_ms;
+        });
+    }
+
+    /// Sets `selected_model` on an existing request by ID (Story 5.1.3).
+    /// Called once per dispatch attempt with the currently-chosen
+    /// candidate's model, so the last attempt wins across retries, matching
+    /// how `provider` is already overwritten on each retry in
+    /// `update_request_timing`.
+    pub fn set_selected_model(&self, request_id: &str, model: Option<String>) {
+        self.mutate_request(request_id, |r| r.selected_model = model);
+    }
+
+    /// Sets `selected_model_was_exploration` on an existing request by ID
+    /// (Pre-mortem P2 #2), called alongside `set_selected_model`.
+    pub fn set_selected_model_was_exploration(
+        &self,
+        request_id: &str,
+        was_exploration: Option<bool>,
+    ) {
+        self.mutate_request(request_id, |r| {
+            r.selected_model_was_exploration = was_exploration;
+        });
+    }
+
+    /// Caches a request's original (pre-dispatch) body, capped at 100
+    /// entries in lockstep with the `recent_requests` ring buffer, for the
+    /// dashboard's `GET /requests/{id}?stage=original` inspector.
+    pub fn push_original_body(&self, request_id: String, body: serde_json::Value) {
         let mut buf = self
-            .recent_requests
+            .original_bodies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for r in buf.iter_mut() {
-            if r.request_id == request_id {
-                r.provider = provider.to_string();
-                r.duration_ms = (duration_ms * 10.0).round() / 10.0;
-                r.first_byte_ms = (first_byte_ms * 10.0).round() / 10.0;
-                r.bedrock_invocation_ms = bedrock_invocation_ms;
-                r.bedrock_first_byte_ms = bedrock_first_byte_ms;
-                return;
-            }
+        if buf.len() == 100 {
+            buf.pop_back();
         }
+        buf.push_front((request_id, body));
+    }
+
+    /// Looks up a cached original body by request id. `None` once evicted
+    /// from the ring buffer (oldest entries fall off after 100 requests).
+    #[must_use]
+    pub fn get_original_body(&self, request_id: &str) -> Option<serde_json::Value> {
+        let buf = self
+            .original_bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        buf.iter()
+            .find(|(id, _)| id == request_id)
+            .map(|(_, body)| body.clone())
     }
 
     /// Get the last `n` requests (newest first).
@@ -273,11 +427,10 @@ impl MetricsCollector {
         result["recent_errors"] = serde_json::Value::Array(recent_errors);
         result["timestamp"] = json!(Utc::now().to_rfc3339());
 
-        // Cooldowns placeholder (wired in from FallbackState in future epics)
-        result["cooldowns"] = json!({
-            "anthropic": { "cooling_down": false, "remaining_seconds": 0 },
-            "bedrock": { "cooling_down": false, "remaining_seconds": 0 }
-        });
+        // `cooldowns` is merged in by the HTTP handler
+        // (`observability::get_metrics`) from `Router::cooldown_snapshot()`
+        // — `MetricsCollector` itself has no reference to `Router`/
+        // `HealthRegistry` (Story 1.5.1).
 
         result
     }
@@ -291,6 +444,7 @@ impl Default for MetricsCollector {
             histogram: Arc::new(DurationHistogram::with_default_window()),
             error_tracker: Arc::new(ErrorTracker::new()),
             recent_requests: Mutex::new(VecDeque::new()),
+            original_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
         }

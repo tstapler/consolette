@@ -231,6 +231,15 @@ impl AnthropicProvider {
 
         debug!("Anthropic non-stream POST {url}");
 
+        if crate::providers::bodies_logged() {
+            tracing::info!(
+                target: "consolette::bodies",
+                upstream = %self.upstream.name,
+                body = %crate::providers::redact_bodies(&body),
+                "anthropic upstream request"
+            );
+        }
+
         let response = self
             .client
             .post(&url)
@@ -250,7 +259,19 @@ impl AnthropicProvider {
             })?;
 
         let status = response.status();
-        map_error_status(status, response).await
+        let out = map_error_status(status, response).await;
+        if crate::providers::bodies_logged() {
+            if let Ok((ref ok, _)) = out {
+                tracing::info!(
+                    target: "consolette::bodies",
+                    upstream = %self.upstream.name,
+                    status = %status,
+                    body = %crate::providers::redact_bodies(ok),
+                    "anthropic upstream response"
+                );
+            }
+        }
+        out
     }
 
     /// Send a streaming request to `POST /v1/messages`.
@@ -287,6 +308,15 @@ impl AnthropicProvider {
         })?;
 
         debug!("Anthropic stream POST {url}");
+
+        if crate::providers::bodies_logged() {
+            tracing::info!(
+                target: "consolette::bodies",
+                upstream = %self.upstream.name,
+                body = %crate::providers::redact_bodies(&body),
+                "anthropic upstream stream request"
+            );
+        }
 
         let response = self
             .stream_client

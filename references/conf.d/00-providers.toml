@@ -1,0 +1,81 @@
+# Example conf.d fragment showing all four supported upstream `kind`s side
+# by side. Copy the block(s) you need into your own
+# ~/.config/consolette/conf.d/*.toml and fill in the placeholder values —
+# see README.md for the full conf.d layering rules.
+#
+# There's no dedicated OpenRouter provider — OpenRouter's API is OpenAI-
+# compatible (https://openrouter.ai/docs/api-reference/authentication), so it
+# just needs its own `kind = "openai"` block:
+#
+# [[upstreams]]
+# name = "openrouter"
+# kind = "openai"
+# base_url = "https://openrouter.ai/api"
+#
+# [upstreams.auth]
+# type = "bearer"
+#
+# [upstreams.auth.token]
+# source = "env"
+# var = "OPENROUTER_API_KEY"
+
+[[upstreams]]
+name = "anthropic"
+kind = "anthropic"
+
+[upstreams.auth]
+type = "bearer"
+
+[upstreams.auth.token]
+source = "env"
+var = "CLAUDE_CODE_OAUTH_TOKEN"
+
+[[upstreams]]
+name = "bedrock"
+kind = "bedrock"
+aws_region = "us-east-1"
+aws_profile = "default"
+max_retries = 3
+
+[[upstreams]]
+name = "openai"
+kind = "openai"
+base_url = "https://api.openai.com"
+
+[upstreams.auth]
+type = "bearer"
+
+[upstreams.auth.token]
+source = "env"
+var = "OPENAI_API_KEY"
+
+# Gemini upstream (Cloud Code Assist / Antigravity subscription), see
+# project_plans/gemini-provider/decisions/ADR-001-gemini-auth-token-source.md
+# and ADR-003-gemini-project-id-resolution.md. `project_id` is flat on the
+# upstream (no nested [upstreams.gemini] table) — same convention every other
+# kind-specific field in this file follows.
+[[upstreams]]
+name = "gemini"
+kind = "gemini"
+project_id = "your-gcp-project-id"
+
+[upstreams.auth]
+type = "exec"
+command = "references/bin/antigravity-token-auth.py"
+cache_ttl_secs = 300
+
+# Fallback (not weighted): Gemini is listed last so it's only ever tried
+# after anthropic/bedrock fail, bounding the blast radius of the accepted
+# protocol/ToS risk (see plan.md's Risk Control section).
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "anthropic"
+
+[[routes.upstreams]]
+name = "bedrock"
+
+[[routes.upstreams]]
+name = "gemini"

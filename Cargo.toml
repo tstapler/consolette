@@ -1,6 +1,6 @@
 [package]
 name = "consolette"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Provider-agnostic LLM router: proxies Anthropic/Bedrock/OpenAI-compatible upstreams with fallback, weighted routing, and rate limiting"

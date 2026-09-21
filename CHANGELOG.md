@@ -1,6 +1,14 @@
 # Changelog
 
 
+### Features
+
+- Implement turn-decay transcript memory pruning and HTTP control plane (e879983)
+
+- Add OpenAI Responses API support and model resolution (093ea6b)
+
+
+
 ### Bug Fixes
 
 - Retry launchctl bootstrap after bootout races (cac3a4d)

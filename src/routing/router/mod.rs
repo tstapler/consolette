@@ -18,7 +18,7 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
-use crate::metrics::MetricsCollector;
+use crate::metrics::{MetricsCollector, RequestTimingUpdate};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
@@ -642,18 +642,7 @@ impl Router {
                     self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
                     #[allow(clippy::cast_precision_loss)]
                     let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
-                    // First-byte time isn't separately measured here (see
-                    // `record_attempt`'s doc comment) — `provider.send`
-                    // returning is the closest proxy we have for either a
-                    // full response or a stream's headers.
-                    self.metrics.update_request_timing(
-                        &request_id,
-                        &chosen.name,
-                        duration_ms,
-                        duration_ms,
-                        0,
-                        0,
-                    );
+                    self.record_first_attempt_timing(&request_id, &chosen.name, duration_ms);
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
@@ -947,6 +936,24 @@ impl Router {
             .record_model_attempt(effective_model, model_outcome);
         self.strategy
             .record_outcome(chosen, duration_ms, success, error_kind);
+    }
+
+    /// Records a successful first-attempt's timing on `/metrics`. First-byte
+    /// time isn't separately measured here (see `record_attempt`'s doc
+    /// comment) — `provider.send` returning is the closest proxy we have for
+    /// either a full response or a stream's headers, so both fields get the
+    /// same `duration_ms`.
+    fn record_first_attempt_timing(&self, request_id: &str, provider_name: &str, duration_ms: f64) {
+        self.metrics.update_request_timing(
+            request_id,
+            RequestTimingUpdate {
+                provider: provider_name,
+                duration_ms,
+                first_byte_ms: duration_ms,
+                bedrock_invocation_ms: 0,
+                bedrock_first_byte_ms: 0,
+            },
+        );
     }
 }
 

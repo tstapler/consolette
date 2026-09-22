@@ -186,42 +186,7 @@ mod tests {
             metrics: Arc::clone(&metrics),
         });
 
-        let state = EntrypointState {
-            dispatch_router: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
-            cost_tracker: Arc::new(
-                crate::cost_metrics::tracker::CostTracker::new(
-                    crate::cost_metrics::pricing::PricingTable::load_default(),
-                )
-                .await,
-            ),
-            metrics,
-            server_info: Arc::new(crate::entrypoint::ServerInfo {
-                port: 0,
-                route_name: "test".to_string(),
-                strategy: "Fallback".to_string(),
-                upstreams: vec![],
-            }),
-            config_dir: Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
-            session_overrides: Arc::new(
-                crate::routing::session_overrides::SessionOverrideStore::new(),
-            ),
-            capability: crate::routing::capability::CapabilityCache::new(
-                std::time::Duration::from_secs(crate::routing::capability::EVAL_TTL_SECS),
-            ),
-            server_tools: Arc::new(crate::server_tools::ServerToolsRuntime::default()),
-            search_pool: Arc::new(crate::server_tools::McpSearchPool::new(
-                crate::server_tools::ServerToolsConfig::default().pool_config(),
-            )),
-            pruning_policy_store: Arc::new(
-                crate::claude_code_session::prune_policy::PruningPolicyStore::default(),
-            ),
-            omission_cache: Arc::new(
-                crate::claude_code_session::omission_cache::OmissionCache::open(
-                    &tempfile::tempdir().unwrap().path().join("cache.sqlite"),
-                )
-                .unwrap(),
-            ),
-        };
+        let state = crate::entrypoint::test_support::state_with_router(router, metrics).await;
         let _ = Config::default;
         (state, calls)
     }

@@ -363,18 +363,18 @@ mod tests {
     ) -> super::super::router::Router {
         use std::sync::Arc;
 
-        super::super::router::Router::new(
-            vec![],
-            vec![Arc::new(ScriptedProvider {
+        super::super::router::Router::new(super::super::router::RouterDeps {
+            candidates: vec![],
+            providers: vec![Arc::new(ScriptedProvider {
                 script: Mutex::new(script.into()),
             })],
-            Arc::new(super::super::strategy::FallbackStrategy),
-            Arc::new(super::super::health::HealthRegistry::new(300)),
-            Arc::new(crate::ratelimit::RateLimiters::new(
+            strategy: Arc::new(super::super::strategy::FallbackStrategy),
+            health: Arc::new(super::super::health::HealthRegistry::new(300)),
+            admission: Arc::new(crate::ratelimit::RateLimiters::new(
                 &crate::config::schema::RateLimitConfig::default(),
             )),
-            crate::metrics::MetricsCollector::new(),
-        )
+            metrics: crate::metrics::MetricsCollector::new(),
+        })
     }
 
     #[tokio::test]

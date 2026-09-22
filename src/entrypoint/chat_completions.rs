@@ -155,7 +155,7 @@ mod tests {
         response: Result<ProviderResponse, ProviderError>,
     ) -> (EntrypointState, Arc<AtomicUsize>) {
         use crate::routing::health::HealthRegistry;
-        use crate::routing::router::Router as DispatchRouter;
+        use crate::routing::router::{Router as DispatchRouter, RouterDeps};
         use crate::routing::strategy::{FallbackStrategy, UpstreamRef};
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -176,14 +176,15 @@ mod tests {
             &crate::config::schema::RateLimitConfig::default(),
         )) as Arc<dyn crate::ratelimit::AdmissionControl>;
         let metrics = crate::metrics::MetricsCollector::new();
-        let router = DispatchRouter::new(
+        let router = DispatchRouter::new(RouterDeps {
             candidates,
-            vec![provider],
-            Arc::new(FallbackStrategy) as Arc<dyn crate::routing::strategy::RoutingStrategy>,
+            providers: vec![provider],
+            strategy: Arc::new(FallbackStrategy)
+                as Arc<dyn crate::routing::strategy::RoutingStrategy>,
             health,
             admission,
-            Arc::clone(&metrics),
-        );
+            metrics: Arc::clone(&metrics),
+        });
 
         let state = EntrypointState {
             dispatch_router: Arc::new(arc_swap::ArcSwap::from_pointee(router)),

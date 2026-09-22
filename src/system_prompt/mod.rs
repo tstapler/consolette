@@ -17,6 +17,52 @@ use cache_aligner::should_add_cache_control;
 use quantum_lock::stabilize_dynamic_fragments;
 use verbosity::{is_continuation_turn, verbosity_suffix};
 
+/// Constant note appended to system prompts for non-vision upstreams.
+pub const NON_VISION_SYSTEM_NOTE: &str = "\n\n[System Override]: You are running on a text-only model without vision capabilities. You CANNOT view images or use the Read tool on image files directly. If [Image #1] or image attachments appear in the conversation, do NOT attempt to invoke the Read tool on image file paths. Rely on provided text transcriptions or ask the user to paste raw text.";
+
+/// Determine if a model name supports vision / image content natively.
+#[must_use]
+pub fn is_vision_model(model_name: &str) -> bool {
+    let lower = model_name.to_lowercase();
+    if lower.contains("deepseek") {
+        return lower.contains("vl") || lower.contains("vision");
+    }
+    if lower.contains("qwen") {
+        return lower.contains("vl") || lower.contains("vision");
+    }
+    if lower.contains("llama") {
+        return lower.contains("vision") || lower.contains("3.2");
+    }
+    if lower.contains("mistral") || lower.contains("codestral") {
+        return lower.contains("pixtral") || lower.contains("vision");
+    }
+    true
+}
+
+/// Neutralize misleading vision instructions in system prompt and inject a
+/// system note for non-vision upstreams.
+#[must_use]
+pub fn patch_non_vision_system_prompt(text: &str) -> String {
+    let mut patched = text
+        .replace(
+            "Reads images (PNG, JPG, …) and presents them visually.",
+            "Reads text files.",
+        )
+        .replace(
+            "Reads images (PNG, JPG, ...) and presents them visually.",
+            "Reads text files.",
+        )
+        .replace(
+            "I have image-reading capabilities through the Read tool.",
+            "I do not have direct image-reading capabilities.",
+        );
+
+    if !patched.contains("[System Override]: You are running on a text-only model") {
+        patched.push_str(NON_VISION_SYSTEM_NOTE);
+    }
+    patched
+}
+
 pub struct SystemPromptPipeline {
     config: Arc<Config>,
 }
@@ -28,17 +74,22 @@ impl SystemPromptPipeline {
     }
 
     /// Apply `CacheAligner` + Verbosity Steering in a single pass.
-    ///
-    /// Input cases handled:
-    /// 1. No `system` field → optionally inject verbosity-only block (no `cache_control`)
-    /// 2. `system` is a `String` → convert to block 0, apply pipeline
-    /// 3. `system` is an `Array` → use as-is, apply pipeline
-    ///
-    /// Output: `system` field replaced with a 1- or 2-element block array.
     #[must_use]
-    pub fn apply(&self, mut body: Value) -> Value {
+    pub fn apply(&self, body: Value) -> Value {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        self.apply_for_model(body, &model)
+    }
+
+    /// Apply `CacheAligner` + Verbosity Steering + Vision System Prompt Patching.
+    #[must_use]
+    pub fn apply_for_model(&self, mut body: Value, model_name: &str) -> Value {
         let verbosity = self.config.verbosity_level;
         let cache_aligner = self.config.cache_aligner;
+        let supports_vision = is_vision_model(model_name);
 
         // Determine if this is a continuation turn (tool results only).
         let is_continuation = body
@@ -56,23 +107,40 @@ impl SystemPromptPipeline {
 
         match system {
             None => {
-                // No system prompt. Only act if verbosity suffix is needed.
+                let mut text = String::new();
+                if !supports_vision {
+                    text.push_str(NON_VISION_SYSTEM_NOTE.trim_start());
+                }
                 if !suffix.is_empty() {
-                    let block = json!({"type": "text", "text": suffix});
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(suffix);
+                }
+                if !text.is_empty() {
+                    let block = json!({"type": "text", "text": text});
                     body["system"] = json!([block]);
                 }
-                // Both features off or not a continuation → no-op.
             }
 
             Some(Value::String(s)) => {
-                let blocks = build_output_blocks(&s, suffix, cache_aligner);
+                let text = if supports_vision {
+                    s
+                } else {
+                    patch_non_vision_system_prompt(&s)
+                };
+                let blocks = build_output_blocks(&text, suffix, cache_aligner);
                 body["system"] = json!(blocks);
             }
 
             Some(Value::Array(arr)) => {
-                // Concatenate all text content from the original blocks into a single string.
                 let combined = extract_text_from_blocks(&arr);
-                let blocks = build_output_blocks(&combined, suffix, cache_aligner);
+                let text = if supports_vision {
+                    combined
+                } else {
+                    patch_non_vision_system_prompt(&combined)
+                };
+                let blocks = build_output_blocks(&text, suffix, cache_aligner);
                 body["system"] = json!(blocks);
             }
 
@@ -268,5 +336,26 @@ mod tests {
         let text = system[0]["text"].as_str().unwrap();
         assert!(text.contains("helpful assistant"));
         assert!(text.contains("Always be polite"));
+    }
+
+    #[test]
+    fn vision_model_detection_correctness() {
+        assert!(!is_vision_model("deepseek-r1"));
+        assert!(!is_vision_model("deepseek-v3"));
+        assert!(!is_vision_model("qwen-2.5-coder-32b"));
+        assert!(!is_vision_model("llama-3.3-70b"));
+        assert!(is_vision_model("claude-3-5-sonnet"));
+        assert!(is_vision_model("gpt-4o"));
+        assert!(is_vision_model("deepseek-vl-7b"));
+        assert!(is_vision_model("qwen-vl-max"));
+    }
+
+    #[test]
+    fn non_vision_system_prompt_patching() {
+        let text = "Reads images (PNG, JPG, ...) and presents them visually. I have image-reading capabilities through the Read tool.";
+        let patched = patch_non_vision_system_prompt(text);
+        assert!(patched.contains("Reads text files."));
+        assert!(patched.contains("I do not have direct image-reading capabilities."));
+        assert!(patched.contains("[System Override]: You are running on a text-only model"));
     }
 }

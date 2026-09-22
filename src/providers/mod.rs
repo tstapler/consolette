@@ -498,7 +498,26 @@ pub(crate) fn extract_text_from_content(content: &serde_json::Value) -> String {
     match content {
         Value::Array(arr) => arr
             .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .filter_map(|b| {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    Some(t.to_string())
+                } else if b.get("type").and_then(Value::as_str) == Some("image") {
+                    let source = b.get("source");
+                    let data = source.and_then(|s| s.get("data")).and_then(Value::as_str);
+                    let media_type = source
+                        .and_then(|s| s.get("media_type"))
+                        .and_then(Value::as_str);
+                    if let Some(data) = data {
+                        Some(crate::vision::extract_text_from_base64_image(
+                            data, media_type,
+                        ))
+                    } else {
+                        Some("[Attached Image: missing base64 source]".to_string())
+                    }
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         Value::String(s) => s.clone(),
@@ -712,10 +731,21 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
     // Gate on the effective model id so tolerant backends keep full schemas.
     let cohere_subset = model.to_lowercase().contains("cohere");
 
+    let supports_vision = crate::system_prompt::is_vision_model(&model);
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(system) = anthropic.get("system").and_then(Value::as_str) {
-        messages.push(json!({"role": "system", "content": system}));
+        let text = if supports_vision {
+            system.to_string()
+        } else {
+            crate::system_prompt::patch_non_vision_system_prompt(system)
+        };
+        messages.push(json!({"role": "system", "content": text}));
+    } else if !supports_vision {
+        messages.push(json!({
+            "role": "system",
+            "content": crate::system_prompt::NON_VISION_SYSTEM_NOTE.trim_start()
+        }));
     }
 
     if let Some(anthropic_messages) = anthropic.get("messages").and_then(Value::as_array) {
@@ -768,14 +798,27 @@ fn anthropic_blocks_to_openai(role: &str, blocks: &[serde_json::Value]) -> Vec<s
     use serde_json::Value;
 
     let mut out = Vec::new();
-    let mut text_parts: Vec<&str> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in blocks {
         match b.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(Value::as_str) {
-                    text_parts.push(t);
+                    text_parts.push(t.to_string());
                 }
+            }
+            Some("image") => {
+                let source = b.get("source");
+                let data = source.and_then(|s| s.get("data")).and_then(Value::as_str);
+                let media_type = source
+                    .and_then(|s| s.get("media_type"))
+                    .and_then(Value::as_str);
+                let ocr_text = if let Some(data) = data {
+                    crate::vision::extract_text_from_base64_image(data, media_type)
+                } else {
+                    "[Attached Image: missing base64 source]".to_string()
+                };
+                text_parts.push(ocr_text);
             }
             Some("tool_use") => {
                 let id = b
@@ -805,8 +848,6 @@ fn anthropic_blocks_to_openai(role: &str, blocks: &[serde_json::Value]) -> Vec<s
                     "content": text
                 }));
             }
-            // thinking/redacted_thinking/image/etc: not representable for
-            // a foreign upstream; dropped.
             _ => {}
         }
     }
@@ -1722,6 +1763,39 @@ mod tests {
         assert!(openai.get("max_tokens").is_none());
         assert!(openai.get("temperature").is_none());
         assert_eq!(openai["stream"], json!(false));
+    }
+
+    #[test]
+    fn translate_anthropic_request_to_openai_non_vision_patches_system_and_transcribes_images() {
+        let anthropic = json!({
+            "model": "deepseek-r1",
+            "system": "Reads images (PNG, JPG, ...) and presents them visually.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Check log:"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8="
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let openai = translate_anthropic_request_to_openai(&anthropic);
+        let sys_content = openai["messages"][0]["content"].as_str().unwrap();
+        assert!(sys_content.contains("Reads text files."));
+        assert!(sys_content.contains("[System Override]: You are running on a text-only model"));
+
+        let user_content = openai["messages"][1]["content"].as_str().unwrap();
+        assert!(user_content.contains("Check log:"));
+        assert!(user_content.contains("Attached Image"));
     }
 
     #[test]

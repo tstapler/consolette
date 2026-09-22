@@ -219,6 +219,7 @@ mod tests {
             name: name.to_string(),
             weight: 1.0,
             model: None,
+            model_family: None,
         }
     }
 
@@ -412,6 +413,7 @@ mod tests {
                 name: "openrouter".to_string(),
                 weight: 1.0,
                 model: Some("a/b:free".to_string()),
+                model_family: None,
             }],
             providers,
             strategy: Arc::clone(&strategy) as Arc<dyn RoutingStrategy>,

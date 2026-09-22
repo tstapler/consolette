@@ -158,6 +158,14 @@ pub struct RouteUpstreamRef {
     /// model instead of forwarding whatever the client requested.
     #[serde(default)]
     pub model: Option<String>,
+    /// Opts a `kind = "openai"` upstream into dynamic model-family
+    /// resolution (e.g. `"gpt-5"`) instead of a static `model` pin, so
+    /// consolette can auto-discover and fail over across that family's live
+    /// catalog. Mutually exclusive with `model` and only valid on
+    /// `kind = "openai"` upstreams — enforced by
+    /// `validate::validate_model_selectors`, not by the type here.
+    #[serde(default)]
+    pub model_family: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -367,11 +375,13 @@ impl Default for Config {
                         name: "anthropic".to_string(),
                         weight: None,
                         model: None,
+                        model_family: None,
                     },
                     RouteUpstreamRef {
                         name: "bedrock".to_string(),
                         weight: None,
                         model: None,
+                        model_family: None,
                     },
                 ],
             }],
@@ -386,6 +396,47 @@ impl Default for Config {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{Config, Strategy, UpstreamKind};
+
+    // Story 1.2.1 (openai-model-resolution): `model_family` deserializes
+    // additively alongside the existing `model` field.
+
+    #[test]
+    fn route_upstream_ref_should_deserialize_model_family_only_config_with_model_none() {
+        let toml = r#"
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "model-gateway-openai"
+model_family = "gpt-5"
+"#;
+
+        let config: Config = toml::from_str(toml).expect("fragment should parse");
+
+        let route_upstream = &config.routes[0].upstreams[0];
+        assert_eq!(route_upstream.model_family, Some("gpt-5".to_string()));
+        assert_eq!(route_upstream.model, None);
+    }
+
+    #[test]
+    fn route_upstream_ref_should_leave_model_family_none_when_only_model_set() {
+        let toml = r#"
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "model-gateway-openai"
+model = "gpt-5.1"
+"#;
+
+        let config: Config = toml::from_str(toml).expect("fragment should parse");
+
+        let route_upstream = &config.routes[0].upstreams[0];
+        assert_eq!(route_upstream.model, Some("gpt-5.1".to_string()));
+        assert_eq!(route_upstream.model_family, None);
+    }
 
     // REQ-1 (Story 1.1.1): `UpstreamKind::Gemini` parses with a required
     // `project_id`, and fails to parse without one.

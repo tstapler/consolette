@@ -252,12 +252,14 @@ fn weighted_router_with_a_cooled_down() -> (Router, Arc<AtomicU32>, Arc<AtomicU3
                 name: "a".to_string(),
                 weight: 0.7,
                 model: None,
+                model_family: None,
             },
             UpstreamRef {
                 index: 1,
                 name: "b".to_string(),
                 weight: 0.3,
                 model: None,
+                model_family: None,
             },
         ],
         providers,
@@ -286,4 +288,156 @@ async fn weighted_never_selects_a_cooled_down_upstream() {
         "cooled upstream must never be selected"
     );
     assert_eq!(b_calls.load(Ordering::SeqCst), 10);
+}
+
+// ── model_family propagation (openai-model-resolution Epic 1.2/1.3) ──
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn dispatch_should_inject_internal_model_family_body_key_when_chosen_candidate_has_model_family(
+) {
+    let received_body = Arc::new(std::sync::Mutex::new(None));
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
+        name: "family",
+        received_body: received_body.clone(),
+    })];
+    let router = Router::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "family".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: Some("gpt-5".to_string()),
+        }],
+        providers,
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(AlwaysAllow),
+        metrics: MetricsCollector::new(),
+    });
+
+    let res = router
+        .dispatch(
+            serde_json::json!({"model": "claude-sonnet-4-5"}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    assert!(res.is_ok());
+    let body = received_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("provider must have been called");
+    assert_eq!(
+        body[crate::providers::openai::MODEL_FAMILY_BODY_KEY],
+        serde_json::json!("gpt-5")
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn dispatch_should_leave_request_body_unchanged_when_chosen_candidate_has_no_model_family() {
+    let received_body = Arc::new(std::sync::Mutex::new(None));
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(CapturingProvider {
+        name: "no-family",
+        received_body: received_body.clone(),
+    })];
+    let router = Router::new(RouterDeps {
+        candidates: vec![upstream(0, "no-family")],
+        providers,
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(AlwaysAllow),
+        metrics: MetricsCollector::new(),
+    });
+
+    let sent = serde_json::json!({"model": "claude-sonnet-4-5"});
+    let res = router
+        .dispatch(sent.clone(), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok());
+    let body = received_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("provider must have been called");
+    assert_eq!(body, sent);
+    assert!(body
+        .get(crate::providers::openai::MODEL_FAMILY_BODY_KEY)
+        .is_none());
+}
+
+// ── Story 2.3.4 (openai-model-resolution plan.md): resolution exhaustion
+// must never trip `HealthRegistry` state beyond what an ordinary
+// `Upstream{..}` error already does today (pitfalls.md's "the single most
+// important thing to guard"). This test is a verification gate, not a
+// feature — plan.md: "This test failing blocks Phase 2 completion." ──
+
+// *Given* a route with a single upstream whose provider returns the same
+// `ProviderError::Upstream{status: 0, ..}` shape `OpenaiProvider`'s
+// resolution walk returns on exhaustion (Epic 2.3's `walk_candidates`/Story
+// 2.3.2b), *when* `Router::dispatch` handles it, *then* `HealthRegistry`'s
+// per-upstream state (`is_available`, `remaining_secs`) is unchanged from
+// before the dispatch — the catch-all `Err(e) => { .. }` arm in `dispatch`
+// (no `health.trip()` call) already treats it exactly like any other
+// `Upstream{..}` error, with no special-casing for resolution exhaustion.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn dispatch_should_leave_health_registry_state_unchanged_when_model_family_resolution_exhausts(
+) {
+    let call_count = Arc::new(AtomicU32::new(0));
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+        name: "openai",
+        error: || ProviderError::Upstream {
+            status: 0,
+            body: "all candidates in family \"gpt-5\" exhausted".to_string(),
+        },
+        call_count: Arc::clone(&call_count),
+    })];
+    let health = Arc::new(HealthRegistry::new(300));
+    let router = Router::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "openai".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: Some("gpt-5".to_string()),
+        }],
+        providers,
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::clone(&health),
+        admission: Arc::new(AlwaysAllow),
+        metrics: MetricsCollector::new(),
+    });
+
+    let before_available = health.is_available(0);
+    let before_remaining = health.remaining_secs(0);
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(
+        matches!(res, Err(ProviderError::Upstream { status: 0, .. })),
+        "expected the resolution-exhaustion-shaped Upstream error to propagate"
+    );
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        health.is_available(0),
+        before_available,
+        "resolution exhaustion must not change HealthRegistry availability"
+    );
+    assert_eq!(
+        health.remaining_secs(0),
+        before_remaining,
+        "resolution exhaustion must not trip a cooldown"
+    );
+    assert!(
+        health.is_available(0),
+        "an ordinary Upstream{{..}} error must never trip cooldown on its own"
+    );
 }

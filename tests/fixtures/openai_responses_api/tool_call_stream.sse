@@ -1,0 +1,27 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_68f1b1c2d3e4f5060000000000000010","object":"response","created_at":1758000100,"status":"in_progress","model":"gpt-4.1-mini","output":[],"parallel_tool_calls":true,"tool_choice":"auto","tools":[{"type":"function","name":"get_weather","description":"Get the current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_68f1b1c2d3e4f5060000000000000010","object":"response","created_at":1758000100,"status":"in_progress","model":"gpt-4.1-mini","output":[],"parallel_tool_calls":true,"tool_choice":"auto","tools":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"fc_68f1b1c2d3e4f5060000000000000011","type":"function_call","status":"in_progress","call_id":"call_5c2b6a0f9d1e4c3a8b7f6e5d4c3b2a1f","name":"get_weather","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":3,"item_id":"fc_68f1b1c2d3e4f5060000000000000011","output_index":0,"delta":"{\"city\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":4,"item_id":"fc_68f1b1c2d3e4f5060000000000000011","output_index":0,"delta":"\"San Fra"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":5,"item_id":"fc_68f1b1c2d3e4f5060000000000000011","output_index":0,"delta":"ncisco\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":6,"item_id":"fc_68f1b1c2d3e4f5060000000000000011","output_index":0,"arguments":"{\"city\":\"San Francisco\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":7,"output_index":0,"item":{"id":"fc_68f1b1c2d3e4f5060000000000000011","type":"function_call","status":"completed","call_id":"call_5c2b6a0f9d1e4c3a8b7f6e5d4c3b2a1f","name":"get_weather","arguments":"{\"city\":\"San Francisco\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":8,"response":{"id":"resp_68f1b1c2d3e4f5060000000000000010","object":"response","created_at":1758000100,"status":"completed","model":"gpt-4.1-mini","output":[{"id":"fc_68f1b1c2d3e4f5060000000000000011","type":"function_call","status":"completed","call_id":"call_5c2b6a0f9d1e4c3a8b7f6e5d4c3b2a1f","name":"get_weather","arguments":"{\"city\":\"San Francisco\"}"}],"parallel_tool_calls":true,"tool_choice":"auto","tools":[],"usage":{"input_tokens":42,"output_tokens":11,"total_tokens":53}}}
+

@@ -5,12 +5,15 @@
 //!
 //! Split by counter domain: this file holds the core per-request/per-upstream
 //! counters and the `/metrics` snapshot; [`model`] holds per-model counters,
-//! [`server_tools`] holds the emulated server-tool (search) counters.
+//! [`server_tools`] holds the emulated server-tool (search) counters,
+//! [`resolution`] holds the `openai-model-resolution` counters.
 
 mod model;
+mod resolution;
 mod server_tools;
 
 pub use model::{ModelCounters, ModelOutcome};
+pub use resolution::{ResolutionOutcome, ResolutionState};
 
 use dashmap::DashMap;
 use serde_json::{json, Value};
@@ -101,6 +104,32 @@ pub struct ProxyMetrics {
     pub duration_5_30s: AtomicU64,
     pub duration_30_60s: AtomicU64,
     pub duration_gt60s: AtomicU64,
+
+    // ---- openai-model-resolution counters (Epic 5.1) ----
+    /// Story 5.1.1: one increment per resolution-walk candidate outcome,
+    /// keyed `(upstream, family, candidate, outcome)` where `outcome` is a
+    /// [`ResolutionOutcome::label`].
+    pub resolution_attempts: DashMap<(String, String, String, String), AtomicU64>,
+    /// Story 5.1.2: cumulative, never-decrementing count of resolution walks
+    /// that exhausted every candidate for a family, keyed `(upstream,
+    /// family)`. The self-healing signal is `resolution_state` below, not
+    /// this counter.
+    pub resolution_exhausted_total: DashMap<(String, String), AtomicU64>,
+    /// Story 5.1.2: current resolution state per family (keyed by family
+    /// name), self-healing on the next successful resolution.
+    pub resolution_state: DashMap<String, ResolutionState>,
+    /// Story 5.2.1: the model id the most recent successful resolution
+    /// walk landed on, keyed by family. Cleared (not left stale) on
+    /// exhaustion, since a resolved model id from before every candidate
+    /// started failing is no longer something a caller should route to.
+    pub resolved_model: DashMap<String, String>,
+    /// Story 5.2.1: which family each upstream resolves against, keyed by
+    /// upstream name. Populated as a side effect of
+    /// `record_resolution_attempt`/`record_resolution_exhausted` (both
+    /// already know the upstream/family pair) so `to_json()` can attach
+    /// flat `resolution_*` fields to the right `providers[upstream]` entry
+    /// without needing config access — see Task 5.2.1a.
+    pub upstream_family: DashMap<String, String>,
 }
 
 impl ProxyMetrics {
@@ -201,9 +230,11 @@ impl ProxyMetrics {
         let mut provider_latency = serde_json::Map::new();
 
         for entry in &self.upstreams {
-            let (provider, latency) = Self::upstream_counters_json(entry.value());
-            providers.insert(entry.key().clone(), provider);
-            provider_latency.insert(entry.key().clone(), latency);
+            let name = entry.key().clone();
+            let (mut provider, latency) = Self::upstream_counters_json(entry.value());
+            self.merge_resolution_fields(&name, &mut provider);
+            providers.insert(name.clone(), provider);
+            provider_latency.insert(name, latency);
         }
 
         (Value::Object(providers), Value::Object(provider_latency))
@@ -349,7 +380,8 @@ impl ProxyMetrics {
                 "rate_limit": self.err_rate_limit.load(Ordering::Relaxed),
                 "validation": self.err_validation.load(Ordering::Relaxed)
             },
-            "server_tools": self.server_tools_json()
+            "server_tools": self.server_tools_json(),
+            "resolution": self.resolution_json()
         })
     }
 }

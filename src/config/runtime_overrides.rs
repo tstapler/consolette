@@ -87,6 +87,7 @@ mod tests {
                 name: "bedrock".to_string(),
                 weight: Some(1.0),
                 model: Some("override-model".to_string()),
+                model_family: None,
             }],
         }
     }

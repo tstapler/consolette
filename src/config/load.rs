@@ -10,7 +10,7 @@ use figment::Figment;
 use super::plugins;
 use super::runtime_overrides::RuntimeOverrides;
 use super::schema::{Config, Upstream, UpstreamKind};
-use super::validate::validate_references;
+use super::validate::{validate_model_selectors, validate_references};
 use super::ConfigError;
 
 /// Env overrides are restricted to a small allowlist of top-level scalars —
@@ -23,8 +23,10 @@ const ENV_ALLOWLIST: &[&str] = &["port", "log", "request_timeout", "cooldown_sec
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError`] if a conf.d file can't be read/parsed or if
-/// reference validation (upstream/route cross-references) fails.
+/// Returns [`ConfigError`] if a conf.d file can't be read/parsed, if
+/// reference validation (upstream/route cross-references) fails, or if a
+/// route upstream's `model`/`model_family` selectors are invalid (Story
+/// 1.2.2).
 pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
     let conf_d = config_dir.join("conf.d");
     let pattern = conf_d.join("*.toml");
@@ -54,6 +56,7 @@ pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
     overrides.apply(&mut config);
 
     validate_references(&config)?;
+    validate_model_selectors(&config)?;
     Ok(config)
 }
 

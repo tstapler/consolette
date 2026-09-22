@@ -15,12 +15,14 @@ fn two_free_model_candidates() -> Vec<UpstreamRef> {
             name: "openrouter".to_string(),
             weight: 1.0,
             model: Some("a/b:free".to_string()),
+            model_family: None,
         },
         UpstreamRef {
             index: 0,
             name: "openrouter".to_string(),
             weight: 1.0,
             model: Some("c/d:free".to_string()),
+            model_family: None,
         },
     ]
 }
@@ -173,6 +175,7 @@ fn openrouter_router_with_two_tripped_free_candidates(
         name: "paid".to_string(),
         weight: 1.0,
         model: None,
+        model_family: None,
     });
     let router = Router::new(RouterDeps {
         candidates,

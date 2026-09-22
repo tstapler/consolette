@@ -74,6 +74,7 @@ async fn from_config_openai_kind_builds_successfully() {
                 name: "my-openai-upstream".to_string(),
                 weight: None,
                 model: None,
+                model_family: None,
             }],
         }],
         ..Config::default()
@@ -85,6 +86,76 @@ async fn from_config_openai_kind_builds_successfully() {
         .expect("Openai-kind upstream must build a Provider");
     assert_eq!(router.candidates[0].name, "my-openai-upstream");
     assert_eq!(router.providers[0].name(), "openai");
+}
+
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn from_config_should_populate_upstream_ref_model_family_when_route_upstream_sets_it() {
+    use crate::config::schema::{Route, RouteUpstreamRef, Upstream, UpstreamKind};
+
+    let config = Config {
+        upstreams: vec![Upstream {
+            name: "my-openai-upstream".to_string(),
+            kind: UpstreamKind::Openai {
+                base_url: "https://example.invalid".to_string(),
+            },
+            auth: None,
+        }],
+        routes: vec![Route {
+            name: "default".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "my-openai-upstream".to_string(),
+                weight: None,
+                model: None,
+                model_family: Some("gpt-5".to_string()),
+            }],
+        }],
+        ..Config::default()
+    };
+
+    let router = Router::from_config(&config, MetricsCollector::new())
+        .await
+        .expect("model_family-only route upstream must build a Router");
+    assert_eq!(router.candidates[0].model_family, Some("gpt-5".to_string()));
+    assert_eq!(router.candidates[0].model, None);
+}
+
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn from_config_should_leave_upstream_ref_model_family_none_when_route_upstream_sets_model_only(
+) {
+    use crate::config::schema::{Route, RouteUpstreamRef, Upstream, UpstreamKind};
+
+    let config = Config {
+        upstreams: vec![Upstream {
+            name: "my-openai-upstream".to_string(),
+            kind: UpstreamKind::Openai {
+                base_url: "https://example.invalid".to_string(),
+            },
+            auth: None,
+        }],
+        routes: vec![Route {
+            name: "default".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "my-openai-upstream".to_string(),
+                weight: None,
+                model: Some("gpt-5.1-codex-max".to_string()),
+                model_family: None,
+            }],
+        }],
+        ..Config::default()
+    };
+
+    let router = Router::from_config(&config, MetricsCollector::new())
+        .await
+        .expect("model-only route upstream must build a Router");
+    assert_eq!(
+        router.candidates[0].model,
+        Some("gpt-5.1-codex-max".to_string())
+    );
+    assert_eq!(router.candidates[0].model_family, None);
 }
 
 #[tokio::test]
@@ -112,6 +183,7 @@ async fn from_config_multi_route_uses_first() {
             name: "bedrock".to_string(),
             weight: None,
             model: None,
+            model_family: None,
         }],
     };
     config.routes = vec![route_a, route_b];
@@ -142,7 +214,9 @@ async fn build_providers_should_construct_provider_for_upstream_kind_gemini() {
         ..Config::default()
     };
 
-    let (providers, openrouter_providers) = build_providers(&config).await.unwrap();
+    let (providers, openrouter_providers) = build_providers(&config, Arc::new(ProxyMetrics::new()))
+        .await
+        .unwrap();
 
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0].0, "gemini");
@@ -190,7 +264,9 @@ async fn build_providers_should_construct_provider_for_upstream_kind_openrouter(
         ..Config::default()
     };
 
-    let (providers, openrouter_providers) = build_providers(&config).await.unwrap();
+    let (providers, openrouter_providers) = build_providers(&config, Arc::new(ProxyMetrics::new()))
+        .await
+        .unwrap();
 
     assert_eq!(providers.len(), 2);
     assert_eq!(providers[1].0, "openrouter");
@@ -220,6 +296,7 @@ async fn from_config_should_reject_openrouter_scored_route_without_openrouter_up
                 name: "anthropic".to_string(),
                 weight: None,
                 model: None,
+                model_family: None,
             }],
         }],
         ..Config::default()
@@ -265,6 +342,7 @@ fn config_with_broken_auth_openrouter_route() -> Config {
                 name: "openrouter".to_string(),
                 weight: None,
                 model: None,
+                model_family: None,
             }],
         }],
         ..Config::default()
@@ -330,6 +408,7 @@ async fn from_config_should_reject_fallback_route_referencing_openrouter_upstrea
                 name: "or".to_string(),
                 weight: None,
                 model: None,
+                model_family: None,
             }],
         }],
         ..Config::default()
@@ -359,6 +438,7 @@ async fn from_config_should_reject_weighted_route_referencing_openrouter_upstrea
                 name: "or".to_string(),
                 weight: None,
                 model: None,
+                model_family: None,
             }],
         }],
         ..Config::default()
@@ -393,11 +473,13 @@ async fn from_config_should_reject_mixed_upstream_fallback_route_containing_open
                     name: "anthropic".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 },
                 RouteUpstreamRef {
                     name: "or".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 },
             ],
         }],
@@ -437,11 +519,13 @@ async fn from_config_should_reject_openrouter_scored_route_mixing_paid_upstream(
                     name: "or".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 },
                 RouteUpstreamRef {
                     name: "paid-anthropic".to_string(),
                     weight: None,
                     model: None,
+                    model_family: None,
                 },
             ],
         }],

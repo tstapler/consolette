@@ -67,6 +67,7 @@ async fn test_state_with_provider(
         name: "test".to_string(),
         weight: 1.0,
         model: None,
+        model_family: None,
     }];
     let health = Arc::new(HealthRegistry::new(300));
     let admission = Arc::new(crate::ratelimit::RateLimiters::new(

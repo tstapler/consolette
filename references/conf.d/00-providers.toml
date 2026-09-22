@@ -49,6 +49,18 @@ type = "bearer"
 source = "env"
 var = "OPENAI_API_KEY"
 
+# Opt-in dynamic model-family resolution (openai-model-resolution project):
+# instead of pinning a route upstream to a specific static `model`, set
+# `model_family` to a family name (e.g. "gpt-5") and consolette resolves it
+# against the upstream's live catalog, failing over across that family
+# instead of breaking outright when a pinned model gets deprecated.
+# `model` and `model_family` are mutually exclusive, and `model_family` is
+# only valid on a `kind = "openai"` route upstream.
+#
+# [[routes.upstreams]]
+# name = "openai"
+# model_family = "gpt-5"
+
 # Gemini upstream (Cloud Code Assist / Antigravity subscription), see
 # project_plans/gemini-provider/decisions/ADR-001-gemini-auth-token-source.md
 # and ADR-003-gemini-project-id-resolution.md. `project_id` is flat on the

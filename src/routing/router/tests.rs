@@ -107,6 +107,7 @@ fn upstream(index: usize, name: &str) -> UpstreamRef {
         name: name.to_string(),
         weight: 1.0,
         model: None,
+        model_family: None,
     }
 }
 

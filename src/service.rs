@@ -32,6 +32,7 @@ pub fn install(start: bool) -> anyhow::Result<()> {
     }
 
     let bin = std::env::current_exe().context("failed to resolve consolette's own binary path")?;
+    resign_in_place(&bin)?;
     let home = std::env::var("HOME").context("HOME is not set")?;
     let launch_agents_dir = PathBuf::from(&home).join("Library").join("LaunchAgents");
     let plist_path = launch_agents_dir.join(format!("{LABEL}.plist"));
@@ -65,6 +66,35 @@ pub fn install(start: bool) -> anyhow::Result<()> {
         println!("started {LABEL}");
     }
 
+    Ok(())
+}
+
+/// Force an ad-hoc re-sign of the binary `launchd` is about to exec.
+///
+/// Locally-built (`cargo build`/`cargo install`) binaries on this machine get
+/// `SIGKilled` with `EXC_CRASH (SIGKILL (Code Signature Invalid))` /
+/// `namespace: CODESIGNING, indicator: Taskgated Invalid Signature` the
+/// moment they're executed — confirmed via the macOS crash report
+/// (`~/Library/Logs/DiagnosticReports/consolette-*.ips`) and reproduced with
+/// byte-identical binaries: the same content ran fine under a fresh
+/// filename but was killed under a path that had been executed before while
+/// merely ad-hoc/linker-signed. This is a documented macOS 26 behavior, not
+/// specific to this binary or an EDR product — see docs/macos-taskgated-sigkill.md
+/// for the root cause and links to other projects (`uv`, `jcode`, Claude
+/// Code) that hit the identical failure. `xattr -d com.apple.provenance`
+/// looks like it works but is silently a no-op (kernel-managed, removal
+/// denied without error); re-signing is what actually clears the cached bad
+/// verdict, and a plain ad-hoc signature (`--sign -`) is sufficient — no
+/// Developer ID or notarization needed.
+fn resign_in_place(bin: &std::path::Path) -> anyhow::Result<()> {
+    let status = Command::new("codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(bin)
+        .status()
+        .context("failed to run `codesign` to re-sign the consolette binary")?;
+    if !status.success() {
+        bail!("`codesign --force --deep --sign -` exited with {status}");
+    }
     Ok(())
 }
 

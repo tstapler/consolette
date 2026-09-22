@@ -18,11 +18,11 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
-use crate::metrics::{MetricsCollector, RequestTimingUpdate};
+use crate::metrics::{MetricsCollector, ProxyMetrics, RequestTimingUpdate};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
-use crate::providers::openai::OpenaiProvider;
+use crate::providers::openai::{OpenaiProvider, MODEL_FAMILY_BODY_KEY};
 use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
@@ -74,6 +74,7 @@ async fn build_non_openrouter_provider(
     resolver: &Arc<dyn SecretResolver + Send + Sync>,
     exec_cache: &Arc<ExecCredentialCache>,
     request_timeout_secs: u64,
+    metrics: &Arc<ProxyMetrics>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     Ok(match &upstream.kind {
         UpstreamKind::Anthropic => Arc::new(AnthropicProvider::new(
@@ -91,6 +92,7 @@ async fn build_non_openrouter_provider(
             Arc::clone(resolver),
             Arc::clone(exec_cache),
             request_timeout_secs,
+            Arc::clone(metrics),
         )?),
         UpstreamKind::Gemini { .. } => Arc::new(GeminiProvider::new(
             Arc::new(upstream.clone()),
@@ -117,11 +119,17 @@ async fn build_provider_for_upstream(
     resolver: &Arc<dyn SecretResolver + Send + Sync>,
     exec_cache: &Arc<ExecCredentialCache>,
     request_timeout_secs: u64,
+    metrics: &Arc<ProxyMetrics>,
 ) -> anyhow::Result<(Arc<dyn Provider>, Option<Arc<OpenrouterProvider>>)> {
     if !matches!(upstream.kind, UpstreamKind::Openrouter {}) {
-        let provider =
-            build_non_openrouter_provider(upstream, resolver, exec_cache, request_timeout_secs)
-                .await?;
+        let provider = build_non_openrouter_provider(
+            upstream,
+            resolver,
+            exec_cache,
+            request_timeout_secs,
+            metrics,
+        )
+        .await?;
         return Ok((provider, None));
     }
 
@@ -159,6 +167,7 @@ async fn build_provider_for_upstream(
 /// Returns `Err` if any upstream fails to construct its `Provider`.
 pub async fn build_providers(
     config: &Config,
+    metrics: Arc<ProxyMetrics>,
 ) -> anyhow::Result<(
     Vec<(String, Arc<dyn Provider>)>,
     HashMap<usize, Arc<OpenrouterProvider>>,
@@ -169,9 +178,14 @@ pub async fn build_providers(
     let mut providers = Vec::with_capacity(config.upstreams.len());
     let mut openrouter_providers = HashMap::new();
     for (index, upstream) in config.upstreams.iter().enumerate() {
-        let (provider, openrouter_provider) =
-            build_provider_for_upstream(upstream, &resolver, &exec_cache, config.request_timeout)
-                .await?;
+        let (provider, openrouter_provider) = build_provider_for_upstream(
+            upstream,
+            &resolver,
+            &exec_cache,
+            config.request_timeout,
+            &metrics,
+        )
+        .await?;
         if let Some(openrouter_provider) = openrouter_provider {
             openrouter_providers.insert(index, openrouter_provider);
         }
@@ -337,6 +351,7 @@ fn build_route_candidates(route: &Route, config: &Config) -> anyhow::Result<Vec<
             name: route_upstream.name.clone(),
             weight: route_upstream.weight.unwrap_or(1.0),
             model: route_upstream.model.clone(),
+            model_family: route_upstream.model_family.clone(),
         });
     }
     Ok(candidates)
@@ -465,7 +480,8 @@ impl Router {
         // after.
         validate_openrouter_strategy_pairing(config)?;
 
-        let (providers, openrouter_providers) = build_providers(config).await?;
+        let (providers, openrouter_providers) =
+            build_providers(config, Arc::clone(&metrics.counters)).await?;
         let providers: Vec<Arc<dyn Provider>> = providers
             .into_iter()
             .map(|(_, provider)| provider)
@@ -523,6 +539,7 @@ impl Router {
             name: pinned.name.clone(),
             weight: pinned.weight,
             model: over.model.clone().or_else(|| pinned.model.clone()),
+            model_family: pinned.model_family.clone(),
         }]
     }
 
@@ -637,7 +654,7 @@ impl Router {
             }
 
             let provider = &self.providers[chosen.index];
-            let request_body = match &chosen.model {
+            let mut request_body = match &chosen.model {
                 Some(model) => {
                     let mut b = body.clone();
                     b["model"] = serde_json::Value::String(model.clone());
@@ -645,6 +662,9 @@ impl Router {
                 }
                 None => body.clone(),
             };
+            if let Some(family) = &chosen.model_family {
+                request_body[MODEL_FAMILY_BODY_KEY] = serde_json::Value::String(family.clone());
+            }
             let attempt_started = std::time::Instant::now();
             let outcome = provider.send(request_body, headers.clone(), stream).await;
 

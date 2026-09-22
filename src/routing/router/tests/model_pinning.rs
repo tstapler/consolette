@@ -18,6 +18,7 @@ async fn dispatch_overrides_model_field_when_upstream_pins_one() {
         name: "pinned".to_string(),
         weight: 1.0,
         model: Some("gpt-5.1-codex-max".to_string()),
+        model_family: None,
     }];
     let router = fallback_router_with_metrics(candidates, providers, &metrics);
 
@@ -130,12 +131,14 @@ fn router_with_model_aware_provider_at_index_2(
                 name: "openrouter".to_string(),
                 weight: 1.0,
                 model: Some(fail_model.to_string()),
+                model_family: None,
             },
             UpstreamRef {
                 index: 2,
                 name: "openrouter".to_string(),
                 weight: 1.0,
                 model: Some("c/d:free".to_string()),
+                model_family: None,
             },
         ],
         providers: vec![
@@ -220,12 +223,14 @@ fn router_with_model_aware_provider_at_index_3(
                 name: name.to_string(),
                 weight: 1.0,
                 model: Some(model_a.to_string()),
+                model_family: None,
             },
             UpstreamRef {
                 index: 3,
                 name: name.to_string(),
                 weight: 1.0,
                 model: Some(model_b.to_string()),
+                model_family: None,
             },
         ],
         providers,

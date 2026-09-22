@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn cache_admits_everything_but_fresh_failures() {
-        let cache = CapabilityCache::new(Duration::from_secs(60));
+        let cache = CapabilityCache::new(Duration::from_mins(1));
 
         assert!(cache.is_admitted(&None));
         assert!(cache.is_admitted(&Some("unseen/model".to_string())));
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn snapshot_reports_fresh_verdicts_with_reasons() {
-        let cache = CapabilityCache::new(Duration::from_secs(60));
+        let cache = CapabilityCache::new(Duration::from_mins(1));
         let _ = cache.set("a/m:free".to_string(), CapabilityVerdict::Pass);
         let _ = cache.set(
             "b/m:free".to_string(),

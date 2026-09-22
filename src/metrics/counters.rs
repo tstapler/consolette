@@ -30,6 +30,17 @@ pub struct UpstreamCounters {
     pub last_error_kind: std::sync::Mutex<Option<&'static str>>,
 }
 
+/// Per-model request and token statistics.
+#[derive(Default)]
+pub struct ModelCounters {
+    pub requests: AtomicU64,
+    pub input_tokens: AtomicU64,
+    pub output_tokens: AtomicU64,
+    pub total_tokens: AtomicU64,
+    pub errors: AtomicU64,
+    pub rate_limits: AtomicU64,
+}
+
 /// All proxy metrics as atomic counters.
 ///
 /// Designed for concurrent access with no locks — each field is independently
@@ -44,6 +55,9 @@ pub struct ProxyMetrics {
     /// Per-upstream breakdown, keyed by upstream config name (e.g.
     /// `"anthropic"`, `"bedrock"`, `"model-gateway-openai"`).
     pub upstreams: DashMap<String, UpstreamCounters>,
+
+    /// Per-model breakdown, keyed by model name (e.g. `"claude-sonnet-5"`, `"deepseek-r1"`).
+    pub models: DashMap<String, ModelCounters>,
 
     // ---- Error type counters ----
     pub err_timeout: AtomicU64,
@@ -102,6 +116,7 @@ impl ProxyMetrics {
             fallback_switches: AtomicU64::new(0),
 
             upstreams: DashMap::new(),
+            models: DashMap::new(),
 
             err_timeout: AtomicU64::new(0),
             err_auth: AtomicU64::new(0),
@@ -324,6 +339,57 @@ impl ProxyMetrics {
         (Value::Object(providers), Value::Object(provider_latency))
     }
 
+    pub fn record_model_attempt(&self, model: &str, is_error: bool, is_rate_limit: bool) {
+        if model.is_empty() || model == "unknown" {
+            return;
+        }
+        let entry = self.models.entry(model.to_string()).or_default();
+        entry.requests.fetch_add(1, Ordering::Relaxed);
+        if is_error {
+            entry.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_rate_limit {
+            entry.rate_limits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_model_tokens(&self, model: &str, input_tokens: u64, output_tokens: u64) {
+        if model.is_empty() || model == "unknown" {
+            return;
+        }
+        let entry = self.models.entry(model.to_string()).or_default();
+        entry
+            .input_tokens
+            .fetch_add(input_tokens, Ordering::Relaxed);
+        entry
+            .output_tokens
+            .fetch_add(output_tokens, Ordering::Relaxed);
+        entry
+            .total_tokens
+            .fetch_add(input_tokens + output_tokens, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn models_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        for entry in &self.models {
+            let k = entry.key().clone();
+            let v = entry.value();
+            map.insert(
+                k,
+                json!({
+                    "requests": v.requests.load(Ordering::Relaxed),
+                    "input_tokens": v.input_tokens.load(Ordering::Relaxed),
+                    "output_tokens": v.output_tokens.load(Ordering::Relaxed),
+                    "total_tokens": v.total_tokens.load(Ordering::Relaxed),
+                    "errors": v.errors.load(Ordering::Relaxed),
+                    "rate_limits": v.rate_limits.load(Ordering::Relaxed),
+                }),
+            );
+        }
+        Value::Object(map)
+    }
+
     /// Snapshot all counters into a `serde_json::Value` for the `/metrics` endpoint.
     #[must_use]
     // Counter values stay far below 2^52, so the `u64 as f64` conversions below
@@ -381,6 +447,7 @@ impl ProxyMetrics {
             },
             "providers": providers,
             "provider_latency": provider_latency,
+            "models": self.models_json(),
             // compression/memory/learn/count_tokens below: counters carried
             // over from the legacy proxy's metrics schema for features that
             // were never ported into `Router::dispatch()` (prompt

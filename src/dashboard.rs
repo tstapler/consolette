@@ -186,6 +186,21 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
 
     <div class="errors-section" style="margin-bottom: 24px;">
+        <div class="errors-title">Model Token Metrics & Statistics</div>
+        <table class="errors-table">
+            <thead>
+                <tr>
+                    <th>Model</th><th>Requests</th><th>Input Tokens</th>
+                    <th>Output Tokens</th><th>Total Tokens</th><th>Errors</th><th>Rate Limits</th>
+                </tr>
+            </thead>
+            <tbody id="models-body">
+                <tr><td colspan="7" class="no-errors">No model traffic recorded yet</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="errors-section" style="margin-bottom: 24px;">
         <div class="errors-title">Recent Requests</div>
         <table class="errors-table">
             <thead>
@@ -423,6 +438,23 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     document.getElementById('comp-before').textContent = (c.total_tokens_before || 0).toLocaleString();
                     document.getElementById('comp-after').textContent = (c.total_tokens_after || 0).toLocaleString();
                     document.getElementById('compression-disabled-notice').style.display = requests === 0 ? 'block' : 'none';
+                }
+
+                const modelsBody = document.getElementById('models-body');
+                if (data.models && Object.keys(data.models).length > 0) {
+                    modelsBody.innerHTML = Object.entries(data.models).map(([model, m]) =>
+                        '<tr>'
+                        + '<td><code>' + model + '</code></td>'
+                        + '<td>' + (m.requests || 0).toLocaleString() + '</td>'
+                        + '<td>' + (m.input_tokens || 0).toLocaleString() + '</td>'
+                        + '<td>' + (m.output_tokens || 0).toLocaleString() + '</td>'
+                        + '<td><strong>' + (m.total_tokens || 0).toLocaleString() + '</strong></td>'
+                        + '<td>' + (m.errors > 0 ? '<span class="error-type">' + m.errors + '</span>' : '0') + '</td>'
+                        + '<td>' + (m.rate_limits > 0 ? '<span class="error-type" style="background:#4a2a1a;color:#fca5a5">' + m.rate_limits + '</span>' : '0') + '</td>'
+                        + '</tr>'
+                    ).join('');
+                } else {
+                    modelsBody.innerHTML = '<tr><td colspan="7" class="no-errors">No model traffic recorded yet</td></tr>';
                 }
 
                 const requestsBody = document.getElementById('requests-body');

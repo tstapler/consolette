@@ -58,6 +58,13 @@ pub async fn post_v1_chat_completions(
         .await
     {
         Ok(ProviderResponse::Full(json)) => {
+            if let Some(usage) = crate::providers::extract_usage(&json) {
+                state.metrics.counters.record_model_tokens(
+                    &model,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                );
+            }
             let openai_json =
                 translate_and_record(&state.cost_tracker, &session_key, request_id, &json).await;
             (StatusCode::OK, Json(openai_json)).into_response()

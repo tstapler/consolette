@@ -803,6 +803,13 @@ impl Router {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e.kind_label())),
         };
+        let is_rate_limit = outcome
+            .err()
+            .is_some_and(super::super::providers::ProviderError::is_rate_limited);
+        let effective_model = chosen.model.as_deref().unwrap_or(model);
+        self.metrics
+            .counters
+            .record_model_attempt(effective_model, !success, is_rate_limit);
         self.strategy
             .record_outcome(chosen, duration_ms, success, error_kind);
     }

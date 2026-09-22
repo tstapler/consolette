@@ -78,6 +78,13 @@ pub async fn post_v1_messages(
         .await
     {
         Ok(ProviderResponse::Full(json)) => {
+            if let Some(usage) = crate::providers::extract_usage(&json) {
+                state.metrics.counters.record_model_tokens(
+                    &model,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                );
+            }
             crate::cost_metrics::record_actual_usage_from_anthropic_response(
                 &state.cost_tracker,
                 &session_key,

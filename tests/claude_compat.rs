@@ -167,8 +167,8 @@ fn malformed_tool_arguments_become_empty_object() {
     assert_eq!(out["content"][0]["input"], json!({}));
 }
 
-#[test]
-fn request_forwards_tools_and_choice() {
+#[tokio::test]
+async fn request_forwards_tools_and_choice() {
     // Claude Code always sends tools; dropping them silently reduces the
     // model to chatter (the other half of premature stopping).
     let anthropic = json!({
@@ -184,7 +184,7 @@ fn request_forwards_tools_and_choice() {
         "messages": [{"role": "user", "content": "what time is it"}]
     });
 
-    let out = translate_anthropic_request_to_openai(&anthropic);
+    let out = translate_anthropic_request_to_openai(&anthropic).await;
     assert_eq!(
         out["tools"],
         json!([{"type": "function", "function": {
@@ -195,8 +195,8 @@ fn request_forwards_tools_and_choice() {
     assert_eq!(out["tool_choice"], json!("auto"));
 }
 
-#[test]
-fn request_maps_tool_result_history_to_tool_role() {
+#[tokio::test]
+async fn request_maps_tool_result_history_to_tool_role() {
     // Multi-turn continuity: without this the model loses tool context and
     // the loop degrades after the first call.
     let anthropic = json!({
@@ -213,7 +213,7 @@ fn request_maps_tool_result_history_to_tool_role() {
         ]
     });
 
-    let out = translate_anthropic_request_to_openai(&anthropic);
+    let out = translate_anthropic_request_to_openai(&anthropic).await;
     let msgs = out["messages"].as_array().expect("messages array");
     assert_eq!(msgs.len(), 3);
     assert_eq!(msgs[1]["role"], json!("assistant"));

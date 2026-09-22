@@ -602,7 +602,7 @@ impl Provider for OpenrouterProvider {
             .unwrap_or("unknown")
             .to_string();
         self.check_cached_price(&model)?;
-        let openai_body = super::translate_anthropic_request_to_openai(&body);
+        let openai_body = super::translate_anthropic_request_to_openai(&body).await;
 
         if stream {
             let response = self

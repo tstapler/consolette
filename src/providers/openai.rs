@@ -351,7 +351,7 @@ impl Provider for OpenaiProvider {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let openai_body = super::translate_anthropic_request_to_openai(&body);
+        let openai_body = super::translate_anthropic_request_to_openai(&body).await;
 
         if stream {
             let response = self.send_streaming_request(openai_body).await?;

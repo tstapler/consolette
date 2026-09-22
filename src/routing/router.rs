@@ -792,7 +792,7 @@ impl Router {
             Ok(()) => {
                 self.metrics
                     .counters
-                    .record_request(upstream, true, duration_ms, 0);
+                    .record_request_success(upstream, duration_ms, 0);
                 // Story 1.4.4: a successful attempt clears the upstream's
                 // last error classification, so the dashboard self-heals
                 // instead of a single past failure permanently pinning its
@@ -802,7 +802,7 @@ impl Router {
             Err(e) => {
                 self.metrics
                     .counters
-                    .record_request(upstream, false, duration_ms, 0);
+                    .record_request_failure(upstream, duration_ms, 0);
                 self.metrics.counters.record_error_kind(e);
                 self.metrics
                     .counters
@@ -834,13 +834,15 @@ impl Router {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e.kind_label())),
         };
-        let is_rate_limit = outcome
-            .err()
-            .is_some_and(super::super::providers::ProviderError::is_rate_limited);
+        let model_outcome = match outcome {
+            Ok(()) => crate::metrics::ModelOutcome::Success,
+            Err(e) if e.is_rate_limited() => crate::metrics::ModelOutcome::RateLimited,
+            Err(_) => crate::metrics::ModelOutcome::Error,
+        };
         let effective_model = chosen.model.as_deref().unwrap_or(model);
         self.metrics
             .counters
-            .record_model_attempt(effective_model, !success, is_rate_limit);
+            .record_model_attempt(effective_model, model_outcome);
         self.strategy
             .record_outcome(chosen, duration_ms, success, error_kind);
     }

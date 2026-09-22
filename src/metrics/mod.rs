@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
 
-pub use counters::ProxyMetrics;
+pub use counters::{ModelOutcome, ProxyMetrics};
 pub use error_tracker::{AggregatedError, ErrorRecord, ErrorTracker};
 pub use histogram::DurationHistogram;
 

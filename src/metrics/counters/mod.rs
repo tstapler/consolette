@@ -2,6 +2,15 @@
 //!
 //! All counters use `AtomicU64` for lock-free concurrent access.
 //! The `ProxyMetrics` struct holds a complete snapshot of all proxy statistics.
+//!
+//! Split by counter domain: this file holds the core per-request/per-upstream
+//! counters and the `/metrics` snapshot; [`model`] holds per-model counters,
+//! [`server_tools`] holds the emulated server-tool (search) counters.
+
+mod model;
+mod server_tools;
+
+pub use model::{ModelCounters, ModelOutcome};
 
 use dashmap::DashMap;
 use serde_json::{json, Value};
@@ -30,21 +39,11 @@ pub struct UpstreamCounters {
     pub last_error_kind: std::sync::Mutex<Option<&'static str>>,
 }
 
-/// Per-model request and token statistics.
-#[derive(Default)]
-pub struct ModelCounters {
-    pub requests: AtomicU64,
-    pub input_tokens: AtomicU64,
-    pub output_tokens: AtomicU64,
-    pub total_tokens: AtomicU64,
-    pub errors: AtomicU64,
-    pub rate_limits: AtomicU64,
-}
-
 /// All proxy metrics as atomic counters.
 ///
 /// Designed for concurrent access with no locks — each field is independently
 /// updated by request handlers and background tasks.
+#[derive(Default)]
 pub struct ProxyMetrics {
     // ---- Request counters ----
     pub requests_total: AtomicU64,
@@ -107,80 +106,40 @@ pub struct ProxyMetrics {
 impl ProxyMetrics {
     /// Create a new zeroed metrics instance.
     #[must_use]
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self {
-            requests_total: AtomicU64::new(0),
-            requests_success: AtomicU64::new(0),
-            errors_total: AtomicU64::new(0),
-            fallback_switches: AtomicU64::new(0),
-
-            upstreams: DashMap::new(),
-            models: DashMap::new(),
-
-            err_timeout: AtomicU64::new(0),
-            err_auth: AtomicU64::new(0),
-            err_rate_limit: AtomicU64::new(0),
-            err_validation: AtomicU64::new(0),
-
-            tokens_before: AtomicU64::new(0),
-            tokens_after: AtomicU64::new(0),
-            requests_compressed: AtomicU64::new(0),
-
-            cache_aligner_applied: AtomicU64::new(0),
-            cache_hits_estimated: AtomicU64::new(0),
-            cache_misses_estimated: AtomicU64::new(0),
-
-            learn_patterns_found: AtomicU64::new(0),
-            verbosity_applied: AtomicU64::new(0),
-
-            memory_puts: AtomicU64::new(0),
-            memory_gets: AtomicU64::new(0),
-            memory_dedup_hits: AtomicU64::new(0),
-
-            count_tokens_total: AtomicU64::new(0),
-            count_tokens_failures: AtomicU64::new(0),
-
-            server_tool_searches_total: AtomicU64::new(0),
-            server_tool_searches_ok: AtomicU64::new(0),
-            server_tool_search_failures: AtomicU64::new(0),
-            server_tool_iterations_total: AtomicU64::new(0),
-            server_tool_backend_hits: DashMap::new(),
-
-            duration_lt1s: AtomicU64::new(0),
-            duration_1_5s: AtomicU64::new(0),
-            duration_5_30s: AtomicU64::new(0),
-            duration_30_60s: AtomicU64::new(0),
-            duration_gt60s: AtomicU64::new(0),
-        }
+        Self::default()
     }
 
-    /// Record one dispatch attempt against a specific upstream, updating the
-    /// global totals, that upstream's own bucket, and the duration
-    /// histogram bucket. Called once per upstream actually tried — a
-    /// request that fails over from upstream A to upstream B records twice,
-    /// once per attempt (`fallback_switches` tracks the failover itself).
-    pub fn record_request(
-        &self,
-        upstream: &str,
-        success: bool,
-        duration_ms: u64,
-        first_byte_ms: u64,
-    ) {
+    /// Record one successful dispatch attempt against a specific upstream,
+    /// updating the global totals, that upstream's own bucket, and the
+    /// duration histogram bucket. Called once per upstream actually tried —
+    /// a request that fails over from upstream A to upstream B records
+    /// twice, once per attempt (`fallback_switches` tracks the failover
+    /// itself).
+    pub fn record_request_success(&self, upstream: &str, duration_ms: u64, first_byte_ms: u64) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
-        if success {
-            self.requests_success.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.errors_total.fetch_add(1, Ordering::Relaxed);
-        }
-
+        self.requests_success.fetch_add(1, Ordering::Relaxed);
         let entry = self.upstreams.entry(upstream.to_string()).or_default();
         entry.requests.fetch_add(1, Ordering::Relaxed);
-        if success {
-            entry.success.fetch_add(1, Ordering::Relaxed);
-        } else {
-            entry.errors.fetch_add(1, Ordering::Relaxed);
-        }
+        entry.success.fetch_add(1, Ordering::Relaxed);
+        Self::record_upstream_timing(&entry, duration_ms, first_byte_ms);
+        drop(entry);
+        self.record_duration_bucket(duration_ms);
+    }
+
+    /// Record one failed dispatch attempt — see [`Self::record_request_success`].
+    pub fn record_request_failure(&self, upstream: &str, duration_ms: u64, first_byte_ms: u64) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.errors_total.fetch_add(1, Ordering::Relaxed);
+        let entry = self.upstreams.entry(upstream.to_string()).or_default();
+        entry.requests.fetch_add(1, Ordering::Relaxed);
+        entry.errors.fetch_add(1, Ordering::Relaxed);
+        Self::record_upstream_timing(&entry, duration_ms, first_byte_ms);
+        drop(entry);
+        self.record_duration_bucket(duration_ms);
+    }
+
+    fn record_upstream_timing(entry: &UpstreamCounters, duration_ms: u64, first_byte_ms: u64) {
         entry
             .duration_sum_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
@@ -191,26 +150,17 @@ impl ProxyMetrics {
                 .fetch_add(first_byte_ms, Ordering::Relaxed);
             entry.first_byte_count.fetch_add(1, Ordering::Relaxed);
         }
-        drop(entry);
+    }
 
-        // Duration bucket
-        match duration_ms {
-            d if d < 1_000 => {
-                self.duration_lt1s.fetch_add(1, Ordering::Relaxed);
-            }
-            d if d < 5_000 => {
-                self.duration_1_5s.fetch_add(1, Ordering::Relaxed);
-            }
-            d if d < 30_000 => {
-                self.duration_5_30s.fetch_add(1, Ordering::Relaxed);
-            }
-            d if d < 60_000 => {
-                self.duration_30_60s.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {
-                self.duration_gt60s.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+    fn record_duration_bucket(&self, duration_ms: u64) {
+        let bucket = match duration_ms {
+            d if d < 1_000 => &self.duration_lt1s,
+            d if d < 5_000 => &self.duration_1_5s,
+            d if d < 30_000 => &self.duration_5_30s,
+            d if d < 60_000 => &self.duration_30_60s,
+            _ => &self.duration_gt60s,
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Sets (or, with `None`, clears) the given upstream's most recent
@@ -224,29 +174,6 @@ impl ProxyMetrics {
             .last_error_kind
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = kind;
-    }
-
-    /// Record one emulated search against a backend (`"brave"`/`"browser"`),
-    /// updating totals, the outcome split, and the per-backend breakdown.
-    pub fn record_server_tool_search(&self, backend: &str, ok: bool) {
-        self.server_tool_searches_total
-            .fetch_add(1, Ordering::Relaxed);
-        if ok {
-            self.server_tool_searches_ok.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.server_tool_search_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        self.server_tool_backend_hits
-            .entry(backend.to_string())
-            .or_default()
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record loop iterations for one emulated request.
-    pub fn record_server_tool_iterations(&self, iterations: u64) {
-        self.server_tool_iterations_total
-            .fetch_add(iterations, Ordering::Relaxed);
     }
 
     /// Classify a dispatch failure into the `error_types` breakdown
@@ -266,128 +193,54 @@ impl ProxyMetrics {
         }
     }
 
-    /// Snapshot the server-tool emulation counters, including the
-    /// per-backend (`brave`/`browser`) breakdown for the D4 dashboard.
-    fn server_tools_json(&self) -> Value {
-        let backends: serde_json::Map<String, Value> = self
-            .server_tool_backend_hits
-            .iter()
-            .map(|entry| {
-                (
-                    entry.key().clone(),
-                    json!(entry.value().load(Ordering::Relaxed)),
-                )
-            })
-            .collect();
-        json!({
-            "searches_total": self.server_tool_searches_total.load(Ordering::Relaxed),
-            "searches_ok": self.server_tool_searches_ok.load(Ordering::Relaxed),
-            "search_failures": self.server_tool_search_failures.load(Ordering::Relaxed),
-            "iterations_total": self.server_tool_iterations_total.load(Ordering::Relaxed),
-            "by_backend": backends
-        })
-    }
-
     /// Builds the `providers` and `provider_latency` sections of `/metrics`
     /// from the per-upstream `DashMap`, one entry per upstream actually
     /// dispatched to at least once.
-    #[allow(clippy::cast_precision_loss)]
     fn upstream_json(&self) -> (Value, Value) {
         let mut providers = serde_json::Map::new();
         let mut provider_latency = serde_json::Map::new();
 
         for entry in &self.upstreams {
-            let name = entry.key().clone();
-            let c = entry.value();
-
-            let last_error_kind = *c
-                .last_error_kind
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            providers.insert(
-                name.clone(),
-                json!({
-                    "requests": c.requests.load(Ordering::Relaxed),
-                    "success": c.success.load(Ordering::Relaxed),
-                    "errors": c.errors.load(Ordering::Relaxed),
-                    "last_error_kind": last_error_kind,
-                }),
-            );
-
-            let dur_count = c.duration_count.load(Ordering::Relaxed);
-            let dur_avg = c
-                .duration_sum_ms
-                .load(Ordering::Relaxed)
-                .checked_div(dur_count)
-                .unwrap_or(0);
-            let fb_count = c.first_byte_count.load(Ordering::Relaxed);
-            let fb_avg = c
-                .first_byte_sum_ms
-                .load(Ordering::Relaxed)
-                .checked_div(fb_count)
-                .unwrap_or(0);
-            provider_latency.insert(
-                name,
-                json!({
-                    "avg_duration_ms": dur_avg,
-                    "avg_first_byte_ms": fb_avg,
-                    "requests": dur_count,
-                }),
-            );
+            let (provider, latency) = Self::upstream_counters_json(entry.value());
+            providers.insert(entry.key().clone(), provider);
+            provider_latency.insert(entry.key().clone(), latency);
         }
 
         (Value::Object(providers), Value::Object(provider_latency))
     }
 
-    pub fn record_model_attempt(&self, model: &str, is_error: bool, is_rate_limit: bool) {
-        if model.is_empty() || model == "unknown" {
-            return;
-        }
-        let entry = self.models.entry(model.to_string()).or_default();
-        entry.requests.fetch_add(1, Ordering::Relaxed);
-        if is_error {
-            entry.errors.fetch_add(1, Ordering::Relaxed);
-        }
-        if is_rate_limit {
-            entry.rate_limits.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    /// One upstream's `providers`/`provider_latency` entry pair.
+    fn upstream_counters_json(c: &UpstreamCounters) -> (Value, Value) {
+        let last_error_kind = *c
+            .last_error_kind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let provider = json!({
+            "requests": c.requests.load(Ordering::Relaxed),
+            "success": c.success.load(Ordering::Relaxed),
+            "errors": c.errors.load(Ordering::Relaxed),
+            "last_error_kind": last_error_kind,
+        });
 
-    pub fn record_model_tokens(&self, model: &str, input_tokens: u64, output_tokens: u64) {
-        if model.is_empty() || model == "unknown" {
-            return;
-        }
-        let entry = self.models.entry(model.to_string()).or_default();
-        entry
-            .input_tokens
-            .fetch_add(input_tokens, Ordering::Relaxed);
-        entry
-            .output_tokens
-            .fetch_add(output_tokens, Ordering::Relaxed);
-        entry
-            .total_tokens
-            .fetch_add(input_tokens + output_tokens, Ordering::Relaxed);
-    }
+        let dur_count = c.duration_count.load(Ordering::Relaxed);
+        let dur_avg = c
+            .duration_sum_ms
+            .load(Ordering::Relaxed)
+            .checked_div(dur_count)
+            .unwrap_or(0);
+        let fb_count = c.first_byte_count.load(Ordering::Relaxed);
+        let fb_avg = c
+            .first_byte_sum_ms
+            .load(Ordering::Relaxed)
+            .checked_div(fb_count)
+            .unwrap_or(0);
+        let latency = json!({
+            "avg_duration_ms": dur_avg,
+            "avg_first_byte_ms": fb_avg,
+            "requests": dur_count,
+        });
 
-    #[must_use]
-    pub fn models_json(&self) -> Value {
-        let mut map = serde_json::Map::new();
-        for entry in &self.models {
-            let k = entry.key().clone();
-            let v = entry.value();
-            map.insert(
-                k,
-                json!({
-                    "requests": v.requests.load(Ordering::Relaxed),
-                    "input_tokens": v.input_tokens.load(Ordering::Relaxed),
-                    "output_tokens": v.output_tokens.load(Ordering::Relaxed),
-                    "total_tokens": v.total_tokens.load(Ordering::Relaxed),
-                    "errors": v.errors.load(Ordering::Relaxed),
-                    "rate_limits": v.rate_limits.load(Ordering::Relaxed),
-                }),
-            );
-        }
-        Value::Object(map)
+        (provider, latency)
     }
 
     /// Snapshot all counters into a `serde_json::Value` for the `/metrics` endpoint.
@@ -506,6 +359,18 @@ mod tests {
     use super::*;
     use crate::providers::ProviderError;
 
+    #[allow(clippy::unwrap_used)]
+    fn assert_last_error_kind(m: &ProxyMetrics, upstream: &str, expected: Option<&str>) {
+        let entry = m.upstreams.get(upstream).unwrap();
+        assert_eq!(
+            *entry
+                .last_error_kind
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            expected
+        );
+    }
+
     #[test]
     fn record_error_kind_classifies_each_variant() {
         let m = ProxyMetrics::new();
@@ -523,8 +388,8 @@ mod tests {
     #[test]
     fn record_request_updates_totals_and_duration_bucket() {
         let m = ProxyMetrics::new();
-        m.record_request("upstream-a", true, 500, 0);
-        m.record_request("upstream-a", false, 2_000, 0);
+        m.record_request_success("upstream-a", 500, 0);
+        m.record_request_failure("upstream-a", 2_000, 0);
 
         assert_eq!(m.requests_total.load(Ordering::Relaxed), 2);
         assert_eq!(m.requests_success.load(Ordering::Relaxed), 1);
@@ -537,9 +402,9 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn record_request_tracks_any_upstream_name_independently() {
         let m = ProxyMetrics::new();
-        m.record_request("model-gateway-openai", true, 100, 20);
-        m.record_request("model-gateway-openai", true, 300, 0);
-        m.record_request("bedrock", false, 1_000, 0);
+        m.record_request_success("model-gateway-openai", 100, 20);
+        m.record_request_success("model-gateway-openai", 300, 0);
+        m.record_request_failure("bedrock", 1_000, 0);
 
         let gateway = m.upstreams.get("model-gateway-openai").unwrap();
         assert_eq!(gateway.requests.load(Ordering::Relaxed), 2);
@@ -558,62 +423,35 @@ mod tests {
 
     // REQ-10 (Story 1.4.4b/c) — focus area.
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn set_last_error_kind_should_set_to_auth_when_gemini_auth_error_recorded() {
         let m = ProxyMetrics::new();
         m.set_last_error_kind("gemini", Some("auth"));
-
-        let entry = m.upstreams.get("gemini").unwrap();
-        assert_eq!(
-            *entry
-                .last_error_kind
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Some("auth")
-        );
+        assert_last_error_kind(&m, "gemini", Some("auth"));
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn set_last_error_kind_should_overwrite_not_coexist_with_stale_prior_kind() {
         let m = ProxyMetrics::new();
         m.set_last_error_kind("gemini", Some("auth"));
         m.set_last_error_kind("gemini", Some("response_shape_mismatch"));
-
-        let entry = m.upstreams.get("gemini").unwrap();
-        assert_eq!(
-            *entry
-                .last_error_kind
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Some("response_shape_mismatch")
-        );
+        assert_last_error_kind(&m, "gemini", Some("response_shape_mismatch"));
     }
 
     // REQ-10 — the self-healing clear-on-success case (Story 1.4.4
     // acceptance criterion).
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn set_last_error_kind_should_reset_to_none_after_subsequent_success() {
         let m = ProxyMetrics::new();
         m.set_last_error_kind("gemini", Some("auth"));
         m.set_last_error_kind("gemini", None);
-
-        let entry = m.upstreams.get("gemini").unwrap();
-        assert_eq!(
-            *entry
-                .last_error_kind
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            None
-        );
+        assert_last_error_kind(&m, "gemini", None);
     }
 
     #[test]
     #[allow(clippy::unwrap_used)]
     fn to_json_should_expose_last_error_kind_per_upstream() {
         let m = ProxyMetrics::new();
-        m.record_request("gemini", false, 100, 0);
+        m.record_request_failure("gemini", 100, 0);
         m.set_last_error_kind("gemini", Some("response_shape_mismatch"));
 
         let json = m.to_json();
@@ -627,8 +465,8 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn to_json_reports_one_providers_entry_per_upstream_seen() {
         let m = ProxyMetrics::new();
-        m.record_request("anthropic", true, 100, 0);
-        m.record_request("model-gateway-openai", true, 200, 0);
+        m.record_request_success("anthropic", 100, 0);
+        m.record_request_success("model-gateway-openai", 200, 0);
 
         let json = m.to_json();
         let providers = json["providers"].as_object().unwrap();
@@ -638,26 +476,5 @@ mod tests {
 
         let latency = json["provider_latency"].as_object().unwrap();
         assert_eq!(latency["anthropic"]["avg_duration_ms"], json!(100));
-    }
-
-    #[test]
-    fn record_server_tool_search_should_label_backends_separately() {
-        let m = ProxyMetrics::new();
-        m.record_server_tool_search("brave", true);
-        m.record_server_tool_search("brave", true);
-        m.record_server_tool_search("browser", true);
-        m.record_server_tool_search("unserved", false);
-        m.record_server_tool_iterations(3);
-
-        assert_eq!(m.server_tool_searches_total.load(Ordering::Relaxed), 4);
-        assert_eq!(m.server_tool_searches_ok.load(Ordering::Relaxed), 3);
-        assert_eq!(m.server_tool_search_failures.load(Ordering::Relaxed), 1);
-        assert_eq!(m.server_tool_iterations_total.load(Ordering::Relaxed), 3);
-
-        let json = m.to_json();
-        assert_eq!(json["server_tools"]["searches_total"], json!(4));
-        assert_eq!(json["server_tools"]["by_backend"]["brave"], json!(2));
-        assert_eq!(json["server_tools"]["by_backend"]["browser"], json!(1));
-        assert_eq!(json["server_tools"]["by_backend"]["unserved"], json!(1));
     }
 }

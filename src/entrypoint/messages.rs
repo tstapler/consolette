@@ -190,22 +190,19 @@ async fn handle_emulated_search(
     .await;
 
     for _ in 0..outcome.searches_brave {
-        state
-            .metrics
-            .counters
-            .record_server_tool_search("brave", true);
+        state.metrics.counters.record_server_tool_search_ok("brave");
     }
     for _ in 0..outcome.searches_browser {
         state
             .metrics
             .counters
-            .record_server_tool_search("browser", true);
+            .record_server_tool_search_ok("browser");
     }
     for _ in 0..outcome.searches_failed {
         state
             .metrics
             .counters
-            .record_server_tool_search("unserved", false);
+            .record_server_tool_search_failed("unserved");
     }
     state
         .metrics

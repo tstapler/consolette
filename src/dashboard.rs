@@ -284,6 +284,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <script>
         let rpmChart, providerChart, durationChart, lagChart;
 
+        // Client-controlled values (e.g. the request body's `model` field)
+        // must be escaped before going into an innerHTML template string.
+        const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
         function initCharts() {
             const chartDefaults = {
                 responsive: true,
@@ -444,7 +448,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 if (data.models && Object.keys(data.models).length > 0) {
                     modelsBody.innerHTML = Object.entries(data.models).map(([model, m]) =>
                         '<tr>'
-                        + '<td><code>' + model + '</code></td>'
+                        + '<td><code>' + esc(model) + '</code></td>'
                         + '<td>' + (m.requests || 0).toLocaleString() + '</td>'
                         + '<td>' + (m.input_tokens || 0).toLocaleString() + '</td>'
                         + '<td>' + (m.output_tokens || 0).toLocaleString() + '</td>'

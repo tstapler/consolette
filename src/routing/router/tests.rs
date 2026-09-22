@@ -13,6 +13,7 @@ mod from_config;
 mod model_pinning;
 mod observability;
 mod per_model_retry;
+mod rate_limit_hold;
 mod selected_model;
 mod selection;
 

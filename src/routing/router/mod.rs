@@ -33,6 +33,17 @@ use super::openrouter_scoring::OpenrouterScoringStrategy;
 use super::session_overrides::{extract_session_id, SessionOverrideStore};
 use super::strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef, WeightedStrategy};
 
+/// `hold_for_rate_limit_cooldown`'s retry budget — how many times `dispatch`
+/// will hold and re-check candidates before giving up.
+const MAX_HOLD_RETRIES: u32 = 3;
+/// `hold_for_rate_limit_cooldown` only holds when the shortest live
+/// cooldown among candidates is at most this many seconds; a longer wait
+/// isn't worth insulating the caller from.
+const MAX_HOLD_WAIT_SECS: u64 = 15;
+/// Fixed jitter added on top of the computed wait, so a hold sleep always
+/// slightly overshoots the cooldown's expiry instead of racing it.
+const HOLD_JITTER_MS: u64 = 200;
+
 /// Owns the dispatch loop for one route: a fixed candidate list, a selection
 /// strategy, and the shared health registry. `providers` is indexed by the
 /// same upstream index as `candidates` and `HealthRegistry`.
@@ -687,16 +698,22 @@ impl Router {
     /// Insulates agents from a brief across-the-board rate-limit cooldown:
     /// when `dispatch`'s selection loop finds every candidate cooling down
     /// (not unhealthy for any other reason), holds the request and signals
-    /// a retry with `already_tried` cleared, up to 3 times, but only when
-    /// the *shortest* live cooldown among `candidates` is itself short
-    /// enough (<=15s) to be worth waiting out. Returns whether the caller
-    /// should retry.
+    /// a retry with `already_tried` cleared, up to `MAX_HOLD_RETRIES` times,
+    /// but only when the *shortest* live cooldown among `candidates` is
+    /// itself short enough (<= `MAX_HOLD_WAIT_SECS`) to be worth waiting
+    /// out. Returns whether the caller should retry.
+    ///
+    /// Worst case this adds up to `MAX_HOLD_RETRIES *
+    /// (MAX_HOLD_WAIT_SECS + HOLD_JITTER_MS)` (~45s) of latency before
+    /// `dispatch` returns an error to the caller — a caller with a tighter
+    /// timeout budget than that may see a client-side timeout before this
+    /// returns.
     async fn hold_for_rate_limit_cooldown(
         &self,
         candidates: &[UpstreamRef],
         hold_retries: &mut u32,
     ) -> bool {
-        if *hold_retries >= 3 {
+        if *hold_retries >= MAX_HOLD_RETRIES {
             return false;
         }
         let Some(wait_secs) = candidates
@@ -707,15 +724,17 @@ impl Router {
         else {
             return false;
         };
-        if wait_secs > 15 {
+        if wait_secs > MAX_HOLD_WAIT_SECS {
             return false;
         }
         tracing::info!(
-            "All upstream candidates rate-limited / cooling down. Holding request for {}s to insulate agent (attempt {}/3)...",
+            "All upstream candidates rate-limited / cooling down. Holding request for {}s to insulate agent (attempt {}/{})...",
             wait_secs,
-            *hold_retries + 1
+            *hold_retries + 1,
+            MAX_HOLD_RETRIES
         );
-        tokio::time::sleep(Duration::from_secs(wait_secs) + Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_secs(wait_secs) + Duration::from_millis(HOLD_JITTER_MS))
+            .await;
         *hold_retries += 1;
         true
     }

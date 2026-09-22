@@ -1,5 +1,5 @@
 //! Live probe: `model_family` resolution (Epic 2/4 of the
-//! `openai-model-resolution` project) against a REAL ExampleCorp Model Gateway
+//! `openai-model-resolution` project) against a REAL `ExampleCorp` Model Gateway
 //! upstream, through a running daemon (`#[ignore]` — needs VPN/SBN Dev
 //! Agent network access).
 //!
@@ -22,7 +22,7 @@
 //! lands: link this file from wherever `model_family` gets documented).
 //!
 //! To run manually, with VPN/SBN Dev Agent active:
-//! 1. Point a `consolette` daemon's config at a real ExampleCorp Model Gateway
+//! 1. Point a `consolette` daemon's config at a real `ExampleCorp` Model Gateway
 //!    OpenAI-compatible upstream with `model_family` set (see
 //!    `references/conf.d/00-providers.toml`'s `model_family` example) under
 //!    some route name, e.g. `openai-gateway-family-probe`.

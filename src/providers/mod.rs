@@ -492,15 +492,71 @@ fn openai_content_to_anthropic(content: serde_json::Value) -> serde_json::Value 
 /// of parts) or an OpenRouter-style `reasoning` value of the same shapes.
 /// Shared by the request translator and both response translators so all
 /// three agree on what "text" means.
+///
+/// A `"type":"image"` block is reported without OCR here — this helper runs
+/// in sync contexts (including `Stream::poll_next`, which can't `.await`),
+/// and none of its `OpenAI`-shaped callers can actually produce that block
+/// (`openai_content_to_anthropic` drops `image_url` parts, and `OpenAI`
+/// request/response content never uses `Anthropic`'s `"image"` shape). The
+/// one caller that can see a genuine `Anthropic` image block — `tool_result`
+/// content in `anthropic_blocks_to_openai` — uses the async
+/// `extract_text_from_content_with_ocr` below instead.
 pub(crate) fn extract_text_from_content(content: &serde_json::Value) -> String {
     use serde_json::Value;
 
     match content {
         Value::Array(arr) => arr
             .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .filter_map(|b| {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    Some(t.to_string())
+                } else if b.get("type").and_then(Value::as_str) == Some("image") {
+                    let media_type = b
+                        .get("source")
+                        .and_then(|s| s.get("media_type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png");
+                    Some(format!("[Attached Image: type={media_type}]"))
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n"),
+        Value::String(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Async counterpart to `extract_text_from_content`, for the one call site
+/// (`tool_result` content in `anthropic_blocks_to_openai`) where a genuine
+/// Anthropic `"type":"image"` block can appear and should be OCR'd rather
+/// than just reported.
+async fn extract_text_from_content_with_ocr(content: &serde_json::Value) -> String {
+    use serde_json::Value;
+
+    match content {
+        Value::Array(arr) => {
+            let mut parts = Vec::with_capacity(arr.len());
+            for b in arr {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    parts.push(t.to_string());
+                } else if b.get("type").and_then(Value::as_str) == Some("image") {
+                    let source = b.get("source");
+                    let data = source.and_then(|s| s.get("data")).and_then(Value::as_str);
+                    let media_type = source
+                        .and_then(|s| s.get("media_type"))
+                        .and_then(Value::as_str);
+                    let text = if let Some(data) = data {
+                        crate::vision::extract_text_from_base64_image(data, media_type).await
+                    } else {
+                        "[Attached Image: missing base64 source]".to_string()
+                    };
+                    parts.push(text);
+                }
+            }
+            parts.join("\n")
+        }
         Value::String(s) => s.clone(),
         _ => String::new(),
     }
@@ -690,7 +746,9 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
 ///   `tool_choice` (`auto/any/tool`) mapped; unknown shapes omitted
 /// - `model`, `max_tokens`, `temperature`, `stream` → forwarded as-is
 #[must_use]
-pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> serde_json::Value {
+pub async fn translate_anthropic_request_to_openai(
+    anthropic: &serde_json::Value,
+) -> serde_json::Value {
     use serde_json::Value;
 
     let model = anthropic
@@ -712,10 +770,21 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
     // Gate on the effective model id so tolerant backends keep full schemas.
     let cohere_subset = model.to_lowercase().contains("cohere");
 
+    let supports_vision = crate::system_prompt::is_vision_model(&model);
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(system) = anthropic.get("system").and_then(Value::as_str) {
-        messages.push(json!({"role": "system", "content": system}));
+        let text = if supports_vision {
+            system.to_string()
+        } else {
+            crate::system_prompt::patch_non_vision_system_prompt(system)
+        };
+        messages.push(json!({"role": "system", "content": text}));
+    } else if !supports_vision {
+        messages.push(json!({
+            "role": "system",
+            "content": crate::system_prompt::NON_VISION_SYSTEM_NOTE.trim_start()
+        }));
     }
 
     if let Some(anthropic_messages) = anthropic.get("messages").and_then(Value::as_array) {
@@ -723,7 +792,7 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
             let content = msg.get("content").cloned().unwrap_or(Value::Null);
             if let Value::Array(blocks) = content {
-                messages.extend(anthropic_blocks_to_openai(role, &blocks));
+                messages.extend(anthropic_blocks_to_openai(role, &blocks, supports_vision).await);
             } else {
                 let text = extract_text_from_content(&content);
                 messages.push(json!({"role": role, "content": text}));
@@ -764,18 +833,40 @@ pub fn translate_anthropic_request_to_openai(anthropic: &serde_json::Value) -> s
 /// `tool_calls`; each user `tool_result` becomes its own `{role:"tool"}`
 /// message; a user turn already fully expressed as tool message(s) yields
 /// nothing more (avoids a duplicate empty user message).
-fn anthropic_blocks_to_openai(role: &str, blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
+///
+/// `supports_vision` gates image handling: a vision-capable upstream gets
+/// the block silently dropped (matches `main`'s pre-OCR behavior — real
+/// `image_url` forwarding is a separate, unimplemented feature), a
+/// non-vision upstream gets an OCR transcription instead.
+async fn anthropic_blocks_to_openai(
+    role: &str,
+    blocks: &[serde_json::Value],
+    supports_vision: bool,
+) -> Vec<serde_json::Value> {
     use serde_json::Value;
 
     let mut out = Vec::new();
-    let mut text_parts: Vec<&str> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in blocks {
         match b.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(Value::as_str) {
-                    text_parts.push(t);
+                    text_parts.push(t.to_string());
                 }
+            }
+            Some("image") if !supports_vision => {
+                let source = b.get("source");
+                let data = source.and_then(|s| s.get("data")).and_then(Value::as_str);
+                let media_type = source
+                    .and_then(|s| s.get("media_type"))
+                    .and_then(Value::as_str);
+                let ocr_text = if let Some(data) = data {
+                    crate::vision::extract_text_from_base64_image(data, media_type).await
+                } else {
+                    "[Attached Image: missing base64 source]".to_string()
+                };
+                text_parts.push(ocr_text);
             }
             Some("tool_use") => {
                 let id = b
@@ -795,18 +886,16 @@ fn anthropic_blocks_to_openai(role: &str, blocks: &[serde_json::Value]) -> Vec<s
             }
             Some("tool_result") => {
                 let call_id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                let text = b
-                    .get("content")
-                    .map(extract_text_from_content)
-                    .unwrap_or_default();
+                let text = match b.get("content") {
+                    Some(content) => extract_text_from_content_with_ocr(content).await,
+                    None => String::new(),
+                };
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
                     "content": text
                 }));
             }
-            // thinking/redacted_thinking/image/etc: not representable for
-            // a foreign upstream; dropped.
             _ => {}
         }
     }
@@ -1688,8 +1777,8 @@ mod tests {
         assert_eq!(report.pending_count, 2);
     }
 
-    #[test]
-    fn translate_anthropic_request_to_openai_flattens_system_and_content_blocks() {
+    #[tokio::test]
+    async fn translate_anthropic_request_to_openai_flattens_system_and_content_blocks() {
         let anthropic = json!({
             "model": "claude-sonnet-5",
             "max_tokens": 512,
@@ -1700,7 +1789,7 @@ mod tests {
             ],
         });
 
-        let openai = translate_anthropic_request_to_openai(&anthropic);
+        let openai = translate_anthropic_request_to_openai(&anthropic).await;
 
         assert_eq!(openai["model"], json!("claude-sonnet-5"));
         assert_eq!(openai["max_tokens"], json!(512));
@@ -1714,14 +1803,90 @@ mod tests {
         );
     }
 
-    #[test]
-    fn translate_anthropic_request_to_openai_omits_absent_optional_fields() {
+    #[tokio::test]
+    async fn translate_anthropic_request_to_openai_omits_absent_optional_fields() {
         let anthropic = json!({"model": "claude-sonnet-5", "messages": []});
-        let openai = translate_anthropic_request_to_openai(&anthropic);
+        let openai = translate_anthropic_request_to_openai(&anthropic).await;
 
         assert!(openai.get("max_tokens").is_none());
         assert!(openai.get("temperature").is_none());
         assert_eq!(openai["stream"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn translate_anthropic_request_to_openai_non_vision_patches_system_and_transcribes_images(
+    ) {
+        let anthropic = json!({
+            "model": "deepseek-r1",
+            "system": "Reads images (PNG, JPG, ...) and presents them visually.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Check log:"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8="
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let openai = translate_anthropic_request_to_openai(&anthropic).await;
+        let sys_content = openai["messages"][0]["content"].as_str().unwrap();
+        assert!(sys_content.contains("Reads text files."));
+        assert!(sys_content.contains("[System Override]: You are running on a text-only model"));
+
+        let user_content = openai["messages"][1]["content"].as_str().unwrap();
+        assert!(user_content.contains("Check log:"));
+        assert!(user_content.contains("Attached Image"));
+    }
+
+    #[tokio::test]
+    async fn translate_anthropic_request_to_openai_vision_model_drops_image_block() {
+        let anthropic = json!({
+            "model": "gpt-4o",
+            "system": "Reads images (PNG, JPG, ...) and presents them visually.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Check log:"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8="
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let openai = translate_anthropic_request_to_openai(&anthropic).await;
+
+        // Vision-capable model: system prompt is left untouched (no
+        // non-vision patch/override note)...
+        let sys_content = openai["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            sys_content,
+            "Reads images (PNG, JPG, ...) and presents them visually."
+        );
+
+        // ...and the image block is dropped rather than OCR'd (matches
+        // main's pre-PR behavior for a foreign upstream), leaving only the
+        // text block's content.
+        let user_content = openai["messages"][1]["content"].as_str().unwrap();
+        assert_eq!(user_content, "Check log:");
+        assert!(!user_content.contains("OCR"));
+        assert!(!user_content.contains("Attached Image"));
     }
 
     #[test]
@@ -2358,8 +2523,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn translate_anthropic_request_to_openai_applies_cohere_subset_by_model_id() {
+    #[tokio::test]
+    async fn translate_anthropic_request_to_openai_applies_cohere_subset_by_model_id() {
         // The same tool schema keeps its anchored pattern for tolerant
         // backends (Laguna) but loses it for Cohere-bound models.
         let request = |model: &str| {
@@ -2376,7 +2541,8 @@ mod tests {
             })
         };
 
-        let cohere = translate_anthropic_request_to_openai(&request("cohere/north-mini-code:free"));
+        let cohere =
+            translate_anthropic_request_to_openai(&request("cohere/north-mini-code:free")).await;
         assert!(
             cohere["tools"][0]["function"]["parameters"]["properties"]["v"]
                 .get("pattern")
@@ -2384,7 +2550,8 @@ mod tests {
             "Cohere-bound request must drop anchored patterns"
         );
 
-        let laguna = translate_anthropic_request_to_openai(&request("poolside/laguna-s-2.1:free"));
+        let laguna =
+            translate_anthropic_request_to_openai(&request("poolside/laguna-s-2.1:free")).await;
         assert_eq!(
             laguna["tools"][0]["function"]["parameters"]["properties"]["v"]["pattern"],
             json!("^[a-z]+$")

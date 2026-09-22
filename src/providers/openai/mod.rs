@@ -693,7 +693,7 @@ impl Provider for OpenaiProvider {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string();
-            let responses_body = responses::translate_anthropic_request_to_responses(body);
+            let responses_body = responses::translate_anthropic_request_to_responses(body).await;
             if stream {
                 let response = match self.send_responses_streaming_request(responses_body).await {
                     Ok(response) => response,
@@ -729,7 +729,7 @@ impl Provider for OpenaiProvider {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let mut openai_body = super::translate_anthropic_request_to_openai(&body);
+        let mut openai_body = super::translate_anthropic_request_to_openai(&body).await;
         // Story 4.1.2: post-process the body the shared translator already
         // produced — never widen `translate_anthropic_request_to_openai`
         // itself, since `OpenrouterProvider::send` calls it too
@@ -1343,7 +1343,7 @@ mod tests {
                 "model": "gpt-5.1-codex-max",
                 "messages": [{"role": "user", "content": "hi"}],
             });
-            let expected = crate::providers::translate_anthropic_request_to_openai(&body);
+            let expected = crate::providers::translate_anthropic_request_to_openai(&body).await;
 
             let result = provider.send(body, HeaderMap::new(), false).await;
             assert!(result.is_ok());

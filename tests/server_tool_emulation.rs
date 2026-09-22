@@ -287,17 +287,18 @@ async fn state_with_response(
         model: None,
         model_family: None,
     }];
-    let router = consolette::routing::router::Router::new(
-        candidates,
-        vec![provider],
-        Arc::new(consolette::routing::strategy::FallbackStrategy)
-            as Arc<dyn consolette::routing::strategy::RoutingStrategy>,
-        Arc::new(consolette::routing::health::HealthRegistry::new(300)),
-        Arc::new(consolette::ratelimit::RateLimiters::new(
-            &consolette::config::schema::RateLimitConfig::default(),
-        )) as Arc<dyn consolette::ratelimit::AdmissionControl>,
-        consolette::metrics::MetricsCollector::new(),
-    );
+    let router =
+        consolette::routing::router::Router::new(consolette::routing::router::RouterDeps {
+            candidates,
+            providers: vec![provider],
+            strategy: Arc::new(consolette::routing::strategy::FallbackStrategy)
+                as Arc<dyn consolette::routing::strategy::RoutingStrategy>,
+            health: Arc::new(consolette::routing::health::HealthRegistry::new(300)),
+            admission: Arc::new(consolette::ratelimit::RateLimiters::new(
+                &consolette::config::schema::RateLimitConfig::default(),
+            )) as Arc<dyn consolette::ratelimit::AdmissionControl>,
+            metrics: consolette::metrics::MetricsCollector::new(),
+        });
     let state = consolette::entrypoint::EntrypointState {
         dispatch_router: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
         cost_tracker: Arc::new(

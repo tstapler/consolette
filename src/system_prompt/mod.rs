@@ -17,6 +17,63 @@ use cache_aligner::should_add_cache_control;
 use quantum_lock::stabilize_dynamic_fragments;
 use verbosity::{is_continuation_turn, verbosity_suffix};
 
+/// Constant note appended to system prompts for non-vision upstreams.
+pub const NON_VISION_SYSTEM_NOTE: &str = "\n\n[System Override]: You are running on a text-only model without vision capabilities. You CANNOT view images or use the Read tool on image files directly. If [Image #1] or image attachments appear in the conversation, do NOT attempt to invoke the Read tool on image file paths. Rely on provided text transcriptions or ask the user to paste raw text.";
+
+/// Determine if a model name supports vision / image content natively.
+///
+/// Defaults to `true` (vision-capable, no OCR/system-note) for any model
+/// that doesn't match one of the known non-vision substrings below. This
+/// codebase routes to a huge, open-ended model catalog (`OpenRouter` alone
+/// serves hundreds of models across many vendors — see
+/// `providers::openrouter::models`), so an exhaustive vision/non-vision
+/// allowlist isn't practical to keep current; most paid API models (GPT,
+/// Claude, Gemini, and most `OpenRouter` listings) are vision-capable, and
+/// only a handful of free-tier/text-only families commonly aren't. Extend
+/// the excluded list below as new non-vision families show up — don't rely
+/// on it being exhaustive.
+#[must_use]
+pub fn is_vision_model(model_name: &str) -> bool {
+    let lower = model_name.to_lowercase();
+    if lower.contains("deepseek") {
+        return lower.contains("vl") || lower.contains("vision");
+    }
+    if lower.contains("qwen") {
+        return lower.contains("vl") || lower.contains("vision");
+    }
+    if lower.contains("llama") {
+        return lower.contains("vision") || lower.contains("3.2");
+    }
+    if lower.contains("mistral") || lower.contains("codestral") {
+        return lower.contains("pixtral") || lower.contains("vision");
+    }
+    true
+}
+
+/// Neutralize misleading vision instructions in system prompt and inject a
+/// system note for non-vision upstreams.
+#[must_use]
+pub fn patch_non_vision_system_prompt(text: &str) -> String {
+    let mut patched = text
+        .replace(
+            "Reads images (PNG, JPG, …) and presents them visually.",
+            "Reads text files.",
+        )
+        .replace(
+            "Reads images (PNG, JPG, ...) and presents them visually.",
+            "Reads text files.",
+        )
+        .replace(
+            "I have image-reading capabilities through the Read tool.",
+            "I do not have direct image-reading capabilities.",
+        );
+
+    if !patched.contains("[System Override]: You are running on a text-only model") {
+        patched.push_str(NON_VISION_SYSTEM_NOTE);
+    }
+    patched
+}
+
 pub struct SystemPromptPipeline {
     config: Arc<Config>,
 }
@@ -268,5 +325,26 @@ mod tests {
         let text = system[0]["text"].as_str().unwrap();
         assert!(text.contains("helpful assistant"));
         assert!(text.contains("Always be polite"));
+    }
+
+    #[test]
+    fn vision_model_detection_correctness() {
+        assert!(!is_vision_model("deepseek-r1"));
+        assert!(!is_vision_model("deepseek-v3"));
+        assert!(!is_vision_model("qwen-2.5-coder-32b"));
+        assert!(!is_vision_model("llama-3.3-70b"));
+        assert!(is_vision_model("claude-3-5-sonnet"));
+        assert!(is_vision_model("gpt-4o"));
+        assert!(is_vision_model("deepseek-vl-7b"));
+        assert!(is_vision_model("qwen-vl-max"));
+    }
+
+    #[test]
+    fn non_vision_system_prompt_patching() {
+        let text = "Reads images (PNG, JPG, ...) and presents them visually. I have image-reading capabilities through the Read tool.";
+        let patched = patch_non_vision_system_prompt(text);
+        assert!(patched.contains("Reads text files."));
+        assert!(patched.contains("I do not have direct image-reading capabilities."));
+        assert!(patched.contains("[System Override]: You are running on a text-only model"));
     }
 }

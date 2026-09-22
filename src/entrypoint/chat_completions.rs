@@ -58,6 +58,13 @@ pub async fn post_v1_chat_completions(
         .await
     {
         Ok(ProviderResponse::Full(json)) => {
+            if let Some(usage) = crate::providers::extract_usage(&json) {
+                state.metrics.counters.record_model_tokens(
+                    &model,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                );
+            }
             let openai_json =
                 translate_and_record(&state.cost_tracker, &session_key, request_id, &json).await;
             (StatusCode::OK, Json(openai_json)).into_response()
@@ -148,7 +155,7 @@ mod tests {
         response: Result<ProviderResponse, ProviderError>,
     ) -> (EntrypointState, Arc<AtomicUsize>) {
         use crate::routing::health::HealthRegistry;
-        use crate::routing::router::Router as DispatchRouter;
+        use crate::routing::router::{Router as DispatchRouter, RouterDeps};
         use crate::routing::strategy::{FallbackStrategy, UpstreamRef};
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -170,51 +177,17 @@ mod tests {
             &crate::config::schema::RateLimitConfig::default(),
         )) as Arc<dyn crate::ratelimit::AdmissionControl>;
         let metrics = crate::metrics::MetricsCollector::new();
-        let router = DispatchRouter::new(
+        let router = DispatchRouter::new(RouterDeps {
             candidates,
-            vec![provider],
-            Arc::new(FallbackStrategy) as Arc<dyn crate::routing::strategy::RoutingStrategy>,
+            providers: vec![provider],
+            strategy: Arc::new(FallbackStrategy)
+                as Arc<dyn crate::routing::strategy::RoutingStrategy>,
             health,
             admission,
-            Arc::clone(&metrics),
-        );
+            metrics: Arc::clone(&metrics),
+        });
 
-        let state = EntrypointState {
-            dispatch_router: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
-            cost_tracker: Arc::new(
-                crate::cost_metrics::tracker::CostTracker::new(
-                    crate::cost_metrics::pricing::PricingTable::load_default(),
-                )
-                .await,
-            ),
-            metrics,
-            server_info: Arc::new(crate::entrypoint::ServerInfo {
-                port: 0,
-                route_name: "test".to_string(),
-                strategy: "Fallback".to_string(),
-                upstreams: vec![],
-            }),
-            config_dir: Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
-            session_overrides: Arc::new(
-                crate::routing::session_overrides::SessionOverrideStore::new(),
-            ),
-            capability: crate::routing::capability::CapabilityCache::new(
-                std::time::Duration::from_secs(crate::routing::capability::EVAL_TTL_SECS),
-            ),
-            server_tools: Arc::new(crate::server_tools::ServerToolsRuntime::default()),
-            search_pool: Arc::new(crate::server_tools::McpSearchPool::new(
-                crate::server_tools::ServerToolsConfig::default().pool_config(),
-            )),
-            pruning_policy_store: Arc::new(
-                crate::claude_code_session::prune_policy::PruningPolicyStore::default(),
-            ),
-            omission_cache: Arc::new(
-                crate::claude_code_session::omission_cache::OmissionCache::open(
-                    &tempfile::tempdir().unwrap().path().join("cache.sqlite"),
-                )
-                .unwrap(),
-            ),
-        };
+        let state = crate::entrypoint::test_support::state_with_router(router, metrics).await;
         let _ = Config::default;
         (state, calls)
     }

@@ -243,22 +243,22 @@ mod tests {
 
     async fn state_with(upstreams: Vec<UpstreamSummary>) -> EntrypointState {
         use crate::routing::health::HealthRegistry;
-        use crate::routing::router::Router as DispatchRouter;
+        use crate::routing::router::{Router as DispatchRouter, RouterDeps};
         use crate::routing::strategy::FallbackStrategy;
 
         let metrics = crate::metrics::MetricsCollector::new();
         EntrypointState {
             dispatch_router: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
-                DispatchRouter::new(
-                    vec![],
-                    vec![],
-                    std::sync::Arc::new(FallbackStrategy),
-                    std::sync::Arc::new(HealthRegistry::new(300)),
-                    std::sync::Arc::new(crate::ratelimit::RateLimiters::new(
+                DispatchRouter::new(RouterDeps {
+                    candidates: vec![],
+                    providers: vec![],
+                    strategy: std::sync::Arc::new(FallbackStrategy),
+                    health: std::sync::Arc::new(HealthRegistry::new(300)),
+                    admission: std::sync::Arc::new(crate::ratelimit::RateLimiters::new(
                         &crate::config::schema::RateLimitConfig::default(),
                     )),
-                    std::sync::Arc::clone(&metrics),
-                ),
+                    metrics: std::sync::Arc::clone(&metrics),
+                }),
             )),
             cost_tracker: std::sync::Arc::new(
                 crate::cost_metrics::tracker::CostTracker::new(

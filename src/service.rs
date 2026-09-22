@@ -72,7 +72,7 @@ pub fn install(start: bool) -> anyhow::Result<()> {
 /// Force an ad-hoc re-sign of the binary `launchd` is about to exec.
 ///
 /// Locally-built (`cargo build`/`cargo install`) binaries on this machine get
-/// SIGKilled with `EXC_CRASH (SIGKILL (Code Signature Invalid))` /
+/// `SIGKilled` with `EXC_CRASH (SIGKILL (Code Signature Invalid))` /
 /// `namespace: CODESIGNING, indicator: Taskgated Invalid Signature` the
 /// moment they're executed — confirmed via the macOS crash report
 /// (`~/Library/Logs/DiagnosticReports/consolette-*.ips`) and reproduced with

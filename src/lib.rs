@@ -26,3 +26,4 @@ pub mod service;
 pub mod session;
 pub mod session_compaction;
 pub mod system_prompt;
+pub mod vision;

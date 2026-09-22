@@ -725,7 +725,7 @@ async fn await_concurrent_walk(
 /// Every test exercising this function mocks `fetch_models`/`probe` (Story
 /// 6.1.1 kept those tests on synthetic `family-v*`-style ids, never a real
 /// catalog snapshot). The one test that runs this walk against a real
-/// ExampleCorp Model Gateway is `tests/openai_gateway_live_probe.rs` —
+/// `ExampleCorp` Model Gateway is `tests/openai_gateway_live_probe.rs` —
 /// `#[ignore]`d, requires VPN/SBN Dev Agent access, run manually via
 /// `cargo test --test openai_gateway_live_probe -- --ignored`.
 pub(crate) async fn resolve_family<F, Fut, P, FutP>(

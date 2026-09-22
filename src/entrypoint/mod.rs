@@ -16,6 +16,8 @@ pub mod landing;
 pub mod messages;
 pub mod observability;
 pub mod openai_stream;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

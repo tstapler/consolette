@@ -80,8 +80,13 @@ fn openai_message_to_responses_items(message: &Value) -> Vec<Value> {
 /// tool-result data, then repackages that already-extracted shape into
 /// Responses' item taxonomy — no separate block-walk of `blocks` happens
 /// here.
-fn anthropic_blocks_to_responses_items(role: &str, blocks: &[Value]) -> Vec<Value> {
-    anthropic_blocks_to_openai(role, blocks)
+async fn anthropic_blocks_to_responses_items(
+    role: &str,
+    blocks: &[Value],
+    supports_vision: bool,
+) -> Vec<Value> {
+    anthropic_blocks_to_openai(role, blocks, supports_vision)
+        .await
         .iter()
         .flat_map(openai_message_to_responses_items)
         .collect()
@@ -117,12 +122,13 @@ fn translate_tool_definition_to_responses(tool: &Value) -> Option<Value> {
 // (`translate_anthropic_request_to_responses(json!({...}))`, no `&`) rather
 // than borrowing like `translate_anthropic_request_to_openai`.
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn translate_anthropic_request_to_responses(anthropic: Value) -> Value {
+pub(crate) async fn translate_anthropic_request_to_responses(anthropic: Value) -> Value {
     let model = anthropic
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("gpt-5")
         .to_string();
+    let supports_vision = crate::system_prompt::is_vision_model(&model);
     let max_tokens = anthropic.get("max_tokens").and_then(Value::as_u64);
     let temperature = anthropic.get("temperature").cloned();
 
@@ -141,7 +147,9 @@ pub(crate) fn translate_anthropic_request_to_responses(anthropic: Value) -> Valu
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
             let content = msg.get("content").cloned().unwrap_or(Value::Null);
             if let Value::Array(blocks) = content {
-                items.extend(anthropic_blocks_to_responses_items(role, &blocks));
+                items.extend(
+                    anthropic_blocks_to_responses_items(role, &blocks, supports_vision).await,
+                );
             } else {
                 let text = crate::providers::extract_text_from_content(&content);
                 if !text.is_empty() {
@@ -816,24 +824,24 @@ mod tests {
     // Story 3.2.1: translate_anthropic_request_to_responses
     // ────────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn translate_anthropic_request_to_responses_should_map_single_user_turn_to_input() {
+    #[tokio::test]
+    async fn translate_anthropic_request_to_responses_should_map_single_user_turn_to_input() {
         let anthropic = json!({
             "model": "gpt-5.3-codex",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 100,
         });
 
-        let result = translate_anthropic_request_to_responses(anthropic);
+        let result = translate_anthropic_request_to_responses(anthropic).await;
 
         assert_eq!(result["model"], json!("gpt-5.3-codex"));
         assert_eq!(result["input"], json!("hi"));
         assert_eq!(result["max_output_tokens"], json!(100));
     }
 
-    #[test]
-    fn translate_anthropic_request_to_responses_should_map_multi_turn_conversation_to_input_items()
-    {
+    #[tokio::test]
+    async fn translate_anthropic_request_to_responses_should_map_multi_turn_conversation_to_input_items(
+    ) {
         let anthropic = json!({
             "model": "gpt-5.3-codex",
             "messages": [
@@ -843,7 +851,7 @@ mod tests {
             ],
         });
 
-        let result = translate_anthropic_request_to_responses(anthropic);
+        let result = translate_anthropic_request_to_responses(anthropic).await;
 
         let input = result["input"]
             .as_array()
@@ -856,8 +864,8 @@ mod tests {
         assert_eq!(input[2]["content"][0]["text"], json!("thanks"));
     }
 
-    #[test]
-    fn translate_anthropic_request_to_responses_should_reuse_shared_block_walker_for_tool_result_block(
+    #[tokio::test]
+    async fn translate_anthropic_request_to_responses_should_reuse_shared_block_walker_for_tool_result_block(
     ) {
         let anthropic = json!({
             "model": "gpt-5.3-codex",
@@ -873,7 +881,7 @@ mod tests {
             ],
         });
 
-        let result = translate_anthropic_request_to_responses(anthropic);
+        let result = translate_anthropic_request_to_responses(anthropic).await;
 
         let input = result["input"].as_array().expect("input must be an array");
         let function_call = input
@@ -898,8 +906,8 @@ mod tests {
     /// validation.md's exact acceptance-criterion test for Story 3.4.1: a
     /// `tool_result` block referencing a prior `tool_use` id must produce a
     /// `function_call_output` item with the matching `call_id`.
-    #[test]
-    fn translate_anthropic_request_to_responses_should_map_tool_result_to_function_call_output_with_matching_call_id(
+    #[tokio::test]
+    async fn translate_anthropic_request_to_responses_should_map_tool_result_to_function_call_output_with_matching_call_id(
     ) {
         let anthropic = json!({
             "model": "gpt-5.3-codex",
@@ -913,7 +921,7 @@ mod tests {
             ],
         });
 
-        let result = translate_anthropic_request_to_responses(anthropic);
+        let result = translate_anthropic_request_to_responses(anthropic).await;
 
         let input = result["input"].as_array().expect("input must be an array");
         let function_call_output = input
@@ -936,8 +944,8 @@ mod tests {
     /// resulting `function_call_output`'s `call_id` must match the
     /// original turn-1 `call_id` end-to-end, with no manual re-typing of
     /// the id in between.
-    #[test]
-    fn translate_anthropic_request_to_responses_should_round_trip_call_id_across_two_turns() {
+    #[tokio::test]
+    async fn translate_anthropic_request_to_responses_should_round_trip_call_id_across_two_turns() {
         let turn_1_response = json!({
             "id": "resp_1", "model": "gpt-5.3-codex",
             "output": [{
@@ -964,7 +972,7 @@ mod tests {
                 ]},
             ],
         });
-        let responses_request = translate_anthropic_request_to_responses(turn_2_request);
+        let responses_request = translate_anthropic_request_to_responses(turn_2_request).await;
         let input = responses_request["input"]
             .as_array()
             .expect("input must be an array");
@@ -976,8 +984,8 @@ mod tests {
         assert_eq!(original_call_id, "call_1");
     }
 
-    #[test]
-    fn translate_anthropic_request_to_responses_should_map_tool_definitions_to_flat_shape() {
+    #[tokio::test]
+    async fn translate_anthropic_request_to_responses_should_map_tool_definitions_to_flat_shape() {
         let anthropic = json!({
             "model": "gpt-5.3-codex",
             "messages": [{"role": "user", "content": "hi"}],
@@ -988,7 +996,7 @@ mod tests {
             }],
         });
 
-        let result = translate_anthropic_request_to_responses(anthropic);
+        let result = translate_anthropic_request_to_responses(anthropic).await;
 
         let tools = result["tools"].as_array().expect("tools must be present");
         assert_eq!(tools.len(), 1);
@@ -1432,7 +1440,7 @@ mod tests {
                     ]},
                 ],
             });
-            let responses_request = translate_anthropic_request_to_responses(turn_2_request);
+            let responses_request = translate_anthropic_request_to_responses(turn_2_request).await;
 
             let input = responses_request["input"]
                 .as_array()

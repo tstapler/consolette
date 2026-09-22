@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
 
-pub use counters::ProxyMetrics;
+pub use counters::{ModelOutcome, ProxyMetrics};
 pub use error_tracker::{AggregatedError, ErrorRecord, ErrorTracker};
 pub use histogram::DurationHistogram;
 
@@ -87,46 +87,19 @@ impl RequestDetail {
         body: &serde_json::Value,
         session_id: Option<String>,
     ) -> Self {
-        let model = body
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
         let messages = body.get("messages").and_then(serde_json::Value::as_array);
         let message_count = messages.map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX));
-
-        let mut type_counts: std::collections::BTreeMap<String, u32> =
-            std::collections::BTreeMap::new();
-        for message in messages.into_iter().flatten() {
-            match message.get("content") {
-                Some(serde_json::Value::String(_)) => {
-                    *type_counts.entry("text".to_string()).or_insert(0) += 1;
-                }
-                Some(serde_json::Value::Array(blocks)) => {
-                    for block in blocks {
-                        let block_type = block
-                            .get("type")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
-                        *type_counts.entry(block_type.to_string()).or_insert(0) += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let msg_types = serde_json::to_string(&type_counts).unwrap_or_else(|_| "{}".to_string());
 
         Self {
             request_id,
             timestamp: Utc::now().to_rfc3339(),
-            model,
+            model: request_model_name(body),
             provider: String::new(),
             tokens_before,
             tokens_after: 0,
             compressed: false,
             stream,
-            msg_types,
+            msg_types: content_block_type_counts_json(messages),
             has_context_management: body.get("context_management").is_some(),
             message_count,
             duration_ms: 0.0,
@@ -140,6 +113,38 @@ impl RequestDetail {
     }
 }
 
+fn request_model_name(body: &serde_json::Value) -> String {
+    body.get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Counts content-block types across a request's `messages` (e.g.
+/// `{"text":2,"tool_use":1}`), JSON-encoded for `RequestDetail::msg_types`.
+fn content_block_type_counts_json(messages: Option<&Vec<serde_json::Value>>) -> String {
+    let mut type_counts: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    for message in messages.into_iter().flatten() {
+        match message.get("content") {
+            Some(serde_json::Value::String(_)) => {
+                *type_counts.entry("text".to_string()).or_insert(0) += 1;
+            }
+            Some(serde_json::Value::Array(blocks)) => {
+                for block in blocks {
+                    let block_type = block
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    *type_counts.entry(block_type.to_string()).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    serde_json::to_string(&type_counts).unwrap_or_else(|_| "{}".to_string())
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // LagSample — event loop lag ring buffer entry
 // ────────────────────────────────────────────────────────────────────────────
@@ -148,6 +153,22 @@ impl RequestDetail {
 struct LagSample {
     timestamp: Instant,
     lag_ms: f64,
+}
+
+/// Buckets a lag sample's age into one of `minutes` 1-minute-wide buckets
+/// counting backward from `now` (bucket 0 = oldest, `minutes - 1` = most
+/// recent), or `None` if the sample predates `now` or has aged out of the
+/// window.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn lag_bucket_index(now: Instant, sample_at: Instant, minutes: u32) -> Option<usize> {
+    let age_secs = now.checked_duration_since(sample_at)?.as_secs();
+    let total_secs = u64::from(minutes) * 60;
+    if age_secs >= total_secs {
+        return None;
+    }
+    let bucket_from_end = age_secs / 60;
+    let idx = (u64::from(minutes) - 1 - bucket_from_end) as usize;
+    (idx < minutes as usize).then_some(idx)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -172,6 +193,18 @@ pub struct MetricsCollector {
     lag_samples: Mutex<VecDeque<LagSample>>,
     /// Most recent lag measurement in milliseconds.
     current_lag_ms: Mutex<f64>,
+}
+
+/// Timing fields recorded once a dispatch attempt completes (Fowler's
+/// introduce-parameter-object — same pattern as `routing::router::
+/// RouterDeps`), passed to [`MetricsCollector::update_request_timing`].
+#[derive(Clone, Copy)]
+pub struct RequestTimingUpdate<'a> {
+    pub provider: &'a str,
+    pub duration_ms: f64,
+    pub first_byte_ms: f64,
+    pub bedrock_invocation_ms: u64,
+    pub bedrock_first_byte_ms: u64,
 }
 
 impl MetricsCollector {
@@ -216,21 +249,13 @@ impl MetricsCollector {
     }
 
     /// Update timing fields on an existing request by ID.
-    pub fn update_request_timing(
-        &self,
-        request_id: &str,
-        provider: &str,
-        duration_ms: f64,
-        first_byte_ms: f64,
-        bedrock_invocation_ms: u64,
-        bedrock_first_byte_ms: u64,
-    ) {
+    pub fn update_request_timing(&self, request_id: &str, update: RequestTimingUpdate<'_>) {
         self.mutate_request(request_id, |r| {
-            r.provider = provider.to_string();
-            r.duration_ms = (duration_ms * 10.0).round() / 10.0;
-            r.first_byte_ms = (first_byte_ms * 10.0).round() / 10.0;
-            r.bedrock_invocation_ms = bedrock_invocation_ms;
-            r.bedrock_first_byte_ms = bedrock_first_byte_ms;
+            r.provider = update.provider.to_string();
+            r.duration_ms = (update.duration_ms * 10.0).round() / 10.0;
+            r.first_byte_ms = (update.first_byte_ms * 10.0).round() / 10.0;
+            r.bedrock_invocation_ms = update.bedrock_invocation_ms;
+            r.bedrock_first_byte_ms = update.bedrock_first_byte_ms;
         });
     }
 
@@ -344,21 +369,14 @@ impl MetricsCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for s in lag_samples.iter() {
-            if let Some(age) = now.checked_duration_since(s.timestamp) {
-                let age_secs = age.as_secs();
-                let total_secs = u64::from(minutes) * 60;
-                if age_secs < total_secs {
-                    let bucket_from_end = age_secs / 60;
-                    let idx = (u64::from(minutes) - 1 - bucket_from_end) as usize;
-                    if idx < max_buckets.len() {
-                        if s.lag_ms > max_buckets[idx] {
-                            max_buckets[idx] = s.lag_ms;
-                        }
-                        sum_buckets[idx] += s.lag_ms;
-                        count_buckets[idx] += 1;
-                    }
-                }
+            let Some(idx) = lag_bucket_index(now, s.timestamp, minutes) else {
+                continue;
+            };
+            if s.lag_ms > max_buckets[idx] {
+                max_buckets[idx] = s.lag_ms;
             }
+            sum_buckets[idx] += s.lag_ms;
+            count_buckets[idx] += 1;
         }
         drop(lag_samples);
 
@@ -383,25 +401,44 @@ impl MetricsCollector {
 
     /// Build the full `/metrics` JSON response (wire-compatible with the
     /// legacy Python proxy's `/metrics` endpoint).
+    ///
+    /// `cooldowns` is merged in separately by the HTTP handler
+    /// (`observability::get_metrics`) from `Router::cooldown_snapshot()` —
+    /// `MetricsCollector` itself has no reference to `Router`/
+    /// `HealthRegistry` (Story 1.5.1).
     #[must_use]
     pub fn to_metrics_json(&self) -> serde_json::Value {
-        let counters_json = self.counters.to_json();
+        let mut result = self.counters.to_json();
+        self.merge_performance_overlay(&mut result);
+        self.merge_recent_activity(&mut result);
+        result["timestamp"] = json!(Utc::now().to_rfc3339());
+        result
+    }
 
-        // RPM chart data from histogram
+    /// Merges the latency-percentile/RPM/lag-chart overlay into `result`.
+    fn merge_performance_overlay(&self, result: &mut serde_json::Value) {
         let rpm_data = self.histogram.rpm_chart_data(16);
-
-        // Latency percentiles
         let (p50, p95, p99) = self.histogram.percentiles();
         let rpm = self.histogram.requests_per_minute();
 
-        // Recent requests
+        result["performance"] = json!({
+            "p50_ms": p50,
+            "p95_ms": p95,
+            "p99_ms": p99,
+            "rpm": (rpm * 10.0).round() / 10.0
+        });
+        result["rpm_data"] = serde_json::Value::Array(rpm_data);
+        result["lag_data"] = serde_json::Value::Array(self.lag_chart_data());
+        result["current_lag_ms"] = json!(self.current_lag_ms());
+    }
+
+    /// Merges the recent-requests/recent-errors arrays into `result`.
+    fn merge_recent_activity(&self, result: &mut serde_json::Value) {
         let recent_requests: Vec<serde_json::Value> = self
             .get_recent_requests(20)
             .iter()
             .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
             .collect();
-
-        // Recent errors
         let recent_errors: Vec<serde_json::Value> = self
             .error_tracker
             .get_recent(20)
@@ -409,30 +446,8 @@ impl MetricsCollector {
             .map(|e| serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
             .collect();
 
-        // Merge counters JSON with additional fields
-        let mut result = counters_json;
-
-        // Performance overlay
-        result["performance"] = json!({
-            "p50_ms": p50,
-            "p95_ms": p95,
-            "p99_ms": p99,
-            "rpm": (rpm * 10.0).round() / 10.0
-        });
-
-        result["rpm_data"] = serde_json::Value::Array(rpm_data);
-        result["lag_data"] = serde_json::Value::Array(self.lag_chart_data());
-        result["current_lag_ms"] = json!(self.current_lag_ms());
         result["recent_requests"] = serde_json::Value::Array(recent_requests);
         result["recent_errors"] = serde_json::Value::Array(recent_errors);
-        result["timestamp"] = json!(Utc::now().to_rfc3339());
-
-        // `cooldowns` is merged in by the HTTP handler
-        // (`observability::get_metrics`) from `Router::cooldown_snapshot()`
-        // — `MetricsCollector` itself has no reference to `Router`/
-        // `HealthRegistry` (Story 1.5.1).
-
-        result
     }
 }
 

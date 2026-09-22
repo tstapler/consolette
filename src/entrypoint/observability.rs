@@ -147,7 +147,7 @@ mod tests {
 
     use crate::providers::{Provider, ProviderError, ProviderResponse};
     use crate::routing::health::HealthRegistry;
-    use crate::routing::router::Router as DispatchRouter;
+    use crate::routing::router::{Router as DispatchRouter, RouterDeps};
     use crate::routing::strategy::{FallbackStrategy, RoutingStrategy, UpstreamRef};
     use axum::http::HeaderMap;
     use std::sync::Arc;
@@ -200,52 +200,12 @@ mod tests {
         }
     }
 
-    /// Builds an `EntrypointState` wrapping a caller-supplied `Router` — the
-    /// same pattern `messages.rs`'s `test_state_with_provider` uses — so a
-    /// test can control candidates/providers/health directly instead of
-    /// going through `Router::from_config`.
-    #[allow(clippy::unwrap_used)]
-    async fn state_with_router(
-        router: DispatchRouter,
-        metrics: Arc<crate::metrics::MetricsCollector>,
-    ) -> EntrypointState {
-        EntrypointState {
-            dispatch_router: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
-            cost_tracker: Arc::new(
-                crate::cost_metrics::tracker::CostTracker::new(
-                    crate::cost_metrics::pricing::PricingTable::load_default(),
-                )
-                .await,
-            ),
-            metrics,
-            server_info: Arc::new(crate::entrypoint::ServerInfo {
-                port: 0,
-                route_name: "test".to_string(),
-                strategy: "Fallback".to_string(),
-                upstreams: vec![],
-            }),
-            config_dir: Arc::new(std::path::PathBuf::from("/tmp/consolette-test")),
-            session_overrides: Arc::new(
-                crate::routing::session_overrides::SessionOverrideStore::new(),
-            ),
-            capability: crate::routing::capability::CapabilityCache::new(
-                std::time::Duration::from_secs(crate::routing::capability::EVAL_TTL_SECS),
-            ),
-            server_tools: Arc::new(crate::server_tools::ServerToolsRuntime::default()),
-            search_pool: Arc::new(crate::server_tools::McpSearchPool::new(
-                crate::server_tools::ServerToolsConfig::default().pool_config(),
-            )),
-            pruning_policy_store: Arc::new(
-                crate::claude_code_session::prune_policy::PruningPolicyStore::default(),
-            ),
-            omission_cache: Arc::new(
-                crate::claude_code_session::omission_cache::OmissionCache::open(
-                    &tempfile::tempdir().unwrap().path().join("cache.sqlite"),
-                )
-                .unwrap(),
-            ),
-        }
-    }
+    /// The shared entrypoint test-fixture builder (`crate::entrypoint::
+    /// test_support::state_with_router`) — same pattern `messages.rs`'s
+    /// `test_state_with_provider` uses — so a test can control
+    /// candidates/providers/health directly instead of going through
+    /// `Router::from_config`.
+    use crate::entrypoint::test_support::state_with_router;
 
     fn always_allow_admission() -> Arc<dyn crate::ratelimit::AdmissionControl> {
         Arc::new(crate::ratelimit::RateLimiters::new(
@@ -287,18 +247,18 @@ mod tests {
             Arc::new(AlwaysOkProvider { name: "gemini" }),
         ];
         let metrics = crate::metrics::MetricsCollector::new();
-        let router = DispatchRouter::new(
-            vec![
+        let router = DispatchRouter::new(RouterDeps {
+            candidates: vec![
                 upstream_ref(0, "anthropic"),
                 upstream_ref(1, "bedrock"),
                 upstream_ref(2, "gemini"),
             ],
             providers,
-            Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
+            strategy: Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
             health,
-            always_allow_admission(),
-            Arc::clone(&metrics),
-        );
+            admission: always_allow_admission(),
+            metrics: Arc::clone(&metrics),
+        });
         let state = state_with_router(router, metrics).await;
 
         let response = get_metrics(State(state)).await.into_response();
@@ -353,14 +313,14 @@ mod tests {
         let providers: Vec<Arc<dyn Provider>> =
             vec![Arc::new(AlwaysAuthErrProvider { name: "gemini" })];
         let metrics = crate::metrics::MetricsCollector::new();
-        let router = DispatchRouter::new(
-            vec![upstream_ref(0, "gemini")],
+        let router = DispatchRouter::new(RouterDeps {
+            candidates: vec![upstream_ref(0, "gemini")],
             providers,
-            Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
+            strategy: Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
             health,
-            always_allow_admission(),
-            Arc::clone(&metrics),
-        );
+            admission: always_allow_admission(),
+            metrics: Arc::clone(&metrics),
+        });
 
         // Induce the real auth failure through `Router::dispatch`, exactly
         // as a live expired-Antigravity-token request would.
@@ -404,14 +364,14 @@ mod tests {
         let providers: Vec<Arc<dyn Provider>> =
             vec![Arc::new(AlwaysOkProvider { name: "primary" })];
         let metrics = crate::metrics::MetricsCollector::new();
-        let router = DispatchRouter::new(
-            vec![upstream_ref(0, "primary")],
+        let router = DispatchRouter::new(RouterDeps {
+            candidates: vec![upstream_ref(0, "primary")],
             providers,
-            Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
+            strategy: Arc::new(FallbackStrategy) as Arc<dyn RoutingStrategy>,
             health,
-            always_allow_admission(),
-            Arc::clone(&metrics),
-        );
+            admission: always_allow_admission(),
+            metrics: Arc::clone(&metrics),
+        });
         let state = state_with_router(router, metrics).await;
 
         let response = get_metrics(State(state)).await.into_response();
@@ -447,8 +407,8 @@ mod tests {
         let providers: Vec<Arc<dyn Provider>> =
             vec![Arc::new(AlwaysOkProvider { name: "openrouter" })];
         let metrics = crate::metrics::MetricsCollector::new();
-        let router = DispatchRouter::new(
-            vec![UpstreamRef {
+        let router = DispatchRouter::new(RouterDeps {
+            candidates: vec![UpstreamRef {
                 index: 0,
                 name: "openrouter".to_string(),
                 weight: 1.0,
@@ -456,11 +416,11 @@ mod tests {
                 model_family: None,
             }],
             providers,
-            Arc::clone(&strategy) as Arc<dyn RoutingStrategy>,
+            strategy: Arc::clone(&strategy) as Arc<dyn RoutingStrategy>,
             health,
-            always_allow_admission(),
-            Arc::clone(&metrics),
-        );
+            admission: always_allow_admission(),
+            metrics: Arc::clone(&metrics),
+        });
 
         // Drive one real selection so `last_scores` (and therefore the
         // `models` block) isn't empty.

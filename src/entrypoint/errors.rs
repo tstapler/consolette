@@ -49,7 +49,7 @@ pub fn map_provider_error_anthropic(err: &ProviderError) -> (StatusCode, Option<
                 StatusCode::from_u16(529).unwrap()
             },
             None,
-            json!({"type":"error","error":{"type":"overloaded_error","message":"all upstream candidates exhausted"}}),
+            json!({"type":"error","error":{"type":"overloaded_error","message":"all upstream candidates exhausted (check monitoring dashboard at http://127.0.0.1:47000/dashboard for rate limits and cooldown status)"}}),
         ),
         ProviderError::ModelUnsupported(model) => (
             StatusCode::NOT_FOUND,
@@ -107,7 +107,7 @@ pub fn map_provider_error_openai(err: &ProviderError) -> (StatusCode, Option<u64
         ProviderError::Exhausted => (
             StatusCode::SERVICE_UNAVAILABLE,
             None,
-            envelope("all upstream candidates exhausted", "server_error"),
+            envelope("all upstream candidates exhausted (check monitoring dashboard at http://127.0.0.1:47000/dashboard for rate limits and cooldown status)", "server_error"),
         ),
         ProviderError::ModelUnsupported(model) => (
             StatusCode::NOT_FOUND,

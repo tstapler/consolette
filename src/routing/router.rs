@@ -475,6 +475,11 @@ impl Router {
     ///
     /// Returns the last [`ProviderError`] encountered once every candidate
     /// upstream has been tried (or none were available/admitted).
+    // The rate-limit hold-and-retry branch pushes this past the default
+    // 100-line threshold; splitting it out would separate the retry
+    // decision from the loop it retries, which is harder to follow than
+    // the extra length.
+    #[allow(clippy::too_many_lines)]
     pub async fn dispatch(
         &self,
         body: serde_json::Value,
@@ -506,10 +511,36 @@ impl Router {
         self.metrics
             .push_original_body(request_id.clone(), body.clone());
 
+        let mut hold_retries: u32 = 0;
+
         loop {
             let healthy = self.admitted_candidates(&candidates, &already_tried);
 
             let Some(chosen) = self.strategy.select(&healthy) else {
+                // Insulate agents from temporary rate-limit cooldowns: if all candidates are in short cooldown, hold and retry.
+                if hold_retries < 3 {
+                    let min_wait_secs = candidates
+                        .iter()
+                        .map(|c| self.health.remaining_secs(c.index))
+                        .filter(|&secs| secs > 0)
+                        .min();
+                    if let Some(wait_secs) = min_wait_secs {
+                        if wait_secs <= 15 {
+                            tracing::info!(
+                                "All upstream candidates rate-limited / cooling down. Holding request for {}s to insulate agent (attempt {}/3)...",
+                                wait_secs,
+                                hold_retries + 1
+                            );
+                            tokio::time::sleep(
+                                Duration::from_secs(wait_secs) + Duration::from_millis(200),
+                            )
+                            .await;
+                            hold_retries += 1;
+                            already_tried.clear();
+                            continue;
+                        }
+                    }
+                }
                 break;
             };
             already_tried.insert((chosen.index, chosen.model.clone()));

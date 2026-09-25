@@ -434,6 +434,57 @@ fn classify_probe_failure(err: &ProviderError) -> OpenaiErrorClass {
     }
 }
 
+/// Epic 3.6's "retry the same candidate against `/v1/responses`" step,
+/// shared by both places a `/v1/chat/completions` probe can turn up
+/// `WrongEndpoint`: the plain first attempt, and a retry that had already
+/// substituted `max_completion_tokens` for `max_tokens` (Story 4.1.1) — a
+/// candidate can need both corrections (gpt-5.6-terra, 2026-09-25 incident).
+/// Success caches `Endpoint::Responses`; failure aborts the walk
+/// (`Transient`-shaped for metrics).
+async fn retry_wrong_endpoint_via_responses<P, FutP>(
+    probe: &mut P,
+    candidate: &str,
+    timeout: Duration,
+    metrics: &ProxyMetrics,
+    upstream: &str,
+    family: &str,
+    index: usize,
+) -> Result<ResolvedModel, ProviderError>
+where
+    P: FnMut(String, Duration, Endpoint, TokenParamStyle) -> FutP,
+    FutP: Future<Output = Result<Value, ProviderError>>,
+{
+    match probe(
+        candidate.to_string(),
+        timeout,
+        Endpoint::Responses,
+        TokenParamStyle::MaxTokens,
+    )
+    .await
+    {
+        Ok(_value) => {
+            record_resolution_success(metrics, upstream, family, candidate, index);
+            Ok(ResolvedModel {
+                model_id: candidate.to_string(),
+                endpoint: Endpoint::Responses,
+                token_param: TokenParamStyle::MaxTokens,
+                resolved_at: Instant::now(),
+            })
+        }
+        Err(err) => {
+            tracing::warn!(
+                family,
+                candidate = %candidate,
+                outcome = "wrong_endpoint_responses_retry_failed",
+                "resolution candidate's /v1/responses retry also failed; \
+                 aborting walk without advancing"
+            );
+            record_resolution_transient(metrics, upstream, family, candidate);
+            Err(err)
+        }
+    }
+}
+
 /// Epic 2.3's real probe-and-walk loop: try each ranked candidate in order,
 /// classifying each failure via [`classify_openai_error`] to decide whether
 /// to advance, abort, or (Epic 3.6) retry against `/v1/responses`.
@@ -591,6 +642,30 @@ where
                             resolved_at: Instant::now(),
                         });
                     }
+                    Err(retry_err) if classify_probe_failure(&retry_err) == OpenaiErrorClass::WrongEndpoint => {
+                        // A candidate can need both corrections at once
+                        // (gpt-5.6-terra, 2026-09-25 incident): the
+                        // max_completion_tokens retry above got far enough
+                        // to reveal it also needs `/v1/responses`, so try
+                        // that before giving up on this candidate.
+                        tracing::warn!(
+                            family,
+                            candidate = %candidate,
+                            outcome = "wrong_endpoint",
+                            "resolution candidate's max_completion_tokens retry also \
+                             requires the Responses API; retrying against /v1/responses"
+                        );
+                        metrics.record_resolution_attempt(
+                            upstream,
+                            family,
+                            candidate,
+                            ResolutionOutcome::RetryResponses,
+                        );
+                        return retry_wrong_endpoint_via_responses(
+                            &mut probe, candidate, timeout, metrics, upstream, family, index,
+                        )
+                        .await;
+                    }
                     Err(retry_err) => {
                         tracing::warn!(
                             family,
@@ -640,42 +715,10 @@ where
                     // `/v1/responses` rather than advancing — advancing here
                     // would wrongly treat a Responses-only model as "dead"
                     // (Story 3.6.1).
-                    match probe(
-                        candidate.clone(),
-                        timeout,
-                        Endpoint::Responses,
-                        TokenParamStyle::MaxTokens,
+                    return retry_wrong_endpoint_via_responses(
+                        &mut probe, candidate, timeout, metrics, upstream, family, index,
                     )
-                    .await
-                    {
-                        Ok(_value) => {
-                            record_resolution_success(metrics, upstream, family, candidate, index);
-                            return Ok(ResolvedModel {
-                                model_id: candidate.clone(),
-                                endpoint: Endpoint::Responses,
-                                token_param: TokenParamStyle::MaxTokens,
-                                resolved_at: Instant::now(),
-                            });
-                        }
-                        Err(err) => {
-                            // The candidate already showed signs of life
-                            // (the chat/completions probe got far enough to
-                            // be classified `WrongEndpoint`, not a generic
-                            // failure) but the Responses retry also failed —
-                            // treat this candidate as not viable and abort
-                            // the walk, consistent with `Transient`/`Other`,
-                            // rather than looping on the same candidate.
-                            tracing::warn!(
-                                family,
-                                candidate = %candidate,
-                                outcome = "wrong_endpoint_responses_retry_failed",
-                                "resolution candidate's /v1/responses retry also failed; \
-                                 aborting walk without advancing"
-                            );
-                            record_resolution_transient(metrics, upstream, family, candidate);
-                            return Err(err);
-                        }
-                    }
+                    .await;
                 }
                 OpenaiErrorClass::Transient => {
                     tracing::warn!(
@@ -2025,6 +2068,74 @@ mod tests {
                 *state.probed.lock().unwrap(),
                 vec!["fam-3".to_string()],
                 "fam-2 must never be probed once the /v1/responses retry for fam-3 succeeds"
+            );
+            assert_eq!(
+                *state.responses_probed.lock().unwrap(),
+                vec!["fam-3".to_string()],
+                "the /v1/responses retry must target the same candidate id"
+            );
+        }
+
+        // 2026-09-25 incident (gpt-5.6-terra): a candidate can need BOTH
+        // corrections — `max_completion_tokens` instead of `max_tokens`,
+        // *and* `/v1/responses` instead of `/v1/chat/completions` — and
+        // before the fix, `classify_probe_failure` was never run on the
+        // max_completion_tokens retry's own failure, so this candidate
+        // aborted the whole walk instead of resolving to `Responses`.
+        #[tokio::test]
+        async fn resolve_should_retry_via_responses_when_max_completion_tokens_retry_also_classifies_wrong_endpoint(
+        ) {
+            let mut chat_responses = HashMap::new();
+            chat_responses.insert(
+                "fam-3".to_string(),
+                ScriptedResponse::error(
+                    400,
+                    "Unsupported parameter: 'max_tokens' is not supported with this model. \
+                     Use 'max_completion_tokens' instead.",
+                ),
+            );
+            let mut max_completion_tokens_responses = HashMap::new();
+            max_completion_tokens_responses.insert(
+                "fam-3".to_string(),
+                ScriptedResponse::error(
+                    400,
+                    "Function tools with reasoning_effort are not supported for fam-3 in \
+                     /v1/chat/completions. To use function tools, use /v1/responses or set \
+                     reasoning_effort to 'none'.",
+                ),
+            );
+            let mut responses_endpoint_responses = HashMap::new();
+            responses_endpoint_responses.insert("fam-3".to_string(), ScriptedResponse::ok());
+            let (base_url, state, _server) = start_scripted_server_full(
+                &["fam-3", "fam-2"],
+                chat_responses,
+                responses_endpoint_responses,
+                max_completion_tokens_responses,
+            )
+            .await;
+            let provider = provider_for(base_url, 60);
+            let resolution_state = ResolutionState::new();
+
+            let result = resolve_family(
+                &resolution_state,
+                "fam-",
+                Duration::from_secs(5),
+                60,
+                || provider.list_models(),
+                probe_via(&provider),
+            )
+            .await;
+
+            let resolved =
+                result.expect("the /v1/responses retry after the max_tokens retry should succeed");
+            assert_eq!(resolved.model_id, "fam-3");
+            assert_eq!(resolved.endpoint, Endpoint::Responses);
+            assert_eq!(
+                *state.probed.lock().unwrap(),
+                vec!["fam-3".to_string(), "fam-3".to_string()],
+                "fam-3 must be probed twice on /v1/chat/completions (max_tokens, then \
+                 max_completion_tokens) before falling back to /v1/responses; fam-2 must \
+                 never be probed once fam-3 resolves"
             );
             assert_eq!(
                 *state.responses_probed.lock().unwrap(),

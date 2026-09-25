@@ -1,13 +1,15 @@
 //! Anthropic API provider.
 //!
 //! Forwards requests to the configured `base_url`'s `/v1/messages`
-//! (defaulting to `https://api.anthropic.com`), cleaning Claude Code /
-//! Bedrock-specific fields that the Anthropic API rejects.
+//! (defaulting to `https://api.anthropic.com`) unchanged, per the gateway
+//! compatibility guide's "Feature pass-through" contract —
+//! `normalize_model_name` is the only body edit this module makes, fixing
+//! up a Bedrock-shaped model id string a client can send to the default endpoint.
 //!
 //! Ported from the legacy `claude-proxy-rs` `AnthropicProvider`. The pure
-//! request/response logic (`clean_request_body`, `normalize_model_name`,
-//! `map_error_status`, the two reqwest clients from ADR-004) carries over
-//! unchanged. What changed is auth and config:
+//! request/response logic (`normalize_model_name`, `map_error_status`, the
+//! two reqwest clients from ADR-004) carries over unchanged. What changed
+//! is auth and config:
 //!
 //! - Legacy sniffed the token shape (`sk-ant-api-*` vs OAuth) to decide
 //!   `x-api-key` vs `Authorization: Bearer`. The new schema makes that an
@@ -28,7 +30,7 @@ use std::time::Duration;
 use http::HeaderMap;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{AuthError, SecretResolver};
@@ -234,9 +236,6 @@ impl AnthropicProvider {
             body["model"] = Value::String(normalized);
         }
 
-        // Clean the request body (strips Bedrock-specific / unsupported fields)
-        clean_request_body(&mut body);
-
         let url = format!("{}/v1/messages", self.base_url);
         let headers = self.build_headers(incoming_headers, &url).await?;
         let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Upstream {
@@ -311,9 +310,6 @@ impl AnthropicProvider {
             let normalized = Self::normalize_model_name(model, self.is_default_endpoint);
             body["model"] = Value::String(normalized);
         }
-
-        // Clean the request body
-        clean_request_body(&mut body);
 
         let url = format!("{}/v1/messages", self.base_url);
         let headers = self.build_headers(incoming_headers, &url).await?;
@@ -497,100 +493,11 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(),
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Body cleaning (ADR-007 — serde_json::Value throughout, no typed structs)
-// ---------------------------------------------------------------------------
-
 /// Lazy-compiled regex for stripping Bedrock model version suffixes.
 static MODEL_VERSION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     #[allow(clippy::unwrap_used)] // literal pattern is known-valid at compile time; cannot fail
     regex::Regex::new(r"-v\d+(?::\d+)?$").unwrap()
 });
-
-/// Clean a request body in-place, removing fields that the Anthropic API
-/// rejects.  Matches the Python `_clean_request_body` implementation.
-///
-/// Strips:
-/// - From each `tools[]` entry: `defer_loading`, `input_examples`, `custom`,
-///   `cache_control`
-/// - From `messages[*].content[*]` of type `tool_result`: removes any
-///   `content[]` items whose `type` is not in the supported set
-/// - From `system[]` `cache_control` objects: removes nested `ephemeral.scope`
-/// - Top-level: `output_config`, `context_management`
-pub fn clean_request_body(body: &mut Value) {
-    // 1. Clean tools[]
-    if let Some(tools) = body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-        for tool in tools.iter_mut() {
-            if let Some(obj) = tool.as_object_mut() {
-                for field in &["defer_loading", "input_examples", "custom", "cache_control"] {
-                    if obj.remove(*field).is_some() {
-                        debug!("Removed '{field}' from tool definition");
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Clean messages[*].content[*] — remove unsupported types from tool_result content
-    if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
-        for message in messages.iter_mut() {
-            if let Some(content) = message.get_mut("content").and_then(|v| v.as_array_mut()) {
-                for item in content.iter_mut() {
-                    if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                        if let Some(inner) = item.get_mut("content").and_then(|v| v.as_array_mut())
-                        {
-                            let before = inner.len();
-                            inner.retain(|c| {
-                                c.get("type").and_then(|t| t.as_str()).is_none_or(|t| {
-                                    matches!(
-                                        t,
-                                        "text"
-                                            | "image"
-                                            | "document"
-                                            | "search_result"
-                                            | "tool_use"
-                                            | "tool_result"
-                                    )
-                                })
-                            });
-                            let removed = before - inner.len();
-                            if removed > 0 {
-                                debug!(
-                                    "Removed {removed} unsupported content block(s) from tool_result"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Clean system[*].cache_control.ephemeral.scope
-    if let Some(system) = body.get_mut("system").and_then(|v| v.as_array_mut()) {
-        for item in system.iter_mut() {
-            if let Some(cc) = item
-                .get_mut("cache_control")
-                .and_then(|v| v.as_object_mut())
-            {
-                if let Some(ephemeral) = cc.get_mut("ephemeral").and_then(|v| v.as_object_mut()) {
-                    if ephemeral.remove("scope").is_some() {
-                        debug!("Removed 'scope' from system[].cache_control.ephemeral");
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Strip top-level Bedrock-specific fields
-    if let Some(obj) = body.as_object_mut() {
-        for field in &["output_config", "context_management"] {
-            if obj.remove(*field).is_some() {
-                info!("Stripped Bedrock-specific top-level field '{field}'");
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Error mapping helper
@@ -707,51 +614,6 @@ mod tests {
             AnthropicProvider::normalize_model_name("claude-3-5-sonnet-20241022", true),
             "claude-3-5-sonnet-20241022"
         );
-    }
-
-    #[test]
-    fn clean_request_body_strips_tool_fields() {
-        let mut body = json!({
-            "tools": [
-                {"name": "t1", "defer_loading": true, "cache_control": {"type": "ephemeral"}}
-            ]
-        });
-        clean_request_body(&mut body);
-        let tool = &body["tools"][0];
-        assert!(tool.get("defer_loading").is_none());
-        assert!(tool.get("cache_control").is_none());
-        assert_eq!(tool["name"], "t1");
-    }
-
-    #[test]
-    fn clean_request_body_strips_top_level_bedrock_fields() {
-        let mut body = json!({"output_config": {}, "context_management": {}, "model": "x"});
-        clean_request_body(&mut body);
-        assert!(body.get("output_config").is_none());
-        assert!(body.get("context_management").is_none());
-        assert_eq!(body["model"], "x");
-    }
-
-    #[test]
-    fn clean_request_body_filters_unsupported_tool_result_content() {
-        let mut body = json!({
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "content": [
-                        {"type": "text", "text": "ok"},
-                        {"type": "tool_reference"}
-                    ]
-                }]
-            }]
-        });
-        clean_request_body(&mut body);
-        let inner = body["messages"][0]["content"][0]["content"]
-            .as_array()
-            .unwrap();
-        assert_eq!(inner.len(), 1);
-        assert_eq!(inner[0]["type"], "text");
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -930,4 +792,9 @@ mod tests {
             );
         }
     }
+    // 2026-09-25: `clean_request_body` (and its three tests, formerly here)
+    // was removed — api.anthropic.com now accepts every field it stripped
+    // (tool search, tool-use examples, prompt caching, effort, context
+    // management), so it was silently breaking those features. See the
+    // module doc comment.
 }

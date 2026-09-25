@@ -400,6 +400,48 @@ impl OpenaiProvider {
         }
     }
 
+    /// Does `error` classify as [`OpenaiErrorClass::WrongEndpoint`]?
+    ///
+    /// Used on the real (non-probe) `/v1/chat/completions` dispatch path:
+    /// unlike `Deprecated`, a `WrongEndpoint` failure there can't be caught
+    /// ahead of time by `walk_candidates`'s tools-free probe (Story
+    /// 2.3.3/`RESOLUTION_TTL`'s doc comment calls this out by name), so the
+    /// real request itself has to detect it and fail over.
+    fn classify_wrong_endpoint_failure(error: &ProviderError) -> bool {
+        match error {
+            ProviderError::Validation(body, status) | ProviderError::Upstream { body, status } => {
+                classify_openai_error(*status, body) == OpenaiErrorClass::WrongEndpoint
+            }
+            _ => false,
+        }
+    }
+
+    /// Promotes a family's cache entry to `Endpoint::Responses` after a real
+    /// request's runtime `WrongEndpoint` retry (below) succeeds, so
+    /// subsequent requests for this family skip straight to `/v1/responses`
+    /// instead of repeating the failed `/v1/chat/completions` attempt every
+    /// time. A no-op for a static-`model` upstream (no `family`), which has
+    /// no cache entry to update.
+    fn promote_cache_to_responses(
+        &self,
+        family: Option<&str>,
+        model_id: &str,
+        token_param: resolution::TokenParamStyle,
+    ) {
+        let Some(family) = family else {
+            return;
+        };
+        self.resolution.cache.insert(
+            family.to_string(),
+            resolution::ResolvedModel {
+                model_id: model_id.to_string(),
+                endpoint: resolution::Endpoint::Responses,
+                token_param,
+                resolved_at: tokio::time::Instant::now(),
+            },
+        );
+    }
+
     /// Send a streaming request to `POST /v1/chat/completions`.
     ///
     /// # Errors
@@ -572,6 +614,17 @@ const OPENAI_ERROR_CLASSIFICATION_TABLE: &[(u16, &str, OpenaiErrorClass)] = &[
     // covering it is a table entry, not a logic change.
     (400, "no longer available", OpenaiErrorClass::Deprecated),
     (404, "v1/responses", OpenaiErrorClass::WrongEndpoint),
+    // Observed for a candidate that supports `/v1/chat/completions` for
+    // plain requests but rejects function tools + `reasoning_effort` there
+    // specifically (e.g. gpt-5.6-terra): "Function tools with
+    // reasoning_effort are not supported for <model> in
+    // /v1/chat/completions. To use function tools, use /v1/responses or set
+    // reasoning_effort to 'none'." The tools-free probe body
+    // (`build_probe_body`) never carries tools, so resolution can cache this
+    // candidate as `ChatCompletions` and only a real, tool-carrying request
+    // ever surfaces this — see the runtime `WrongEndpoint` retry in
+    // `OpenaiProvider::send`.
+    (400, "use /v1/responses", OpenaiErrorClass::WrongEndpoint),
 ];
 
 /// Classify an `OpenAI` HTTP error status + response body for the
@@ -753,7 +806,24 @@ impl Provider for OpenaiProvider {
                 Ok(response) => response,
                 Err(err) => {
                     self.invalidate_cache_on_deprecated_failure(family.as_deref(), &err);
-                    return Err(err);
+                    // Runtime counterpart to Epic 3.6's probe-time
+                    // `WrongEndpoint` retry: the tools-free probe body never
+                    // exercises this failure (see `classify_wrong_endpoint_failure`'s
+                    // doc comment), so a real request carrying tools can hit
+                    // it even after resolution cached this candidate as
+                    // `ChatCompletions`. Retry the same request against
+                    // `/v1/responses` once before giving up.
+                    if !Self::classify_wrong_endpoint_failure(&err) {
+                        return Err(err);
+                    }
+                    let responses_body = responses::translate_anthropic_request_to_responses(body);
+                    let response = self.send_responses_streaming_request(responses_body).await?;
+                    self.promote_cache_to_responses(family.as_deref(), &model, token_param);
+                    let byte_stream = response
+                        .bytes_stream()
+                        .map(|r| r.map_err(anyhow::Error::from));
+                    let translated = responses::ResponsesToAnthropicStream::new(byte_stream, model);
+                    return Ok(ProviderResponse::Stream(Box::pin(translated)));
                 }
             };
             let byte_stream = response
@@ -772,7 +842,16 @@ impl Provider for OpenaiProvider {
                     // so the next request for it re-walks instead of
                     // repeatedly hitting the same dead model.
                     self.invalidate_cache_on_deprecated_failure(family.as_deref(), &err);
-                    return Err(err);
+                    // See the streaming branch above for why a real request
+                    // (not just the resolution probe) has to check this too.
+                    if !Self::classify_wrong_endpoint_failure(&err) {
+                        return Err(err);
+                    }
+                    let responses_body = responses::translate_anthropic_request_to_responses(body);
+                    let value = self.send_responses_request(responses_body).await?;
+                    self.promote_cache_to_responses(family.as_deref(), &model, token_param);
+                    let anthropic_value = responses::translate_responses_response_to_anthropic(value);
+                    return Ok(ProviderResponse::Full(anthropic_value));
                 }
             };
             let anthropic_value = super::translate_openai_response_to_anthropic(
@@ -1622,6 +1701,86 @@ mod tests {
             assert_eq!(outgoing.body["model"], json!("gpt-5.3-codex"));
         }
 
+        /// Chat-completions handler for the `WrongEndpoint`-runtime-retry
+        /// test below: always fails with the exact 400 phrasing observed
+        /// for a model that rejects function tools + `reasoning_effort` on
+        /// `/v1/chat/completions` (gpt-5.6-terra, 2026-09-25 incident).
+        async fn handle_chat_completions_rejects_tools_with_reasoning_effort(
+            axum::extract::State(captured): axum::extract::State<
+                Arc<Mutex<Option<CapturedRequest>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> (StatusCode, axum::Json<Value>) {
+            *captured.lock().unwrap() = Some(CapturedRequest {
+                path: "/v1/chat/completions".to_string(),
+                body,
+            });
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error": {
+                        "message": "Function tools with reasoning_effort are not supported for gpt-5.6-terra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+                        "type": "invalid_request_error",
+                        "param": "reasoning_effort",
+                        "code": null,
+                    }
+                })),
+            )
+        }
+
+        #[tokio::test]
+        async fn send_should_retry_via_responses_endpoint_when_real_request_hits_tools_reasoning_effort_wrong_endpoint_error(
+        ) {
+            let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
+            let app = axum::Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    axum::routing::post(handle_chat_completions_rejects_tools_with_reasoning_effort),
+                )
+                .route("/v1/responses", axum::routing::post(handle_responses))
+                .with_state(captured.clone());
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("mock server bind should succeed");
+            let addr = listener
+                .local_addr()
+                .expect("mock server local_addr should succeed");
+            let _server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let base_url = format!("http://{addr}");
+            let provider = provider_for(base_url);
+
+            let body = json!({
+                "model": "gpt-5.6-terra",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "get_time", "description": "d", "input_schema": {}}],
+            });
+
+            let result = provider.send(body, HeaderMap::new(), false).await;
+            let response = result.expect(
+                "a real request classified WrongEndpoint must retry via /v1/responses, not fail",
+            );
+
+            let ProviderResponse::Full(anthropic_value) = response else {
+                panic!("non-streaming send must return ProviderResponse::Full");
+            };
+            assert_eq!(
+                anthropic_value["content"],
+                json!([{"type": "text", "text": "hello from responses"}])
+            );
+
+            let outgoing = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("mock server must have received the /v1/responses retry");
+            assert_eq!(
+                outgoing.path, "/v1/responses",
+                "runtime WrongEndpoint retry must land on /v1/responses"
+            );
+        }
+
         #[tokio::test]
         async fn send_should_post_to_chat_completions_when_no_family_key_is_present() {
             // Regression check for the "completely unchanged" requirement: a
@@ -1665,6 +1824,16 @@ mod tests {
         let body = r#"{"error":{"type":"invalid_request_error","message":"This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead"}}"#;
         assert_eq!(
             classify_openai_error(404, body),
+            OpenaiErrorClass::WrongEndpoint
+        );
+    }
+
+    #[test]
+    fn classify_openai_error_should_return_wrong_endpoint_for_400_tools_reasoning_effort_message()
+    {
+        let body = r#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-5.6-terra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.","type":"invalid_request_error","param":"reasoning_effort","code":null}}"#;
+        assert_eq!(
+            classify_openai_error(400, body),
             OpenaiErrorClass::WrongEndpoint
         );
     }

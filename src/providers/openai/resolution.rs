@@ -310,27 +310,67 @@ impl ResolutionState {
 // ────────────────────────────────────────────────────────────────────────
 
 /// Story 2.3.1: a minimal, side-effect-free probe request body for
-/// `model_id` — a single short user message, no `tools` key, and a token
-/// budget well below `capability.rs`'s `EVAL_MAX_TOKENS = 64` tool-probing
-/// shape (this probe only needs to confirm the model id is alive/routable,
-/// not that it can call tools).
+/// `model_id` — a single short user message and a token budget well below
+/// `capability.rs`'s `EVAL_MAX_TOKENS = 64` (this probe only needs to
+/// confirm the model id is alive/routable, not that it actually calls a
+/// tool — `probe_candidate` only checks the HTTP status, never the
+/// response content).
+///
+/// Carries a minimal `tools` entry (same distinctive `EVAL_TOOL_NAME` as
+/// `capability.rs`'s tool-calling probe, so both are identifiable in
+/// logs/upstream dashboards as synthetic traffic) *specifically* because a
+/// tools-free probe body was found not to be representative of real
+/// traffic: some candidates accept plain `/v1/chat/completions` requests
+/// but 400 once a request carries both a `tools` array and
+/// `reasoning_effort` (gpt-5.6-terra, 2026-09-25 incident) — a
+/// `WrongEndpoint`-classified failure a tools-free probe can never observe,
+/// so it got cached as `ChatCompletions` and only failed on the first real
+/// tool-carrying client request. Carrying `tools` here lets `walk_candidates`
+/// catch that at resolution time via the same `WrongEndpoint` retry-as-
+/// `Responses` path (Epic 3.6) instead of relying solely on the runtime
+/// fallback in `OpenaiProvider::send`.
 pub(crate) fn build_probe_body(model_id: &str) -> Value {
     json!({
         "model": model_id,
         "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 16,
+        "tools": [probe_tool_definition()],
     })
 }
 
 /// Epic 3.6's `/v1/responses` counterpart to [`build_probe_body`] — same
 /// candidate id, but shaped for the Responses API's `input`/
 /// `max_output_tokens` fields (see `responses::translate_anthropic_request_to_responses`)
-/// instead of `/v1/chat/completions`'s `messages`/`max_tokens`.
+/// instead of `/v1/chat/completions`'s `messages`/`max_tokens`. Carries the
+/// same synthetic tool as `build_probe_body` (flat shape, per the Responses
+/// API's tool schema — no nested `function` key) so the `WrongEndpoint`
+/// retry this feeds is a like-for-like confirmation, not just a bare-text
+/// success on a candidate that was rejected specifically for its tools.
 pub(crate) fn build_probe_body_responses(model_id: &str) -> Value {
     json!({
         "model": model_id,
         "input": "hi",
         "max_output_tokens": 16,
+        "tools": [{
+            "type": "function",
+            "name": crate::routing::capability::EVAL_TOOL_NAME,
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    })
+}
+
+/// The `/v1/chat/completions`-shaped synthetic tool definition shared by
+/// [`build_probe_body`] — same name as `capability.rs`'s tool-calling probe
+/// (`EVAL_TOOL_NAME`), but nested OpenAI-style under `function` rather than
+/// flat (see [`build_probe_body_responses`] for the Responses API's flat
+/// equivalent).
+fn probe_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": crate::routing::capability::EVAL_TOOL_NAME,
+            "parameters": {"type": "object", "properties": {}},
+        },
     })
 }
 
@@ -1171,13 +1211,19 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn build_probe_body_should_omit_tools_and_cap_token_budget_at_sixteen() {
+    fn build_probe_body_should_carry_a_synthetic_tool_and_cap_token_budget_at_sixteen() {
+        // 2026-09-25: reversed from "must never carry a tools array" — a
+        // tools-free probe can't detect a candidate that 400s specifically
+        // on tools + reasoning_effort (see this function's doc comment).
         let body = build_probe_body("family-v3-preview");
 
         assert_eq!(body["model"], serde_json::json!("family-v3-preview"));
-        assert!(
-            body.get("tools").is_none(),
-            "a probe body must never carry a tools array"
+        let tools = body["tools"].as_array().expect("probe body must carry a tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], serde_json::json!("function"));
+        assert_eq!(
+            tools[0]["function"]["name"],
+            serde_json::json!(crate::routing::capability::EVAL_TOOL_NAME)
         );
         let max_tokens = body["max_tokens"]
             .as_u64()
@@ -1185,6 +1231,23 @@ mod tests {
         assert!(
             max_tokens <= 16,
             "probe max_tokens must stay well below capability.rs's EVAL_MAX_TOKENS (64)"
+        );
+    }
+
+    #[test]
+    fn build_probe_body_responses_should_carry_the_flat_shaped_synthetic_tool() {
+        let body = build_probe_body_responses("family-v3-preview");
+
+        let tools = body["tools"].as_array().expect("probe body must carry a tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], serde_json::json!("function"));
+        assert_eq!(
+            tools[0]["name"],
+            serde_json::json!(crate::routing::capability::EVAL_TOOL_NAME)
+        );
+        assert!(
+            tools[0].get("function").is_none(),
+            "Responses tool shape must be flat, not nested under a `function` key"
         );
     }
 

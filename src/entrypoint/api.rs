@@ -92,14 +92,31 @@ pub async fn get_models(
 ///
 /// Returns 500 if the on-disk config fails to load, or 404 if no route is
 /// configured.
+#[derive(Serialize)]
+struct RouteWithHealth<'a> {
+    #[serde(flatten)]
+    route: &'a Route,
+    health_state: serde_json::Value,
+}
+
 pub async fn get_route(
     State(state): State<EntrypointState>,
-) -> Result<Json<Route>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let config = crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
-    config.routes.into_iter().next().map(Json).ok_or((
+    let route = config.routes.into_iter().next().ok_or((
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "no route configured" })),
-    ))
+    ))?;
+    let health_state = state.dispatch_router.load().cooldown_snapshot();
+    let val = serde_json::to_value(RouteWithHealth {
+        route: &route,
+        health_state,
+    })
+    .map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    ))?;
+    Ok(Json(val))
 }
 
 /// Replaces the active route: validates the proposed route's upstream
@@ -575,10 +592,11 @@ name = "anthropic"
         let state = state_for(dir.path()).await;
 
         let Json(route) = get_route(State(state)).await.unwrap();
-        assert_eq!(route.name, "default");
-        assert_eq!(route.strategy, Strategy::Fallback);
-        assert_eq!(route.upstreams.len(), 1);
-        assert_eq!(route.upstreams[0].name, "anthropic");
+        assert_eq!(route["name"], "default");
+        assert_eq!(route["strategy"], "fallback");
+        assert_eq!(route["upstreams"].as_array().unwrap().len(), 1);
+        assert_eq!(route["upstreams"][0]["name"], "anthropic");
+        assert!(route.get("health_state").is_some());
     }
 
     #[tokio::test]
@@ -705,7 +723,7 @@ name = "anthropic"
 
         // A subsequent GET (re-reading from disk) reflects the change.
         let Json(fetched) = get_route(State(state.clone())).await.unwrap();
-        assert_eq!(fetched, new_route);
+        assert_eq!(fetched["name"], new_route.name);
 
         // The live router was hot-swapped, not just the on-disk config.
         let live = state.dispatch_router.load();

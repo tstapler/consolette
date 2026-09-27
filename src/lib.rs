@@ -27,3 +27,4 @@ pub mod session;
 pub mod session_compaction;
 pub mod system_prompt;
 pub mod vision;
+pub mod syntax_variance;

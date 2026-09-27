@@ -84,6 +84,7 @@ pub(crate) struct GeminiToAnthropicStream<S> {
     inner: eventsource_stream::EventStream<S>,
     id: String,
     model: String,
+    input_tokens: u64,
     started: bool,
     finished: bool,
     done: bool,
@@ -115,7 +116,7 @@ impl<S> GeminiToAnthropicStream<S> {
                     "content": [],
                     "model": self.model,
                     "stop_reason": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}
                 }
             }),
         ));
@@ -197,12 +198,18 @@ where
             inner: inner.eventsource(),
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             model,
+            input_tokens: 0,
             started: false,
             finished: false,
             done: false,
             active_blocks: Vec::new(),
             pending: VecDeque::new(),
         }
+    }
+
+    pub(crate) fn with_input_tokens(mut self, input_tokens: u64) -> Self {
+        self.input_tokens = input_tokens;
+        self
     }
 }
 

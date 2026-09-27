@@ -267,6 +267,10 @@ pub struct Config {
     pub request_timeout: u64,
     #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
     #[serde(default = "default_config_dir")]
     pub config_dir: String,
     #[serde(default = "default_true")]
@@ -317,6 +321,12 @@ fn default_request_timeout() -> u64 {
 fn default_cooldown_seconds() -> u64 {
     300
 }
+fn default_health_check_interval_secs() -> u64 {
+    10
+}
+fn default_failure_threshold() -> u32 {
+    3
+}
 fn default_true() -> bool {
     true
 }
@@ -341,6 +351,8 @@ impl Default for Config {
             log: default_log(),
             request_timeout: default_request_timeout(),
             cooldown_seconds: default_cooldown_seconds(),
+            health_check_interval_secs: default_health_check_interval_secs(),
+            failure_threshold: default_failure_threshold(),
             config_dir: default_config_dir(),
             compress: true,
             compress_floor_bytes: default_compress_floor_bytes(),

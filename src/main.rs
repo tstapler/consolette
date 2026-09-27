@@ -262,6 +262,7 @@ fn config_dir() -> PathBuf {
 struct CombinedMcpServer {
     compaction: CompactionMcpServer,
     context_forensics: consolette::context_forensics::mcp_server::ContextForensicsMcpServer,
+    forensics_store: Arc<consolette::context_forensics::store::ContextForensicsStore>,
 }
 
 impl CombinedMcpServer {
@@ -276,6 +277,11 @@ impl CombinedMcpServer {
             self.compaction.dispatch(request)
         } else if consolette::context_forensics::mcp_server::owns_tool(&request.name) {
             self.context_forensics.dispatch(&request)
+        } else if consolette::syntax_variance::mcp_server::owns_tool(&request.name) {
+            match consolette::syntax_variance::handle_get_syntax_variances(&self.forensics_store) {
+                Ok(json) => rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(json.to_string())]),
+                Err(err) => rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(err.to_string())]),
+            }
         } else {
             rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
                 "unknown tool: {}",
@@ -306,6 +312,7 @@ impl rmcp::ServerHandler for CombinedMcpServer {
     {
         let mut tools = consolette::claude_code_session::mcp_server::tool_defs();
         tools.extend(consolette::context_forensics::mcp_server::tool_defs());
+        tools.extend(consolette::syntax_variance::mcp_server::tool_defs());
         std::future::ready(Ok(rmcp::model::ListToolsResult {
             tools,
             ..Default::default()
@@ -332,13 +339,15 @@ async fn mcp() -> anyhow::Result<()> {
     )
     .context("failed to open context-forensics store")?;
     let pricing = consolette::cost_metrics::pricing::PricingTable::load_default();
+    let store_arc = Arc::new(store);
     let server = CombinedMcpServer {
         compaction: CompactionMcpServer::new(Arc::new(cache)),
         context_forensics:
             consolette::context_forensics::mcp_server::ContextForensicsMcpServer::new(
-                Arc::new(store),
+                Arc::clone(&store_arc),
                 Arc::new(pricing),
             ),
+        forensics_store: store_arc,
     };
 
     let transport = stdio();
@@ -550,11 +559,12 @@ mod tests {
 
     fn combined_server(dir: &TempDir) -> CombinedMcpServer {
         let cache = OmissionCache::open(&dir.path().join("omission-cache.sqlite")).unwrap();
-        let store = ContextForensicsStore::open(&dir.path().join("store.sqlite")).unwrap();
+        let store = Arc::new(ContextForensicsStore::open(&dir.path().join("store.sqlite")).unwrap());
         let pricing = PricingTable::load_default();
         CombinedMcpServer {
             compaction: CompactionMcpServer::new(Arc::new(cache)),
-            context_forensics: ContextForensicsMcpServer::new(Arc::new(store), Arc::new(pricing)),
+            context_forensics: ContextForensicsMcpServer::new(Arc::clone(&store), Arc::new(pricing)),
+            forensics_store: store,
         }
     }
 

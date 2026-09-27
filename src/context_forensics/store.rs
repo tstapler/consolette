@@ -583,6 +583,16 @@ CREATE TABLE IF NOT EXISTS hook_events (
     received_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS syntax_variances (
+    variance_type TEXT NOT NULL,
+    key_name      TEXT NOT NULL,
+    sample_json   TEXT NOT NULL,
+    count         INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    PRIMARY KEY (variance_type, key_name)
+);
+
 CREATE TABLE IF NOT EXISTS subagents (
     id                           TEXT PRIMARY KEY,
     parent_session_id            TEXT NOT NULL REFERENCES sessions(id),
@@ -718,7 +728,7 @@ impl ContextForensicsStore {
             .join("context-forensics.sqlite")
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.conn
             .lock()
             .map_err(|_| anyhow!("context-forensics store connection lock poisoned"))

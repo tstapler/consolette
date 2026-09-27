@@ -99,8 +99,8 @@ async fn anthropic_blocks_to_responses_items(
 /// sanitization chat/completions uses) and re-flattens its output, so a
 /// schema-sanitization fix in one path is not silently missing from the
 /// other.
-fn translate_tool_definition_to_responses(tool: &Value) -> Option<Value> {
-    let openai_shaped = crate::providers::translate_tool_definition(tool, false)?;
+fn translate_tool_definition_to_responses(tool: &Value, sanitize_subset: bool) -> Option<Value> {
+    let openai_shaped = crate::providers::translate_tool_definition(tool, sanitize_subset)?;
     let function = openai_shaped.get("function")?;
     Some(json!({
         "type": "function",
@@ -132,13 +132,44 @@ pub(crate) async fn translate_anthropic_request_to_responses(anthropic: Value) -
     let max_tokens = anthropic.get("max_tokens").and_then(Value::as_u64);
     let temperature = anthropic.get("temperature").cloned();
 
+    let is_claude = crate::system_prompt::is_claude_model(&model);
+    let sanitize_subset = model.to_lowercase().contains("cohere") || !is_claude;
+
+    let tool_names: Vec<&str> = anthropic
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut items: Vec<Value> = Vec::new();
 
-    if let Some(system) = anthropic.get("system").and_then(Value::as_str) {
+    let system_raw = anthropic.get("system").and_then(Value::as_str);
+    let system_text = match system_raw {
+        Some(sys) => {
+            if !is_claude && !tool_names.is_empty() {
+                crate::system_prompt::patch_open_model_tool_prompt(sys, &tool_names)
+            } else {
+                sys.to_string()
+            }
+        }
+        None => {
+            if !is_claude && !tool_names.is_empty() {
+                crate::system_prompt::patch_open_model_tool_prompt("", &tool_names)
+            } else {
+                String::new()
+            }
+        }
+    };
+
+    if !system_text.is_empty() {
         items.push(json!({
             "type": "message",
             "role": "system",
-            "content": [{"type": "input_text", "text": system}],
+            "content": [{"type": "input_text", "text": system_text}],
         }));
     }
 
@@ -201,7 +232,7 @@ pub(crate) async fn translate_anthropic_request_to_responses(anthropic: Value) -
     if let Some(tools) = anthropic.get("tools").and_then(Value::as_array) {
         let mapped: Vec<Value> = tools
             .iter()
-            .filter_map(translate_tool_definition_to_responses)
+            .filter_map(|t| translate_tool_definition_to_responses(t, sanitize_subset))
             .collect();
         if !mapped.is_empty() {
             body["tools"] = Value::Array(mapped);
@@ -436,6 +467,7 @@ pub(crate) struct ResponsesToAnthropicStream<S> {
     inner: eventsource_stream::EventStream<S>,
     id: String,
     model: String,
+    input_tokens: u64,
     started: bool,
     finished: bool,
     done: bool,
@@ -456,6 +488,7 @@ where
             inner: inner.eventsource(),
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             model,
+            input_tokens: 0,
             started: false,
             finished: false,
             done: false,
@@ -463,6 +496,11 @@ where
             item_index: HashMap::new(),
             blocks: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_input_tokens(mut self, input_tokens: u64) -> Self {
+        self.input_tokens = input_tokens;
+        self
     }
 
     fn frame(event: &str, data: &Value) -> Bytes {
@@ -485,7 +523,7 @@ where
                     "content": [],
                     "model": self.model,
                     "stop_reason": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}
                 }
             }),
         ));

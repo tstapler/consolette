@@ -268,13 +268,30 @@ pub(crate) fn translate_anthropic_request_to_gemini(
         }
     }
 
-    let system_instruction =
-        anthropic
-            .get("system")
-            .and_then(Value::as_str)
-            .map(|s| GeminiSystemInstruction {
-                parts: vec![GeminiPart::text(s.to_string())],
-            });
+    let tool_names: Vec<&str> = anthropic
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let system_raw = anthropic.get("system").and_then(Value::as_str).unwrap_or("");
+    let system_text = if !tool_names.is_empty() {
+        crate::system_prompt::patch_open_model_tool_prompt(system_raw, &tool_names)
+    } else {
+        system_raw.to_string()
+    };
+
+    let system_instruction = if !system_text.is_empty() {
+        Some(GeminiSystemInstruction {
+            parts: vec![GeminiPart::text(system_text)],
+        })
+    } else {
+        None
+    };
 
     // TODO(gemini-provider plan.md Unresolved Questions, "Exact gemini-3-pro
     // max-output-token ceiling"): GEMINI_3_PRO_OUTPUT_CEILING was never

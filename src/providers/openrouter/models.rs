@@ -102,10 +102,16 @@ pub(super) fn parse_free_model_entries(value: &Value) -> Vec<FreeModelEntry> {
         .into_iter()
         .filter_map(|entry| {
             let id = entry.get("id").and_then(Value::as_str)?.to_string();
-            let pricing = entry.get("pricing")?;
-            let prompt = pricing.get("prompt").and_then(Value::as_str)?;
-            let completion = pricing.get("completion").and_then(Value::as_str)?;
-            if prompt == "0" && completion == "0" {
+            let is_free_id = id.ends_with(":free");
+            let is_zero_pricing = entry.get("pricing").map_or(false, |pricing| {
+                let is_zero_str = |v: Option<&Value>| {
+                    v.and_then(Value::as_str).is_some_and(|s| {
+                        s == "0" || s == "0.0" || (s.starts_with("0.0") && s.chars().all(|c| c == '0' || c == '.'))
+                    })
+                };
+                is_zero_str(pricing.get("prompt")) && is_zero_str(pricing.get("completion"))
+            });
+            if is_free_id || is_zero_pricing {
                 Some(FreeModelEntry {
                     id,
                     price_prompt: 0.0,

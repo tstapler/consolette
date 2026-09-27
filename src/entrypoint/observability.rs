@@ -270,7 +270,7 @@ mod tests {
 
         assert_eq!(
             json["cooldowns"]["anthropic"],
-            serde_json::json!({"cooling_down": false, "remaining_seconds": 0}),
+            serde_json::json!({"circuit_state": "closed", "cooling_down": false, "remaining_seconds": 0}),
             "anthropic must be healthy, not contaminated by bedrock/gemini's cooldowns"
         );
         assert_eq!(

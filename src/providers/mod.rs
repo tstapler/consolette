@@ -764,27 +764,47 @@ pub async fn translate_anthropic_request_to_openai(
         .unwrap_or(false);
     let temperature = anthropic.get("temperature").cloned();
 
-    // Cohere-backed models validate tool schemas against a strict JSON
-    // Schema subset (no `^$` anchors or lookarounds in `pattern`, whitelisted
-    // `format`s, no `allOf`/`oneOf`/ranges — see `sanitize_schema_cohere_subset`).
-    // Gate on the effective model id so tolerant backends keep full schemas.
-    let cohere_subset = model.to_lowercase().contains("cohere");
+    // Cohere-backed models and open-weight models validate tool schemas
+    // against a strict JSON Schema subset (no `^$` anchors or lookarounds in
+    // `pattern`, whitelisted `format`s, no `allOf`/`oneOf`/ranges — see
+    // `sanitize_schema_cohere_subset`).
+    // Native Anthropic Claude models keep raw schemas.
+    let is_claude = crate::system_prompt::is_claude_model(&model);
+    let sanitize_subset = model.to_lowercase().contains("cohere") || !is_claude;
 
     let supports_vision = crate::system_prompt::is_vision_model(&model);
     let mut messages: Vec<Value> = Vec::new();
 
-    if let Some(system) = anthropic.get("system").and_then(Value::as_str) {
-        let text = if supports_vision {
-            system.to_string()
+    let tool_names: Vec<&str> = anthropic
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let system_raw = anthropic.get("system").and_then(Value::as_str);
+    let mut system_text = if let Some(sys) = system_raw {
+        if supports_vision {
+            sys.to_string()
         } else {
-            crate::system_prompt::patch_non_vision_system_prompt(system)
-        };
-        messages.push(json!({"role": "system", "content": text}));
+            crate::system_prompt::patch_non_vision_system_prompt(sys)
+        }
     } else if !supports_vision {
-        messages.push(json!({
-            "role": "system",
-            "content": crate::system_prompt::NON_VISION_SYSTEM_NOTE.trim_start()
-        }));
+        crate::system_prompt::NON_VISION_SYSTEM_NOTE.trim_start().to_string()
+    } else {
+        String::new()
+    };
+
+    if !is_claude && !tool_names.is_empty() {
+        system_text =
+            crate::system_prompt::patch_open_model_tool_prompt(&system_text, &tool_names);
+    }
+
+    if !system_text.is_empty() {
+        messages.push(json!({"role": "system", "content": system_text}));
     }
 
     if let Some(anthropic_messages) = anthropic.get("messages").and_then(Value::as_array) {
@@ -815,7 +835,7 @@ pub async fn translate_anthropic_request_to_openai(
     if let Some(tools) = anthropic.get("tools").and_then(Value::as_array) {
         let mapped: Vec<Value> = tools
             .iter()
-            .filter_map(|t| translate_tool_definition(t, cohere_subset))
+            .filter_map(|t| translate_tool_definition(t, sanitize_subset))
             .collect();
         if !mapped.is_empty() {
             body["tools"] = Value::Array(mapped);
@@ -2525,8 +2545,8 @@ mod tests {
 
     #[tokio::test]
     async fn translate_anthropic_request_to_openai_applies_cohere_subset_by_model_id() {
-        // The same tool schema keeps its anchored pattern for tolerant
-        // backends (Laguna) but loses it for Cohere-bound models.
+        // The same tool schema keeps its anchored pattern for native Claude
+        // models but loses it for Cohere and open-weight non-Claude models.
         let request = |model: &str| {
             json!({
                 "model": model,
@@ -2550,10 +2570,19 @@ mod tests {
             "Cohere-bound request must drop anchored patterns"
         );
 
-        let laguna =
-            translate_anthropic_request_to_openai(&request("poolside/laguna-s-2.1:free")).await;
+        let qwen =
+            translate_anthropic_request_to_openai(&request("qwen/qwen-2.5-coder-32b-instruct:free")).await;
+        assert!(
+            qwen["tools"][0]["function"]["parameters"]["properties"]["v"]
+                .get("pattern")
+                .is_none(),
+            "Open-weight request must drop anchored patterns"
+        );
+
+        let claude =
+            translate_anthropic_request_to_openai(&request("claude-3-5-sonnet")).await;
         assert_eq!(
-            laguna["tools"][0]["function"]["parameters"]["properties"]["v"]["pattern"],
+            claude["tools"][0]["function"]["parameters"]["properties"]["v"]["pattern"],
             json!("^[a-z]+$")
         );
     }

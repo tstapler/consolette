@@ -220,3 +220,35 @@ fn v1_models_lists_pinned_ids_deduped() {
     assert_eq!(v["has_more"], serde_json::json!(false));
     assert_eq!(v["data"][0]["type"], serde_json::json!("model"));
 }
+
+#[test]
+fn clamp_context_budget_should_clamp_max_tokens_when_total_requested_exceeds_context_limit() {
+    // 193,614 input tokens estimated (~774,456 chars) + 64,000 max_tokens > 256,000 limit
+    let big_prompt = "x".repeat(774_456);
+    let mut body = serde_json::json!({
+        "model": "google/gemini-2.5-flash:free",
+        "max_tokens": 64000,
+        "messages": [{"role": "user", "content": big_prompt}]
+    });
+
+    clamp_context_budget(&mut body);
+
+    let est_input = u64::from(estimate_tokens(&body));
+    let clamped_max = body["max_tokens"].as_u64().unwrap();
+    assert!(clamped_max < 64000);
+    assert!(est_input + clamped_max <= 256_000);
+}
+
+#[test]
+fn clamp_context_budget_should_leave_requests_unchanged_when_tokens_fit_comfortably() {
+    let mut body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+
+    clamp_context_budget(&mut body);
+
+    assert_eq!(body["max_tokens"], 4096);
+}
+

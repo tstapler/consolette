@@ -695,6 +695,7 @@ impl Provider for OpenaiProvider {
                 .to_string();
             let responses_body = responses::translate_anthropic_request_to_responses(body).await;
             if stream {
+                let est_tokens = u64::from(u32::try_from(responses_body.to_string().len() / 4).unwrap_or(u32::MAX));
                 let response = match self.send_responses_streaming_request(responses_body).await {
                     Ok(response) => response,
                     Err(err) => {
@@ -706,7 +707,7 @@ impl Provider for OpenaiProvider {
                     .bytes_stream()
                     .map(|r| r.map_err(anyhow::Error::from));
                 let translated =
-                    responses::ResponsesToAnthropicStream::new(byte_stream, model_hint);
+                    responses::ResponsesToAnthropicStream::new(byte_stream, model_hint).with_input_tokens(est_tokens);
                 return Ok(ProviderResponse::Stream(Box::pin(translated)));
             }
             let value = match self.send_responses_request(responses_body).await {
@@ -743,6 +744,7 @@ impl Provider for OpenaiProvider {
         }
 
         if stream {
+            let est_tokens = u64::from(u32::try_from(openai_body.to_string().len() / 4).unwrap_or(u32::MAX));
             let response = match self.send_streaming_request(openai_body).await {
                 Ok(response) => response,
                 Err(err) => {
@@ -753,7 +755,7 @@ impl Provider for OpenaiProvider {
             let byte_stream = response
                 .bytes_stream()
                 .map(|r| r.map_err(anyhow::Error::from));
-            let translated = OpenaiToAnthropicStream::new(byte_stream, model);
+            let translated = OpenaiToAnthropicStream::new(byte_stream, model).with_input_tokens(est_tokens);
             Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
             let value = match self.send_request(openai_body).await {
@@ -818,6 +820,7 @@ pub(crate) struct OpenaiToAnthropicStream<S> {
     inner: eventsource_stream::EventStream<S>,
     id: String,
     model: String,
+    input_tokens: u64,
     started: bool,
     finished: bool,
     done: bool,
@@ -849,6 +852,7 @@ where
             inner: inner.eventsource(),
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             model,
+            input_tokens: 0,
             started: false,
             finished: false,
             done: false,
@@ -856,6 +860,11 @@ where
             text_started: false,
             tools: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_input_tokens(mut self, input_tokens: u64) -> Self {
+        self.input_tokens = input_tokens;
+        self
     }
 
     fn frame(event: &str, data: &Value) -> Bytes {
@@ -881,7 +890,7 @@ where
                     "content": [],
                     "model": self.model,
                     "stop_reason": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}
                 }
             }),
         ));

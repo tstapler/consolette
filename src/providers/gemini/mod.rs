@@ -484,8 +484,10 @@ impl Provider for GeminiProvider {
             let byte_stream = response
                 .bytes_stream()
                 .map(|r| r.map_err(anyhow::Error::from));
-            let est_tokens = u64::from(u32::try_from(body.to_string().len() / 4).unwrap_or(u32::MAX));
-            let translated = GeminiToAnthropicStream::new(byte_stream, model).with_input_tokens(est_tokens);
+            let est_tokens =
+                u64::from(u32::try_from(body.to_string().len() / 4).unwrap_or(u32::MAX));
+            let translated =
+                GeminiToAnthropicStream::new(byte_stream, model).with_input_tokens(est_tokens);
             return Ok(ProviderResponse::Stream(Box::pin(translated)));
         }
         let value = self.send_request(body).await?;

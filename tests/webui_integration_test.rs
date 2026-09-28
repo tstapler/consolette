@@ -1,5 +1,6 @@
 //! Integration tests for embedded WebUI static assets, SSE streaming,
 //! and REST API endpoints (Epic 7, Tasks 7.2.1 & 7.2.2).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
@@ -164,7 +165,10 @@ async fn test_dashboard_config_api_get_and_put() {
     let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
     let config_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(config_json.get("providers").is_some());
-    assert!(config_json.get("fallbackCascade").is_some() || config_json.get("fallback_cascade").is_some());
+    assert!(
+        config_json.get("fallbackCascade").is_some()
+            || config_json.get("fallback_cascade").is_some()
+    );
 
     // PUT /v1/dashboard/config
     let put_body = serde_json::to_vec(&config_json).unwrap();

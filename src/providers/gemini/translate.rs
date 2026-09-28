@@ -278,7 +278,10 @@ pub(crate) fn translate_anthropic_request_to_gemini(
         })
         .unwrap_or_default();
 
-    let system_raw = anthropic.get("system").and_then(Value::as_str).unwrap_or("");
+    let system_raw = anthropic
+        .get("system")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let system_text = if !tool_names.is_empty() {
         crate::system_prompt::patch_open_model_tool_prompt(system_raw, &tool_names)
     } else {

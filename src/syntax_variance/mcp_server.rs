@@ -1,7 +1,7 @@
 //! MCP tool server for syntax variances.
 
-use serde_json::{json, Value};
 use crate::context_forensics::store::ContextForensicsStore;
+use serde_json::{json, Value};
 
 pub const TOOL_NAME_GET_SYNTAX_VARIANCES: &str = "get_syntax_variances";
 

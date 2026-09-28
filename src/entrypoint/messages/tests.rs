@@ -251,4 +251,3 @@ fn clamp_context_budget_should_leave_requests_unchanged_when_tokens_fit_comforta
 
     assert_eq!(body["max_tokens"], 4096);
 }
-

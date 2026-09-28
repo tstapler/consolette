@@ -107,8 +107,10 @@ pub async fn post_v1_messages(
     let mut variances = crate::syntax_variance::inspect_headers(&headers);
     variances.extend(crate::syntax_variance::inspect_request_body(&body));
     if !variances.is_empty() {
-        let store_path = crate::context_forensics::store::ContextForensicsStore::default_store_path();
-        if let Ok(store) = crate::context_forensics::store::ContextForensicsStore::open(&store_path) {
+        let store_path =
+            crate::context_forensics::store::ContextForensicsStore::default_store_path();
+        if let Ok(store) = crate::context_forensics::store::ContextForensicsStore::open(&store_path)
+        {
             let _ = crate::syntax_variance::record_variances(&store, &variances);
         }
     }

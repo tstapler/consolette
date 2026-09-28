@@ -445,7 +445,10 @@ async fn dispatch_should_leave_health_registry_state_unchanged_when_model_family
 #[tokio::test]
 async fn circuit_breaker_threshold_failures_instantly_reroutes_traffic() {
     let (providers, primary_calls, fallback_calls) =
-        err_then_ok_providers(|| ProviderError::Upstream { status: 503, body: "service unavailable".into() });
+        err_then_ok_providers(|| ProviderError::Upstream {
+            status: 503,
+            body: "service unavailable".into(),
+        });
     let health = Arc::new(HealthRegistry::with_thresholds(300, 2));
     let router = fallback_router(providers, health.clone());
 
@@ -455,7 +458,10 @@ async fn circuit_breaker_threshold_failures_instantly_reroutes_traffic() {
         .await;
     assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
     assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(health.get_circuit_state(0), crate::routing::health::CircuitState::Closed);
+    assert_eq!(
+        health.get_circuit_state(0),
+        crate::routing::health::CircuitState::Closed
+    );
 
     // 2nd request: primary fails again (2nd failure -> threshold reached -> trips to Open)
     let _ = router
@@ -463,7 +469,10 @@ async fn circuit_breaker_threshold_failures_instantly_reroutes_traffic() {
         .await;
     assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
     assert_eq!(fallback_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(health.get_circuit_state(0), crate::routing::health::CircuitState::Open);
+    assert_eq!(
+        health.get_circuit_state(0),
+        crate::routing::health::CircuitState::Open
+    );
     assert!(!health.is_available(0));
 
     // 3rd request: primary is OPEN -> completely bypassed! Sent directly to fallback without primary call.
@@ -471,7 +480,14 @@ async fn circuit_breaker_threshold_failures_instantly_reroutes_traffic() {
         .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
         .await;
     assert!(res.is_ok());
-    assert_eq!(primary_calls.load(Ordering::SeqCst), 2, "primary must be zero-traffic bypassed when Open");
-    assert_eq!(fallback_calls.load(Ordering::SeqCst), 3, "fallback served request instantly");
+    assert_eq!(
+        primary_calls.load(Ordering::SeqCst),
+        2,
+        "primary must be zero-traffic bypassed when Open"
+    );
+    assert_eq!(
+        fallback_calls.load(Ordering::SeqCst),
+        3,
+        "fallback served request instantly"
+    );
 }
-

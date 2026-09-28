@@ -6,5 +6,7 @@ pub mod mcp_server;
 pub mod store;
 
 pub use inspector::{inspect_headers, inspect_request_body, SyntaxVariance};
-pub use mcp_server::{handle_get_syntax_variances, owns_tool, tool_defs, TOOL_NAME_GET_SYNTAX_VARIANCES};
+pub use mcp_server::{
+    handle_get_syntax_variances, owns_tool, tool_defs, TOOL_NAME_GET_SYNTAX_VARIANCES,
+};
 pub use store::{get_variances, record_variances, SyntaxVarianceRecord};

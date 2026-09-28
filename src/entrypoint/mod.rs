@@ -659,8 +659,10 @@ mod tests {
 
     #[tokio::test]
     async fn entrypoint_legacy_fallback_serves_legacy_dashboard_html() {
-        let mut config = Config::default();
-        config.web_ui = WebUiMode::Legacy;
+        let config = Config {
+            web_ui: WebUiMode::Legacy,
+            ..Default::default()
+        };
         let state = EntrypointState::build(&config, std::path::Path::new("/tmp/consolette-test"))
             .await
             .unwrap();

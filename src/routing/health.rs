@@ -163,9 +163,10 @@ impl HealthRegistry {
     }
 
     pub fn record_success(&self, idx: usize) {
-        let mut entry = self.breakers.entry(idx).or_insert_with(|| {
-            CircuitBreaker::new(self.failure_threshold, self.cooldown_duration)
-        });
+        let mut entry = self
+            .breakers
+            .entry(idx)
+            .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.cooldown_duration));
         entry.record_success(Instant::now());
     }
 
@@ -174,9 +175,10 @@ impl HealthRegistry {
         if !allowed {
             return;
         }
-        let mut entry = self.breakers.entry(idx).or_insert_with(|| {
-            CircuitBreaker::new(self.failure_threshold, self.cooldown_duration)
-        });
+        let mut entry = self
+            .breakers
+            .entry(idx)
+            .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.cooldown_duration));
         entry.record_failure(Instant::now());
     }
 
@@ -185,9 +187,10 @@ impl HealthRegistry {
         if !allowed {
             return;
         }
-        let mut entry = self.breakers.entry(idx).or_insert_with(|| {
-            CircuitBreaker::new(self.failure_threshold, self.cooldown_duration)
-        });
+        let mut entry = self
+            .breakers
+            .entry(idx)
+            .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.cooldown_duration));
         entry.trip(Instant::now(), override_duration);
     }
 

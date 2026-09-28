@@ -695,7 +695,9 @@ impl Provider for OpenaiProvider {
                 .to_string();
             let responses_body = responses::translate_anthropic_request_to_responses(body).await;
             if stream {
-                let est_tokens = u64::from(u32::try_from(responses_body.to_string().len() / 4).unwrap_or(u32::MAX));
+                let est_tokens = u64::from(
+                    u32::try_from(responses_body.to_string().len() / 4).unwrap_or(u32::MAX),
+                );
                 let response = match self.send_responses_streaming_request(responses_body).await {
                     Ok(response) => response,
                     Err(err) => {
@@ -707,7 +709,8 @@ impl Provider for OpenaiProvider {
                     .bytes_stream()
                     .map(|r| r.map_err(anyhow::Error::from));
                 let translated =
-                    responses::ResponsesToAnthropicStream::new(byte_stream, model_hint).with_input_tokens(est_tokens);
+                    responses::ResponsesToAnthropicStream::new(byte_stream, model_hint)
+                        .with_input_tokens(est_tokens);
                 return Ok(ProviderResponse::Stream(Box::pin(translated)));
             }
             let value = match self.send_responses_request(responses_body).await {
@@ -744,7 +747,8 @@ impl Provider for OpenaiProvider {
         }
 
         if stream {
-            let est_tokens = u64::from(u32::try_from(openai_body.to_string().len() / 4).unwrap_or(u32::MAX));
+            let est_tokens =
+                u64::from(u32::try_from(openai_body.to_string().len() / 4).unwrap_or(u32::MAX));
             let response = match self.send_streaming_request(openai_body).await {
                 Ok(response) => response,
                 Err(err) => {
@@ -755,7 +759,8 @@ impl Provider for OpenaiProvider {
             let byte_stream = response
                 .bytes_stream()
                 .map(|r| r.map_err(anyhow::Error::from));
-            let translated = OpenaiToAnthropicStream::new(byte_stream, model).with_input_tokens(est_tokens);
+            let translated =
+                OpenaiToAnthropicStream::new(byte_stream, model).with_input_tokens(est_tokens);
             Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
             let value = match self.send_request(openai_body).await {

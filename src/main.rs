@@ -286,8 +286,16 @@ impl CombinedMcpServer {
             self.context_forensics.dispatch(&request)
         } else if consolette::syntax_variance::mcp_server::owns_tool(&request.name) {
             match consolette::syntax_variance::handle_get_syntax_variances(&self.forensics_store) {
-                Ok(json) => rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(json.to_string())]),
-                Err(err) => rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(err.to_string())]),
+                Ok(json) => {
+                    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                        json.to_string(),
+                    )])
+                }
+                Err(err) => {
+                    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                        err.to_string(),
+                    )])
+                }
             }
         } else {
             rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
@@ -566,11 +574,15 @@ mod tests {
 
     fn combined_server(dir: &TempDir) -> CombinedMcpServer {
         let cache = OmissionCache::open(&dir.path().join("omission-cache.sqlite")).unwrap();
-        let store = Arc::new(ContextForensicsStore::open(&dir.path().join("store.sqlite")).unwrap());
+        let store =
+            Arc::new(ContextForensicsStore::open(&dir.path().join("store.sqlite")).unwrap());
         let pricing = PricingTable::load_default();
         CombinedMcpServer {
             compaction: CompactionMcpServer::new(Arc::new(cache)),
-            context_forensics: ContextForensicsMcpServer::new(Arc::clone(&store), Arc::new(pricing)),
+            context_forensics: ContextForensicsMcpServer::new(
+                Arc::clone(&store),
+                Arc::new(pricing),
+            ),
             forensics_store: store,
         }
     }

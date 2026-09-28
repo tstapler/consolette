@@ -1,10 +1,10 @@
 //! Persists syntax variances to `syntax_variances` table in `ContextForensicsStore`.
 
+use super::inspector::SyntaxVariance;
+use crate::context_forensics::store::ContextForensicsStore;
 use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use crate::context_forensics::store::ContextForensicsStore;
-use super::inspector::SyntaxVariance;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyntaxVarianceRecord {
@@ -71,6 +71,7 @@ pub fn get_variances(store: &ContextForensicsStore) -> Result<Vec<SyntaxVariance
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
@@ -85,8 +86,8 @@ mod tests {
             sample_json: "{}".to_string(),
         };
 
-        record_variances(&store, &[v1.clone()]).unwrap();
-        record_variances(&store, &[v1.clone()]).unwrap();
+        record_variances(&store, std::slice::from_ref(&v1)).unwrap();
+        record_variances(&store, std::slice::from_ref(&v1)).unwrap();
 
         let records = get_variances(&store).unwrap();
         assert_eq!(records.len(), 1);

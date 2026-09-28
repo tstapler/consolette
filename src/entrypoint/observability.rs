@@ -187,7 +187,10 @@ pub async fn get_dashboard_benchmark(
         } else {
             req.provider.clone()
         };
-        groups.entry((req.model.clone(), provider)).or_default().push(req);
+        groups
+            .entry((req.model.clone(), provider))
+            .or_default()
+            .push(req);
     }
 
     let mut items = Vec::new();
@@ -292,7 +295,6 @@ pub async fn get_dashboard_benchmark(
     Json(items)
 }
 
-
 /// `GET /requests/{id}?stage=original|compressed` — the dashboard's
 /// request-body inspector. `original` serves the cached pre-dispatch body;
 /// `compressed` serves the cached compressed body if recorded, or 404s if missing.
@@ -363,7 +365,9 @@ pub fn validate_base_url(url_str: &str) -> Result<(), String> {
     if parsed.scheme() != "https" {
         return Err("Scheme must be HTTPS".to_string());
     }
-    let host = parsed.host_str().ok_or_else(|| "Missing host in URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Missing host in URL".to_string())?;
     let host_clean = host.trim_start_matches('[').trim_end_matches(']');
     let host_lower = host_clean.to_lowercase();
     if host_lower == "localhost" || host_lower.ends_with(".internal") || host_lower == "127.0.0.1" {
@@ -426,7 +430,10 @@ pub async fn get_dashboard_config(
                 | crate::config::schema::AuthMethod::Bearer { token: key } => {
                     if let crate::config::schema::SecretRef::Inline { value } = key {
                         p_obj.insert("apiKey".to_string(), serde_json::json!(mask_api_key(value)));
-                        p_obj.insert("api_key".to_string(), serde_json::json!(mask_api_key(value)));
+                        p_obj.insert(
+                            "api_key".to_string(),
+                            serde_json::json!(mask_api_key(value)),
+                        );
                     }
                 }
                 _ => {}
@@ -489,7 +496,9 @@ pub async fn put_dashboard_config(
         || headers
             .get("host")
             .and_then(|h| h.to_str().ok())
-            .map_or(false, |h| !h.starts_with("127.0.0.1") && !h.starts_with("localhost"));
+            .map_or(false, |h| {
+                !h.starts_with("127.0.0.1") && !h.starts_with("localhost")
+            });
 
     if is_non_loopback && !headers.contains_key("x-consolette-auth") {
         return Err((
@@ -521,8 +530,14 @@ pub async fn put_dashboard_config(
                         Json(serde_json::json!({ "error": err })),
                     )
                 })?;
-                if let Some(upstream) = current_config.upstreams.iter_mut().find(|u| u.name == *p_name) {
-                    if let crate::config::schema::UpstreamKind::Openai { base_url } = &mut upstream.kind {
+                if let Some(upstream) = current_config
+                    .upstreams
+                    .iter_mut()
+                    .find(|u| u.name == *p_name)
+                {
+                    if let crate::config::schema::UpstreamKind::Openai { base_url } =
+                        &mut upstream.kind
+                    {
                         *base_url = b_url.to_string();
                     }
                 }
@@ -543,7 +558,9 @@ pub async fn put_dashboard_config(
                             Some(crate::config::schema::AuthMethod::Apikey { key, .. })
                             | Some(crate::config::schema::AuthMethod::Bearer { token: key }) => {
                                 match key {
-                                    crate::config::schema::SecretRef::Inline { value } => Some(value.clone()),
+                                    crate::config::schema::SecretRef::Inline { value } => {
+                                        Some(value.clone())
+                                    }
                                     _ => None,
                                 }
                             }
@@ -554,9 +571,15 @@ pub async fn put_dashboard_config(
                     api_key.to_string()
                 };
 
-                if let Some(upstream) = current_config.upstreams.iter_mut().find(|u| u.name == *p_name) {
+                if let Some(upstream) = current_config
+                    .upstreams
+                    .iter_mut()
+                    .find(|u| u.name == *p_name)
+                {
                     upstream.auth = Some(crate::config::schema::AuthMethod::Apikey {
-                        key: crate::config::schema::SecretRef::Inline { value: effective_key },
+                        key: crate::config::schema::SecretRef::Inline {
+                            value: effective_key,
+                        },
                         header: "x-api-key".to_string(),
                     });
                 }
@@ -631,32 +654,36 @@ pub async fn put_dashboard_config(
         })?;
     }
 
-    let new_router = crate::routing::router::Router::from_config(&current_config, Arc::clone(&state.metrics))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("failed to rebuild router: {e}") })),
-            )
-        })?
-        .with_session_overrides(Arc::clone(&state.session_overrides))
-        .with_capability(Arc::clone(&state.capability));
+    let new_router =
+        crate::routing::router::Router::from_config(&current_config, Arc::clone(&state.metrics))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("failed to rebuild router: {e}") })),
+                )
+            })?
+            .with_session_overrides(Arc::clone(&state.session_overrides))
+            .with_capability(Arc::clone(&state.capability));
 
     state.dispatch_router.store(Arc::new(new_router));
 
-    let _ = state.event_tx.send(crate::entrypoint::events::DashboardEvent::ConfigChanged(
-        crate::entrypoint::events::ConfigChangedData {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            route_name: state.server_info.route_name.clone(),
-            strategy: state.server_info.strategy.clone(),
-        },
-    ));
+    let _ = state
+        .event_tx
+        .send(crate::entrypoint::events::DashboardEvent::ConfigChanged(
+            crate::entrypoint::events::ConfigChangedData {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                route_name: state.server_info.route_name.clone(),
+                strategy: state.server_info.strategy.clone(),
+            },
+        ));
 
     get_dashboard_config(State(state.clone())).await
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::config::schema::Config;
 
@@ -713,7 +740,8 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     async fn compressed_stage_returns_cached_body_or_404() {
         let original = serde_json::json!({"model": "claude", "messages": []});
-        let compressed = serde_json::json!({"model": "claude", "messages": [{"role": "user", "content": "c"}]});
+        let compressed =
+            serde_json::json!({"model": "claude", "messages": [{"role": "user", "content": "c"}]});
         let state = state_with_cached_body("req-1", original).await;
 
         // Unrecorded compressed stage returns 404
@@ -729,7 +757,9 @@ mod tests {
         assert_eq!(result_404.unwrap_err(), StatusCode::NOT_FOUND);
 
         // Once pushed, compressed stage returns body
-        state.metrics.push_compressed_body("req-1".to_string(), compressed.clone());
+        state
+            .metrics
+            .push_compressed_body("req-1".to_string(), compressed.clone());
         let result_ok = get_request_body(
             State(state),
             Path("req-1".to_string()),
@@ -772,7 +802,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-abc");
         assert_eq!(sessions[0].turn_count, 1);
-        assert_eq!(sessions[0].token_savings_percent, 40.0);
+        assert!((sessions[0].token_savings_percent - 40.0).abs() < f64::EPSILON);
         assert_eq!(sessions[0].provider, "anthropic");
     }
 
@@ -1142,7 +1172,8 @@ mod tests {
 
         let Json(benchmarks) = get_dashboard_benchmark(State(state)).await;
         assert!(!benchmarks.is_empty(), "benchmark list should not be empty");
-        assert!(benchmarks.iter().any(|b| b.model.contains("claude") || b.model.contains("gpt") || b.model.contains("deepseek")));
+        assert!(benchmarks.iter().any(|b| b.model.contains("claude")
+            || b.model.contains("gpt")
+            || b.model.contains("deepseek")));
     }
 }
-

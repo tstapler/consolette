@@ -401,7 +401,9 @@ mod tests {
         assert!(patched.contains("[System Override - Tool Availability]"));
         assert!(patched.contains("[GlobTool, GrepTool, View, Edit, Bash]"));
         assert!(patched.contains("GlobTool / glob / file_search -> Use GlobTool"));
-        assert!(patched.contains("CRITICAL: All tools listed in your API tools schema ARE ENABLED AND AVAILABLE"));
+        assert!(patched.contains(
+            "CRITICAL: All tools listed in your API tools schema ARE ENABLED AND AVAILABLE"
+        ));
 
         // Idempotency test
         let double_patched = patch_open_model_tool_prompt(&patched, &tools);

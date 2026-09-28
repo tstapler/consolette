@@ -793,14 +793,15 @@ pub async fn translate_anthropic_request_to_openai(
             crate::system_prompt::patch_non_vision_system_prompt(sys)
         }
     } else if !supports_vision {
-        crate::system_prompt::NON_VISION_SYSTEM_NOTE.trim_start().to_string()
+        crate::system_prompt::NON_VISION_SYSTEM_NOTE
+            .trim_start()
+            .to_string()
     } else {
         String::new()
     };
 
     if !is_claude && !tool_names.is_empty() {
-        system_text =
-            crate::system_prompt::patch_open_model_tool_prompt(&system_text, &tool_names);
+        system_text = crate::system_prompt::patch_open_model_tool_prompt(&system_text, &tool_names);
     }
 
     if !system_text.is_empty() {
@@ -2570,8 +2571,10 @@ mod tests {
             "Cohere-bound request must drop anchored patterns"
         );
 
-        let qwen =
-            translate_anthropic_request_to_openai(&request("qwen/qwen-2.5-coder-32b-instruct:free")).await;
+        let qwen = translate_anthropic_request_to_openai(&request(
+            "qwen/qwen-2.5-coder-32b-instruct:free",
+        ))
+        .await;
         assert!(
             qwen["tools"][0]["function"]["parameters"]["properties"]["v"]
                 .get("pattern")
@@ -2579,8 +2582,7 @@ mod tests {
             "Open-weight request must drop anchored patterns"
         );
 
-        let claude =
-            translate_anthropic_request_to_openai(&request("claude-3-5-sonnet")).await;
+        let claude = translate_anthropic_request_to_openai(&request("claude-3-5-sonnet")).await;
         assert_eq!(
             claude["tools"][0]["function"]["parameters"]["properties"]["v"]["pattern"],
             json!("^[a-z]+$")

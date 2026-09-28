@@ -277,7 +277,9 @@ impl std::str::FromStr for WebUiMode {
         match s.to_lowercase().as_str() {
             "angular" => Ok(Self::Angular),
             "legacy" => Ok(Self::Legacy),
-            _ => Err(format!("invalid web ui mode: {s} (expected legacy|angular)")),
+            _ => Err(format!(
+                "invalid web ui mode: {s} (expected legacy|angular)"
+            )),
         }
     }
 }
@@ -437,7 +439,7 @@ impl Default for Config {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{Config, Strategy, UpstreamKind};
 

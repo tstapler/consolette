@@ -112,10 +112,12 @@ pub async fn get_route(
         route: &route,
         health_state,
     })
-    .map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": e.to_string() })),
-    ))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
     Ok(Json(val))
 }
 

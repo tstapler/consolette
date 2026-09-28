@@ -605,7 +605,8 @@ impl Provider for OpenrouterProvider {
         let openai_body = super::translate_anthropic_request_to_openai(&body).await;
 
         if stream {
-            let est_tokens = u64::from(u32::try_from(openai_body.to_string().len() / 4).unwrap_or(u32::MAX));
+            let est_tokens =
+                u64::from(u32::try_from(openai_body.to_string().len() / 4).unwrap_or(u32::MAX));
             let response = self
                 .send_streaming_request(openai_body)
                 .await
@@ -613,7 +614,8 @@ impl Provider for OpenrouterProvider {
             let byte_stream = response
                 .bytes_stream()
                 .map(|r| r.map_err(anyhow::Error::from));
-            let translated = super::openai::OpenaiToAnthropicStream::new(byte_stream, model).with_input_tokens(est_tokens);
+            let translated = super::openai::OpenaiToAnthropicStream::new(byte_stream, model)
+                .with_input_tokens(est_tokens);
             Ok(ProviderResponse::Stream(Box::pin(translated)))
         } else {
             let value = self

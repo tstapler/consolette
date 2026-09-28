@@ -57,15 +57,20 @@ pub fn inspect_headers(headers: &HeaderMap) -> Vec<SyntaxVariance> {
                     variances.push(SyntaxVariance {
                         variance_type: "header".to_string(),
                         key_name: format!("anthropic-beta:{flag}"),
-                        sample_json: serde_json::json!({ "header": "anthropic-beta", "value": flag }).to_string(),
+                        sample_json:
+                            serde_json::json!({ "header": "anthropic-beta", "value": flag })
+                                .to_string(),
                     });
                 }
             }
-        } else if !KNOWN_HEADERS.contains(&name_str.as_str()) && (name_str.starts_with("x-") || name_str.starts_with("anthropic-")) {
+        } else if !KNOWN_HEADERS.contains(&name_str.as_str())
+            && (name_str.starts_with("x-") || name_str.starts_with("anthropic-"))
+        {
             variances.push(SyntaxVariance {
                 variance_type: "header".to_string(),
                 key_name: name_str.clone(),
-                sample_json: serde_json::json!({ "header": name_str, "value": val_str }).to_string(),
+                sample_json: serde_json::json!({ "header": name_str, "value": val_str })
+                    .to_string(),
             });
         }
     }
@@ -109,11 +114,17 @@ mod tests {
     #[test]
     fn inspect_headers_should_flag_anthropic_beta_flags() {
         let mut headers = HeaderMap::new();
-        headers.insert("anthropic-beta", HeaderValue::from_static("prompt-caching-2024-07-16, thinking-2025-02-19"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("prompt-caching-2024-07-16, thinking-2025-02-19"),
+        );
 
         let variances = inspect_headers(&headers);
         assert_eq!(variances.len(), 2);
-        assert_eq!(variances[0].key_name, "anthropic-beta:prompt-caching-2024-07-16");
+        assert_eq!(
+            variances[0].key_name,
+            "anthropic-beta:prompt-caching-2024-07-16"
+        );
         assert_eq!(variances[1].key_name, "anthropic-beta:thinking-2025-02-19");
     }
 

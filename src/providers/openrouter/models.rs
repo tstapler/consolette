@@ -106,7 +106,9 @@ pub(super) fn parse_free_model_entries(value: &Value) -> Vec<FreeModelEntry> {
             let is_zero_pricing = entry.get("pricing").map_or(false, |pricing| {
                 let is_zero_str = |v: Option<&Value>| {
                     v.and_then(Value::as_str).is_some_and(|s| {
-                        s == "0" || s == "0.0" || (s.starts_with("0.0") && s.chars().all(|c| c == '0' || c == '.'))
+                        s == "0"
+                            || s == "0.0"
+                            || (s.starts_with("0.0") && s.chars().all(|c| c == '0' || c == '.'))
                     })
                 };
                 is_zero_str(pricing.get("prompt")) && is_zero_str(pricing.get("completion"))

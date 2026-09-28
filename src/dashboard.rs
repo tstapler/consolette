@@ -670,12 +670,8 @@ pub async fn serve_embedded_asset(uri: Uri) -> Response {
     let raw_path = uri.path();
 
     // Strip `/dashboard` or `/dashboard/` prefix if present
-    let relative_path = raw_path
-        .strip_prefix("/dashboard")
-        .unwrap_or(raw_path);
-    let relative_path = relative_path
-        .strip_prefix('/')
-        .unwrap_or(relative_path);
+    let relative_path = raw_path.strip_prefix("/dashboard").unwrap_or(raw_path);
+    let relative_path = relative_path.strip_prefix('/').unwrap_or(relative_path);
 
     let target_file = if relative_path.is_empty() {
         "index.html"
@@ -727,6 +723,7 @@ fn build_asset_response(path: &str, data: &[u8]) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::DASHBOARD_HTML;
 
     #[test]

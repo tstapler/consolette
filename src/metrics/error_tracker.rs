@@ -221,7 +221,8 @@ pub fn compute_fingerprint(sig: &ErrorSignature) -> String {
 /// Equivalent to the legacy Python `ErrorTracker` class but without `SQLite` persistence.
 pub struct ErrorTracker {
     inner: Mutex<ErrorTrackerInner>,
-    pub event_tx: Mutex<Option<tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>>>,
+    pub event_tx:
+        Mutex<Option<tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>>>,
 }
 
 struct ErrorTrackerInner {
@@ -245,7 +246,10 @@ impl ErrorTracker {
         }
     }
 
-    pub fn set_event_tx(&self, tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>) {
+    pub fn set_event_tx(
+        &self,
+        tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
+    ) {
         if let Ok(mut guard) = self.event_tx.lock() {
             *guard = Some(tx);
         }
@@ -310,7 +314,9 @@ impl ErrorTracker {
                     status_code: None,
                     message: sig.message,
                 };
-                let _ = tx.send(crate::entrypoint::events::DashboardEvent::ErrorLogged(err_data));
+                let _ = tx.send(crate::entrypoint::events::DashboardEvent::ErrorLogged(
+                    err_data,
+                ));
             }
         }
 

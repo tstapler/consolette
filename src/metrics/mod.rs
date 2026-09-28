@@ -195,7 +195,8 @@ pub struct MetricsCollector {
     lag_samples: Mutex<VecDeque<LagSample>>,
     /// Most recent lag measurement in milliseconds.
     current_lag_ms: Mutex<f64>,
-    pub event_tx: Mutex<Option<tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>>>,
+    pub event_tx:
+        Mutex<Option<tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>>>,
 }
 
 /// Timing fields recorded once a dispatch attempt completes (Fowler's
@@ -226,7 +227,10 @@ impl MetricsCollector {
         })
     }
 
-    pub fn set_event_tx(&self, tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>) {
+    pub fn set_event_tx(
+        &self,
+        tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
+    ) {
         if let Ok(mut guard) = self.event_tx.lock() {
             *guard = Some(tx.clone());
         }
@@ -292,7 +296,9 @@ impl MetricsCollector {
         if let Some(trace) = trace_event {
             if let Ok(guard) = self.event_tx.lock() {
                 if let Some(ref tx) = *guard {
-                    let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(trace));
+                    let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
+                        trace,
+                    ));
                 }
             }
         }

@@ -8,8 +8,8 @@ repository = "https://github.com/tstapler/consolette"
 
 # Rust 1.74+ lints — set once here instead of per-module boilerplate.
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
 

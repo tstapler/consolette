@@ -103,7 +103,7 @@ pub(super) fn parse_free_model_entries(value: &Value) -> Vec<FreeModelEntry> {
         .filter_map(|entry| {
             let id = entry.get("id").and_then(Value::as_str)?.to_string();
             let is_free_id = id.ends_with(":free");
-            let is_zero_pricing = entry.get("pricing").map_or(false, |pricing| {
+            let is_zero_pricing = entry.get("pricing").is_some_and(|pricing| {
                 let is_zero_str = |v: Option<&Value>| {
                     v.and_then(Value::as_str).is_some_and(|s| {
                         s == "0"

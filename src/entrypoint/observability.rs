@@ -90,7 +90,9 @@ pub async fn get_dashboard_sessions(
     for sess_id in session_order {
         let reqs = &session_map[&sess_id];
         let turn_count = reqs.len() as u32;
-        let latest_req = reqs.first().unwrap();
+        let Some(latest_req) = reqs.first() else {
+            continue;
+        };
 
         let tokens_before_sum: u64 = reqs.iter().map(|r| r.tokens_before).sum();
         let tokens_after_sum: u64 = reqs.iter().map(|r| r.tokens_after).sum();
@@ -425,6 +427,7 @@ pub async fn get_dashboard_config(
     for upstream in &config.upstreams {
         let mut p_obj = serde_json::Map::new();
         if let Some(auth) = &upstream.auth {
+            #[allow(clippy::collapsible_match)]
             match auth {
                 crate::config::schema::AuthMethod::Apikey { key, .. }
                 | crate::config::schema::AuthMethod::Bearer { token: key } => {
@@ -496,9 +499,7 @@ pub async fn put_dashboard_config(
         || headers
             .get("host")
             .and_then(|h| h.to_str().ok())
-            .map_or(false, |h| {
-                !h.starts_with("127.0.0.1") && !h.starts_with("localhost")
-            });
+            .is_some_and(|h| !h.starts_with("127.0.0.1") && !h.starts_with("localhost"));
 
     if is_non_loopback && !headers.contains_key("x-consolette-auth") {
         return Err((

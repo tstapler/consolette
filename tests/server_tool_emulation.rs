@@ -334,6 +334,9 @@ async fn state_with_response(
             )
             .unwrap(),
         ),
+        event_tx: tokio::sync::broadcast::channel(1024).0,
+        web_ui: consolette::config::schema::WebUiMode::Angular,
+        config_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     (state, calls)
 }

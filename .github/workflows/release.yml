@@ -136,6 +136,15 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build Angular WebUI
+        run: |
+          cd ui
+          npm ci
+          npm run build
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}

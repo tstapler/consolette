@@ -50,5 +50,8 @@ pub(crate) async fn state_with_router(
             )
             .unwrap(),
         ),
+        event_tx: tokio::sync::broadcast::channel(1024).0,
+        web_ui: crate::config::schema::WebUiMode::Angular,
+        config_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
 }

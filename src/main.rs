@@ -22,7 +22,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the tool's primary CLI behavior.
-    Run,
+    Run {
+        /// Web UI mode: `angular` (default) or `legacy`.
+        #[arg(long = "web-ui")]
+        web_ui: Option<String>,
+    },
     /// Locate Claude Code session transcripts under
     /// `~/.claude/projects/**/*.jsonl` and print them sorted.
     ListSessions {
@@ -120,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Run => run().await,
+        Command::Run { web_ui } => run(web_ui).await,
         Command::ListSessions { sort, limit } => list_sessions_command(&sort, limit),
         Command::Mcp => mcp().await,
         Command::CompactSession {
@@ -181,8 +185,11 @@ fn context_tracker_down_command() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run() -> anyhow::Result<()> {
-    let config = config::load(&config_dir())?;
+async fn run(web_ui_override: Option<String>) -> anyhow::Result<()> {
+    let mut config = config::load(&config_dir())?;
+    if let Some(web_ui_str) = web_ui_override {
+        config.web_ui = web_ui_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    }
     println!(
         "consolette: loaded config (port {}, {} upstream(s), {} route(s))",
         config.port,

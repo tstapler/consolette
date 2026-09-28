@@ -4,7 +4,10 @@
 //! `stapler-scripts/claude-proxy/main.py`. The JS polls `/metrics` and
 //! `/errors/summary` automatically every 30/60 seconds.
 
-use axum::response::{Html, IntoResponse};
+use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Response};
+use rust_embed::RustEmbed;
+use sha2::{Digest, Sha256};
 
 /// The full dashboard HTML, inlined as a compile-time constant.
 ///
@@ -657,6 +660,71 @@ pub async fn handle_dashboard() -> impl IntoResponse {
     Html(DASHBOARD_HTML)
 }
 
+/// Embedded Angular 19 SPA static assets.
+#[derive(RustEmbed)]
+#[folder = "ui/dist/consolette/browser"]
+pub struct DashboardAssets;
+
+/// Axum route handler serving embedded static assets with SPA client-side fallback handling.
+pub async fn serve_embedded_asset(uri: Uri) -> Response {
+    let raw_path = uri.path();
+
+    // Strip `/dashboard` or `/dashboard/` prefix if present
+    let relative_path = raw_path
+        .strip_prefix("/dashboard")
+        .unwrap_or(raw_path);
+    let relative_path = relative_path
+        .strip_prefix('/')
+        .unwrap_or(relative_path);
+
+    let target_file = if relative_path.is_empty() {
+        "index.html"
+    } else {
+        relative_path
+    };
+
+    if let Some(asset) = DashboardAssets::get(target_file) {
+        return build_asset_response(target_file, &asset.data);
+    }
+
+    // Fallback logic: extensionless routes serve index.html for client-side SPA routing
+    if !target_file.contains('.') {
+        if let Some(index_asset) = DashboardAssets::get("index.html") {
+            return build_asset_response("index.html", &index_asset.data);
+        }
+    }
+
+    (StatusCode::NOT_FOUND, "404 Not Found").into_response()
+}
+
+fn build_asset_response(path: &str, data: &[u8]) -> Response {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let mut hash = Sha256::new();
+    hash.update(data);
+    let etag = format!("\"{:x}\"", hash.finalize());
+
+    let cache_control = if path == "index.html" || path.ends_with(".html") {
+        "no-cache, no-store, must-revalidate"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+
+    let mut response = (StatusCode::OK, data.to_vec()).into_response();
+    let headers = response.headers_mut();
+
+    if let Ok(mime_val) = HeaderValue::from_str(mime.as_ref()) {
+        headers.insert(header::CONTENT_TYPE, mime_val);
+    }
+    if let Ok(etag_val) = HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, etag_val);
+    }
+    if let Ok(cc_val) = HeaderValue::from_str(cache_control) {
+        headers.insert(header::CACHE_CONTROL, cc_val);
+    }
+
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::DASHBOARD_HTML;
@@ -931,5 +999,58 @@ mod tests {
             block.contains("lastKind === 'response_shape_mismatch' ? 'status-schema-drift'"),
             "lastKind === 'response_shape_mismatch' must map directly to 'status-schema-drift'"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_embedded_asset_serves_index_html_with_correct_headers() {
+        use axum::http::{header, StatusCode, Uri};
+
+        let uri: Uri = "/dashboard/index.html".parse().unwrap();
+        let response = super::serve_embedded_asset(uri).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache, no-store, must-revalidate"
+        );
+        assert!(response.headers().get(header::ETAG).is_some());
+    }
+
+    #[tokio::test]
+    async fn serve_embedded_asset_strips_query_parameters_and_serves() {
+        use axum::http::{header, StatusCode, Uri};
+
+        let uri: Uri = "/dashboard/index.html?v=1.0.0".parse().unwrap();
+        let response = super::serve_embedded_asset(uri).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_embedded_asset_spa_fallback_for_extensionless_routes() {
+        use axum::http::{header, StatusCode, Uri};
+
+        let uri: Uri = "/dashboard/sessions".parse().unwrap();
+        let response = super::serve_embedded_asset(uri).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_embedded_asset_returns_404_for_missing_file_with_extension() {
+        use axum::http::{StatusCode, Uri};
+
+        let uri: Uri = "/dashboard/nonexistent_file.js".parse().unwrap();
+        let response = super::serve_embedded_asset(uri).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

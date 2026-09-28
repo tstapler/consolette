@@ -346,7 +346,7 @@ impl AnthropicProvider {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(60);
             warn!("Anthropic rate limited ({status}), retry-after {retry_after}s");
-            return Err(ProviderError::RateLimited);
+            return Err(ProviderError::RateLimitedWithRetry { retry_after });
         }
 
         if status.is_client_error() {
@@ -595,7 +595,7 @@ async fn map_error_status(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(60);
         warn!("Anthropic rate limited ({status}), retry-after {retry_after}s");
-        return Err(ProviderError::RateLimited);
+        return Err(ProviderError::RateLimitedWithRetry { retry_after });
     }
 
     if status.is_client_error() {

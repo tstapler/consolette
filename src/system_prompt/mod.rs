@@ -50,6 +50,40 @@ pub fn is_vision_model(model_name: &str) -> bool {
     true
 }
 
+/// Determine if a model name is an official Anthropic Claude model.
+#[must_use]
+pub fn is_claude_model(model_name: &str) -> bool {
+    model_name.to_lowercase().contains("claude")
+}
+
+/// Constant note header for open-weight / non-Claude model tool availability.
+pub const TOOL_AVAILABILITY_SYSTEM_NOTE: &str = "\n\n[System Override - Tool Availability]: You have access to active function calling tools in this session: ";
+
+/// Inject explicit tool availability and name-aliasing instructions for open-weight / non-Claude models.
+#[must_use]
+pub fn patch_open_model_tool_prompt(text: &str, tool_names: &[&str]) -> String {
+    if tool_names.is_empty() || text.contains("[System Override - Tool Availability]") {
+        return text.to_string();
+    }
+
+    let names_str = tool_names.join(", ");
+    let note = format!(
+        "{TOOL_AVAILABILITY_SYSTEM_NOTE}[{names_str}].\n\
+        Tool Name Aliasing Reference:\n\
+        - GlobTool / glob / file_search -> Use GlobTool\n\
+        - GrepTool / grep / text_search -> Use GrepTool\n\
+        - View / Read / FileReadTool -> Use View or FileReadTool\n\
+        - Edit / FileEditTool / replace -> Use Edit or FileEditTool\n\
+        - Bash / bash / shell -> Use Bash\n\
+        - LS / DirectoryListTool -> Use LS or DirectoryListTool\n\
+        CRITICAL: All tools listed in your API tools schema ARE ENABLED AND AVAILABLE via tool calls (function calling). Do NOT claim tools like glob, grep, read, or edit are unavailable. ALWAYS invoke the corresponding function tool when searching files, reading file contents, editing code, or executing terminal commands."
+    );
+
+    let mut patched = text.to_string();
+    patched.push_str(&note);
+    patched
+}
+
 /// Neutralize misleading vision instructions in system prompt and inject a
 /// system note for non-vision upstreams.
 #[must_use]
@@ -346,5 +380,37 @@ mod tests {
         assert!(patched.contains("Reads text files."));
         assert!(patched.contains("I do not have direct image-reading capabilities."));
         assert!(patched.contains("[System Override]: You are running on a text-only model"));
+    }
+
+    #[test]
+    fn claude_model_detection_correctness() {
+        assert!(is_claude_model("claude-3-5-sonnet"));
+        assert!(is_claude_model("claude-3-7-sonnet"));
+        assert!(is_claude_model("anthropic/claude-3.5-haiku"));
+        assert!(!is_claude_model("qwen/qwen-2.5-coder-32b-instruct:free"));
+        assert!(!is_claude_model("meta-llama/llama-3.3-70b-instruct:free"));
+        assert!(!is_claude_model("deepseek/deepseek-r1:free"));
+        assert!(!is_claude_model("gpt-4o"));
+    }
+
+    #[test]
+    fn open_model_tool_prompt_patching() {
+        let text = "You are a helpful coding assistant.";
+        let tools = vec!["GlobTool", "GrepTool", "View", "Edit", "Bash"];
+        let patched = patch_open_model_tool_prompt(text, &tools);
+        assert!(patched.contains("[System Override - Tool Availability]"));
+        assert!(patched.contains("[GlobTool, GrepTool, View, Edit, Bash]"));
+        assert!(patched.contains("GlobTool / glob / file_search -> Use GlobTool"));
+        assert!(patched.contains(
+            "CRITICAL: All tools listed in your API tools schema ARE ENABLED AND AVAILABLE"
+        ));
+
+        // Idempotency test
+        let double_patched = patch_open_model_tool_prompt(&patched, &tools);
+        assert_eq!(patched, double_patched);
+
+        // Empty tools test
+        let empty_tools: Vec<&str> = vec![];
+        assert_eq!(patch_open_model_tool_prompt(text, &empty_tools), text);
     }
 }

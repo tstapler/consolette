@@ -51,7 +51,7 @@ pub struct Router {
     candidates: Vec<UpstreamRef>,
     providers: Vec<Arc<dyn Provider>>,
     strategy: Arc<dyn RoutingStrategy>,
-    health: Arc<HealthRegistry>,
+    pub health: Arc<HealthRegistry>,
     admission: Arc<dyn AdmissionControl>,
     metrics: Arc<MetricsCollector>,
     /// Session-scoped route pins, consulted before `strategy` on every
@@ -487,7 +487,10 @@ impl Router {
             .map(|(_, provider)| provider)
             .collect();
 
-        let health = Arc::new(HealthRegistry::new(config.cooldown_seconds));
+        let health = Arc::new(HealthRegistry::with_thresholds(
+            config.cooldown_seconds,
+            config.failure_threshold,
+        ));
         disable_bedrock_cooldown(config, &health);
 
         let route = select_primary_route(config)?;
@@ -827,17 +830,26 @@ impl Router {
     /// `/metrics`' `cooldowns` field (Story 1.5.1) — replaces the previous
     /// hardcoded `anthropic`/`bedrock`-only placeholder in
     /// `MetricsCollector::to_metrics_json`, which silently produced fake
-    /// data for every other upstream (including Gemini).
+    /// Accessor for candidate upstreams.
+    #[must_use]
+    pub fn candidates(&self) -> &[UpstreamRef] {
+        &self.candidates
+    }
+
+    /// `cooldowns`-facing snapshot: every candidate's remaining cooldown,
+    /// and circuit breaker state.
     #[must_use]
     pub fn cooldown_snapshot(&self) -> serde_json::Value {
         let mut result = serde_json::Map::with_capacity(self.candidates.len());
         for candidate in &self.candidates {
             let remaining = self.health.remaining_secs(candidate.index);
+            let circuit_state = self.health.get_circuit_state(candidate.index);
             result.insert(
                 candidate.name.clone(),
                 serde_json::json!({
                     "cooling_down": remaining > 0,
                     "remaining_seconds": remaining,
+                    "circuit_state": circuit_state,
                 }),
             );
         }
@@ -852,7 +864,8 @@ impl Router {
     pub fn eval_targets(&self) -> Vec<(usize, String)> {
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
-        for candidate in &self.candidates {
+        let expanded = self.strategy.expand_candidates(self.candidates.clone());
+        for candidate in &expanded {
             if let Some(model) = candidate.model.clone() {
                 if model.ends_with(":free") && seen.insert((candidate.index, model.clone())) {
                     targets.push((candidate.index, model));
@@ -975,6 +988,15 @@ impl Router {
             .record_model_attempt(effective_model, model_outcome);
         self.strategy
             .record_outcome(chosen, duration_ms, success, error_kind);
+        match outcome {
+            Ok(()) => {
+                self.health.record_success(chosen.index);
+            }
+            Err(e) if !e.is_validation() && !e.is_auth() => {
+                self.health.record_failure(chosen.index);
+            }
+            _ => {}
+        }
     }
 
     /// Records a successful first-attempt's timing on `/metrics`. First-byte

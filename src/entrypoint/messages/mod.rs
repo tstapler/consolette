@@ -41,6 +41,54 @@ fn request_model_name(body: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Context window ceiling (in tokens) used when calculating headroom.
+fn resolve_context_limit(model: &str) -> u64 {
+    let lower = model.to_lowercase();
+    if lower.contains("claude") || lower.contains("gpt-4") {
+        200_000
+    } else {
+        256_000
+    }
+}
+
+/// Dynamic context headroom guardian:
+/// Prevents HTTP 400 `Context length exceeded` errors from upstream model endpoints
+/// by:
+/// 1. Eliding older tool results if estimated prompt tokens near the context window ceiling.
+/// 2. Dynamically clamping `max_tokens` so `input_tokens + max_tokens` stays safely within bounds.
+pub fn clamp_context_budget(body: &mut serde_json::Value) {
+    let model = request_model_name(body);
+    let context_limit = resolve_context_limit(&model);
+    let safety_margin = 1024u64;
+
+    let mut est_input = u64::from(estimate_tokens(body));
+    let requested_max = body
+        .get("max_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(4096);
+
+    // Step 1: If prompt input alone is near or exceeding context limit minus minimum output room,
+    // apply tool result budgeting on `messages` to prune oversized tool outputs.
+    let min_output_headroom = 4096u64;
+    if est_input + min_output_headroom + safety_margin > context_limit {
+        if let Some(messages) = body.get("messages") {
+            let (budgeted, _stats) =
+                crate::session_compaction::tool_result_budget::budget_tool_results(messages, 6);
+            body["messages"] = budgeted;
+            est_input = u64::from(estimate_tokens(body));
+        }
+    }
+
+    // Step 2: Dynamically clamp `max_tokens` so total requested tokens <= context_limit - safety_margin.
+    let headroom = context_limit
+        .saturating_sub(est_input)
+        .saturating_sub(safety_margin);
+    if headroom > 0 && requested_max > headroom {
+        let clamped_max = headroom.max(1024);
+        body["max_tokens"] = serde_json::Value::from(clamped_max);
+    }
+}
+
 /// # Panics
 ///
 /// Does not panic in practice: the `Response::builder()` call below only
@@ -51,8 +99,22 @@ fn request_model_name(body: &serde_json::Value) -> String {
 pub async fn post_v1_messages(
     State(state): State<EntrypointState>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Response {
+    clamp_context_budget(&mut body);
+
+    // Syntax variance telemetry (ADR-001): flag unmapped headers or body keys
+    let mut variances = crate::syntax_variance::inspect_headers(&headers);
+    variances.extend(crate::syntax_variance::inspect_request_body(&body));
+    if !variances.is_empty() {
+        let store_path =
+            crate::context_forensics::store::ContextForensicsStore::default_store_path();
+        if let Ok(store) = crate::context_forensics::store::ContextForensicsStore::open(&store_path)
+        {
+            let _ = crate::syntax_variance::record_variances(&store, &variances);
+        }
+    }
+
     let stream = request_stream_flag(&body);
     let model = request_model_name(&body);
     let est_tokens = estimate_tokens(&body);

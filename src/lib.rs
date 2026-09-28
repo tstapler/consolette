@@ -25,5 +25,6 @@ pub mod server_tools;
 pub mod service;
 pub mod session;
 pub mod session_compaction;
+pub mod syntax_variance;
 pub mod system_prompt;
 pub mod vision;

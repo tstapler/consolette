@@ -189,10 +189,14 @@ pub struct MetricsCollector {
     /// `compressed` counterpart yet: that stage needs the `compression`
     /// module wired into dispatch, which isn't in scope here.
     original_bodies: Mutex<VecDeque<(String, serde_json::Value)>>,
+    /// Ring buffer of `(request_id, compressed request body)`, capped at 100 entries.
+    compressed_bodies: Mutex<VecDeque<(String, serde_json::Value)>>,
     /// Rolling event-loop lag samples (15-min window).
     lag_samples: Mutex<VecDeque<LagSample>>,
     /// Most recent lag measurement in milliseconds.
     current_lag_ms: Mutex<f64>,
+    pub event_tx:
+        Mutex<Option<tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>>>,
 }
 
 /// Timing fields recorded once a dispatch attempt completes (Fowler's
@@ -216,9 +220,21 @@ impl MetricsCollector {
             error_tracker: Arc::new(ErrorTracker::new()),
             recent_requests: Mutex::new(VecDeque::new()),
             original_bodies: Mutex::new(VecDeque::new()),
+            compressed_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
+            event_tx: Mutex::new(None),
         })
+    }
+
+    pub fn set_event_tx(
+        &self,
+        tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
+    ) {
+        if let Ok(mut guard) = self.event_tx.lock() {
+            *guard = Some(tx.clone());
+        }
+        self.error_tracker.set_event_tx(tx);
     }
 
     // ── Request ring buffer ──────────────────────────────────────────────────
@@ -250,13 +266,42 @@ impl MetricsCollector {
 
     /// Update timing fields on an existing request by ID.
     pub fn update_request_timing(&self, request_id: &str, update: RequestTimingUpdate<'_>) {
+        let mut trace_event = None;
         self.mutate_request(request_id, |r| {
             r.provider = update.provider.to_string();
             r.duration_ms = (update.duration_ms * 10.0).round() / 10.0;
             r.first_byte_ms = (update.first_byte_ms * 10.0).round() / 10.0;
             r.bedrock_invocation_ms = update.bedrock_invocation_ms;
             r.bedrock_first_byte_ms = update.bedrock_first_byte_ms;
+
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let duration_u64 = update.duration_ms.max(0.0) as u64;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let first_byte_u64 = update.first_byte_ms.max(0.0) as u64;
+
+            trace_event = Some(crate::entrypoint::events::RequestTraceData {
+                request_id: r.request_id.clone(),
+                timestamp: r.timestamp.clone(),
+                provider: r.provider.clone(),
+                model: r.model.clone(),
+                duration_ms: duration_u64,
+                first_byte_ms: first_byte_u64,
+                tokens_before: r.tokens_before,
+                tokens_after: r.tokens_after,
+                compressed: r.compressed,
+                status_code: 200,
+            });
         });
+
+        if let Some(trace) = trace_event {
+            if let Ok(guard) = self.event_tx.lock() {
+                if let Some(ref tx) = *guard {
+                    let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
+                        trace,
+                    ));
+                }
+            }
+        }
     }
 
     /// Sets `selected_model` on an existing request by ID (Story 5.1.3).
@@ -307,6 +352,30 @@ impl MetricsCollector {
             .map(|(_, body)| body.clone())
     }
 
+    /// Caches a request's compressed body, capped at 100 entries.
+    pub fn push_compressed_body(&self, request_id: String, body: serde_json::Value) {
+        let mut buf = self
+            .compressed_bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.len() == 100 {
+            buf.pop_back();
+        }
+        buf.push_front((request_id, body));
+    }
+
+    /// Looks up a cached compressed body by request id.
+    #[must_use]
+    pub fn get_compressed_body(&self, request_id: &str) -> Option<serde_json::Value> {
+        let buf = self
+            .compressed_bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        buf.iter()
+            .find(|(id, _)| id == request_id)
+            .map(|(_, body)| body.clone())
+    }
+
     /// Get the last `n` requests (newest first).
     #[must_use]
     pub fn get_recent_requests(&self, n: usize) -> Vec<RequestDetail> {
@@ -340,7 +409,8 @@ impl MetricsCollector {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = lag_ms;
     }
 
-    fn current_lag_ms(&self) -> f64 {
+    #[must_use]
+    pub fn current_lag_ms(&self) -> f64 {
         *self
             .current_lag_ms
             .lock()
@@ -460,8 +530,10 @@ impl Default for MetricsCollector {
             error_tracker: Arc::new(ErrorTracker::new()),
             recent_requests: Mutex::new(VecDeque::new()),
             original_bodies: Mutex::new(VecDeque::new()),
+            compressed_bodies: Mutex::new(VecDeque::new()),
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
+            event_tx: Mutex::new(None),
         }
     }
 }

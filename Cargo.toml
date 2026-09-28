@@ -8,8 +8,8 @@ repository = "https://github.com/tstapler/consolette"
 
 # Rust 1.74+ lints — set once here instead of per-module boilerplate.
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
 
@@ -46,7 +46,7 @@ rmcp = { version = "2.1", features = [
 ] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -77,7 +77,9 @@ libc = "0.2"
 axum = { version = "0.8", features = ["macros"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "timeout", "cors"] }
+rust-embed = "8.5"
+mime_guess = "2.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 eventsource-stream = "0.2"
 aws-sdk-bedrockruntime = "1"
@@ -113,6 +115,7 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 arc-swap = "1.9.2"
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3"

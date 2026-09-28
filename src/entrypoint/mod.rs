@@ -12,6 +12,7 @@ pub mod api;
 pub mod chat_completions;
 pub mod cost_tee;
 pub mod errors;
+pub mod events;
 pub mod landing;
 pub mod messages;
 pub mod observability;
@@ -23,10 +24,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::claude_code_session::omission_cache::OmissionCache;
 use crate::claude_code_session::prune_policy::PruningPolicyStore;
-use crate::config::schema::{Config, UpstreamKind};
+use crate::config::schema::{Config, UpstreamKind, WebUiMode};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::metrics::MetricsCollector;
@@ -93,6 +95,12 @@ pub struct EntrypointState {
     pub pruning_policy_store: Arc<PruningPolicyStore>,
     /// Long-lived SQLite cache for tool output pruned during compaction passes.
     pub omission_cache: Arc<OmissionCache>,
+    /// Broadcast channel for real-time SSE telemetry events.
+    pub event_tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
+    /// Web UI mode: Angular (embedded SPA) or Legacy.
+    pub web_ui: WebUiMode,
+    /// Thread-safe lock for atomic configuration updates and disk persistence.
+    pub config_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl EntrypointState {
@@ -120,6 +128,10 @@ impl EntrypointState {
         tokio::spawn(crate::routing::capability::run_eval_loop(Arc::clone(
             &dispatch_router,
         )));
+        tokio::spawn(crate::routing::health::run_health_prober(
+            Arc::clone(&dispatch_router),
+            std::time::Duration::from_secs(config.health_check_interval_secs),
+        ));
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
         let server_tools = Arc::new(ServerToolsRuntime {
             config: config.server_tools.clone(),
@@ -128,18 +140,11 @@ impl EntrypointState {
         let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
         let pruning_policy_store = Arc::new(PruningPolicyStore::default());
         let omission_cache = Arc::new(OmissionCache::open(&OmissionCache::default_cache_path())?);
-        // Pre-mortem failure 2: one boot log line stating whether emulation
-        // is armed and whether the backend binary resolves, so "silently
-        // degraded since restart" is visible in logs. No child is spawned
-        // here (lazy pool start on first search).
-        tracing::info!(
-            enabled = server_tools.config.enabled,
-            route_eligible = server_tools.route_eligible,
-            backend_path = %server_tools.config.backend_path,
-            backend_reachable =
-                crate::server_tools::backend_reachable(&server_tools.config.backend_path),
-            "server-tool emulation configured"
-        );
+        let (event_tx, _) = tokio::sync::broadcast::channel(1024);
+        metrics.set_event_tx(event_tx.clone());
+
+        let ticker_tx = event_tx.clone();
+        let ticker_metrics = Arc::clone(&metrics);
         let route = config.routes.first();
         let server_info = Arc::new(ServerInfo {
             port: config.port,
@@ -154,6 +159,60 @@ impl EntrypointState {
                 })
                 .collect(),
         });
+        let ticker_server_info = Arc::clone(&server_info);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if ticker_tx.receiver_count() == 0 {
+                    continue;
+                }
+                let rpm = ticker_metrics.histogram.requests_per_minute();
+                let total_requests = ticker_metrics
+                    .counters
+                    .requests_total
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let tokens_before = ticker_metrics
+                    .counters
+                    .tokens_before
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let tokens_after = ticker_metrics
+                    .counters
+                    .tokens_after
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let total_tokens_saved = tokens_before.saturating_sub(tokens_after);
+                let current_lag_ms = ticker_metrics.current_lag_ms();
+                let mut provider_health = std::collections::HashMap::new();
+                for upstream in &ticker_server_info.upstreams {
+                    provider_health.insert(upstream.name.clone(), "healthy".to_string());
+                }
+
+                let tick_data = crate::entrypoint::events::MetricsTickData {
+                    rpm,
+                    total_requests,
+                    total_tokens_saved,
+                    current_lag_ms,
+                    provider_health,
+                };
+                let _ = ticker_tx.send(crate::entrypoint::events::DashboardEvent::MetricsTick(
+                    tick_data,
+                ));
+            }
+        });
+
+        // Pre-mortem failure 2: one boot log line stating whether emulation
+        // is armed and whether the backend binary resolves, so "silently
+        // degraded since restart" is visible in logs. No child is spawned
+        // here (lazy pool start on first search).
+        tracing::info!(
+            enabled = server_tools.config.enabled,
+            route_eligible = server_tools.route_eligible,
+            backend_path = %server_tools.config.backend_path,
+            backend_reachable =
+                crate::server_tools::backend_reachable(&server_tools.config.backend_path),
+            "server-tool emulation configured"
+        );
         Ok(Self {
             dispatch_router,
             cost_tracker,
@@ -166,6 +225,9 @@ impl EntrypointState {
             search_pool,
             pruning_policy_store,
             omission_cache,
+            event_tx,
+            web_ui: config.web_ui,
+            config_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 }
@@ -183,7 +245,12 @@ fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
 /// Builds the axum `Router` exposing the landing page and the entrypoint
 /// routes, with request tracing applied.
 pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
-    axum::Router::new()
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let mut router = axum::Router::new()
         .route("/", axum::routing::get(landing::get_index))
         .route(
             "/v1/messages",
@@ -198,9 +265,45 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             axum::routing::post(crate::entrypoint::chat_completions::post_v1_chat_completions),
         )
         .route(
+            "/v1/dashboard/events",
+            axum::routing::get(events::handle_sse_events),
+        )
+        .route(
+            "/v1/dashboard/sessions",
+            axum::routing::get(observability::get_dashboard_sessions),
+        )
+        .route(
+            "/v1/dashboard/benchmark",
+            axum::routing::get(observability::get_dashboard_benchmark),
+        )
+        .route(
+            "/v1/dashboard/config",
+            axum::routing::get(observability::get_dashboard_config)
+                .put(observability::put_dashboard_config),
+        );
+
+    if state.web_ui == WebUiMode::Legacy {
+        router = router.route(
             "/dashboard",
             axum::routing::get(crate::dashboard::handle_dashboard),
-        )
+        );
+    } else {
+        router = router
+            .route(
+                "/dashboard",
+                axum::routing::get(crate::dashboard::serve_embedded_asset),
+            )
+            .route(
+                "/dashboard/",
+                axum::routing::get(crate::dashboard::serve_embedded_asset),
+            )
+            .route(
+                "/dashboard/{*path}",
+                axum::routing::get(crate::dashboard::serve_embedded_asset),
+            );
+    }
+
+    router
         .route("/metrics", axum::routing::get(observability::get_metrics))
         .route(
             "/errors/summary",
@@ -234,6 +337,7 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             "/session/prune/stats",
             axum::routing::get(api::get_session_prune_stats),
         )
+        .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -551,5 +655,62 @@ mod tests {
 
         tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn entrypoint_legacy_fallback_serves_legacy_dashboard_html() {
+        let config = Config {
+            web_ui: WebUiMode::Legacy,
+            ..Default::default()
+        };
+        let state = EntrypointState::build(&config, std::path::Path::new("/tmp/consolette-test"))
+            .await
+            .unwrap();
+        let router = entrypoint_router(state);
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/dashboard")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("Claude Proxy Dashboard"));
+    }
+
+    #[tokio::test]
+    async fn sse_event_stream_returns_text_event_stream() {
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
+        let router = entrypoint_router(state);
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/v1/dashboard/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/event-stream"));
     }
 }

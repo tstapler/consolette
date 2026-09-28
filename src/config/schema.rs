@@ -253,6 +253,37 @@ impl RateLimitConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebUiMode {
+    #[default]
+    Angular,
+    Legacy,
+}
+
+impl std::fmt::Display for WebUiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Angular => write!(f, "angular"),
+            Self::Legacy => write!(f, "legacy"),
+        }
+    }
+}
+
+impl std::str::FromStr for WebUiMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "angular" => Ok(Self::Angular),
+            "legacy" => Ok(Self::Legacy),
+            _ => Err(format!(
+                "invalid web ui mode: {s} (expected legacy|angular)"
+            )),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 // `config_dir` naturally shares a prefix with the struct name; renaming it
@@ -267,6 +298,10 @@ pub struct Config {
     pub request_timeout: u64,
     #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
     #[serde(default = "default_config_dir")]
     pub config_dir: String,
     #[serde(default = "default_true")]
@@ -279,6 +314,8 @@ pub struct Config {
     pub verbosity_level: u8,
     #[serde(default = "default_memory_max_entries")]
     pub memory_max_entries: usize,
+    #[serde(default)]
+    pub web_ui: WebUiMode,
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
     #[serde(default)]
@@ -317,6 +354,12 @@ fn default_request_timeout() -> u64 {
 fn default_cooldown_seconds() -> u64 {
     300
 }
+fn default_health_check_interval_secs() -> u64 {
+    10
+}
+fn default_failure_threshold() -> u32 {
+    3
+}
 fn default_true() -> bool {
     true
 }
@@ -341,12 +384,15 @@ impl Default for Config {
             log: default_log(),
             request_timeout: default_request_timeout(),
             cooldown_seconds: default_cooldown_seconds(),
+            health_check_interval_secs: default_health_check_interval_secs(),
+            failure_threshold: default_failure_threshold(),
             config_dir: default_config_dir(),
             compress: true,
             compress_floor_bytes: default_compress_floor_bytes(),
             cache_aligner: false,
             verbosity_level: default_verbosity_level(),
             memory_max_entries: default_memory_max_entries(),
+            web_ui: WebUiMode::Angular,
             upstreams: vec![
                 Upstream {
                     name: "anthropic".to_string(),
@@ -393,7 +439,7 @@ impl Default for Config {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{Config, Strategy, UpstreamKind};
 
@@ -530,5 +576,20 @@ name = "openrouter"
 
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.routes[0].strategy, Strategy::OpenrouterScored);
+    }
+
+    #[test]
+    fn config_should_parse_web_ui_flag() {
+        use super::WebUiMode;
+
+        let toml = r#"web_ui = "legacy""#;
+        let config: Config = toml::from_str(toml).expect("parse web_ui legacy");
+        assert_eq!(config.web_ui, WebUiMode::Legacy);
+
+        let default_config = Config::default();
+        assert_eq!(default_config.web_ui, WebUiMode::Angular);
+
+        assert_eq!("legacy".parse::<WebUiMode>().unwrap(), WebUiMode::Legacy);
+        assert_eq!("angular".parse::<WebUiMode>().unwrap(), WebUiMode::Angular);
     }
 }

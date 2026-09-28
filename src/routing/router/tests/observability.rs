@@ -358,6 +358,6 @@ async fn cooldown_snapshot_should_report_zero_remaining_seconds_for_a_healthy_ca
 
     assert_eq!(
         snapshot["anthropic"],
-        serde_json::json!({"cooling_down": false, "remaining_seconds": 0})
+        serde_json::json!({"circuit_state": "closed", "cooling_down": false, "remaining_seconds": 0})
     );
 }

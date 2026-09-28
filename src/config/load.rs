@@ -15,7 +15,14 @@ use super::ConfigError;
 
 /// Env overrides are restricted to a small allowlist of top-level scalars —
 /// arrays-of-tables (`upstreams`/`routes`) are file-only (ADR-001).
-const ENV_ALLOWLIST: &[&str] = &["port", "log", "request_timeout", "cooldown_seconds"];
+const ENV_ALLOWLIST: &[&str] = &[
+    "port",
+    "log",
+    "request_timeout",
+    "cooldown_seconds",
+    "health_check_interval_secs",
+    "failure_threshold",
+];
 
 /// Load config from `<config_dir>/conf.d/*.toml`, sorted lexically, deep-merged
 /// over built-in defaults, with `CONSOLETTE_`-prefixed env vars as the

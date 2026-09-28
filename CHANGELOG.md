@@ -1,11 +1,35 @@
 # Changelog
 
 
+### Bug Fixes
+
+- Gate OCR on vision support, run it off the async runtime (d02ba7d)
+
+- Force ad-hoc re-sign to avoid macOS taskgated SIGKILL (ff6bd8a)
+
+
 ### Features
 
 - Implement turn-decay transcript memory pruning and HTTP control plane (e879983)
 
-- Add OpenAI Responses API support and model resolution (093ea6b)
+- OCR non-vision-model image attachments via tesseract (8faac0a)
+
+- Per-model token/request counters on the dashboard (3cf2717)
+
+- Hold requests through short rate-limit cooldowns (eac9b21)
+
+- Add OpenAI Responses API support and model resolution (45a4347)
+
+- Proactive upstream health probing, circuit breaking, and openrouter free model expansion (1e5c6e0)
+
+
+### Refactor
+
+- Split counters.rs into a module, remove flag args (90161e9)
+
+- Split router.rs into a module, fix long-fn/nesting/param-list (47eb596)
+
+- Split messages.rs, fix long-fn/nesting/param-list (7213245)
 
 
 

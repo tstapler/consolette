@@ -1,5 +1,7 @@
 //! Config schema: plain TOML-portable structs (no figment-only constructs),
 //! so the same conf.d files load unchanged in Python `tomllib` (CD-1, NFR-2).
+//! Also hosts small behavioral helpers tied to that schema, e.g.
+//! `resolve_anthropic_endpoint`/`default_anthropic_base_url`.
 
 use std::collections::HashMap;
 use std::fmt;

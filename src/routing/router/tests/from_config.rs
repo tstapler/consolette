@@ -282,19 +282,21 @@ async fn build_providers_should_construct_provider_for_upstream_kind_openrouter(
 // through the `Provider` trait's public `send` method, proving both the
 // trailing-slash trim and the constructor wiring work end-to-end.
 #[tokio::test]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::type_complexity)]
 async fn build_providers_should_wire_a_configured_anthropic_base_url_through_to_a_real_request() {
     use std::sync::Mutex;
     use tokio::net::TcpListener;
 
-    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured: Arc<Mutex<Option<(String, serde_json::Value)>>> = Arc::new(Mutex::new(None));
     let captured_for_handler = captured.clone();
     async fn handle_messages(
-        axum::extract::State(captured): axum::extract::State<Arc<Mutex<Option<String>>>>,
+        axum::extract::State(captured): axum::extract::State<
+            Arc<Mutex<Option<(String, serde_json::Value)>>>,
+        >,
         uri: axum::http::Uri,
-        axum::Json(_body): axum::Json<serde_json::Value>,
+        axum::Json(body): axum::Json<serde_json::Value>,
     ) -> axum::Json<serde_json::Value> {
-        *captured.lock().unwrap() = Some(uri.path().to_string());
+        *captured.lock().unwrap() = Some((uri.path().to_string(), body));
         axum::Json(serde_json::json!({
             "id": "msg_test",
             "type": "message",
@@ -345,12 +347,40 @@ async fn build_providers_should_wire_a_configured_anthropic_base_url_through_to_
         panic!("send should succeed: {err:?}");
     }
 
-    let path = captured
+    let (path, _body) = captured
         .lock()
         .unwrap()
         .clone()
         .expect("mock server must have received a request");
     assert_eq!(path, "/v1/messages");
+
+    // Also prove is_default_endpoint is wired correctly, not just base_url:
+    // a custom (non-default) base_url must NOT trigger Bedrock-model-id
+    // stripping. This would catch a regression where
+    // `build_non_openrouter_provider` hardcodes `is_default_endpoint = true`
+    // while still passing through the correct resolved `base_url`.
+    let bedrock_model_id = "us.anthropic.claude-3-5-sonnet-20241022-v1:0";
+    let response = providers[0]
+        .1
+        .send(
+            serde_json::json!({"model": bedrock_model_id, "messages": []}),
+            http::HeaderMap::new(),
+            false,
+        )
+        .await;
+    if let Err(err) = response {
+        panic!("send should succeed: {err:?}");
+    }
+
+    let (_path, body) = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock server must have received the second request");
+    assert_eq!(
+        body["model"], bedrock_model_id,
+        "custom base_url must not strip the Bedrock-format model id"
+    );
 }
 
 // REQ-1/Blocker 5 (Story 4.3.1, Task 4.3.1b): a route using

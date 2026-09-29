@@ -74,6 +74,10 @@ impl AnthropicProvider {
     /// results are cached across requests/upstreams). `request_timeout_secs`
     /// comes from the top-level `Config::request_timeout`.
     ///
+    /// `is_default_endpoint` must be the value `resolve_anthropic_endpoint`
+    /// (`src/config/schema.rs`) derived from `base_url` — passing an
+    /// arbitrary bool silently changes Bedrock-model-id-stripping behavior.
+    ///
     /// # Errors
     ///
     /// Returns a [`ProviderError::Upstream`] if either reqwest `Client`
@@ -175,12 +179,8 @@ impl AnthropicProvider {
     ///   present, otherwise falls back to the default version.
     /// - Sets auth per the upstream's configured `AuthMethod` (see
     ///   `apply_auth`).
-    ///
-    /// These two headers are forwarded verbatim to whatever `base_url` is
-    /// configured, not just `api.anthropic.com`. There is no per-upstream
-    /// header allow/deny-list today; that's a deliberate, documented
-    /// limitation (see `project_plans/anthropic-upstream-base-url`), not an
-    /// oversight — add one if a non-Anthropic relay ever chokes on them.
+    /// - Forwarded verbatim to whatever `base_url` is configured; no
+    ///   per-upstream header allow/deny-list yet.
     async fn build_headers(
         &self,
         incoming: &HeaderMap,
@@ -756,11 +756,10 @@ mod tests {
 
     // ────────────────────────────────────────────────────────────────────
     // base_url / is_default_endpoint regression tests (Phase 4, Stories
-    // 4.1.1/4.1.2): a local mock server proves the configured base_url is
-    // actually used for outgoing requests, and that Bedrock-id stripping is
-    // gated on is_default_endpoint end-to-end, for both send_request and
-    // send_streaming_request. Not shared with openai/mod.rs's equivalent
-    // helper — response shapes differ (plan.md Pattern Decisions).
+    // 4.1.1/4.1.2): a local mock server proves base_url is used and
+    // Bedrock-id stripping is gated on is_default_endpoint, for both
+    // send_request and send_streaming_request. Not shared with
+    // openai/mod.rs's equivalent helper — response shapes differ.
     // ────────────────────────────────────────────────────────────────────
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::type_complexity)]
     mod base_url_and_normalization {
@@ -790,11 +789,10 @@ mod tests {
         }
 
         /// Minimal local `/v1/messages` double that captures the request
-        /// path and JSON body it received and always returns a well-formed
-        /// message response. Dropping the returned `JoinHandle` does not
-        /// abort the spawned task (Tokio detaches it) — it relies on
-        /// `#[tokio::test]`'s per-test `Runtime` being torn down at test
-        /// end, which does abort tasks spawned on it.
+        /// path and JSON body and always returns a well-formed response.
+        /// Dropping the returned `JoinHandle` does not abort the spawned
+        /// task (Tokio detaches it) — relies on `#[tokio::test]`'s
+        /// per-test `Runtime` teardown to abort it instead.
         async fn start_capturing_messages_server() -> (
             String,
             Arc<Mutex<Option<(String, Value)>>>,

@@ -2053,7 +2053,10 @@ mod tests {
             .await;
 
             assert!(
-                matches!(result, Err(ProviderError::RateLimited | ProviderError::RateLimitedWithRetry { .. })),
+                matches!(
+                    result,
+                    Err(ProviderError::RateLimited | ProviderError::RateLimitedWithRetry { .. })
+                ),
                 "expected a rate-limited error, got {result:?}"
             );
             assert_eq!(

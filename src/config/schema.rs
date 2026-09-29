@@ -1,5 +1,7 @@
 //! Config schema: plain TOML-portable structs (no figment-only constructs),
 //! so the same conf.d files load unchanged in Python `tomllib` (CD-1, NFR-2).
+//! Also hosts small behavioral helpers tied to that schema, e.g.
+//! `resolve_anthropic_endpoint`/`default_anthropic_base_url`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -8,6 +10,22 @@ use serde::{Deserialize, Serialize};
 
 fn default_apikey_header() -> String {
     "x-api-key".to_string()
+}
+
+// `pub(crate)`, not private like the other `default_*` fns: also called from
+// `router.rs::build_providers` to compute `is_default_endpoint`.
+pub(crate) fn default_anthropic_base_url() -> String {
+    "https://api.anthropic.com".to_string()
+}
+
+/// Trim all trailing `/` from a configured Anthropic `base_url` and report
+/// whether the result is the real `api.anthropic.com` host — computed once
+/// in `router.rs::build_providers` so `anthropic.rs` doesn't need to know
+/// about this module's default value.
+pub(crate) fn resolve_anthropic_endpoint(base_url: &str) -> (String, bool) {
+    let trimmed = base_url.trim_end_matches('/').to_string();
+    let is_default = trimmed == default_anthropic_base_url();
+    (trimmed, is_default)
 }
 
 fn default_cache_ttl_secs() -> u64 {
@@ -105,7 +123,10 @@ pub enum AuthMethod {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum UpstreamKind {
-    Anthropic,
+    Anthropic {
+        #[serde(default = "default_anthropic_base_url")]
+        base_url: String,
+    },
     Bedrock {
         #[serde(default)]
         aws_region: Option<String>,
@@ -121,6 +142,19 @@ pub enum UpstreamKind {
         project_id: String,
     },
     Openrouter {},
+}
+
+impl UpstreamKind {
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            UpstreamKind::Anthropic { .. } => "anthropic",
+            UpstreamKind::Bedrock { .. } => "bedrock",
+            UpstreamKind::Openai { .. } => "openai",
+            UpstreamKind::Gemini { .. } => "gemini",
+            UpstreamKind::Openrouter {} => "openrouter",
+        }
+    }
 }
 
 // Note: no `deny_unknown_fields` here — serde does not support combining it
@@ -396,7 +430,9 @@ impl Default for Config {
             upstreams: vec![
                 Upstream {
                     name: "anthropic".to_string(),
-                    kind: UpstreamKind::Anthropic,
+                    kind: UpstreamKind::Anthropic {
+                        base_url: default_anthropic_base_url(),
+                    },
                     auth: Some(AuthMethod::Bearer {
                         token: SecretRef::Env {
                             var: "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
@@ -441,7 +477,9 @@ impl Default for Config {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{Config, Strategy, UpstreamKind};
+    use super::{
+        default_anthropic_base_url, resolve_anthropic_endpoint, Config, Strategy, UpstreamKind,
+    };
 
     // Story 1.2.1 (openai-model-resolution): `model_family` deserializes
     // additively alongside the existing `model` field.
@@ -554,6 +592,115 @@ base_url = "https://x"
         assert!(
             err.to_string().contains("base_url"),
             "expected error to name the unknown field `base_url`, got: {err}"
+        );
+    }
+
+    // Story 1.1.1 (anthropic-upstream-base-url): `UpstreamKind::Anthropic`
+    // gains a defaulted `base_url`.
+
+    #[test]
+    fn anthropic_upstream_should_default_base_url_when_omitted() {
+        let toml = r#"
+[[upstreams]]
+name = "anthropic"
+kind = "anthropic"
+
+[upstreams.auth]
+type = "bearer"
+
+[upstreams.auth.token]
+source = "env"
+var = "CLAUDE_CODE_OAUTH_TOKEN"
+"#;
+
+        let config: Config = toml::from_str(toml).expect("fragment should parse");
+
+        assert_eq!(
+            config.upstreams[0].kind,
+            UpstreamKind::Anthropic {
+                base_url: default_anthropic_base_url()
+            }
+        );
+    }
+
+    #[test]
+    fn anthropic_upstream_should_honor_an_explicit_base_url() {
+        let toml = r#"
+[[upstreams]]
+name = "internal-claude-gateway"
+kind = "anthropic"
+base_url = "https://gateway.internal.example/anthropic"
+
+[upstreams.auth]
+type = "bearer"
+
+[upstreams.auth.token]
+source = "env"
+var = "GATEWAY_TOKEN"
+"#;
+
+        let config: Config = toml::from_str(toml).expect("fragment should parse");
+
+        match &config.upstreams[0].kind {
+            UpstreamKind::Anthropic { base_url } => {
+                assert_eq!(base_url, "https://gateway.internal.example/anthropic");
+            }
+            other => panic!("expected UpstreamKind::Anthropic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_upstream_should_reject_an_unknown_field_via_deny_unknown_fields() {
+        let toml = r#"
+[[upstreams]]
+name = "anthropic"
+kind = "anthropic"
+bas_url = "typo"
+
+[upstreams.auth]
+type = "bearer"
+
+[upstreams.auth.token]
+source = "env"
+var = "CLAUDE_CODE_OAUTH_TOKEN"
+"#;
+
+        let result = toml::from_str::<Config>(toml);
+
+        assert!(
+            result.is_err(),
+            "expected parse failure for unknown field `bas_url`, got {result:?}"
+        );
+    }
+
+    // Story 3.1.1 (anthropic-upstream-base-url): `resolve_anthropic_endpoint`
+    // trims trailing slashes and flags whether the result is the default host.
+
+    #[test]
+    fn resolve_anthropic_endpoint_should_trim_all_trailing_slashes_and_flag_a_custom_host() {
+        assert_eq!(
+            resolve_anthropic_endpoint("https://gateway.internal.example/anthropic///"),
+            (
+                "https://gateway.internal.example/anthropic".to_string(),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_anthropic_endpoint_should_not_misclassify_a_trailing_slash_typo_on_the_default_host()
+    {
+        assert_eq!(
+            resolve_anthropic_endpoint("https://api.anthropic.com/"),
+            ("https://api.anthropic.com".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn resolve_anthropic_endpoint_should_flag_the_exact_default_host_with_no_trailing_slash() {
+        assert_eq!(
+            resolve_anthropic_endpoint("https://api.anthropic.com"),
+            ("https://api.anthropic.com".to_string(), true)
         );
     }
 

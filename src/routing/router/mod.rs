@@ -77,12 +77,18 @@ async fn build_non_openrouter_provider(
     metrics: &Arc<ProxyMetrics>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     Ok(match &upstream.kind {
-        UpstreamKind::Anthropic => Arc::new(AnthropicProvider::new(
-            Arc::new(upstream.clone()),
-            Arc::clone(resolver),
-            Arc::clone(exec_cache),
-            request_timeout_secs,
-        )?),
+        UpstreamKind::Anthropic { base_url } => {
+            let (resolved_base_url, is_default_endpoint) =
+                crate::config::schema::resolve_anthropic_endpoint(base_url);
+            Arc::new(AnthropicProvider::new(
+                Arc::new(upstream.clone()),
+                resolved_base_url,
+                is_default_endpoint,
+                Arc::clone(resolver),
+                Arc::clone(exec_cache),
+                request_timeout_secs,
+            )?)
+        }
         UpstreamKind::Bedrock { .. } => {
             Arc::new(BedrockProvider::new(Arc::new(upstream.clone())).await)
         }

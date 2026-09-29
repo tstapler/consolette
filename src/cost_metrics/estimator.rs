@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::SecretResolver;
-use crate::config::schema::Upstream;
+use crate::config::schema::{Upstream, UpstreamKind};
 use crate::providers::anthropic::apply_auth_headers;
 
 use super::types::{EstimatorKind, TokenCount, TokenSource};
@@ -278,12 +278,13 @@ impl AnthropicCountTokensEstimator {
         resolver: Arc<dyn SecretResolver + Send + Sync>,
         exec_cache: Arc<ExecCredentialCache>,
     ) -> Self {
-        Self::with_base_url(
-            upstream,
-            resolver,
-            exec_cache,
-            Self::DEFAULT_BASE_URL.to_string(),
-        )
+        let base_url = match &upstream.kind {
+            UpstreamKind::Anthropic { base_url } => {
+                crate::config::schema::resolve_anthropic_endpoint(base_url).0
+            }
+            _ => Self::DEFAULT_BASE_URL.to_string(),
+        };
+        Self::with_base_url(upstream, resolver, exec_cache, base_url)
     }
 
     /// Construct an estimator pointed at `base_url` instead of the real
@@ -461,7 +462,9 @@ mod tests {
     fn test_upstream() -> Arc<Upstream> {
         Arc::new(Upstream {
             name: "anthropic-test".to_string(),
-            kind: UpstreamKind::Anthropic,
+            kind: UpstreamKind::Anthropic {
+                base_url: "https://api.anthropic.com".to_string(),
+            },
             auth: Some(AuthMethod::Apikey {
                 key: SecretRef::Inline {
                     value: "test-api-key".to_string(),
@@ -478,6 +481,33 @@ mod tests {
             Arc::new(ExecCredentialCache::new()),
             base_url,
         )
+    }
+
+    #[test]
+    fn new_should_derive_trimmed_base_url_from_upstream_kind_not_the_default() {
+        let upstream = Arc::new(Upstream {
+            name: "anthropic-gateway".to_string(),
+            kind: UpstreamKind::Anthropic {
+                base_url: "https://gateway.internal.example/anthropic/".to_string(),
+            },
+            auth: Some(AuthMethod::Apikey {
+                key: SecretRef::Inline {
+                    value: "test-api-key".to_string(),
+                },
+                header: "x-api-key".to_string(),
+            }),
+        });
+
+        let estimator = AnthropicCountTokensEstimator::new(
+            upstream,
+            Arc::new(SystemSecretResolver),
+            Arc::new(ExecCredentialCache::new()),
+        );
+
+        assert_eq!(
+            estimator.base_url,
+            "https://gateway.internal.example/anthropic"
+        );
     }
 
     #[tokio::test]

@@ -251,3 +251,24 @@ fn clamp_context_budget_should_leave_requests_unchanged_when_tokens_fit_comforta
 
     assert_eq!(body["max_tokens"], 4096);
 }
+
+#[test]
+fn merge_local_models_should_append_new_ids_skip_duplicates_and_update_cursors() {
+    let mut body = serde_json::json!({
+        "data": [{"type": "model", "id": "a", "display_name": "a", "created_at": "t"}],
+        "has_more": false, "first_id": "a", "last_id": "a"
+    });
+    super::merge_local_models(
+        &mut body,
+        &["a".to_string(), "local/ollama/llama3.2".to_string()],
+    );
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["a", "local/ollama/llama3.2"]);
+    assert_eq!(body["first_id"], "a");
+    assert_eq!(body["last_id"], "local/ollama/llama3.2");
+}

@@ -22,6 +22,7 @@ use crate::metrics::{MetricsCollector, ProxyMetrics, RequestTimingUpdate};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
+use crate::providers::local_discovery::{LocalCatalog, LocalTarget};
 use crate::providers::openai::{OpenaiProvider, MODEL_FAMILY_BODY_KEY};
 use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
@@ -43,6 +44,8 @@ const MAX_HOLD_WAIT_SECS: u64 = 15;
 /// Fixed jitter added on top of the computed wait, so a hold sleep always
 /// slightly overshoots the cooldown's expiry instead of racing it.
 const HOLD_JITTER_MS: u64 = 200;
+/// Local models can be slow to load on first request.
+const LOCAL_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// Owns the dispatch loop for one route: a fixed candidate list, a selection
 /// strategy, and the shared health registry. `providers` is indexed by the
@@ -65,6 +68,11 @@ pub struct Router {
     /// as `session_overrides` via `with_capability`, so learned verdicts
     /// survive a route hot-swap.
     capability: Arc<CapabilityCache>,
+    /// Live catalog of auto-discovered local models (`local/<backend>/<model>`).
+    /// Carried across a route hot-swap via `with_local_catalog`.
+    local_catalog: Arc<LocalCatalog>,
+    /// Lazily-built providers for discovered local endpoints, keyed by base URL.
+    local_providers: dashmap::DashMap<String, Arc<dyn Provider>>,
 }
 
 /// The four non-`openrouter`-kind upstreams: a plain `Arc<dyn Provider>`,
@@ -422,7 +430,65 @@ impl Router {
             capability: CapabilityCache::new(Duration::from_secs(
                 crate::routing::capability::EVAL_TTL_SECS,
             )),
+            local_catalog: LocalCatalog::new(),
+            local_providers: dashmap::DashMap::new(),
         }
+    }
+
+    /// Swaps in the shared local-model catalog (see `with_capability` for the
+    /// carry-across contract).
+    #[must_use]
+    pub fn with_local_catalog(mut self, local_catalog: Arc<LocalCatalog>) -> Self {
+        self.local_catalog = local_catalog;
+        self
+    }
+
+    #[must_use]
+    pub fn local_catalog(&self) -> Arc<LocalCatalog> {
+        Arc::clone(&self.local_catalog)
+    }
+
+    /// Sends a request for a discovered `local/<backend>/<model>` straight to
+    /// that backend's OpenAI-compatible endpoint, bypassing route candidates:
+    /// the client named the model explicitly, so there is nothing to select.
+    async fn dispatch_local(
+        &self,
+        target: LocalTarget,
+        mut body: serde_json::Value,
+        headers: HeaderMap,
+        stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let provider = match self.local_providers.get(&target.base_url) {
+            Some(p) => Arc::clone(&p),
+            None => {
+                let upstream = Arc::new(crate::config::schema::Upstream {
+                    name: format!("local/{}", target.backend.slug()),
+                    kind: UpstreamKind::Openai {
+                        base_url: target.base_url.clone(),
+                    },
+                    // OpenaiProvider requires an auth method; local servers
+                    // ignore the header, so a placeholder bearer suffices.
+                    auth: Some(crate::config::schema::AuthMethod::Bearer {
+                        token: crate::config::schema::SecretRef::Inline {
+                            value: "local".to_string(),
+                        },
+                    }),
+                });
+                let p: Arc<dyn Provider> = Arc::new(OpenaiProvider::new(
+                    upstream,
+                    target.base_url.clone(),
+                    Arc::new(SystemSecretResolver),
+                    Arc::new(ExecCredentialCache::new()),
+                    LOCAL_REQUEST_TIMEOUT_SECS,
+                    Arc::clone(&self.metrics.counters),
+                )?);
+                self.local_providers
+                    .insert(target.base_url.clone(), Arc::clone(&p));
+                p
+            }
+        };
+        body["model"] = serde_json::Value::String(target.model);
+        provider.send(body, headers, stream).await
     }
 
     /// Swaps in a shared capability-verdict cache, replacing the empty one
@@ -606,6 +672,10 @@ impl Router {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+
+        if let Some(target) = self.local_catalog.resolve(&model) {
+            return self.dispatch_local(target, body, headers, stream).await;
+        }
 
         let session_id = extract_session_id(&body);
         let candidates = self.effective_candidates(session_id.as_deref());

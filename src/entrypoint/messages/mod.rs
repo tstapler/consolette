@@ -514,7 +514,34 @@ pub async fn get_v1_models(
         )
     })?;
 
-    Ok(Json(v1_models_from_config(&config)))
+    let mut body = v1_models_from_config(&config);
+    merge_local_models(
+        &mut body,
+        &state.dispatch_router.load().local_catalog().model_ids(),
+    );
+    Ok(Json(body))
+}
+
+/// Appends auto-discovered `local/...` ids to a `/v1/models` body, skipping
+/// any already listed, and refreshes the pagination cursors.
+fn merge_local_models(body: &mut serde_json::Value, local_ids: &[String]) {
+    use serde_json::json;
+    let Some(data) = body
+        .get_mut("data")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    for id in local_ids {
+        if !data.iter().any(|m| m["id"] == json!(id)) {
+            data.push(json!({"type": "model", "id": id, "display_name": id, "created_at": now}));
+        }
+    }
+    let first = data.first().map_or(json!(""), |m| m["id"].clone());
+    let last = data.last().map_or(json!(""), |m| m["id"].clone());
+    body["first_id"] = first;
+    body["last_id"] = last;
 }
 
 /// Build the `GET /v1/models` response body from a loaded config (pure,

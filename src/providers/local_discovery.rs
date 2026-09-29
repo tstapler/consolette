@@ -17,6 +17,10 @@ pub const SCAN_TIMEOUT: Duration = Duration::from_millis(500);
 pub const SCAN_INTERVAL: Duration = Duration::from_secs(15);
 const HOST: &str = "http://127.0.0.1";
 const ID_PREFIX: &str = "local/";
+/// Caps on what an unauthenticated localhost listener can make us hold or echo.
+const MAX_BODY_BYTES: usize = 1 << 20;
+const MAX_MODELS: usize = 256;
+const MAX_ID_LEN: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LocalBackend {
@@ -99,6 +103,13 @@ impl LocalCatalog {
         }
     }
 
+    #[must_use]
+    pub fn has(&self, backend: LocalBackend) -> bool {
+        self.endpoints
+            .read()
+            .is_ok_and(|m| m.contains_key(&backend))
+    }
+
     /// Catalog ids (`local/<backend>/<model>`), sorted.
     #[must_use]
     pub fn model_ids(&self) -> Vec<String> {
@@ -150,11 +161,12 @@ pub fn normalize_models(body: &Value) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|m| m.get("id").and_then(Value::as_str))
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && id.len() <= MAX_ID_LEN && !id.chars().any(char::is_control))
         .map(str::to_string)
         .collect();
     ids.sort();
     ids.dedup();
+    ids.truncate(MAX_MODELS);
     ids
 }
 
@@ -173,7 +185,11 @@ pub async fn scan_endpoint(
         .ok()?
         .error_for_status()
         .ok()?;
-    let body: Value = resp.json().await.ok()?;
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() > MAX_BODY_BYTES {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(&bytes).ok()?;
     let models = normalize_models(&body);
     (!models.is_empty()).then(|| Endpoint {
         base_url: base_url.to_string(),
@@ -191,6 +207,17 @@ pub async fn scan_all(client: &reqwest::Client, catalog: &LocalCatalog) {
         )
     });
     for (backend, endpoint) in futures_util::future::join_all(scans).await {
+        if let Some(e) = &endpoint {
+            if !catalog.has(backend) {
+                tracing::warn!(
+                    backend = backend.slug(),
+                    url = %e.base_url,
+                    models = e.models.len(),
+                    "local LLM backend discovered; its models are now routable as local/{}/*",
+                    backend.slug()
+                );
+            }
+        }
         catalog.set(backend, endpoint);
     }
 }
@@ -225,6 +252,34 @@ mod tests {
             {"id": ""}, {"name": "no-id"}, {"id": 7}
         ]});
         assert_eq!(normalize_models(&body), vec!["llama3.2", "qwen3:8b"]);
+    }
+
+    #[test]
+    fn normalize_models_should_cap_count_and_reject_long_or_control_char_ids() {
+        let mut data: Vec<Value> = (0..400)
+            .map(|i| json!({"id": format!("m{i:03}")}))
+            .collect();
+        data.push(json!({"id": "x".repeat(MAX_ID_LEN + 1)}));
+        data.push(json!({"id": "bad\nid"}));
+        let ids = normalize_models(&json!({ "data": data }));
+        assert_eq!(ids.len(), MAX_MODELS);
+        assert!(ids.iter().all(|i| i.starts_with('m')));
+    }
+
+    #[tokio::test]
+    async fn scan_endpoint_should_reject_oversized_bodies() {
+        let big = "a".repeat(MAX_BODY_BYTES + 1);
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move || {
+                let big = big.clone();
+                async move { axum::Json(json!({"data": [{"id": big}]})) }
+            }),
+        );
+        let base = serve(app).await;
+        assert!(scan_endpoint(&reqwest::Client::new(), &base, SCAN_TIMEOUT)
+            .await
+            .is_none());
     }
 
     #[test]

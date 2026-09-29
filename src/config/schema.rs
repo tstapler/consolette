@@ -305,7 +305,8 @@ pub struct Config {
     #[serde(default = "default_config_dir")]
     pub config_dir: String,
     /// Scan localhost for Ollama / LM Studio / OpenAI-compatible servers and
-    /// serve their models as `local/<backend>/<model>`.
+    /// serve their models as `local/<backend>/<model>`. Read once at startup:
+    /// changing it requires a restart (route hot-swaps do not respawn the scanner).
     #[serde(default = "default_true")]
     pub local_discovery: bool,
     #[serde(default = "default_true")]

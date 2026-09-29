@@ -551,3 +551,21 @@ async fn local_model_id_routes_to_discovered_endpoint_with_prefix_stripped() {
     let sent = seen.lock().unwrap().clone().unwrap();
     assert_eq!(sent["model"], "llama3.2");
 }
+
+#[tokio::test]
+async fn unknown_local_model_id_falls_through_to_normal_routing() {
+    let (providers, primary_calls, _) = two_ok_providers();
+    let router = fallback_router(providers, Arc::new(HealthRegistry::new(300)));
+
+    let res = router
+        .dispatch(
+            serde_json::json!({"model": "local/ollama/not-discovered"}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+}

@@ -791,8 +791,10 @@ mod tests {
 
         /// Minimal local `/v1/messages` double that captures the request
         /// path and JSON body it received and always returns a well-formed
-        /// message response, torn down when the returned `JoinHandle` is
-        /// dropped.
+        /// message response. Dropping the returned `JoinHandle` does not
+        /// abort the spawned task (Tokio detaches it) — it relies on
+        /// `#[tokio::test]`'s per-test `Runtime` being torn down at test
+        /// end, which does abort tasks spawned on it.
         async fn start_capturing_messages_server() -> (
             String,
             Arc<Mutex<Option<(String, Value)>>>,

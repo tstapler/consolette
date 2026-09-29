@@ -22,6 +22,7 @@
 [[upstreams]]
 name = "anthropic"
 kind = "anthropic"
+# base_url = "https://gateway.internal.example/anthropic"  # optional, defaults to https://api.anthropic.com
 
 [upstreams.auth]
 type = "bearer"

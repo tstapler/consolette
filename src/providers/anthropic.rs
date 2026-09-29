@@ -1,7 +1,8 @@
 //! Anthropic API provider.
 //!
-//! Forwards requests to `https://api.anthropic.com/v1/messages`, cleaning
-//! Claude Code / Bedrock-specific fields that the Anthropic API rejects.
+//! Forwards requests to the configured `base_url`'s `/v1/messages`
+//! (defaulting to `https://api.anthropic.com`), cleaning Claude Code /
+//! Bedrock-specific fields that the Anthropic API rejects.
 //!
 //! Ported from the legacy `claude-proxy-rs` `AnthropicProvider`. The pure
 //! request/response logic (`clean_request_body`, `normalize_model_name`,
@@ -48,11 +49,11 @@ pub struct AnthropicProvider {
     client: Client,
     /// Non-pooled client for SSE streaming (prevents pool exhaustion).
     stream_client: Client,
-    /// Base URL for the Anthropic API. `UpstreamKind::Anthropic` carries no
-    /// base-URL override field in the new schema (only `Openai` does), so
-    /// this is hardcoded, matching legacy's default. See the final port
-    /// report for this gap.
     base_url: String,
+    /// Whether `base_url` resolved to the real `api.anthropic.com` (as
+    /// opposed to an operator-configured custom endpoint) — gates
+    /// `normalize_model_name`'s Bedrock-id stripping.
+    is_default_endpoint: bool,
     /// The upstream this provider was constructed for — supplies `name` (for
     /// logging/exec-cache keying) and `auth`.
     upstream: Arc<Upstream>,
@@ -79,6 +80,8 @@ impl AnthropicProvider {
     /// fails to build (e.g. an invalid TLS backend configuration).
     pub fn new(
         upstream: Arc<Upstream>,
+        base_url: String,
+        is_default_endpoint: bool,
         resolver: Arc<dyn SecretResolver + Send + Sync>,
         exec_cache: Arc<ExecCredentialCache>,
         request_timeout_secs: u64,
@@ -107,7 +110,8 @@ impl AnthropicProvider {
         Ok(Self {
             client,
             stream_client,
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url,
+            is_default_endpoint,
             upstream,
             resolver,
             exec_cache,
@@ -119,7 +123,12 @@ impl AnthropicProvider {
     /// Claude Code occasionally sends Bedrock-format names (e.g.
     /// `us.anthropic.claude-3-5-sonnet-20241022-v1:0`) to the Anthropic
     /// endpoint.  Strip the prefix and version suffix so the API accepts it.
-    fn normalize_model_name(model: &str) -> String {
+    /// Only applied when constructed against the default `api.anthropic.com`
+    /// host — see plan.md Story 3.1.2.
+    fn normalize_model_name(model: &str, is_default_endpoint: bool) -> String {
+        if !is_default_endpoint {
+            return model.to_string();
+        }
         let model = if let Some(stripped) = model.strip_prefix("us.anthropic.") {
             stripped.to_string()
         } else {
@@ -166,6 +175,12 @@ impl AnthropicProvider {
     ///   present, otherwise falls back to the default version.
     /// - Sets auth per the upstream's configured `AuthMethod` (see
     ///   `apply_auth`).
+    ///
+    /// These two headers are forwarded verbatim to whatever `base_url` is
+    /// configured, not just `api.anthropic.com`. There is no per-upstream
+    /// header allow/deny-list today; that's a deliberate, documented
+    /// limitation (see `project_plans/anthropic-upstream-base-url`), not an
+    /// oversight — add one if a non-Anthropic relay ever chokes on them.
     async fn build_headers(
         &self,
         incoming: &HeaderMap,
@@ -215,7 +230,7 @@ impl AnthropicProvider {
     ) -> Result<(Value, StatusCode), ProviderError> {
         // Normalize model name
         if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
-            let normalized = Self::normalize_model_name(model);
+            let normalized = Self::normalize_model_name(model, self.is_default_endpoint);
             body["model"] = Value::String(normalized);
         }
 
@@ -293,7 +308,7 @@ impl AnthropicProvider {
 
         // Normalize model name
         if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
-            let normalized = Self::normalize_model_name(model);
+            let normalized = Self::normalize_model_name(model, self.is_default_endpoint);
             body["model"] = Value::String(normalized);
         }
 
@@ -678,7 +693,10 @@ mod tests {
     #[test]
     fn normalize_model_name_strips_bedrock_prefix_and_suffix() {
         assert_eq!(
-            AnthropicProvider::normalize_model_name("us.anthropic.claude-3-5-sonnet-20241022-v1:0"),
+            AnthropicProvider::normalize_model_name(
+                "us.anthropic.claude-3-5-sonnet-20241022-v1:0",
+                true
+            ),
             "claude-3-5-sonnet-20241022"
         );
     }
@@ -686,7 +704,7 @@ mod tests {
     #[test]
     fn normalize_model_name_leaves_plain_names_alone() {
         assert_eq!(
-            AnthropicProvider::normalize_model_name("claude-3-5-sonnet-20241022"),
+            AnthropicProvider::normalize_model_name("claude-3-5-sonnet-20241022", true),
             "claude-3-5-sonnet-20241022"
         );
     }
@@ -734,5 +752,182 @@ mod tests {
             .unwrap();
         assert_eq!(inner.len(), 1);
         assert_eq!(inner[0]["type"], "text");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // base_url / is_default_endpoint regression tests (Phase 4, Stories
+    // 4.1.1/4.1.2): a local mock server proves the configured base_url is
+    // actually used for outgoing requests, and that Bedrock-id stripping is
+    // gated on is_default_endpoint end-to-end, for both send_request and
+    // send_streaming_request. Not shared with openai/mod.rs's equivalent
+    // helper — response shapes differ (plan.md Pattern Decisions).
+    // ────────────────────────────────────────────────────────────────────
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::type_complexity)]
+    mod base_url_and_normalization {
+        use super::*;
+        use crate::auth::exec::ExecCredentialCache;
+        use crate::auth::SystemSecretResolver;
+        use crate::config::schema::{SecretRef, UpstreamKind};
+        use std::sync::Mutex;
+        use tokio::net::TcpListener;
+
+        async fn handle_messages(
+            axum::extract::State(captured): axum::extract::State<
+                Arc<Mutex<Option<(String, Value)>>>,
+            >,
+            uri: axum::http::Uri,
+            axum::Json(body): axum::Json<Value>,
+        ) -> axum::Json<Value> {
+            *captured.lock().unwrap() = Some((uri.path().to_string(), body));
+            axum::Json(json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-3-5-sonnet-20241022",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+        }
+
+        /// Minimal local `/v1/messages` double that captures the request
+        /// path and JSON body it received and always returns a well-formed
+        /// message response, torn down when the returned `JoinHandle` is
+        /// dropped.
+        async fn start_capturing_messages_server() -> (
+            String,
+            Arc<Mutex<Option<(String, Value)>>>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let captured: Arc<Mutex<Option<(String, Value)>>> = Arc::new(Mutex::new(None));
+            let captured_for_handler = captured.clone();
+            let app = axum::Router::new()
+                .route("/v1/messages", axum::routing::post(handle_messages))
+                .with_state(captured_for_handler);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("mock server bind should succeed");
+            let addr = listener
+                .local_addr()
+                .expect("mock server local_addr should succeed");
+            let handle = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (format!("http://{addr}"), captured, handle)
+        }
+
+        fn provider_for(base_url: String, is_default_endpoint: bool) -> AnthropicProvider {
+            let upstream = Arc::new(Upstream {
+                name: "test-anthropic".to_string(),
+                kind: UpstreamKind::Anthropic {
+                    base_url: base_url.clone(),
+                },
+                auth: Some(AuthMethod::Bearer {
+                    token: SecretRef::Inline {
+                        value: "sk-ant-test".to_string(),
+                    },
+                }),
+            });
+            AnthropicProvider::new(
+                upstream,
+                base_url,
+                is_default_endpoint,
+                Arc::new(SystemSecretResolver),
+                Arc::new(ExecCredentialCache::new()),
+                30,
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn send_request_should_hit_the_configured_base_url() {
+            let (base_url, captured, _server) = start_capturing_messages_server().await;
+            let provider = provider_for(base_url, true);
+            let body = json!({"model": "claude-3-5-sonnet-20241022", "messages": []});
+
+            let result = provider.send_request(body.clone(), &HeaderMap::new()).await;
+            assert!(result.is_ok(), "send_request should succeed: {result:?}");
+
+            let (path, captured_body) = captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("mock server must have received a request");
+            assert_eq!(path, "/v1/messages");
+            assert_eq!(captured_body, body);
+        }
+
+        #[tokio::test]
+        async fn send_streaming_request_should_hit_the_configured_base_url() {
+            let (base_url, captured, _server) = start_capturing_messages_server().await;
+            let provider = provider_for(base_url, true);
+            let body = json!({"model": "claude-3-5-sonnet-20241022", "messages": []});
+
+            let result = provider
+                .send_streaming_request(body, &HeaderMap::new())
+                .await;
+            assert!(
+                result.is_ok(),
+                "send_streaming_request should succeed: {result:?}"
+            );
+
+            let (path, _captured_body) = captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("mock server must have received a request");
+            assert_eq!(path, "/v1/messages");
+        }
+
+        #[tokio::test]
+        async fn send_request_should_not_normalize_model_name_when_endpoint_is_not_default() {
+            let (base_url, captured, _server) = start_capturing_messages_server().await;
+            let provider = provider_for(base_url, false);
+            let body = json!({
+                "model": "us.anthropic.claude-3-5-sonnet-20241022-v1:0",
+                "messages": []
+            });
+
+            let result = provider.send_request(body, &HeaderMap::new()).await;
+            assert!(result.is_ok(), "send_request should succeed: {result:?}");
+
+            let (_path, captured_body) = captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("mock server must have received a request");
+            assert_eq!(
+                captured_body.get("model").and_then(Value::as_str),
+                Some("us.anthropic.claude-3-5-sonnet-20241022-v1:0")
+            );
+        }
+
+        #[tokio::test]
+        async fn send_streaming_request_should_not_normalize_model_name_when_endpoint_is_not_default(
+        ) {
+            let (base_url, captured, _server) = start_capturing_messages_server().await;
+            let provider = provider_for(base_url, false);
+            let body = json!({
+                "model": "us.anthropic.claude-3-5-sonnet-20241022-v1:0",
+                "messages": []
+            });
+
+            let result = provider
+                .send_streaming_request(body, &HeaderMap::new())
+                .await;
+            assert!(
+                result.is_ok(),
+                "send_streaming_request should succeed: {result:?}"
+            );
+
+            let (_path, captured_body) = captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("mock server must have received a request");
+            assert_eq!(
+                captured_body.get("model").and_then(Value::as_str),
+                Some("us.anthropic.claude-3-5-sonnet-20241022-v1:0")
+            );
+        }
     }
 }

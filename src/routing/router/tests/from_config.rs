@@ -244,7 +244,9 @@ async fn build_providers_should_construct_provider_for_upstream_kind_openrouter(
         upstreams: vec![
             crate::config::schema::Upstream {
                 name: "anthropic".to_string(),
-                kind: UpstreamKind::Anthropic,
+                kind: UpstreamKind::Anthropic {
+                    base_url: "https://api.anthropic.com".to_string(),
+                },
                 auth: Some(crate::config::schema::AuthMethod::Bearer {
                     token: crate::config::schema::SecretRef::Inline {
                         value: "sk-ant-test".to_string(),
@@ -275,6 +277,82 @@ async fn build_providers_should_construct_provider_for_upstream_kind_openrouter(
     assert!(openrouter_providers.contains_key(&1));
 }
 
+// Story 4.1.3 (project_plans/anthropic-upstream-base-url): exercises the
+// real `build_providers` wiring (not a hand-constructed `AnthropicProvider`)
+// through the `Provider` trait's public `send` method, proving both the
+// trailing-slash trim and the constructor wiring work end-to-end.
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn build_providers_should_wire_a_configured_anthropic_base_url_through_to_a_real_request() {
+    use std::sync::Mutex;
+    use tokio::net::TcpListener;
+
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_for_handler = captured.clone();
+    async fn handle_messages(
+        axum::extract::State(captured): axum::extract::State<Arc<Mutex<Option<String>>>>,
+        uri: axum::http::Uri,
+        axum::Json(_body): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        *captured.lock().unwrap() = Some(uri.path().to_string());
+        axum::Json(serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude-3-5-sonnet-20241022",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+    }
+    let app = axum::Router::new()
+        .route("/v1/messages", axum::routing::post(handle_messages))
+        .with_state(captured_for_handler);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock server bind should succeed");
+    let addr = listener
+        .local_addr()
+        .expect("mock server local_addr should succeed");
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config = Config {
+        upstreams: vec![bearer_upstream(
+            "anthropic",
+            UpstreamKind::Anthropic {
+                base_url: format!("http://{addr}/"),
+            },
+            "sk-ant-test",
+        )],
+        ..Config::default()
+    };
+
+    let (providers, _openrouter_providers) =
+        build_providers(&config, Arc::new(ProxyMetrics::new()))
+            .await
+            .unwrap();
+
+    let response = providers[0]
+        .1
+        .send(
+            serde_json::json!({"model": "claude-3-5-sonnet-20241022", "messages": []}),
+            http::HeaderMap::new(),
+            false,
+        )
+        .await;
+    if let Err(err) = response {
+        panic!("send should succeed: {err:?}");
+    }
+
+    let path = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock server must have received a request");
+    assert_eq!(path, "/v1/messages");
+}
+
 // REQ-1/Blocker 5 (Story 4.3.1, Task 4.3.1b): a route using
 // `strategy = "openrouter_scored"` whose upstreams resolve to no
 // `openrouter`-kind upstream at all fails `from_config`, naming the
@@ -286,7 +364,9 @@ async fn from_config_should_reject_openrouter_scored_route_without_openrouter_up
     let config = Config {
         upstreams: vec![bearer_upstream(
             "anthropic",
-            UpstreamKind::Anthropic,
+            UpstreamKind::Anthropic {
+                base_url: "https://api.anthropic.com".to_string(),
+            },
             "sk-ant-test",
         )],
         routes: vec![Route {
@@ -462,7 +542,13 @@ async fn from_config_should_reject_mixed_upstream_fallback_route_containing_open
 
     let config = Config {
         upstreams: vec![
-            bearer_upstream("anthropic", UpstreamKind::Anthropic, "sk-ant-test"),
+            bearer_upstream(
+                "anthropic",
+                UpstreamKind::Anthropic {
+                    base_url: "https://api.anthropic.com".to_string(),
+                },
+                "sk-ant-test",
+            ),
             bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test"),
         ],
         routes: vec![Route {
@@ -509,7 +595,13 @@ async fn from_config_should_reject_openrouter_scored_route_mixing_paid_upstream(
     let config = Config {
         upstreams: vec![
             bearer_upstream("or", UpstreamKind::Openrouter {}, "sk-or-v1-test"),
-            bearer_upstream("paid-anthropic", UpstreamKind::Anthropic, "sk-ant-test"),
+            bearer_upstream(
+                "paid-anthropic",
+                UpstreamKind::Anthropic {
+                    base_url: "https://api.anthropic.com".to_string(),
+                },
+                "sk-ant-test",
+            ),
         ],
         routes: vec![Route {
             name: "r2".to_string(),

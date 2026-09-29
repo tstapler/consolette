@@ -28,7 +28,9 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::claude_code_session::omission_cache::OmissionCache;
 use crate::claude_code_session::prune_policy::PruningPolicyStore;
-use crate::config::schema::{Config, UpstreamKind, WebUiMode};
+#[cfg(test)]
+use crate::config::schema::UpstreamKind;
+use crate::config::schema::{Config, WebUiMode};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
 use crate::metrics::MetricsCollector;
@@ -155,7 +157,7 @@ impl EntrypointState {
                 .iter()
                 .map(|u| UpstreamSummary {
                     name: u.name.clone(),
-                    kind: upstream_kind_label(&u.kind),
+                    kind: u.kind.label(),
                 })
                 .collect(),
         });
@@ -229,16 +231,6 @@ impl EntrypointState {
             web_ui: config.web_ui,
             config_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
-    }
-}
-
-fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
-    match kind {
-        UpstreamKind::Anthropic => "anthropic",
-        UpstreamKind::Bedrock { .. } => "bedrock",
-        UpstreamKind::Openai { .. } => "openai",
-        UpstreamKind::Gemini { .. } => "gemini",
-        UpstreamKind::Openrouter {} => "openrouter",
     }
 }
 
@@ -428,17 +420,14 @@ mod tests {
             project_id: "p1".to_string(),
         };
 
-        assert_eq!(upstream_kind_label(&kind), "gemini");
+        assert_eq!(kind.label(), "gemini");
     }
 
     // REQ-1 (Story 1.2.3, Task 1.2.3d): `upstream_kind_label` accepts
     // `UpstreamKind::Openrouter`.
     #[test]
     fn upstream_kind_label_should_return_openrouter_for_new_variant() {
-        assert_eq!(
-            upstream_kind_label(&UpstreamKind::Openrouter {}),
-            "openrouter"
-        );
+        assert_eq!(UpstreamKind::Openrouter {}.label(), "openrouter");
     }
 
     #[tokio::test]

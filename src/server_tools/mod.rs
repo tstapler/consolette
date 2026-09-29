@@ -214,7 +214,7 @@ impl ServerToolsRuntime {
                 .find(|u| u.name == referenced.name)
                 .map(|u| &u.kind);
             match kind {
-                Some(UpstreamKind::Anthropic) => {}
+                Some(UpstreamKind::Anthropic { .. }) => {}
                 None | Some(_) => return true,
             }
         }

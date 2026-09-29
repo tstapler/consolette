@@ -39,16 +39,6 @@ pub fn validate_references(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn upstream_kind_label(kind: &UpstreamKind) -> &'static str {
-    match kind {
-        UpstreamKind::Anthropic => "anthropic",
-        UpstreamKind::Bedrock { .. } => "bedrock",
-        UpstreamKind::Openai { .. } => "openai",
-        UpstreamKind::Gemini { .. } => "gemini",
-        UpstreamKind::Openrouter {} => "openrouter",
-    }
-}
-
 /// Enforces `RouteUpstreamRef.model`/`model_family` as mutually exclusive,
 /// required-on-`kind = "openai"` selectors (Story 1.2.2), and that
 /// `model_family` — an internal dispatch key only `OpenaiProvider::send`
@@ -85,7 +75,7 @@ pub fn validate_model_selectors(config: &Config) -> Result<(), ConfigError> {
                 return Err(ConfigError::ModelFamilyOnNonOpenaiUpstream {
                     route: route.name.clone(),
                     upstream: reference.name.clone(),
-                    kind: upstream_kind_label(&upstream.kind).to_string(),
+                    kind: upstream.kind.label().to_string(),
                 });
             }
         }

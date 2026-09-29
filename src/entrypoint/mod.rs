@@ -121,9 +121,17 @@ impl EntrypointState {
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
         let session_overrides = Arc::new(SessionOverrideStore::new());
         let capability = CapabilityCache::new(std::time::Duration::from_secs(EVAL_TTL_SECS));
+        let local_catalog = crate::providers::local_discovery::LocalCatalog::new();
+        if config.local_discovery {
+            tokio::spawn(crate::providers::local_discovery::run_local_discovery(
+                Arc::clone(&local_catalog),
+                crate::providers::local_discovery::SCAN_INTERVAL,
+            ));
+        }
         let dispatch_router = Arc::new(ArcSwap::from_pointee(
             DispatchRouter::from_config(config, Arc::clone(&metrics))
                 .await?
+                .with_local_catalog(local_catalog)
                 .with_session_overrides(Arc::clone(&session_overrides))
                 .with_capability(Arc::clone(&capability)),
         ));

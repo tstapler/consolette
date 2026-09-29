@@ -9,6 +9,7 @@
 pub mod anthropic;
 pub mod bedrock;
 pub mod gemini;
+pub mod local_discovery;
 pub mod openai;
 pub mod openrouter;
 

@@ -665,7 +665,8 @@ pub async fn put_dashboard_config(
                 )
             })?
             .with_session_overrides(Arc::clone(&state.session_overrides))
-            .with_capability(Arc::clone(&state.capability));
+            .with_capability(Arc::clone(&state.capability))
+            .with_local_catalog(state.dispatch_router.load().local_catalog());
 
     state.dispatch_router.store(Arc::new(new_router));
 

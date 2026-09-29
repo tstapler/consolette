@@ -491,3 +491,81 @@ async fn circuit_breaker_threshold_failures_instantly_reroutes_traffic() {
         "fallback served request instantly"
     );
 }
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn local_model_id_routes_to_discovered_endpoint_with_prefix_stripped() {
+    use crate::providers::local_discovery::{Endpoint, LocalBackend};
+    use std::sync::Mutex;
+
+    let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let seen_in_handler = Arc::clone(&seen);
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+            let seen = Arc::clone(&seen_in_handler);
+            async move {
+                *seen.lock().unwrap() = Some(b);
+                axum::Json(serde_json::json!({
+                    "id": "x", "object": "chat.completion", "model": "llama3.2",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hi"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let catalog = crate::providers::local_discovery::LocalCatalog::new();
+    catalog.set(
+        LocalBackend::Ollama,
+        Some(Endpoint {
+            base_url: format!("http://{addr}"),
+            models: vec!["llama3.2".to_string()],
+        }),
+    );
+    let (providers, primary_calls, _) = two_ok_providers();
+    let router =
+        fallback_router(providers, Arc::new(HealthRegistry::new(300))).with_local_catalog(catalog);
+
+    let res = router
+        .dispatch(
+            serde_json::json!({
+                "model": "local/ollama/llama3.2",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    if let Err(e) = &res {
+        panic!("local dispatch failed: {e:?}");
+    }
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+    let sent = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(sent["model"], "llama3.2");
+}
+
+#[tokio::test]
+async fn unknown_local_model_id_falls_through_to_normal_routing() {
+    let (providers, primary_calls, _) = two_ok_providers();
+    let router = fallback_router(providers, Arc::new(HealthRegistry::new(300)));
+
+    let res = router
+        .dispatch(
+            serde_json::json!({"model": "local/ollama/not-discovered"}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+}

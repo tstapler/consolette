@@ -170,7 +170,8 @@ pub async fn post_route(
             )
         })?
         .with_session_overrides(std::sync::Arc::clone(&state.session_overrides))
-        .with_capability(std::sync::Arc::clone(&state.capability));
+        .with_capability(std::sync::Arc::clone(&state.capability))
+        .with_local_catalog(state.dispatch_router.load().local_catalog());
     state.dispatch_router.store(std::sync::Arc::new(new_router));
 
     // Re-evaluate admission against the new pins without blocking the

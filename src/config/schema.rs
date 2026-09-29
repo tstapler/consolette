@@ -338,6 +338,11 @@ pub struct Config {
     pub failure_threshold: u32,
     #[serde(default = "default_config_dir")]
     pub config_dir: String,
+    /// Scan localhost for Ollama / LM Studio / OpenAI-compatible servers and
+    /// serve their models as `local/<backend>/<model>`. Read once at startup:
+    /// changing it requires a restart (route hot-swaps do not respawn the scanner).
+    #[serde(default = "default_true")]
+    pub local_discovery: bool,
     #[serde(default = "default_true")]
     pub compress: bool,
     #[serde(default = "default_compress_floor_bytes")]
@@ -421,6 +426,7 @@ impl Default for Config {
             health_check_interval_secs: default_health_check_interval_secs(),
             failure_threshold: default_failure_threshold(),
             config_dir: default_config_dir(),
+            local_discovery: true,
             compress: true,
             compress_floor_bytes: default_compress_floor_bytes(),
             cache_aligner: false,

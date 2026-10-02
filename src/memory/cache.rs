@@ -57,6 +57,19 @@ pub const BYPASS_HEADER: &str = "x-consolette-cache-bypass";
 /// Tuning knobs for the `[response_cache]` config table. All optional; a
 /// missing table yields the cache disabled (opt-in — a stale replayed
 /// answer is a worse failure mode than a missed cache hit).
+///
+/// **Residual risk, by design, not yet mitigated**: [`compute_cache_key`]
+/// has no session/origin binding, and `entrypoint_router`'s CORS policy is
+/// wide open (`allow_origin(Any)`) to match this proxy's documented no-auth
+/// loopback trust model. Any local process, or any webpage open in the
+/// user's browser, can therefore plant a response under a key a *different*
+/// legitimate request will later present — and for a coding agent whose
+/// system prompt and tool schemas are largely fixed/predictable, that key
+/// isn't hard to guess. This is strictly worse than the pre-existing no-auth
+/// risk (which only ever affected the forged request's own response): once
+/// this cache is enabled, a forged request can corrupt what a *different*
+/// session receives. Enable `[response_cache]` only when you trust every
+/// process and browser tab that can reach this proxy's loopback port.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseCacheConfig {
@@ -91,11 +104,24 @@ impl Default for ResponseCacheConfig {
     }
 }
 
+/// Request fields that affect generation behavior (not content) and must
+/// therefore be part of the cache key — two requests with identical
+/// conversational content but, say, different `temperature` are asking
+/// for different *behavior*, not the same cached answer.
+const GENERATION_PARAM_FIELDS: &[&str] = &[
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+];
+
 /// Deterministic cache key: sha256 of the model name, system prompt, tool
-/// definitions, and newest message in `body` — the fields that actually
-/// determine the model's next turn. Earlier turns are deliberately
-/// excluded: two requests that reached the same newest turn via different
-/// history are, for caching purposes, asking the same question.
+/// definitions, generation parameters, and newest message in `body` — the
+/// fields that actually determine the model's next turn. Earlier turns are
+/// deliberately excluded: two requests that reached the same newest turn
+/// via different history are, for caching purposes, asking the same
+/// question.
 #[must_use]
 pub fn compute_cache_key(body: &Value) -> String {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
@@ -114,6 +140,11 @@ pub fn compute_cache_key(body: &Value) -> String {
     // keys in a stable, canonical order regardless of request field order.
     for part in [&model, &system, &tools, &last_message] {
         hasher.update(part.to_string().as_bytes());
+        hasher.update(b"\0");
+    }
+    for field in GENERATION_PARAM_FIELDS {
+        let value = body.get(*field).cloned().unwrap_or(Value::Null);
+        hasher.update(value.to_string().as_bytes());
         hasher.update(b"\0");
     }
     hex::encode(hasher.finalize())
@@ -165,12 +196,24 @@ pub fn body_uses_mutating_tool(body: &Value, mutating_tools: &[String]) -> bool 
     };
 
     last_content.iter().any(|block| {
-        block.get("type").and_then(Value::as_str) == Some("tool_result")
-            && block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .and_then(|id| tool_names.get(id))
-                .is_some_and(|name| mutating_tools.iter().any(|m| m == name))
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            return false;
+        }
+        match block.get("tool_use_id").and_then(Value::as_str) {
+            Some(id) => match tool_names.get(id) {
+                // A resolvable id: bypass only if it names a configured
+                // mutating tool.
+                Some(name) => mutating_tools.iter().any(|m| m == name),
+                // An id with no matching `tool_use` anywhere in the
+                // conversation: fail closed. We cannot verify this was a
+                // read-only tool, and `/v1/messages` has no auth — an
+                // external caller can send an orphaned `tool_result`
+                // directly, so this path is reachable, not hypothetical.
+                None => true,
+            },
+            // No `tool_use_id` at all: same fail-closed reasoning.
+            None => true,
+        }
     })
 }
 
@@ -302,7 +345,12 @@ impl ResponseCache {
             .map(|expires_at| expires_at < Utc::now())
             .unwrap_or(true);
         if expired {
-            self.delete(key);
+            // Guarded by the exact `expires_at` this call observed, not a
+            // bare key match: a concurrent `put()` between the SELECT above
+            // and this DELETE would have written a new row with a *new*
+            // `expires_at`, and the guard makes this a no-op against that
+            // fresh row instead of deleting it out from under the writer.
+            self.delete_if_still_expired(key, &expires_at);
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -328,16 +376,22 @@ impl ResponseCache {
         ) {
             Ok(row) => Some(row),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, cache_key = key, "response cache lookup failed");
+                None
+            }
         }
     }
 
-    fn delete(&self, key: &str) {
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                "DELETE FROM response_cache WHERE cache_key = ?1",
-                params![key],
-            );
+    fn delete_if_still_expired(&self, key: &str, expected_expires_at: &str) {
+        let Ok(conn) = self.conn.lock() else {
+            return;
+        };
+        if let Err(error) = conn.execute(
+            "DELETE FROM response_cache WHERE cache_key = ?1 AND expires_at = ?2",
+            params![key, expected_expires_at],
+        ) {
+            tracing::warn!(%error, cache_key = key, "response cache expired-entry cleanup failed");
         }
     }
 
@@ -363,13 +417,19 @@ impl ResponseCache {
         let expires_at = now + chrono::Duration::seconds(ttl_secs);
 
         let Ok(conn) = self.conn.lock() else {
+            tracing::warn!(
+                cache_key = key,
+                "response cache mutex poisoned, dropping write"
+            );
             return;
         };
-        let _ = conn.execute(
+        if let Err(error) = conn.execute(
             "DELETE FROM response_cache WHERE expires_at < ?1",
             params![now.to_rfc3339()],
-        );
-        let _ = conn.execute(
+        ) {
+            tracing::warn!(%error, "response cache expired-rows cleanup failed");
+        }
+        if let Err(error) = conn.execute(
             "INSERT OR REPLACE INTO response_cache \
              (cache_key, response_json, model, estimated_cost_usd, created_at, expires_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -381,7 +441,9 @@ impl ResponseCache {
                 now.to_rfc3339(),
                 expires_at.to_rfc3339()
             ],
-        );
+        ) {
+            tracing::warn!(%error, cache_key = key, "response cache write failed");
+        }
     }
 
     /// Hit-ratio/savings snapshot for `GET /metrics`'s `response_cache`
@@ -529,6 +591,117 @@ mod tests {
         });
 
         assert!(cache.cacheable_key(&body, &HeaderMap::new()).is_some());
+    }
+
+    #[test]
+    fn cacheable_key_should_return_none_when_matching_tool_use_is_several_turns_back() {
+        let dir = TempDir::new().unwrap();
+        let cache = temp_cache(&dir, enabled_config());
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                ]},
+                {"role": "assistant", "content": "noted"},
+                {"role": "user", "content": "now do something else"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "done"}
+                ]}
+            ]
+        });
+
+        assert_eq!(cache.cacheable_key(&body, &HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn cacheable_key_should_return_none_when_one_of_several_parallel_tool_results_is_mutating() {
+        let dir = TempDir::new().unwrap();
+        let cache = temp_cache(&dir, enabled_config());
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}},
+                    {"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file contents"},
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "ran"}
+                ]}
+            ]
+        });
+
+        assert_eq!(cache.cacheable_key(&body, &HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn cacheable_key_should_return_none_when_tool_result_has_no_matching_tool_use() {
+        // Fail closed: an orphaned `tool_use_id` (no matching `tool_use`
+        // anywhere in the conversation) can't be verified as a read-only
+        // tool, and /v1/messages has no auth — an external caller can send
+        // this directly, so it must miss rather than risk a replay.
+        let dir = TempDir::new().unwrap();
+        let cache = temp_cache(&dir, enabled_config());
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_unknown", "content": "ok"}
+                ]}
+            ]
+        });
+
+        assert_eq!(cache.cacheable_key(&body, &HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn compute_cache_key_should_differ_when_generation_parameters_differ() {
+        let base = json!({
+            "model": "m",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "same question"}]
+        });
+        let different_max_tokens = json!({
+            "model": "m",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "same question"}]
+        });
+        let different_temperature = json!({
+            "model": "m",
+            "max_tokens": 100,
+            "temperature": 1,
+            "messages": [{"role": "user", "content": "same question"}]
+        });
+
+        assert_ne!(
+            compute_cache_key(&base),
+            compute_cache_key(&different_max_tokens)
+        );
+        assert_ne!(
+            compute_cache_key(&base),
+            compute_cache_key(&different_temperature)
+        );
+    }
+
+    #[test]
+    fn put_should_default_estimated_cost_to_zero_when_model_is_unpriced() {
+        let dir = TempDir::new().unwrap();
+        let cache = temp_cache(&dir, enabled_config());
+        let response = json!({"usage": {"input_tokens": 1000, "output_tokens": 500}});
+
+        cache.put("key-a", "some-totally-unknown-model-id", &response);
+        let _ = cache.get("key-a");
+
+        let stats = cache.stats_json();
+        assert_eq!(stats["hits"], 1);
+        assert_eq!(stats["estimated_savings_usd"], 0.0);
     }
 
     #[test]

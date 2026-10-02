@@ -9,6 +9,29 @@ use crate::routing::router::Router as DispatchRouter;
 
 use super::EntrypointState;
 
+/// A fresh, disabled-by-default `ResponseCache` backed by a leaked
+/// `TempDir`.
+///
+/// Leaked deliberately: a bare `&tempfile::tempdir().unwrap().path()...`
+/// inline expression is dropped (deleting the directory) at the end of
+/// *that* statement, not at the end of the test — a real bug this exact
+/// helper replaces, since `ResponseCache::open` needs its backing directory
+/// to outlive every request made against the `EntrypointState` it's
+/// installed into.
+#[allow(clippy::unwrap_used)]
+pub(crate) fn leaked_response_cache(
+    config: crate::memory::cache::ResponseCacheConfig,
+) -> Arc<crate::memory::cache::ResponseCache> {
+    let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    Arc::new(
+        crate::memory::cache::ResponseCache::open(
+            &dir.path().join("response-cache.sqlite"),
+            config,
+        )
+        .unwrap(),
+    )
+}
+
 /// Builds an `EntrypointState` wrapping a caller-supplied `Router` so a
 /// test can control candidates/providers/health directly instead of going
 /// through `Router::from_config`.
@@ -50,16 +73,7 @@ pub(crate) async fn state_with_router(
             )
             .unwrap(),
         ),
-        response_cache: Arc::new(
-            crate::memory::cache::ResponseCache::open(
-                &tempfile::tempdir()
-                    .unwrap()
-                    .path()
-                    .join("response-cache.sqlite"),
-                crate::memory::cache::ResponseCacheConfig::default(),
-            )
-            .unwrap(),
-        ),
+        response_cache: leaked_response_cache(crate::memory::cache::ResponseCacheConfig::default()),
         event_tx: tokio::sync::broadcast::channel(1024).0,
         web_ui: crate::config::schema::WebUiMode::Angular,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),

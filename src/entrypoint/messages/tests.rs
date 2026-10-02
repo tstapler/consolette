@@ -306,20 +306,7 @@ async fn test_state_with_repeating_provider(
     });
 
     let mut state = crate::entrypoint::test_support::state_with_router(router, metrics).await;
-    // Leaked deliberately: `ResponseCache` needs its backing directory to
-    // outlive every request made against this `state` across the test, and
-    // a bare `tempfile::tempdir()` inline expression gets dropped (deleting
-    // the directory) at the end of *this* statement rather than at the end
-    // of the test — that race is exactly what broke the cache's
-    // write-then-read tests the first time this helper was written.
-    let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-    state.response_cache = Arc::new(
-        crate::memory::cache::ResponseCache::open(
-            &dir.path().join("response-cache.sqlite"),
-            cache_config,
-        )
-        .unwrap(),
-    );
+    state.response_cache = crate::entrypoint::test_support::leaked_response_cache(cache_config);
     (state, calls)
 }
 

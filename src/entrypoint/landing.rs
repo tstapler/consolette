@@ -293,15 +293,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            response_cache: std::sync::Arc::new(
-                crate::memory::cache::ResponseCache::open(
-                    &tempfile::tempdir()
-                        .unwrap()
-                        .path()
-                        .join("response-cache.sqlite"),
-                    crate::memory::cache::ResponseCacheConfig::default(),
-                )
-                .unwrap(),
+            response_cache: crate::entrypoint::test_support::leaked_response_cache(
+                crate::memory::cache::ResponseCacheConfig::default(),
             ),
             event_tx: tokio::sync::broadcast::channel(1024).0,
             web_ui: crate::config::schema::WebUiMode::Angular,

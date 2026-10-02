@@ -129,6 +129,10 @@ pub async fn post_v1_messages(
     };
     if let Some(key) = &cache_key {
         if let Some(cached) = state.response_cache.get(key) {
+            // A cache hit never reaches `begin_cost_tracking`/`Router::dispatch`,
+            // so it must bump `requests_total` here or the dashboard would
+            // silently undercount traffic once the cache starts hitting.
+            state.metrics.counters.record_cache_hit();
             return (StatusCode::OK, Json(cached)).into_response();
         }
     }

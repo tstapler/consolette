@@ -394,7 +394,7 @@ fn default_cooldown_seconds() -> u64 {
     300
 }
 fn default_health_check_interval_secs() -> u64 {
-    10
+    0
 }
 fn default_failure_threshold() -> u32 {
     3

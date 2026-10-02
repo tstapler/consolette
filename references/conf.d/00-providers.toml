@@ -92,3 +92,14 @@ name = "bedrock"
 
 [[routes.upstreams]]
 name = "gemini"
+
+[ratelimit.defaults]
+on_breach = "delay"
+max_delay_ms = 30000
+
+[ratelimit.upstreams.anthropic]
+rpm = 60
+
+[ratelimit.upstreams.openai]
+rpm = 60
+

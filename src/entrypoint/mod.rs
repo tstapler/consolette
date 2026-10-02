@@ -138,10 +138,12 @@ impl EntrypointState {
         tokio::spawn(crate::routing::capability::run_eval_loop(Arc::clone(
             &dispatch_router,
         )));
-        tokio::spawn(crate::routing::health::run_health_prober(
-            Arc::clone(&dispatch_router),
-            std::time::Duration::from_secs(config.health_check_interval_secs),
-        ));
+        if config.health_check_interval_secs > 0 {
+            tokio::spawn(crate::routing::health::run_health_prober(
+                Arc::clone(&dispatch_router),
+                std::time::Duration::from_secs(config.health_check_interval_secs),
+            ));
+        }
         let cost_tracker = Arc::new(CostTracker::new(PricingTable::load_default()).await);
         let server_tools = Arc::new(ServerToolsRuntime {
             config: config.server_tools.clone(),

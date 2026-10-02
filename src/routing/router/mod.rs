@@ -940,8 +940,7 @@ impl Router {
     pub fn eval_targets(&self) -> Vec<(usize, String)> {
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
-        let expanded = self.strategy.expand_candidates(self.candidates.clone());
-        for candidate in &expanded {
+        for candidate in &self.candidates {
             if let Some(model) = candidate.model.clone() {
                 if model.ends_with(":free") && seen.insert((candidate.index, model.clone())) {
                     targets.push((candidate.index, model));
@@ -1068,7 +1067,7 @@ impl Router {
             Ok(()) => {
                 self.health.record_success(chosen.index);
             }
-            Err(e) if !e.is_validation() && !e.is_auth() => {
+            Err(e) if !e.is_validation() && !e.is_auth() && !e.is_rate_limited() => {
                 self.health.record_failure(chosen.index);
             }
             _ => {}

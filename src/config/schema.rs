@@ -368,6 +368,10 @@ pub struct Config {
     /// bounds, and timeouts.
     #[serde(default)]
     pub server_tools: crate::server_tools::ServerToolsConfig,
+    /// Semantic response-cache knobs (all optional; missing table ⇒
+    /// cache disabled). See `crate::memory::cache::ResponseCache`.
+    #[serde(default)]
+    pub response_cache: crate::memory::cache::ResponseCacheConfig,
 }
 
 /// `serve-cost`'s config-file surface (Epic 2.3, Story 2.3.1): the
@@ -476,6 +480,7 @@ impl Default for Config {
             ratelimit: RateLimitConfig::default(),
             cost_metrics: CostMetricsConfig::default(),
             server_tools: crate::server_tools::ServerToolsConfig::default(),
+            response_cache: crate::memory::cache::ResponseCacheConfig::default(),
         }
     }
 }

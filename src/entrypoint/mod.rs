@@ -33,6 +33,7 @@ use crate::config::schema::UpstreamKind;
 use crate::config::schema::{Config, WebUiMode};
 use crate::cost_metrics::pricing::PricingTable;
 use crate::cost_metrics::tracker::CostTracker;
+use crate::memory::cache::ResponseCache;
 use crate::metrics::MetricsCollector;
 use crate::routing::capability::{CapabilityCache, EVAL_TTL_SECS};
 use crate::routing::router::Router as DispatchRouter;
@@ -97,6 +98,10 @@ pub struct EntrypointState {
     pub pruning_policy_store: Arc<PruningPolicyStore>,
     /// Long-lived SQLite cache for tool output pruned during compaction passes.
     pub omission_cache: Arc<OmissionCache>,
+    /// Semantic cache of full `/v1/messages` responses, keyed by model +
+    /// system prompt + tool defs + newest turn (issue #24). Disabled by
+    /// default — see `crate::memory::cache::ResponseCacheConfig`.
+    pub response_cache: Arc<ResponseCache>,
     /// Broadcast channel for real-time SSE telemetry events.
     pub event_tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
     /// Web UI mode: Angular (embedded SPA) or Legacy.
@@ -150,6 +155,10 @@ impl EntrypointState {
         let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
         let pruning_policy_store = Arc::new(PruningPolicyStore::default());
         let omission_cache = Arc::new(OmissionCache::open(&OmissionCache::default_cache_path())?);
+        let response_cache = Arc::new(ResponseCache::open(
+            &ResponseCache::default_cache_path(),
+            config.response_cache.clone(),
+        )?);
         let (event_tx, _) = tokio::sync::broadcast::channel(1024);
         metrics.set_event_tx(event_tx.clone());
 
@@ -235,6 +244,7 @@ impl EntrypointState {
             search_pool,
             pruning_policy_store,
             omission_cache,
+            response_cache,
             event_tx,
             web_ui: config.web_ui,
             config_lock: Arc::new(tokio::sync::Mutex::new(())),

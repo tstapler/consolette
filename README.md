@@ -178,6 +178,55 @@ Operational notes:
 - `allowed_domains` / `blocked_domains` / `user_location` hints are V1
   logged-and-ignored (one log line per affected request).
 
+### Response cache
+
+Opt-in semantic cache for non-streaming `POST /v1/messages` requests: when
+a request's model, system prompt, tool definitions, generation parameters
+(`max_tokens`/`temperature`/`top_p`/`top_k`/`stop_sequences`), and newest
+turn are identical to a previous request's, the previous response is
+replayed without forwarding to the upstream — zero latency, zero
+additional spend. Disabled by default (shown with defaults):
+
+```toml
+# ~/.config/consolette/conf.d/30-response-cache.toml
+[response_cache]
+enabled = false
+ttl_secs = 900                    # how long an entry stays servable
+mutating_tools = ["Bash", "Edit", "Write"]
+```
+
+**Security note before enabling**: this proxy has no request
+authentication and its CORS policy is wide open (by design, to support any
+local client). The cache key has no session/origin binding, so any local
+process or browser tab that can reach this proxy's loopback port can plant
+a cached response under a key a *different*, legitimate session will later
+present — worse than the pre-existing no-auth risk, since a forged request
+can now affect someone else's response, not just its own. Only enable
+`[response_cache]` when you trust everything that can reach the loopback
+port.
+
+Operational notes:
+
+- Only non-streaming requests are cached today; a streaming request always
+  bypasses the cache (neither read nor write) — interactive Claude Code
+  turns stream, so this cache mainly benefits non-streaming/batch callers
+  today, not Claude Code's own live-typing requests.
+- A request whose newest turn is a `tool_result` for a tool named in
+  `mutating_tools` always misses, in both directions — it's never looked
+  up and never written, since replaying a cached answer after a mutating
+  tool call risks echoing stale guidance about changed state. A
+  `tool_result` whose `tool_use_id` can't be resolved to any tool in the
+  conversation (malformed or externally-crafted input) is treated the same
+  way — fail closed, not cacheable.
+- Send `X-Consolette-Cache-Bypass: true` to force a miss for one request
+  without disabling the cache globally.
+- A cache hit is counted toward `GET /metrics`'s `summary.total_requests`,
+  but never reaches the per-upstream dispatch path — it won't appear in
+  any upstream's own request/latency counters.
+- Hit ratio and estimated savings are on `GET /dashboard` ("Response
+  Cache" panel) and `GET /metrics`'s `response_cache` field; both reset on
+  restart (in-memory counters, not persisted).
+
 ## CLI reference
 
 | Command | Purpose |

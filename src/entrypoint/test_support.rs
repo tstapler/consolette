@@ -50,6 +50,16 @@ pub(crate) async fn state_with_router(
             )
             .unwrap(),
         ),
+        response_cache: Arc::new(
+            crate::memory::cache::ResponseCache::open(
+                &tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("response-cache.sqlite"),
+                crate::memory::cache::ResponseCacheConfig::default(),
+            )
+            .unwrap(),
+        ),
         event_tx: tokio::sync::broadcast::channel(1024).0,
         web_ui: crate::config::schema::WebUiMode::Angular,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),

@@ -334,6 +334,16 @@ async fn state_with_response(
             )
             .unwrap(),
         ),
+        response_cache: Arc::new(
+            consolette::memory::cache::ResponseCache::open(
+                &tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("response-cache.sqlite"),
+                consolette::memory::cache::ResponseCacheConfig::default(),
+            )
+            .unwrap(),
+        ),
         event_tx: tokio::sync::broadcast::channel(1024).0,
         web_ui: consolette::config::schema::WebUiMode::Angular,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),

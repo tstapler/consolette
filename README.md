@@ -178,6 +178,36 @@ Operational notes:
 - `allowed_domains` / `blocked_domains` / `user_location` hints are V1
   logged-and-ignored (one log line per affected request).
 
+### Response cache
+
+Opt-in semantic cache for non-streaming `POST /v1/messages` requests: when
+a request's model, system prompt, tool definitions, and newest turn are
+identical to a previous request's, the previous response is replayed
+without forwarding to the upstream — zero latency, zero additional spend.
+Disabled by default (shown with defaults):
+
+```toml
+# ~/.config/consolette/conf.d/30-response-cache.toml
+[response_cache]
+enabled = false
+ttl_secs = 900                    # how long an entry stays servable
+mutating_tools = ["Bash", "Edit", "Write"]
+```
+
+Operational notes:
+
+- Only non-streaming requests are cached today; a streaming request always
+  bypasses the cache (neither read nor write).
+- A request whose newest turn is a `tool_result` for a tool named in
+  `mutating_tools` always misses, in both directions — it's never looked
+  up and never written, since replaying a cached answer after a mutating
+  tool call risks echoing stale guidance about changed state.
+- Send `X-Consolette-Cache-Bypass: true` to force a miss for one request
+  without disabling the cache globally.
+- Hit ratio and estimated savings are on `GET /dashboard` ("Response
+  Cache" panel) and `GET /metrics`'s `response_cache` field; both reset on
+  restart (in-memory counters, not persisted).
+
 ## CLI reference
 
 | Command | Purpose |

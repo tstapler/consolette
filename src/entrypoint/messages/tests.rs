@@ -239,6 +239,179 @@ fn clamp_context_budget_should_clamp_max_tokens_when_total_requested_exceeds_con
     assert!(est_input + clamped_max <= 256_000);
 }
 
+/// Unlike `FixedProvider` (which panics on a second call, by design —
+/// every existing test above wants exactly one dispatch), this provider
+/// always answers with a fresh clone of the same full JSON body, so the
+/// cache tests below can assert on call *count* across multiple requests
+/// instead of relying on a panic to prove "never called again."
+struct RepeatingProvider {
+    response: serde_json::Value,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for RepeatingProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ProviderResponse::Full(self.response.clone()))
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+async fn test_state_with_repeating_provider(
+    response: serde_json::Value,
+    cache_config: crate::memory::cache::ResponseCacheConfig,
+) -> (EntrypointState, Arc<AtomicUsize>) {
+    use crate::routing::health::HealthRegistry;
+    use crate::routing::router::{Router as DispatchRouter, RouterDeps};
+    use crate::routing::strategy::{FallbackStrategy, UpstreamRef};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn Provider> = Arc::new(RepeatingProvider {
+        response,
+        calls: Arc::clone(&calls),
+    });
+
+    let candidates = vec![UpstreamRef {
+        index: 0,
+        name: "test".to_string(),
+        weight: 1.0,
+        model: None,
+        model_family: None,
+    }];
+    let health = Arc::new(HealthRegistry::new(300));
+    let admission = Arc::new(crate::ratelimit::RateLimiters::new(
+        &crate::config::schema::RateLimitConfig::default(),
+    )) as Arc<dyn crate::ratelimit::AdmissionControl>;
+    let metrics = crate::metrics::MetricsCollector::new();
+    let router = DispatchRouter::new(RouterDeps {
+        candidates,
+        providers: vec![provider],
+        strategy: Arc::new(FallbackStrategy) as Arc<dyn crate::routing::strategy::RoutingStrategy>,
+        health,
+        admission,
+        metrics: Arc::clone(&metrics),
+    });
+
+    let mut state = crate::entrypoint::test_support::state_with_router(router, metrics).await;
+    // Leaked deliberately: `ResponseCache` needs its backing directory to
+    // outlive every request made against this `state` across the test, and
+    // a bare `tempfile::tempdir()` inline expression gets dropped (deleting
+    // the directory) at the end of *this* statement rather than at the end
+    // of the test — that race is exactly what broke the cache's
+    // write-then-read tests the first time this helper was written.
+    let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    state.response_cache = Arc::new(
+        crate::memory::cache::ResponseCache::open(
+            &dir.path().join("response-cache.sqlite"),
+            cache_config,
+        )
+        .unwrap(),
+    );
+    (state, calls)
+}
+
+fn enabled_cache_config() -> crate::memory::cache::ResponseCacheConfig {
+    crate::memory::cache::ResponseCacheConfig {
+        enabled: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn second_identical_request_is_served_from_cache_without_calling_upstream_again() {
+    let expected = serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "content": [{"type": "text", "text": "hello"}],
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let (state, calls) =
+        test_state_with_repeating_provider(expected.clone(), enabled_cache_config()).await;
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false
+    });
+
+    let first = post_messages(state.clone(), body.clone()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let second = post_messages(state, body).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a repeat request must be served from cache, not re-dispatched upstream"
+    );
+    let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(json, expected);
+}
+
+#[tokio::test]
+async fn requests_following_an_identical_bash_tool_result_are_never_cached() {
+    let response =
+        serde_json::json!({"id": "msg_1", "usage": {"input_tokens": 1, "output_tokens": 1}});
+    let (state, calls) = test_state_with_repeating_provider(response, enabled_cache_config()).await;
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 100,
+        "stream": false,
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+            ]}
+        ]
+    });
+
+    let _ = post_messages(state.clone(), body.clone()).await;
+    let _ = post_messages(state, body).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a tool_result for a configured mutating tool must bypass the cache in both directions"
+    );
+}
+
+#[tokio::test]
+async fn cache_disabled_by_default_dispatches_every_request_upstream() {
+    let response = serde_json::json!({"id": "msg_1"});
+    let (state, calls) = test_state_with_repeating_provider(
+        response,
+        crate::memory::cache::ResponseCacheConfig::default(),
+    )
+    .await;
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false
+    });
+
+    let _ = post_messages(state.clone(), body.clone()).await;
+    let _ = post_messages(state, body).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn clamp_context_budget_should_leave_requests_unchanged_when_tokens_fit_comfortably() {
     let mut body = serde_json::json!({

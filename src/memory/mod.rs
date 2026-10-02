@@ -3,6 +3,7 @@
 //! Provides `MemoryStore` + `DedupState` and the axum handler implementations
 //! for `PUT /memory/{key}`, `GET /memory/{key}`, and `GET /memory`.
 
+pub mod cache;
 pub mod dedup;
 pub mod store;
 

@@ -119,6 +119,20 @@ pub async fn post_v1_messages(
     let model = request_model_name(&body);
     let est_tokens = estimate_tokens(&body);
 
+    // Semantic response cache (issue #24): only non-streaming requests are
+    // considered — replaying a cached response as a synthetic SSE stream
+    // is out of scope for this feature.
+    let cache_key = if stream {
+        None
+    } else {
+        state.response_cache.cacheable_key(&body, &headers)
+    };
+    if let Some(key) = &cache_key {
+        if let Some(cached) = state.response_cache.get(key) {
+            return (StatusCode::OK, Json(cached)).into_response();
+        }
+    }
+
     let (session_key, request_id) = begin_cost_tracking(&state.cost_tracker).await;
 
     // Server-tool emulation (D1): requests carrying a server web_search def
@@ -144,42 +158,61 @@ pub async fn post_v1_messages(
         .load()
         .dispatch(body, headers, stream, est_tokens)
         .await;
-    handle_direct_dispatch(&state, model, session_key, request_id, result).await
+    handle_direct_dispatch(
+        &state,
+        DirectDispatchContext {
+            model,
+            session_key,
+            request_id,
+            cache_key,
+        },
+        result,
+    )
+    .await
+}
+
+/// Bundles the per-request bookkeeping `handle_direct_dispatch`/
+/// `direct_full_response` thread through to a successful response: model
+/// name, cost-tracking keys, and the (optional) cache key to populate on a
+/// fresh, non-cached answer. Same introduce-parameter-object pattern as
+/// `EmulatedSearchParams`.
+struct DirectDispatchContext {
+    model: String,
+    session_key: SessionKey,
+    request_id: RequestId,
+    cache_key: Option<String>,
 }
 
 /// Handles the direct-dispatch (non-emulated) outcome of `post_v1_messages`:
 /// full JSON, tee'd stream, or a mapped provider error.
 async fn handle_direct_dispatch(
     state: &EntrypointState,
-    model: String,
-    session_key: SessionKey,
-    request_id: RequestId,
+    ctx: DirectDispatchContext,
     result: Result<ProviderResponse, ProviderError>,
 ) -> Response {
     match result {
-        Ok(ProviderResponse::Full(json)) => {
-            direct_full_response(state, &model, session_key, request_id, json).await
-        }
+        Ok(ProviderResponse::Full(json)) => direct_full_response(state, ctx, json).await,
         Ok(ProviderResponse::Stream(s)) => {
-            direct_stream_response(state, model, session_key, request_id, s)
+            direct_stream_response(state, ctx.model, ctx.session_key, ctx.request_id, s)
         }
-        Err(e) => direct_error_response(state, &session_key, request_id, &e).await,
+        Err(e) => direct_error_response(state, &ctx.session_key, ctx.request_id, &e).await,
     }
 }
 
 async fn direct_full_response(
     state: &EntrypointState,
-    model: &str,
-    session_key: SessionKey,
-    request_id: RequestId,
+    ctx: DirectDispatchContext,
     json: serde_json::Value,
 ) -> Response {
-    record_model_token_usage(state, model, &json);
+    if let Some(key) = &ctx.cache_key {
+        state.response_cache.put(key, &ctx.model, &json);
+    }
+    record_model_token_usage(state, &ctx.model, &json);
     record_actual_usage_from_anthropic_response(
         &state.cost_tracker,
-        &session_key,
-        request_id,
-        model,
+        &ctx.session_key,
+        ctx.request_id,
+        &ctx.model,
         &json,
     )
     .await;

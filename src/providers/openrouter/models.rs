@@ -126,6 +126,80 @@ pub(super) fn parse_free_model_entries(value: &Value) -> Vec<FreeModelEntry> {
         .collect()
 }
 
+/// Key metadata returned by `GET {BASE_URL}/key` — includes usage and daily free model limits.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct FreeModelDailyRequests {
+    pub used: u64,
+    pub limit: u64,
+    pub remaining: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct OpenrouterKeyInfo {
+    pub usage: f64,
+    pub free_model_daily_requests: Option<FreeModelDailyRequests>,
+}
+
+/// Shared GET helper for `{BASE_URL}/key` — queries OpenRouter API key status.
+pub(super) async fn fetch_key_info_raw(
+    provider: &OpenrouterProvider,
+) -> Result<OpenrouterKeyInfo, ProviderError> {
+    fetch_key_info_raw_at(provider, BASE_URL).await
+}
+
+pub(super) async fn fetch_key_info_raw_at(
+    provider: &OpenrouterProvider,
+    base_url: &str,
+) -> Result<OpenrouterKeyInfo, ProviderError> {
+    let url = format!("{base_url}/key");
+    let headers = provider.build_headers(&url).await?;
+
+    debug!("OpenRouter GET {url}");
+
+    let response = provider
+        .client
+        .get(&url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| map_send_error(&e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(classify_error_response(status, response, None).await);
+    }
+
+    let value: Value = response.json().await.map_err(|e| ProviderError::Upstream {
+        status: status.as_u16(),
+        body: e.to_string(),
+    })?;
+
+    parse_key_info(&value).ok_or_else(|| ProviderError::Upstream {
+        status: status.as_u16(),
+        body: "failed to parse OpenRouter key info".to_string(),
+    })
+}
+
+/// Parses the JSON response from `GET {BASE_URL}/key`.
+pub(super) fn parse_key_info(value: &Value) -> Option<OpenrouterKeyInfo> {
+    let data = value.get("data")?;
+    let usage = data.get("usage").and_then(Value::as_f64).unwrap_or(0.0);
+    let free_reqs = data.get("free_model_daily_requests").and_then(|reqs| {
+        let used = reqs.get("used").and_then(Value::as_u64)?;
+        let limit = reqs.get("limit").and_then(Value::as_u64)?;
+        let remaining = reqs.get("remaining").and_then(Value::as_u64)?;
+        Some(FreeModelDailyRequests {
+            used,
+            limit,
+            remaining,
+        })
+    });
+    Some(OpenrouterKeyInfo {
+        usage,
+        free_model_daily_requests: free_reqs,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -248,5 +322,30 @@ mod tests {
         // exactly "one HTTP GET feeds both."
         assert_eq!(parse_model_infos(&value).len(), 3);
         assert_eq!(parse_free_model_entries(&value).len(), 1);
+    }
+
+    #[test]
+    fn parse_key_info_should_extract_usage_and_daily_free_model_limits() {
+        let fixture = json!({
+            "data": {
+                "usage": 22.6083,
+                "free_model_daily_requests": {
+                    "used": 1005,
+                    "limit": 1000,
+                    "remaining": 0
+                }
+            }
+        });
+
+        let info = parse_key_info(&fixture).expect("parse_key_info should return Some");
+        assert_eq!(info.usage, 22.6083);
+        assert_eq!(
+            info.free_model_daily_requests,
+            Some(FreeModelDailyRequests {
+                used: 1005,
+                limit: 1000,
+                remaining: 0,
+            })
+        );
     }
 }

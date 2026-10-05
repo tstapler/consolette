@@ -569,6 +569,7 @@ impl RoutingStrategy for OpenrouterScoringStrategy {
                 "age_secs": age_secs,
                 "last_refresh": last_refresh.map(|t| t.to_rfc3339()),
                 "last_invalidation_reason": self.model_cache.last_invalidation_reason(),
+                "key_info": self.model_cache.key_info(),
             },
             "models": models,
         }))

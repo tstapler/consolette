@@ -88,6 +88,8 @@ pub struct ModelListCache {
     /// spawned task solves that without a self-referential
     /// `Weak<ModelListCache>`.
     refresh_in_flight: Arc<AtomicBool>,
+    /// Last fetched OpenRouter API key status info (usage and free model daily requests).
+    key_info: Mutex<Option<super::OpenrouterKeyInfo>>,
 }
 
 impl ModelListCache {
@@ -105,6 +107,7 @@ impl ModelListCache {
             recent_not_found: DashMap::new(),
             provider,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            key_info: Mutex::new(None),
         }
     }
 
@@ -127,6 +130,7 @@ impl ModelListCache {
             recent_not_found: DashMap::new(),
             provider: Weak::new(),
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            key_info: Mutex::new(None),
         }
     }
 
@@ -166,6 +170,15 @@ impl ModelListCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
     }
 
+    /// Last fetched OpenRouter API key status info (usage and free model daily requests).
+    #[must_use]
+    pub fn key_info(&self) -> Option<super::OpenrouterKeyInfo> {
+        self.key_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Re-fetches `provider.list_free_models()` and replaces the cached
     /// snapshot on success, recording `last_refresh`.
     ///
@@ -184,6 +197,12 @@ impl ModelListCache {
     /// Returns `Err` if `provider.list_free_models()` fails.
     pub async fn refresh(&self, provider: &OpenrouterProvider) -> anyhow::Result<()> {
         let entries = provider.list_free_models().await?;
+        if let Ok(key_info) = provider.fetch_key_info().await {
+            *self
+                .key_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key_info);
+        }
         self.cache.insert((), Arc::new(entries));
         *self
             .last_refresh

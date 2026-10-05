@@ -32,6 +32,7 @@ use super::anthropic::apply_auth_headers;
 use super::{ModelInfo, Provider, ProviderError, ProviderResponse};
 
 pub use cache::{FreeModelEntry, ModelListCache};
+pub use models::{FreeModelDailyRequests, OpenrouterKeyInfo};
 
 /// Base URL for `OpenRouter`'s OpenAI-compatible API. Hardcoded, matching
 /// `AnthropicProvider`/`GeminiProvider`'s precedent — `UpstreamKind::Openrouter`
@@ -353,6 +354,11 @@ impl OpenrouterProvider {
         Ok(models::parse_free_model_entries(&value))
     }
 
+    /// Fetch OpenRouter API key status metadata (`GET {BASE_URL}/key`).
+    pub async fn fetch_key_info(&self) -> Result<OpenrouterKeyInfo, ProviderError> {
+        models::fetch_key_info_raw(self).await
+    }
+
     /// Pre-flight per-dispatch price recheck (Task 2.1.2c, money-safety
     /// backstop mechanism 2): verifies the *specific selected model's*
     /// cached price is `(0.0, 0.0)`, not just that its id is present in the
@@ -377,6 +383,23 @@ impl OpenrouterProvider {
             );
             return Ok(());
         };
+
+        if let Some(key_info) = self.model_cache.key_info() {
+            if let Some(ref reqs) = key_info.free_model_daily_requests {
+                if reqs.remaining == 0
+                    && (model.ends_with(":free")
+                        || list.iter().any(|e| e.id == model && e.price_prompt == 0.0))
+                {
+                    warn!(
+                        model,
+                        used = reqs.used,
+                        limit = reqs.limit,
+                        "openrouter: free model daily request quota is exhausted (0 remaining); rejecting request"
+                    );
+                    return Err(ProviderError::RateLimitedWithRetry { retry_after: 3600 });
+                }
+            }
+        }
 
         let is_verified_free = list
             .iter()

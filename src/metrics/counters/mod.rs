@@ -156,6 +156,16 @@ impl ProxyMetrics {
         self.record_duration_bucket(duration_ms);
     }
 
+    /// Record a response-cache hit (issue #24): counts toward `requests_total`/
+    /// `requests_success` like any other successful request, but — unlike
+    /// [`Self::record_request_success`] — touches no per-upstream bucket and
+    /// no duration/first-byte histogram, since no upstream was actually
+    /// dispatched to and there is no real latency to record.
+    pub fn record_cache_hit(&self) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.requests_success.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one failed dispatch attempt — see [`Self::record_request_success`].
     pub fn record_request_failure(&self, upstream: &str, duration_ms: u64, first_byte_ms: u64) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);

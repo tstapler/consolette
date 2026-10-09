@@ -334,6 +334,20 @@ async fn state_with_response(
             )
             .unwrap(),
         ),
+        response_cache: {
+            // Leaked deliberately: a bare `tempfile::tempdir()` inline
+            // expression is dropped (deleting the directory) at the end of
+            // this statement rather than at the end of the test, which
+            // `ResponseCache::open` needs to outlive.
+            let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+            Arc::new(
+                consolette::memory::cache::ResponseCache::open(
+                    &dir.path().join("response-cache.sqlite"),
+                    consolette::memory::cache::ResponseCacheConfig::default(),
+                )
+                .unwrap(),
+            )
+        },
         event_tx: tokio::sync::broadcast::channel(1024).0,
         web_ui: consolette::config::schema::WebUiMode::Angular,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),

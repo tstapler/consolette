@@ -189,6 +189,28 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         </div>
     </div>
 
+    <div class="chart-container" style="margin-bottom: 24px;">
+        <div class="chart-title">Response Cache</div>
+        <div class="stats-grid" style="margin-top: 12px; margin-bottom: 0;">
+            <div class="stat-card">
+                <div class="stat-label">Hit Ratio</div>
+                <div class="stat-value" id="cache-hit-ratio">0%</div>
+                <div class="stat-subtitle" id="cache-hit-count">0 hits / 0 misses</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Estimated Savings</div>
+                <div class="stat-value" id="cache-savings">$0.00</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Bypassed (mutating tool / header)</div>
+                <div class="stat-value" id="cache-bypassed">0</div>
+            </div>
+        </div>
+        <div id="cache-disabled-notice" style="display:none; color:#888; font-size:13px; padding:8px 0; text-align:center;">
+            Response cache inactive — set [response_cache] enabled = true to turn it on
+        </div>
+    </div>
+
     <div class="errors-section" style="margin-bottom: 24px;">
         <div class="errors-title">Model Token Metrics & Statistics</div>
         <table class="errors-table">
@@ -451,6 +473,17 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     document.getElementById('comp-before').textContent = (c.total_tokens_before || 0).toLocaleString();
                     document.getElementById('comp-after').textContent = (c.total_tokens_after || 0).toLocaleString();
                     document.getElementById('compression-disabled-notice').style.display = requests === 0 ? 'block' : 'none';
+                }
+
+                if (data.response_cache) {
+                    const rc = data.response_cache;
+                    const hits = rc.hits || 0;
+                    const misses = rc.misses || 0;
+                    document.getElementById('cache-hit-ratio').textContent = ((rc.hit_ratio || 0) * 100).toFixed(1) + '%';
+                    document.getElementById('cache-hit-count').textContent = hits.toLocaleString() + ' hits / ' + misses.toLocaleString() + ' misses';
+                    document.getElementById('cache-savings').textContent = '$' + (rc.estimated_savings_usd || 0).toFixed(2);
+                    document.getElementById('cache-bypassed').textContent = (rc.bypassed || 0).toLocaleString();
+                    document.getElementById('cache-disabled-notice').style.display = rc.enabled ? 'none' : 'block';
                 }
 
                 const modelsBody = document.getElementById('models-body');

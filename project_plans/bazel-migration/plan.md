@@ -106,12 +106,18 @@ Not measured: a UI edit that changes the bundle (should re-embed, untested), Lin
 integration tests in `tests/`, the other three bins (`mcp-proxy`, `cmdcrush`, `readme-check`),
 clippy/rustfmt aspects, CI/remote cache.
 
-**Open problem — UI target runs unsandboxed.** In the Bazel sandbox `ng build` fails with
-"`.../bin/ui/src/main.ts` is missing from the TypeScript compilation"; with
-`--spawn_strategy=local` it succeeds. Hypothesis (not confirmed): sandbox symlinks make tsc's
-realpath'd tsconfig and the plugin's file lookup disagree. `//ui:dashboard` is tagged
-`no-sandbox`, which costs hermeticity and remote-cache eligibility for that action. A proper fix
-(Node `--preserve-symlinks`, or a `rules_ts` compile step) is unexplored.
+**Resolved — UI target now builds sandboxed.** In the Bazel sandbox a bare `ng build` fails with
+"`.../bin/ui/src/main.ts` is missing from the TypeScript compilation" (it works with
+`--spawn_strategy=local`). Sandbox inputs are symlinks; the failing path was the real output-base
+path, so the compiler plugin and TypeScript disagree on file identity (consistent with the
+evidence, not proven in the plugin source). `ng build --preserve-symlinks` fixes `main.ts` but
+breaks pnpm-style `node_modules` resolution (`@kurkle/color` unresolved), which needs realpaths.
+Fix: `ui/bazel_ng_build.mjs` copies the sources (dereferenced) into a scratch dir, symlinks
+`node_modules`, and runs `ng build` there; `//ui:dashboard` is a `js_run_binary` over that
+wrapper, no `no-sandbox` tag. Verified: action runs under `darwin-sandbox`, a real UI change
+(title) re-embeds and changes the binary hash, `bazel test //:tests` passes. Not verified: Linux,
+remote cache hit rates, determinism of the bundle across machines. A `rules_ts`/`ts_project`
+compile step was not tried. Reusable guidance: the `bazel-angular` skill.
 
 **Other friction hit:** `rules_js` needs a committed `pnpm-lock.yaml` generated from
 `package-lock.json` (so npm and Bazel lockfiles must be kept in sync: `bazel run @npm//:sync`),

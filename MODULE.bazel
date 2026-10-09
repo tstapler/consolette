@@ -1,0 +1,55 @@
+module(
+    name = "consolette",
+    version = "0.3.0",
+)
+
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_cc", version = "0.2.26")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.98.1"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+# rust-embed must embed at compile time under Bazel (its debug mode reads the source tree at runtime).
+# Cargo forwards the feature to the macro/utils crates; crate_universe annotations do not.
+[
+    crate.annotation(
+        crate = name,
+        crate_features = ["debug-embed"],
+    )
+    for name in ["rust-embed", "rust-embed-impl", "rust-embed-utils"]
+]
+use_repo(crate, "crates")
+
+bazel_dep(name = "aspect_rules_js", version = "3.5.1")
+bazel_dep(name = "rules_nodejs", version = "6.7.6")
+
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(node_version = "20.19.0")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    npm_package_lock = "//ui:package-lock.json",
+    # Generated from package-lock.json by rules_js; commit it. Refresh: bazel run @npm//:sync
+    pnpm_lock = "//ui:pnpm-lock.yaml",
+    update_pnpm_lock = True,
+    data = [
+        "//ui:package.json",
+        "//ui:pnpm-workspace.yaml",
+    ],
+    # esbuild/parcel ship prebuilt platform binaries via optionalDependencies; no install hooks needed.
+    run_lifecycle_hooks = False,
+)
+use_repo(npm, "npm")

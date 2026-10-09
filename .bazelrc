@@ -1,0 +1,9 @@
+# Strict, reproducible defaults; per-developer overrides go in user.bazelrc (gitignored).
+common --enable_bzlmod
+build --incompatible_strict_action_env
+build --enable_platform_specific_config
+build --show_timestamps
+test --test_output=errors
+# Opt out of Aspect ruleset telemetry (rules_js).
+common --repo_env=DO_NOT_TRACK=1
+try-import %workspace%/user.bazelrc

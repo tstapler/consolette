@@ -1,0 +1,43 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//ui:@angular/cli/package_json.bzl", angular_cli = "bin")
+
+package(default_visibility = ["//visibility:public"])
+
+npm_link_all_packages(name = "node_modules")
+
+# Inputs mirror build.rs's UI_INPUTS; Bazel tracks them hermetically.
+_UI_SRCS = glob(["src/**", "public/**"]) + [
+    "angular.json",
+    "package.json",
+    "tsconfig.json",
+    "tsconfig.app.json",
+]
+
+# js_library stages sources and configs together in the bin dir, where tsc/ng expect them.
+js_library(
+    name = "ui_srcs",
+    srcs = _UI_SRCS,
+)
+
+# Served at /dashboard (src/dashboard.rs), so assets must resolve under that base.
+angular_cli.ng(
+    name = "dashboard",
+    srcs = [
+        ":node_modules",
+        ":ui_srcs",
+    ],
+    args = [
+        "build",
+        "--base-href",
+        "/dashboard/",
+        "--output-path",
+        "dist/consolette",
+    ],
+    chdir = package_name(),
+    env = {"NG_CLI_ANALYTICS": "false"},
+    out_dirs = ["dist/consolette"],
+    # SPIKE LIMITATION: in the sandbox, ng/tsc fail to match main.ts (symlinked inputs resolve to
+    # different real paths). Works unsandboxed; the proper fix is open (see plan.md).
+    tags = ["no-sandbox"],
+)

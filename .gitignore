@@ -1,2 +1,6 @@
 /target
 .envrc
+# Bazel
+/bazel-*
+/user.bazelrc
+/.aspect/

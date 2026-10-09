@@ -86,9 +86,45 @@ for far less than a Bazel migration, and keeps `cargo-dist`. Run the Phase 1 spi
 team wants hermetic caching across more languages or services; Risk 1 (`rust-embed`) and the
 Phase 3 release split are the two reasons it could be a bad trade for a single-crate app.
 
+## Phase 1 spike results (branch `spike/bazel`, 2026-10-09, Bazel 9.3.0)
+
+Measured on this machine (macOS arm64). Files: `MODULE.bazel`, `BUILD.bazel`, `ui/BUILD.bazel`,
+`.bazelrc`, `.bazelversion`, `ui/pnpm-lock.yaml`, `ui/pnpm-workspace.yaml`.
+
+| Check | Result |
+|---|---|
+| `bazel build //:consolette` (rules_rust 0.74.0, crate_universe from `Cargo.lock`) | builds; cold ≈ 9 min / ~1000 actions |
+| Real Angular bundle via `rules_js` 3.5.1, embedded in the binary | works (`//ui:dashboard` → `rust-embed`) |
+| Risk 1, `rust-embed` | solved: `debug-embed` on `rust-embed`, `-impl`, `-utils` (annotations do not forward Cargo features) + `rustc_env CARGO_MANIFEST_DIR=$(BINDIR)` |
+| Risk 2, `rusqlite` bundled + AWS SDK | both compile and link |
+| `bazel test //:tests` (lib unit tests incl. `embedded_index_assets_resolve_under_dashboard_base`) | passes, 4.5 s warm |
+| No-op rebuild | 0.6 s |
+| Rust file edit → rebuild | 22.8 s (lib recompiles; same as cargo order of magnitude) |
+| UI edit that doesn't change the bundle (a comment) | 4.0 s, Rust not rebuilt (early cutoff) |
+
+Not measured: a UI edit that changes the bundle (should re-embed, untested), Linux, the
+integration tests in `tests/`, the other three bins (`mcp-proxy`, `cmdcrush`, `readme-check`),
+clippy/rustfmt aspects, CI/remote cache.
+
+**Open problem — UI target runs unsandboxed.** In the Bazel sandbox `ng build` fails with
+"`.../bin/ui/src/main.ts` is missing from the TypeScript compilation"; with
+`--spawn_strategy=local` it succeeds. Hypothesis (not confirmed): sandbox symlinks make tsc's
+realpath'd tsconfig and the plugin's file lookup disagree. `//ui:dashboard` is tagged
+`no-sandbox`, which costs hermeticity and remote-cache eligibility for that action. A proper fix
+(Node `--preserve-symlinks`, or a `rules_ts` compile step) is unexplored.
+
+**Other friction hit:** `rules_js` needs a committed `pnpm-lock.yaml` generated from
+`package-lock.json` (so npm and Bazel lockfiles must be kept in sync: `bazel run @npm//:sync`),
+a `pnpm-workspace.yaml` stating `onlyBuiltDependencies`, and `run_lifecycle_hooks = False`
+(hooks not exercised). Aspect telemetry is on by default; `.bazelrc` sets `DO_NOT_TRACK=1`.
+
+Gate G1 stays open: the technical risks are smaller than feared, but the release split (Phase 3)
+and the unsandboxed UI action are the real costs.
+
 ## Unverified
 
-Everything under "Limits" and Risks 1–2 is reasoning from the repo's shape, not tested. Bazel
-module versions and the exact `rules_js`/`rules_rust` attribute names should be taken from
-their current docs when the spike starts. Local tooling present: `bazel`/`bazelisk` at
-`/opt/homebrew/bin`.
+Limits above and Phase 2/3 estimates are reasoning from the repo's shape, not tested. CI should
+follow the repo's `bazel-github-actions-ci` guidance (`bazel-contrib/setup-bazel` with a
+per-job `disk-cache`, `cache-save` only on push, `permissions: contents: read`, `test_suite`
+for aggregation) when Phase 2 starts; profile slow builds with `--profile` + Perfetto, not
+`bazel analyze-profile` (removed in Bazel 9).

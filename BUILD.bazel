@@ -1,0 +1,53 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml", "Cargo.lock"])
+
+rust_library(
+    name = "consolette_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = [
+            "src/main.rs",
+            "src/bin/**",
+        ],
+    ),
+    # include_str!/include_bytes! targets under src/ (json, html, ...), plus the embedded UI.
+    compile_data = glob(
+        ["src/**"],
+        exclude = ["src/**/*.rs"],
+    ) + ["//ui:dashboard"],
+    crate_name = "consolette",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    # rust-embed resolves its folder relative to CARGO_MANIFEST_DIR; generated UI lives in bin dir.
+    rustc_env = {"CARGO_MANIFEST_DIR": "$(BINDIR)"},
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "consolette",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":consolette_lib"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "consolette_lib_test",
+    crate = ":consolette_lib",
+    # Unit tests include_str! fixtures from tests/fixtures.
+    compile_data = glob(["tests/fixtures/**"]),
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# test_suite (not alias) so `bazel test //:tests` actually forwards the test providers.
+test_suite(
+    name = "tests",
+    tests = [":consolette_lib_test"],
+)

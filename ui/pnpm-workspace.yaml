@@ -1,0 +1,2 @@
+# Read by rules_js only; npm ignores it. No dependency needs install-time build scripts.
+onlyBuiltDependencies: []

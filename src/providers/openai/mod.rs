@@ -816,7 +816,7 @@ impl Provider for OpenaiProvider {
                     if !Self::classify_wrong_endpoint_failure(&err) {
                         return Err(err);
                     }
-                    let responses_body = responses::translate_anthropic_request_to_responses(body);
+                    let responses_body = responses::translate_anthropic_request_to_responses(body).await;
                     let response = self.send_responses_streaming_request(responses_body).await?;
                     self.promote_cache_to_responses(family.as_deref(), &model, token_param);
                     let byte_stream = response
@@ -847,7 +847,7 @@ impl Provider for OpenaiProvider {
                     if !Self::classify_wrong_endpoint_failure(&err) {
                         return Err(err);
                     }
-                    let responses_body = responses::translate_anthropic_request_to_responses(body);
+                    let responses_body = responses::translate_anthropic_request_to_responses(body).await;
                     let value = self.send_responses_request(responses_body).await?;
                     self.promote_cache_to_responses(family.as_deref(), &model, token_param);
                     let anthropic_value = responses::translate_responses_response_to_anthropic(value);

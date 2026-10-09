@@ -349,10 +349,15 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             "/session/prune/stats",
             axum::routing::get(api::get_session_prune_stats),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
+
+/// Above Anthropic's 32 MB request cap so the upstream, not axum's 2 MB default,
+/// rejects oversized image-heavy sessions.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Binds `127.0.0.1:{port}` and serves until Ctrl-C/SIGTERM.
 ///
@@ -514,6 +519,34 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn v1_messages_accepts_bodies_over_axum_default_limit() {
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
+        let router = entrypoint_router(state);
+        // ~3 MB of base64-sized text: past axum's 2 MB default, as with image-heavy sessions.
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "A".repeat(3 * 1024 * 1024)}],
+        })
+        .to_string();
+        let resp = router
+            .oneshot(
+                axum::http::Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

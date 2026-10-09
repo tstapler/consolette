@@ -1062,6 +1062,34 @@ mod tests {
         );
     }
 
+    /// The SPA is only served under `/dashboard`, so the built `<base href>` must be
+    /// `/dashboard/` or the browser requests assets at `/` and gets 404s.
+    #[tokio::test]
+    async fn embedded_index_assets_resolve_under_dashboard_base() {
+        use axum::http::{header, StatusCode, Uri};
+
+        let index = super::DashboardAssets::get("index.html").unwrap();
+        let html = std::str::from_utf8(&index.data).unwrap();
+        if !html.contains("<app-root") {
+            return; // build.rs placeholder: UI not built (`make ui`), nothing to check
+        }
+        assert!(html.contains(r#"<base href="/dashboard/">"#), "base href: {html:.300}");
+
+        let assets = html
+            .split(['"', '\''])
+            .filter(|a| (a.ends_with(".js") || a.ends_with(".css")) && !a.contains("://"));
+        let mut checked = 0;
+        for asset in assets {
+            let uri: Uri = format!("/dashboard/{asset}").parse().unwrap();
+            let response = super::serve_embedded_asset(uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{asset}");
+            let ct = response.headers().get(header::CONTENT_TYPE).unwrap();
+            assert_ne!(ct, "text/html", "{asset} fell through to the SPA fallback");
+            checked += 1;
+        }
+        assert!(checked > 0, "no assets found in index.html");
+    }
+
     #[tokio::test]
     async fn serve_embedded_asset_spa_fallback_for_extensionless_routes() {
         use axum::http::{header, StatusCode, Uri};

@@ -11,6 +11,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # build.rs builds the dashboard UI; fail rather than embed a placeholder page.
+      CONSOLETTE_REQUIRE_UI: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,11 +23,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Build WebUI
-        run: |
-          cd ui
-          npm ci
-          npm run build
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

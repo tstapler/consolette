@@ -1,0 +1,11 @@
+# Captured 2026-10-10 from target/debug/consolette run (HOME=/tmp/spike111/home, fake anthropic-kind upstream on :18081)
+# curl -N http://127.0.0.1:18080/v1/dashboard/events  while POST /v1/messages model=claude-haiku-4-5 succeeded (HTTP 200)
+
+event: message
+data: {"type":"MetricsTick","data":{"rpm":0.0,"total_requests":0,"total_tokens_saved":0,"current_lag_ms":2.159584,"provider_health":{"fake":"healthy"}}}
+
+event: message
+data: {"type":"RequestTrace","data":{"request_id":"05029c2a-4418-415f-b4cb-5791f7b957dc","timestamp":"2026-10-10T18:09:53.222465+00:00","provider":"fake","model":"claude-haiku-4-5","duration_ms":2,"first_byte_ms":2,"tokens_before":22,"tokens_after":0,"compressed":false,"status_code":200}}
+
+event: message
+data: {"type":"MetricsTick","data":{"rpm":0.0,"total_requests":1,"total_tokens_saved":0,"current_lag_ms":2.541167,"provider_health":{"fake":"healthy"}}}

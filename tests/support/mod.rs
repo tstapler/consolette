@@ -8,3 +8,4 @@
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test-only harness
 
 pub mod fake_upstream;
+pub mod live_server;

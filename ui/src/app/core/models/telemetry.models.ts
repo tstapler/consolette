@@ -33,6 +33,8 @@ export interface RequestTraceData {
   /** 0 = terminal trace; a lower revision never overwrites a higher one. */
   traceRevision: number;
   firstByteState?: FirstByteState;
+  /** Per-attempt chain; arrives with the attempts work (Epic 2). */
+  attempts?: Array<{ upstream: string }>;
 }
 
 export interface ErrorLoggedData {

@@ -2,7 +2,7 @@ import { Injectable, DestroyRef, inject, signal, computed } from '@angular/core'
 import { Observable, Subject } from 'rxjs';
 import { DashboardEvent } from '../models/telemetry.models';
 
-export type SseConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
+export type SseConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 
 export interface SseServiceOptions {
   url?: string;
@@ -48,6 +48,7 @@ export class SseService {
     if (options?.maxBackoffMs) this.maxBackoffMs = options.maxBackoffMs;
     if (options?.maxRetryAttempts) this.maxRetryAttempts = options.maxRetryAttempts;
 
+    if (this.statusSignal() === 'disconnected') this.statusSignal.set('connecting');
     this.initEventSource();
   }
 

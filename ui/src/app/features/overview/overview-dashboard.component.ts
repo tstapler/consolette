@@ -86,6 +86,8 @@ import { RequestTraceData } from '../../core/models/telemetry.models';
       <!-- Live Recent Traces Feed Table -->
       <app-recent-trace-table
         [traces]="metricsStore.recentTraces()"
+        [connectionStatus]="metricsStore.connectionStatus()"
+        [retryAttempt]="metricsStore.retryCount()"
         (inspectPayload)="onInspectTrace($event)"
       ></app-recent-trace-table>
     </div>

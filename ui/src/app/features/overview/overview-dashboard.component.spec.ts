@@ -18,7 +18,8 @@ describe('OverviewDashboardComponent', () => {
 
     const mockSseService = {
       events$: mockSseEvents$.asObservable(),
-      connectionStatus: () => 'Connected'
+      connectionStatus: () => 'Connected',
+      retryCount: () => 0
     };
 
     await TestBed.configureTestingModule({

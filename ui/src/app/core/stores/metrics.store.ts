@@ -25,6 +25,7 @@ export class MetricsStore {
   public readonly recentTraces = this.recentTracesSignal.asReadonly();
   public readonly timeSeriesPoints = this.timeSeriesPointsSignal.asReadonly();
   public readonly connectionStatus = this.sseService.connectionStatus;
+  public readonly retryCount = this.sseService.retryCount;
 
   public readonly rpm = computed(() => this.metricsSignal()?.rpm ?? 0);
   public readonly currentLagMs = computed(() => this.metricsSignal()?.currentLagMs ?? 0);

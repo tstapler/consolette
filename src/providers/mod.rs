@@ -136,6 +136,29 @@ impl ProviderError {
             ProviderError::ResponseShapeMismatch(_) => "response_shape_mismatch",
         }
     }
+
+    /// HTTP status recorded on the request trace when this error is the
+    /// terminal outcome of a dispatch.
+    #[must_use]
+    pub fn trace_status(&self) -> u16 {
+        const fn http_status(status: u16, fallback: u16) -> u16 {
+            if status >= 100 && status <= 599 {
+                status
+            } else {
+                fallback
+            }
+        }
+        match self {
+            ProviderError::RateLimited | ProviderError::RateLimitedWithRetry { .. } => 429,
+            ProviderError::Auth(_) => 401,
+            ProviderError::Validation(_, status) => http_status(*status, 400),
+            ProviderError::Timeout => 504,
+            ProviderError::ModelUnsupported(_) => 404,
+            ProviderError::Upstream { status, .. } => http_status(*status, 502),
+            ProviderError::Exhausted => 503,
+            ProviderError::ResponseShapeMismatch(_) => 502,
+        }
+    }
 }
 
 /// One model reported by an upstream's model-listing call.
@@ -1501,6 +1524,74 @@ mod tests {
     use crate::cost_metrics::types::RequestId;
     use crate::session_compaction::tiered::CompactionTier;
     use crate::session_compaction::SessionKey;
+
+    // Exhaustive on purpose: adding a `ProviderError` variant breaks this
+    // match, forcing the `trace_status` table below to be revisited.
+    fn variant_slot(e: &ProviderError) -> usize {
+        match e {
+            ProviderError::RateLimited => 0,
+            ProviderError::RateLimitedWithRetry { .. } => 1,
+            ProviderError::Auth(_) => 2,
+            ProviderError::Validation(..) => 3,
+            ProviderError::Timeout => 4,
+            ProviderError::ModelUnsupported(_) => 5,
+            ProviderError::Upstream { .. } => 6,
+            ProviderError::Exhausted => 7,
+            ProviderError::ResponseShapeMismatch(_) => 8,
+        }
+    }
+
+    #[test]
+    fn trace_status_should_map_every_provider_error_variant_via_exhaustive_helper() {
+        let table: Vec<(ProviderError, u16)> = vec![
+            (ProviderError::RateLimited, 429),
+            (ProviderError::RateLimitedWithRetry { retry_after: 30 }, 429),
+            (ProviderError::Auth("no".to_string()), 401),
+            (ProviderError::Validation("bad".to_string(), 422), 422),
+            (ProviderError::Validation("bad".to_string(), 400), 400),
+            (ProviderError::Timeout, 504),
+            (ProviderError::ModelUnsupported("m".to_string()), 404),
+            (
+                ProviderError::Upstream {
+                    status: 0,
+                    body: String::new(),
+                },
+                502,
+            ),
+            (
+                ProviderError::Upstream {
+                    status: 529,
+                    body: String::new(),
+                },
+                529,
+            ),
+            (ProviderError::Exhausted, 503),
+            (ProviderError::ResponseShapeMismatch("x".to_string()), 502),
+        ];
+        for (err, expected) in &table {
+            assert_eq!(err.trace_status(), *expected, "{err:?}");
+        }
+        let covered: std::collections::BTreeSet<usize> =
+            table.iter().map(|(e, _)| variant_slot(e)).collect();
+        assert_eq!(
+            covered.into_iter().collect::<Vec<_>>(),
+            (0..=8).collect::<Vec<_>>(),
+            "table must cover every ProviderError variant"
+        );
+    }
+
+    #[test]
+    fn trace_status_should_fall_back_to_502_when_carried_status_is_not_a_valid_http_code() {
+        for status in [0_u16, 99, 600, u16::MAX] {
+            let upstream = ProviderError::Upstream {
+                status,
+                body: String::new(),
+            };
+            assert_eq!(upstream.trace_status(), 502, "Upstream {status}");
+        }
+        let validation = ProviderError::Validation("bad".to_string(), 0);
+        assert_eq!(validation.trace_status(), 400);
+    }
 
     #[test]
     fn rate_limited_with_retry_reports_seconds() {

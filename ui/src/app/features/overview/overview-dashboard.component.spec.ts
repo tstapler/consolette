@@ -53,7 +53,7 @@ describe('OverviewDashboardComponent', () => {
       data: {
         rpm: 120,
         totalRequests: 500,
-        tokensSaved: 10000,
+        totalTokensSaved: 10000,
         tps: 45,
         medianTtftMs: 150,
         tokenSavingsPercent: 35.5,

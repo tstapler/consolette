@@ -49,13 +49,13 @@ import { RequestTraceData } from '../../../core/models/telemetry.models';
                 </div>
               </td>
               <td class="py-3 px-4 font-mono text-neutral-300 whitespace-nowrap">
-                {{ trace.durationMs }}ms
+                {{ trace.timeToHeadersMs }}ms
               </td>
               <td class="py-3 px-4 font-mono text-neutral-400 whitespace-nowrap">
-                {{ trace.firstByteMs }}ms
+                {{ trace.firstByteMs === null ? '—' : trace.firstByteMs + 'ms' }}
               </td>
               <td class="py-3 px-4 font-mono whitespace-nowrap">
-                <span class="text-neutral-300">{{ trace.tokensAfter }}</span>
+                <span class="text-neutral-300">{{ trace.tokensAfter ?? '—' }}</span>
                 <span *ngIf="getSavedPercent(trace) > 0" class="ml-1.5 text-emerald-400 font-semibold text-[10px]">
                   (-{{ getSavedPercent(trace) }}%)
                 </span>
@@ -115,6 +115,7 @@ export class RecentTraceTableComponent {
 
   public getSavedPercent(trace: RequestTraceData): number {
     if (!trace.tokensBefore || trace.tokensBefore <= 0) return 0;
+    if (trace.tokensAfter === null) return 0;
     const diff = trace.tokensBefore - trace.tokensAfter;
     if (diff <= 0) return 0;
     return Math.round((diff / trace.tokensBefore) * 100);

@@ -29,7 +29,8 @@ export class MetricsStore {
   public readonly rpm = computed(() => this.metricsSignal()?.rpm ?? 0);
   public readonly currentLagMs = computed(() => this.metricsSignal()?.currentLagMs ?? 0);
   public readonly isContended = computed(() => (this.metricsSignal()?.currentLagMs ?? 0) > 100);
-  public readonly tokensSaved = computed(() => this.metricsSignal()?.tokensSaved ?? 0);
+  public readonly totalRequests = computed(() => this.metricsSignal()?.totalRequests ?? 0);
+  public readonly tokensSaved = computed(() => this.metricsSignal()?.totalTokensSaved ?? 0);
   public readonly tps = computed(() => this.metricsSignal()?.tps ?? 0);
   public readonly medianTtftMs = computed(() => this.metricsSignal()?.medianTtftMs ?? 0);
   public readonly tokenSavingsPercent = computed(() => this.metricsSignal()?.tokenSavingsPercent ?? 0);
@@ -59,8 +60,16 @@ export class MetricsStore {
 
   public pushTrace(trace: RequestTraceData): void {
     this.recentTracesSignal.update((existing) => {
-      const updated = [trace, ...existing];
-      return updated.slice(0, this.maxTracesLimit);
+      const idx = existing.findIndex((t) => t.requestId === trace.requestId);
+      if (idx === -1) {
+        return [trace, ...existing].slice(0, this.maxTracesLimit);
+      }
+      if (trace.traceRevision < existing[idx].traceRevision) {
+        return existing;
+      }
+      const updated = existing.slice();
+      updated[idx] = trace;
+      return updated;
     });
   }
 

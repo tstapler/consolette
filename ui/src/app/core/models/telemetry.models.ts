@@ -1,38 +1,53 @@
+/** Field names mirror the backend wire contract, pinned by `src/testing/fixtures/sse/*.json` (ADR-001). */
 export interface MetricsTickData {
   rpm: number;
   totalRequests: number;
-  tokensSaved: number;
+  totalTokensSaved: number;
+  currentLagMs: number;
+  providerHealth?: Record<string, string>;
+  // No backend source yet; read by the Overview tiles, which tolerate absence.
   tps?: number;
   medianTtftMs?: number;
   tokenSavingsPercent?: number;
-  currentLagMs: number;
-  providerHealth?: Record<string, 'Healthy' | 'Degraded' | 'Cooldown' | 'AuthError' | string>;
 }
+
+export type CompressionStatus = 'off' | 'none' | 'skipped' | 'failed' | 'compressed';
+export type TraceKind = 'routed' | 'cache_hit' | 'local';
+export type FirstByteState = 'pending' | 'measured' | 'ended_empty' | 'client_closed';
 
 export interface RequestTraceData {
   id: string;
-  requestId?: string;
+  requestId: string;
   timestamp: string;
   provider: string;
   model: string;
-  durationMs: number;
-  firstByteMs: number;
+  timeToHeadersMs: number;
+  firstByteMs: number | null;
+  totalMs: number | null;
   tokensBefore: number;
-  tokensAfter: number;
-  compressionStatus: string;
+  tokensAfter: number | null;
+  compressionStatus: CompressionStatus;
+  stream: boolean;
+  traceKind: TraceKind;
   statusCode: number;
+  /** 0 = terminal trace; a lower revision never overwrites a higher one. */
+  traceRevision: number;
+  firstByteState?: FirstByteState;
 }
 
 export interface ErrorLoggedData {
-  providerId: string;
-  statusCode: number;
-  errorDetails: string;
   timestamp: string;
+  provider: string;
+  model: string;
+  errorType: string;
+  statusCode: number | null;
+  message: string;
 }
 
 export interface ConfigChangedData {
   timestamp: string;
-  changedKeys?: string[];
+  routeName: string;
+  strategy: string;
 }
 
 export type DashboardEvent =

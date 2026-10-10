@@ -1,5 +1,11 @@
 import { TestBed, fakeAsync, tick } from '@angular/core/testing';
 import { SseService } from './sse.service';
+import { DashboardEvent } from '../models/telemetry.models';
+import traceSuccess from '../../../testing/fixtures/sse/request-trace-success.json';
+import traceFailure from '../../../testing/fixtures/sse/request-trace-failure.json';
+import metricsTick from '../../../testing/fixtures/sse/metrics-tick.json';
+import errorLogged from '../../../testing/fixtures/sse/error-logged.json';
+import configChanged from '../../../testing/fixtures/sse/config-changed.json';
 
 describe('SseService (TC-UNIT-08 & TC-UNIT-09)', () => {
   let service: SseService;
@@ -86,5 +92,17 @@ describe('SseService (TC-UNIT-08 & TC-UNIT-09)', () => {
 
     expect(instance.close).toHaveBeenCalled();
     expect(service.connectionStatus()).toBe('disconnected');
+  });
+
+  it('should emit each shared fixture frame unchanged as a typed DashboardEvent', () => {
+    const seen: DashboardEvent[] = [];
+    service.events$.subscribe((e) => seen.push(e));
+    service.connect({ url: '/test/events' });
+    const frames = [traceSuccess, traceFailure, metricsTick, errorLogged, configChanged];
+
+    frames.forEach((f) => activeMockInstances[0].onmessage({ data: JSON.stringify(f) }));
+
+    expect(seen.map((e) => e.type)).toEqual(['RequestTrace', 'RequestTrace', 'MetricsTick', 'ErrorLogged', 'ConfigChanged']);
+    expect(seen).toEqual(frames as unknown as DashboardEvent[]);
   });
 });

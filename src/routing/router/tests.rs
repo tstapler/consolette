@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use super::*;
 
 mod basic_dispatch;
+mod characterization;
 mod from_config;
 mod model_pinning;
 mod observability;

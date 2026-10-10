@@ -274,23 +274,7 @@ impl MetricsCollector {
             r.bedrock_invocation_ms = update.bedrock_invocation_ms;
             r.bedrock_first_byte_ms = update.bedrock_first_byte_ms;
 
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let duration_u64 = update.duration_ms.max(0.0) as u64;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let first_byte_u64 = update.first_byte_ms.max(0.0) as u64;
-
-            trace_event = Some(crate::entrypoint::events::RequestTraceData {
-                request_id: r.request_id.clone(),
-                timestamp: r.timestamp.clone(),
-                provider: r.provider.clone(),
-                model: r.model.clone(),
-                duration_ms: duration_u64,
-                first_byte_ms: first_byte_u64,
-                tokens_before: r.tokens_before,
-                tokens_after: r.tokens_after,
-                compressed: r.compressed,
-                status_code: 200,
-            });
+            trace_event = Some(crate::entrypoint::events::RequestTraceData::from_detail(r));
         });
 
         if let Some(trace) = trace_event {

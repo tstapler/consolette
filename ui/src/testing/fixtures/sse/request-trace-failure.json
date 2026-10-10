@@ -1,0 +1,1 @@
+{"type":"RequestTrace","data":{"id":"req_456","requestId":"req_456","timestamp":"2026-10-10T18:10:01.000000+00:00","provider":"openai","model":"gpt-4o","timeToHeadersMs":1210,"firstByteMs":null,"totalMs":null,"tokensBefore":640,"tokensAfter":null,"compressionStatus":"off","stream":true,"traceKind":"routed","statusCode":503,"traceRevision":0}}

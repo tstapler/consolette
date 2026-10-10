@@ -1,0 +1,1 @@
+{"type":"RequestTrace","data":{"id":"req_123","requestId":"req_123","timestamp":"2026-10-10T18:09:53.222465+00:00","provider":"anthropic","model":"claude-haiku-4-5","timeToHeadersMs":42,"firstByteMs":null,"totalMs":null,"tokensBefore":1870,"tokensAfter":null,"compressionStatus":"off","stream":false,"traceKind":"routed","statusCode":200,"traceRevision":0}}

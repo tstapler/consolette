@@ -361,3 +361,123 @@ async fn cooldown_snapshot_should_report_zero_remaining_seconds_for_a_healthy_ca
         serde_json::json!({"circuit_state": "closed", "cooling_down": false, "remaining_seconds": 0})
     );
 }
+
+fn two_rate_limited_router(metrics: &Arc<MetricsCollector>) -> Router {
+    let providers: Vec<Arc<dyn Provider>> = ["a", "b"]
+        .into_iter()
+        .map(|name| {
+            Arc::new(AlwaysErrProvider {
+                name,
+                error: || ProviderError::RateLimited,
+                call_count: Arc::new(AtomicU32::new(0)),
+            }) as Arc<dyn Provider>
+        })
+        .collect();
+    fallback_router_with_metrics(vec![upstream(0, "a"), upstream(1, "b")], providers, metrics)
+}
+
+#[tokio::test(start_paused = true)]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_one_trace_status_429_when_all_upstreams_rate_limited() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    // Default 300s cooldown is above MAX_HOLD_WAIT_SECS, so no hold sleep.
+    let router = two_rate_limited_router(&metrics);
+
+    let res = router
+        .dispatch(
+            serde_json::json!({"model": "claude-sonnet-4"}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    assert!(matches!(res, Err(ProviderError::RateLimited)));
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 429);
+    assert_eq!(traces[0].model, "claude-sonnet-4");
+    assert_eq!(
+        traces[0].request_id,
+        metrics.get_recent_requests(1)[0].request_id
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_one_trace_status_400_and_return_err_when_validation_error() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+        name: "only",
+        error: || ProviderError::Validation("bad".to_string(), 400),
+        call_count: Arc::new(AtomicU32::new(0)),
+    })];
+    let router = fallback_router_with_metrics(vec![upstream(0, "only")], providers, &metrics);
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(matches!(res, Err(ProviderError::Validation(_, 400))));
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 400);
+}
+
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_exactly_one_trace_status_200_when_upstream_ok() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let router = single_ok_provider_fallback_router("only", Arc::clone(&metrics));
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok());
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 200);
+    assert_eq!(traces[0].provider, "only");
+}
+
+struct HangingProvider;
+
+#[async_trait::async_trait]
+impl Provider for HangingProvider {
+    fn name(&self) -> &str {
+        "hang"
+    }
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        std::future::pending().await
+    }
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_one_499_trace_when_upstream_hangs_and_future_dropped() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(HangingProvider)];
+    let router = fallback_router_with_metrics(vec![upstream(0, "hang")], providers, &metrics);
+
+    let dispatch = router.dispatch(serde_json::json!({}), HeaderMap::new(), false, 0);
+    let timed_out = tokio::time::timeout(Duration::from_secs(5), dispatch).await;
+
+    assert!(timed_out.is_err(), "upstream never responds");
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 499);
+    assert_eq!(metrics.get_recent_requests(10).len(), 1);
+}

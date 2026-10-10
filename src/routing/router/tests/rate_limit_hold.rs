@@ -213,3 +213,29 @@ async fn skips_hold_when_cooldown_exceeds_15s() {
         started.elapsed()
     );
 }
+
+/// Dropping `dispatch` while it sleeps in the rate-limit hold is a client
+/// abort: one 499 trace, not a leaked entry with no terminal trace.
+#[tokio::test(start_paused = true)]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_499_when_dropped_during_hold() {
+    let provider: Arc<dyn Provider> = Arc::new(AlwaysOkProvider {
+        name: "only",
+        call_count: Arc::new(AtomicU32::new(0)),
+    });
+    let health = Arc::new(HealthRegistry::new(300));
+    health.trip(
+        0,
+        Some(Duration::from_secs(10) + Duration::from_millis(500)),
+    );
+    let router = single_candidate_router(provider, health);
+    let mut rx = subscribe_events(&router.metrics);
+
+    let dispatch = router.dispatch(serde_json::json!({}), HeaderMap::new(), false, 0);
+    let timed_out = tokio::time::timeout(Duration::from_secs(1), dispatch).await;
+
+    assert!(timed_out.is_err(), "still holding after 1s");
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 499);
+}

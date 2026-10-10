@@ -142,3 +142,33 @@ async fn dispatch_should_leave_selected_model_was_exploration_none_for_fallback_
         "FallbackStrategy has no explore/greedy distinction to report"
     );
 }
+
+// The setters are gone: `finish` alone populates the selection, including on
+// a failed request (the previous setters only ran for completed attempts).
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn selected_model_and_exploration_should_be_populated_by_finish_after_setters_removed() {
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+        name: "openrouter",
+        error: || ProviderError::Validation("bad".to_string(), 400),
+        call_count: Arc::new(AtomicU32::new(0)),
+    })];
+    let metrics = MetricsCollector::new();
+    let router = fallback_router_with_metrics(
+        vec![UpstreamRef {
+            model: Some("a/b:free".to_string()),
+            ..upstream(0, "openrouter")
+        }],
+        providers,
+        &metrics,
+    );
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_err());
+    let recent = metrics.get_recent_requests(1);
+    assert_eq!(recent[0].selected_model, Some("a/b:free".to_string()));
+    assert_eq!(recent[0].status_code, 400);
+}

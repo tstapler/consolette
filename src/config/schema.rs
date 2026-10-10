@@ -355,6 +355,10 @@ pub struct Config {
     pub memory_max_entries: usize,
     #[serde(default)]
     pub web_ui: WebUiMode,
+    /// Also emit legacy snake_case keys on dashboard `RequestTrace` SSE frames, for one release
+    /// after the camelCase switch (ADR-001 item 4). Off by default.
+    #[serde(default)]
+    pub compat_snake_case: bool,
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
     #[serde(default)]
@@ -437,6 +441,7 @@ impl Default for Config {
             verbosity_level: default_verbosity_level(),
             memory_max_entries: default_memory_max_entries(),
             web_ui: WebUiMode::Angular,
+            compat_snake_case: false,
             upstreams: vec![
                 Upstream {
                     name: "anthropic".to_string(),
@@ -734,6 +739,13 @@ name = "openrouter"
 
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.routes[0].strategy, Strategy::OpenrouterScored);
+    }
+
+    #[test]
+    fn config_should_parse_compat_snake_case_flag_defaulting_to_false() {
+        assert!(!Config::default().compat_snake_case);
+        let config: Config = toml::from_str("compat_snake_case = true").expect("parse");
+        assert!(config.compat_snake_case);
     }
 
     #[test]

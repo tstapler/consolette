@@ -76,6 +76,7 @@ pub(crate) async fn state_with_router(
         response_cache: leaked_response_cache(crate::memory::cache::ResponseCacheConfig::default()),
         event_tx: tokio::sync::broadcast::channel(1024).0,
         web_ui: crate::config::schema::WebUiMode::Angular,
+        compat_snake_case: false,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
 }

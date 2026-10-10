@@ -298,6 +298,7 @@ mod tests {
             ),
             event_tx: tokio::sync::broadcast::channel(1024).0,
             web_ui: crate::config::schema::WebUiMode::Angular,
+            compat_snake_case: false,
             config_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }

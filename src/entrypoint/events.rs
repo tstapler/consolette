@@ -138,14 +138,46 @@ pub enum DashboardEvent {
     ConfigChanged(ConfigChangedData),
 }
 
+/// Legacy snake_case key -> camelCase source key, for the one-release `compat_snake_case` rollback.
+const LEGACY_REQUEST_TRACE_KEYS: [(&str, &str); 6] = [
+    ("request_id", "requestId"),
+    ("duration_ms", "timeToHeadersMs"),
+    ("first_byte_ms", "firstByteMs"),
+    ("tokens_before", "tokensBefore"),
+    ("tokens_after", "tokensAfter"),
+    ("status_code", "statusCode"),
+];
+
+/// Serializes one event for the SSE frame. With `compat_snake_case`, a `RequestTrace` also
+/// carries the pre-camelCase keys so an external consumer keeps working for one release
+/// (ADR-001 item 4). Serialization failure yields an empty string, matching the old behavior.
+#[must_use]
+pub fn event_json(event: &DashboardEvent, compat_snake_case: bool) -> String {
+    if !compat_snake_case || !matches!(event, DashboardEvent::RequestTrace(_)) {
+        return serde_json::to_string(event).unwrap_or_default();
+    }
+    let Ok(mut value) = serde_json::to_value(event) else {
+        return String::new();
+    };
+    if let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut()) {
+        for (legacy, current) in LEGACY_REQUEST_TRACE_KEYS {
+            if let Some(v) = data.get(current).cloned() {
+                data.insert(legacy.to_string(), v);
+            }
+        }
+    }
+    value.to_string()
+}
+
 /// GET `/v1/dashboard/events` — Server-Sent Events endpoint streaming real-time proxy telemetry.
 pub async fn handle_sse_events(
     State(state): State<EntrypointState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).map(|msg| match msg {
+    let compat_snake_case = state.compat_snake_case;
+    let stream = BroadcastStream::new(rx).map(move |msg| match msg {
         Ok(event) => {
-            let json = serde_json::to_string(&event).unwrap_or_default();
+            let json = event_json(&event, compat_snake_case);
             Ok(Event::default().event("message").data(json))
         }
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
@@ -189,7 +221,11 @@ mod tests {
         assert_eq!(event, deserialized);
     }
 
-    const FIXTURES: [(&str, &str); 5] = [
+    const FIXTURES: [(&str, &str); 6] = [
+        (
+            "request-trace-success-compat.json",
+            include_str!("../../ui/src/testing/fixtures/sse/request-trace-success-compat.json"),
+        ),
         (
             "request-trace-success.json",
             include_str!("../../ui/src/testing/fixtures/sse/request-trace-success.json"),
@@ -214,7 +250,10 @@ mod tests {
 
     #[test]
     fn fixtures_should_pin_each_variant_so_snake_to_camel_drift_fails_both_sides() {
-        for (name, raw) in FIXTURES {
+        for (name, raw) in FIXTURES
+            .iter()
+            .filter(|(n, _)| !n.ends_with("-compat.json"))
+        {
             let expected: serde_json::Value = serde_json::from_str(raw).expect(name);
             let event: DashboardEvent = serde_json::from_str(raw)
                 .unwrap_or_else(|e| panic!("{name} does not parse into DashboardEvent: {e}"));
@@ -321,5 +360,28 @@ mod tests {
             assert!(!json.is_empty());
             assert!(json.contains(r#""type""#), "{json}");
         }
+    }
+
+    #[test]
+    fn request_trace_should_emit_legacy_snake_case_keys_alongside_camel_case_only_when_compat_snake_case_true(
+    ) {
+        let event = DashboardEvent::RequestTrace(RequestTraceData::from_detail(&sample_detail()));
+
+        let compat: serde_json::Value =
+            serde_json::from_str(&event_json(&event, true)).expect("compat json");
+        let default: serde_json::Value =
+            serde_json::from_str(&event_json(&event, false)).expect("default json");
+
+        assert_eq!(compat, fixture_value("request-trace-success-compat.json"));
+        assert_eq!(default, fixture_value("request-trace-success.json"));
+    }
+
+    #[test]
+    fn compat_snake_case_should_leave_other_event_types_untouched() {
+        let event: DashboardEvent =
+            serde_json::from_value(fixture_value("metrics-tick.json")).expect("parse");
+        let json: serde_json::Value =
+            serde_json::from_str(&event_json(&event, true)).expect("json");
+        assert_eq!(json, fixture_value("metrics-tick.json"));
     }
 }

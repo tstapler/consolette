@@ -106,6 +106,8 @@ pub struct EntrypointState {
     pub event_tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
     /// Web UI mode: Angular (embedded SPA) or Legacy.
     pub web_ui: WebUiMode,
+    /// Also emit legacy snake_case keys on `RequestTrace` SSE frames (ADR-001 item 4 rollback).
+    pub compat_snake_case: bool,
     /// Thread-safe lock for atomic configuration updates and disk persistence.
     pub config_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -249,6 +251,7 @@ impl EntrypointState {
             response_cache,
             event_tx,
             web_ui: config.web_ui,
+            compat_snake_case: config.compat_snake_case,
             config_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -703,6 +706,7 @@ mod tests {
     async fn entrypoint_legacy_fallback_serves_legacy_dashboard_html() {
         let config = Config {
             web_ui: WebUiMode::Legacy,
+            compat_snake_case: false,
             ..Default::default()
         };
         let state = EntrypointState::build(&config, std::path::Path::new("/tmp/consolette-test"))

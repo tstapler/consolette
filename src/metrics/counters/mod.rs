@@ -95,6 +95,14 @@ pub struct ProxyMetrics {
     pub server_tool_searches_ok: AtomicU64,
     pub server_tool_search_failures: AtomicU64,
     pub server_tool_iterations_total: AtomicU64,
+
+    // ---- Terminal-trace safety nets (ADR-002) ----
+    /// Requests whose `TraceScope` dropped before `finish` because the
+    /// handler future was cancelled (client abort): traced as 499.
+    pub trace_cancelled_total: AtomicU64,
+    /// Requests whose `TraceScope` dropped unfinished although the handler
+    /// returned or panicked: a bug, traced as 500.
+    pub trace_unfinished_total: AtomicU64,
     /// Per-backend hits, keyed `"brave"` / `"browser"` (D4 dashboard label).
     pub server_tool_backend_hits: DashMap<String, AtomicU64>,
 
@@ -331,6 +339,8 @@ impl ProxyMetrics {
         };
 
         json!({
+            "trace_cancelled_total": self.trace_cancelled_total.load(Ordering::Relaxed),
+            "trace_unfinished_total": self.trace_unfinished_total.load(Ordering::Relaxed),
             "summary": {
                 "total_requests": total,
                 "total_success": success,

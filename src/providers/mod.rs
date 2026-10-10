@@ -161,6 +161,26 @@ impl ProviderError {
     }
 }
 
+impl From<&ProviderError> for crate::metrics::trace::AttemptOutcome {
+    /// Classifies an error as an attempt outcome; carries no response body.
+    fn from(err: &ProviderError) -> Self {
+        use crate::metrics::trace::AttemptOutcome;
+        match err {
+            ProviderError::RateLimited | ProviderError::RateLimitedWithRetry { .. } => {
+                AttemptOutcome::RateLimited
+            }
+            ProviderError::Timeout => AttemptOutcome::Timeout,
+            ProviderError::Auth(_) => AttemptOutcome::Auth,
+            ProviderError::Validation(..) | ProviderError::ModelUnsupported(_) => {
+                AttemptOutcome::Validation
+            }
+            ProviderError::ResponseShapeMismatch(_) => AttemptOutcome::ShapeMismatch,
+            // `Exhausted` is never an attempt; mapped defensively.
+            ProviderError::Upstream { .. } | ProviderError::Exhausted => AttemptOutcome::Upstream,
+        }
+    }
+}
+
 /// One model reported by an upstream's model-listing call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelInfo {
@@ -1576,6 +1596,54 @@ mod tests {
         assert_eq!(
             covered.into_iter().collect::<Vec<_>>(),
             (0..=8).collect::<Vec<_>>(),
+            "table must cover every ProviderError variant"
+        );
+    }
+
+    #[test]
+    fn attempt_outcome_should_map_every_provider_error_variant_and_never_leak_body() {
+        use crate::metrics::trace::AttemptOutcome as O;
+        let table: Vec<(ProviderError, O)> = vec![
+            (ProviderError::RateLimited, O::RateLimited),
+            (
+                ProviderError::RateLimitedWithRetry { retry_after: 30 },
+                O::RateLimited,
+            ),
+            (ProviderError::Auth("no".to_string()), O::Auth),
+            (
+                ProviderError::Validation("bad".to_string(), 400),
+                O::Validation,
+            ),
+            (ProviderError::Timeout, O::Timeout),
+            (
+                ProviderError::ModelUnsupported("m".to_string()),
+                O::Validation,
+            ),
+            (
+                ProviderError::Upstream {
+                    status: 529,
+                    body: "sk-SENTINEL".to_string(),
+                },
+                O::Upstream,
+            ),
+            (ProviderError::Exhausted, O::Upstream),
+            (
+                ProviderError::ResponseShapeMismatch("x".to_string()),
+                O::ShapeMismatch,
+            ),
+        ];
+        for (err, expected) in &table {
+            let got = O::from(err);
+            assert_eq!(got, *expected, "{err:?}");
+            assert!(
+                !format!("{got:?}{}", serde_json::to_string(&got).unwrap()).contains("SENTINEL")
+            );
+        }
+        let covered: std::collections::BTreeSet<usize> =
+            table.iter().map(|(e, _)| variant_slot(e)).collect();
+        assert_eq!(
+            covered.len(),
+            9,
             "table must cover every ProviderError variant"
         );
     }

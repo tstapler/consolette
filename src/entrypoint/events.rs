@@ -103,7 +103,7 @@ impl RequestTraceData {
             compression_status: CompressionStatus::Off,
             stream: detail.stream,
             trace_kind: TraceKind::Routed,
-            status_code: 200,
+            status_code: detail.status_code,
             trace_revision: 0,
             first_byte_state: None,
         }
@@ -282,6 +282,7 @@ mod tests {
             session_id: None,
             selected_model: None,
             selected_model_was_exploration: None,
+            status_code: 200,
         }
     }
 

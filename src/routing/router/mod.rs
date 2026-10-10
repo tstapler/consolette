@@ -18,7 +18,8 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
-use crate::metrics::{MetricsCollector, ProxyMetrics, RequestTimingUpdate};
+use crate::metrics::trace::{AttemptOutcome, AttemptRecord, RequestOutcome, TraceScope};
+use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
@@ -660,12 +661,70 @@ impl Router {
     /// (`SessionOverrideStore`/`effective_candidates`) takes precedence over
     /// this route's normal candidate list.
     ///
+    /// This is the compat wrapper over [`Self::dispatch_traced`]: it owns a
+    /// [`TraceScope`] for the request, so every terminal path (success,
+    /// error, or the future being dropped) emits exactly one `RequestTrace`.
+    /// Local-catalog models bypass the scope (no trace until Story 2.1.6b).
+    ///
     /// # Errors
     ///
     /// Returns the last [`ProviderError`] encountered once every candidate
     /// upstream has been tried (or none were available/admitted).
     pub async fn dispatch(
         &self,
+        body: serde_json::Value,
+        headers: HeaderMap,
+        stream: bool,
+        est_tokens: u32,
+    ) -> Result<ProviderResponse, ProviderError> {
+        if let Some(target) = self.local_target(&body) {
+            return self.dispatch_local(target, body, headers, stream).await;
+        }
+        let mut scope = TraceScope::begin(&self.metrics, &body, stream, u64::from(est_tokens));
+        let result = self
+            .dispatch_traced(&mut scope, body, headers, stream, est_tokens)
+            .await;
+        scope.finish(match &result {
+            Ok(_) => RequestOutcome::ok(),
+            Err(e) => RequestOutcome::status(e.trace_status()),
+        });
+        scope.mark_handler_returned();
+        result
+    }
+
+    fn local_target(&self, body: &serde_json::Value) -> Option<LocalTarget> {
+        let model = body.get("model").and_then(serde_json::Value::as_str)?;
+        self.local_catalog.resolve(model)
+    }
+
+    /// Dispatch against a caller-owned `scope`, which the caller must finish.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::dispatch`].
+    pub async fn dispatch_traced(
+        &self,
+        scope: &mut TraceScope,
+        body: serde_json::Value,
+        headers: HeaderMap,
+        stream: bool,
+        est_tokens: u32,
+    ) -> Result<ProviderResponse, ProviderError> {
+        if let Some(target) = self.local_target(&body) {
+            return self.dispatch_local(target, body, headers, stream).await;
+        }
+        let session_id = extract_session_id(&body);
+        let candidates = self.effective_candidates(session_id.as_deref());
+        let candidates = self.strategy.expand_candidates(candidates);
+        self.dispatch_attempts(scope, &candidates, body, headers, stream, est_tokens)
+            .await
+    }
+
+    /// The candidate-selection / retry / hold loop.
+    async fn dispatch_attempts(
+        &self,
+        scope: &mut TraceScope,
+        candidates: &[UpstreamRef],
         body: serde_json::Value,
         headers: HeaderMap,
         stream: bool,
@@ -679,36 +738,16 @@ impl Router {
             .unwrap_or("unknown")
             .to_string();
 
-        if let Some(target) = self.local_catalog.resolve(&model) {
-            return self.dispatch_local(target, body, headers, stream).await;
-        }
-
-        let session_id = extract_session_id(&body);
-        let candidates = self.effective_candidates(session_id.as_deref());
-        let candidates = self.strategy.expand_candidates(candidates);
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.metrics
-            .push_request(crate::metrics::RequestDetail::from_body(
-                request_id.clone(),
-                stream,
-                u64::from(est_tokens),
-                &body,
-                session_id.clone(),
-            ));
-        self.metrics
-            .push_original_body(request_id.clone(), body.clone());
-
         let mut hold_retries: u32 = 0;
 
         loop {
-            let healthy = self.admitted_candidates(&candidates, &already_tried);
+            let healthy = self.admitted_candidates(candidates, &already_tried);
 
             let Some(chosen) = self.strategy.select(&healthy) else {
                 // Insulate agents from temporary rate-limit cooldowns: if
                 // all candidates are in short cooldown, hold and retry.
                 if self
-                    .hold_for_rate_limit_cooldown(&candidates, &mut hold_retries)
+                    .hold_for_rate_limit_cooldown(candidates, &mut hold_retries)
                     .await
                 {
                     already_tried.clear();
@@ -717,7 +756,7 @@ impl Router {
                 break;
             };
             already_tried.insert((chosen.index, chosen.model.clone()));
-            self.record_selection(&request_id, &chosen);
+            self.record_selection(scope, &chosen);
 
             // ADR-004: post-selection admission check, before the provider
             // call — a Shed re-selects from the remaining pool via the same
@@ -750,18 +789,19 @@ impl Router {
             match outcome {
                 Ok(response) => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
-                    #[allow(clippy::cast_precision_loss)]
-                    let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
-                    self.record_first_attempt_timing(&request_id, &chosen.name, duration_ms);
+                    scope.record_attempt(attempt_record(&chosen, attempt_started, None));
+                    scope.record_provider(&chosen.name);
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
                     return Err(e);
                 }
                 Err(e) if e.is_rate_limited() => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
-                    self.maybe_trip_rate_limit(&candidates, &already_tried, &chosen, &e);
+                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
+                    self.maybe_trip_rate_limit(candidates, &already_tried, &chosen, &e);
                     last_error = Some(e);
                 }
                 Err(e) if e.is_response_shape_mismatch() => {
@@ -772,6 +812,7 @@ impl Router {
                     // permanently-broken Gemini endpoint isn't retried on
                     // every request forever.
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
                     self.health.trip(
                         chosen.index,
                         Some(Duration::from_secs(
@@ -782,13 +823,14 @@ impl Router {
                 }
                 Err(e) => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
                     last_error = Some(e);
                 }
             }
         }
 
         if last_error.is_none() {
-            self.attribute_exhausted_kind(&candidates);
+            self.attribute_exhausted_kind(candidates);
         }
 
         Err(last_error.unwrap_or(ProviderError::Exhausted))
@@ -845,15 +887,12 @@ impl Router {
     /// rather than the greedy argmax choice — both `None` for every
     /// non-model-pinned route and, for the latter, for any strategy that
     /// doesn't track the explore/greedy distinction.
-    fn record_selection(&self, request_id: &str, chosen: &UpstreamRef) {
-        self.metrics
-            .set_selected_model(request_id, chosen.model.clone());
+    fn record_selection(&self, scope: &mut TraceScope, chosen: &UpstreamRef) {
         let was_exploration = chosen
             .model
             .as_deref()
             .and_then(|m| self.strategy.last_selection_was_exploration(m));
-        self.metrics
-            .set_selected_model_was_exploration(request_id, was_exploration);
+        scope.record_selection(chosen.model.clone(), was_exploration);
     }
 
     /// Trips the whole-upstream cooldown for a rate-limited attempt, unless
@@ -1073,23 +1112,17 @@ impl Router {
             _ => {}
         }
     }
+}
 
-    /// Records a successful first-attempt's timing on `/metrics`. First-byte
-    /// time isn't separately measured here (see `record_attempt`'s doc
-    /// comment) — `provider.send` returning is the closest proxy we have for
-    /// either a full response or a stream's headers, so both fields get the
-    /// same `duration_ms`.
-    fn record_first_attempt_timing(&self, request_id: &str, provider_name: &str, duration_ms: f64) {
-        self.metrics.update_request_timing(
-            request_id,
-            RequestTimingUpdate {
-                provider: provider_name,
-                duration_ms,
-                first_byte_ms: duration_ms,
-                bedrock_invocation_ms: 0,
-                bedrock_first_byte_ms: 0,
-            },
-        );
+fn attempt_record(
+    chosen: &UpstreamRef,
+    started: std::time::Instant,
+    error: Option<&ProviderError>,
+) -> AttemptRecord {
+    AttemptRecord {
+        upstream: chosen.name.clone(),
+        outcome: error.map_or(AttemptOutcome::Ok, AttemptOutcome::from),
+        latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }
 }
 

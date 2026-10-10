@@ -4,6 +4,7 @@
 pub mod counters;
 pub mod error_tracker;
 pub mod histogram;
+pub mod trace;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -55,7 +56,7 @@ pub struct RequestDetail {
     pub session_id: Option<String>,
     /// The specific per-model candidate dispatch actually selected (e.g.
     /// `"deepseek/deepseek-chat-v3.1:free"`), populated post-selection via
-    /// [`MetricsCollector::set_selected_model`] (Story 5.1.3). `None` at
+    /// [`trace::TraceScope::record_selection`] (Story 5.1.3). `None` at
     /// construction and for every non-model-pinned route
     /// (`FallbackStrategy`/`WeightedStrategy` candidates always carry
     /// `model: None`).
@@ -63,18 +64,22 @@ pub struct RequestDetail {
     /// Whether `selected_model`'s pick was an epsilon-greedy exploration
     /// choice rather than the greedy argmax one (Pre-mortem P2 #2),
     /// populated post-selection via
-    /// [`MetricsCollector::set_selected_model_was_exploration`]. `None` at
+    /// [`trace::TraceScope::record_selection`]. `None` at
     /// construction, for every non-model-pinned route, and for a strategy
     /// that doesn't track the distinction — same nullability convention as
     /// `selected_model`.
     pub selected_model_was_exploration: Option<bool>,
+    /// HTTP status of the request's terminal trace; 0 until the owning
+    /// `TraceScope` finishes (or drops).
+    #[serde(default)]
+    pub status_code: u16,
 }
 
 impl RequestDetail {
     /// Builds the initial ring-buffer entry for an incoming request, before
     /// dispatch has picked an upstream: `provider` starts empty and timing
     /// fields start at zero, filled in later via
-    /// [`MetricsCollector::update_request_timing`] once dispatch resolves.
+    /// [`MetricsCollector::finish_scope`] once the request's `TraceScope` finishes.
     /// `message_count`/`msg_types`/`has_context_management` are derived from
     /// the Anthropic-shaped request `body` (already true for both
     /// `/v1/messages` and `/v1/chat/completions`, since the latter is
@@ -109,6 +114,7 @@ impl RequestDetail {
             session_id,
             selected_model: None,
             selected_model_was_exploration: None,
+            status_code: 0,
         }
     }
 }
@@ -201,7 +207,7 @@ pub struct MetricsCollector {
 
 /// Timing fields recorded once a dispatch attempt completes (Fowler's
 /// introduce-parameter-object — same pattern as `routing::router::
-/// RouterDeps`), passed to [`MetricsCollector::update_request_timing`].
+/// RouterDeps`), passed to [`MetricsCollector::finish_scope`].
 #[derive(Clone, Copy)]
 pub struct RequestTimingUpdate<'a> {
     pub provider: &'a str,
@@ -209,6 +215,14 @@ pub struct RequestTimingUpdate<'a> {
     pub first_byte_ms: f64,
     pub bedrock_invocation_ms: u64,
     pub bedrock_first_byte_ms: u64,
+}
+
+/// Terminal state `TraceScope` hands to [`MetricsCollector::finish_scope`].
+pub(crate) struct ScopeFinish<'a> {
+    pub status_code: u16,
+    pub timing: RequestTimingUpdate<'a>,
+    pub selected_model: Option<String>,
+    pub selected_model_was_exploration: Option<bool>,
 }
 
 impl MetricsCollector {
@@ -251,8 +265,7 @@ impl MetricsCollector {
         buf.push_front(detail);
     }
 
-    /// Shared in-place-mutate-by-id pattern behind `update_request_timing`,
-    /// `set_selected_model`, and `set_selected_model_was_exploration`: a
+    /// Shared in-place-mutate-by-id pattern behind `finish_scope`: a
     /// no-op once the request has aged out of the 100-entry ring buffer.
     fn mutate_request(&self, request_id: &str, f: impl FnOnce(&mut RequestDetail)) {
         let mut buf = self
@@ -264,49 +277,36 @@ impl MetricsCollector {
         }
     }
 
-    /// Update timing fields on an existing request by ID.
-    pub fn update_request_timing(&self, request_id: &str, update: RequestTimingUpdate<'_>) {
+    /// Writes a request's terminal state into its ring-buffer entry and emits
+    /// exactly one `RequestTrace`. Called only from `TraceScope::finish` and
+    /// its `Drop`, so it must stay poison-safe and non-panicking. A request
+    /// that has aged out of the ring buffer emits nothing.
+    pub(crate) fn finish_scope(&self, request_id: &str, update: ScopeFinish<'_>) {
         let mut trace_event = None;
         self.mutate_request(request_id, |r| {
-            r.provider = update.provider.to_string();
-            r.duration_ms = (update.duration_ms * 10.0).round() / 10.0;
-            r.first_byte_ms = (update.first_byte_ms * 10.0).round() / 10.0;
-            r.bedrock_invocation_ms = update.bedrock_invocation_ms;
-            r.bedrock_first_byte_ms = update.bedrock_first_byte_ms;
-
+            let timing = update.timing;
+            r.provider = timing.provider.to_string();
+            r.duration_ms = (timing.duration_ms * 10.0).round() / 10.0;
+            r.first_byte_ms = (timing.first_byte_ms * 10.0).round() / 10.0;
+            r.bedrock_invocation_ms = timing.bedrock_invocation_ms;
+            r.bedrock_first_byte_ms = timing.bedrock_first_byte_ms;
+            r.selected_model = update.selected_model;
+            r.selected_model_was_exploration = update.selected_model_was_exploration;
+            r.status_code = update.status_code;
             trace_event = Some(crate::entrypoint::events::RequestTraceData::from_detail(r));
         });
 
         if let Some(trace) = trace_event {
-            if let Ok(guard) = self.event_tx.lock() {
-                if let Some(ref tx) = *guard {
-                    let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
-                        trace,
-                    ));
-                }
+            let guard = self
+                .event_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
+                    trace,
+                ));
             }
         }
-    }
-
-    /// Sets `selected_model` on an existing request by ID (Story 5.1.3).
-    /// Called once per dispatch attempt with the currently-chosen
-    /// candidate's model, so the last attempt wins across retries, matching
-    /// how `provider` is already overwritten on each retry in
-    /// `update_request_timing`.
-    pub fn set_selected_model(&self, request_id: &str, model: Option<String>) {
-        self.mutate_request(request_id, |r| r.selected_model = model);
-    }
-
-    /// Sets `selected_model_was_exploration` on an existing request by ID
-    /// (Pre-mortem P2 #2), called alongside `set_selected_model`.
-    pub fn set_selected_model_was_exploration(
-        &self,
-        request_id: &str,
-        was_exploration: Option<bool>,
-    ) {
-        self.mutate_request(request_id, |r| {
-            r.selected_model_was_exploration = was_exploration;
-        });
     }
 
     /// Caches a request's original (pre-dispatch) body, capped at 100

@@ -5,7 +5,9 @@ use std::sync::{Mutex, OnceLock};
 
 use tempfile::TempDir;
 
-use super::schema::{AuthMethod, Config, RateLimit, SecretRef, Strategy, UpstreamKind};
+use super::schema::{
+    AuthMethod, CatalogRefreshMode, Config, RateLimit, SecretRef, Strategy, UpstreamKind,
+};
 use super::validate::validate_references;
 use super::{load, ConfigError};
 
@@ -454,4 +456,58 @@ weight = 0.3
     let route = config.routes.iter().find(|r| r.name == "split").unwrap();
     assert_eq!(route.strategy, Strategy::Weighted);
     assert_eq!(route.upstreams[0].weight, Some(0.7));
+}
+
+#[test]
+fn config_without_model_catalog_section_should_default_catalog_refresh_on_demand() {
+    let _guard = env_lock().lock().unwrap();
+    let dir = TempDir::new().unwrap();
+    conf_d(&dir);
+
+    let config = load(dir.path()).unwrap();
+
+    assert_eq!(
+        config.model_catalog.refresh_mode(),
+        CatalogRefreshMode::OnDemand
+    );
+    assert_eq!(config.model_catalog.min_retry_secs, 300);
+    assert_eq!(config.model_catalog.stale_after_secs, 1800);
+}
+
+#[test]
+fn model_catalog_section_should_parse_modes_and_clamp_interval_below_300s() {
+    let _guard = env_lock().lock().unwrap();
+    let dir = TempDir::new().unwrap();
+    write(
+        &conf_d(&dir),
+        "40-catalog.toml",
+        "[model_catalog]\nrefresh = \"interval\"\ninterval_secs = 60\nmin_retry_secs = 120\n",
+    );
+
+    let config = load(dir.path()).unwrap();
+
+    assert_eq!(
+        config.model_catalog.refresh_mode(),
+        CatalogRefreshMode::Interval { secs: 300 }
+    );
+    assert_eq!(config.model_catalog.min_retry_secs, 120);
+
+    write(
+        &conf_d(&dir),
+        "40-catalog.toml",
+        "[model_catalog]\nrefresh = \"off\"\n",
+    );
+    let off = load(dir.path()).unwrap();
+    assert_eq!(off.model_catalog.refresh_mode(), CatalogRefreshMode::Off);
+
+    write(
+        &conf_d(&dir),
+        "40-catalog.toml",
+        "[model_catalog]\nrefresh = \"interval\"\ninterval_secs = 900\n",
+    );
+    let long = load(dir.path()).unwrap();
+    assert_eq!(
+        long.model_catalog.refresh_mode(),
+        CatalogRefreshMode::Interval { secs: 900 }
+    );
 }

@@ -376,6 +376,8 @@ pub struct Config {
     /// cache disabled). See `crate::memory::cache::ResponseCache`.
     #[serde(default)]
     pub response_cache: crate::memory::cache::ResponseCacheConfig,
+    #[serde(default)]
+    pub model_catalog: ModelCatalogConfig,
 }
 
 /// `serve-cost`'s config-file surface (Epic 2.3, Story 2.3.1): the
@@ -387,6 +389,82 @@ pub struct Config {
 pub struct CostMetricsConfig {
     #[serde(default)]
     pub port: Option<u16>,
+}
+
+const DEFAULT_CATALOG_INTERVAL_SECS: u64 = 600;
+/// Floor for interval refreshes: each refresh runs credential helpers.
+const MIN_CATALOG_INTERVAL_SECS: u64 = 300;
+
+/// When the model catalog refreshes itself.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogRefreshSetting {
+    #[default]
+    OnDemand,
+    Interval,
+    Off,
+}
+
+/// Resolved refresh mode (interval already clamped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogRefreshMode {
+    OnDemand,
+    Interval { secs: u64 },
+    Off,
+}
+
+/// `[model_catalog]` table. Refreshing runs each upstream's credential flow
+/// (SSO prompts, `exec` helpers, paid API calls), so the default is
+/// `on_demand`: only the dashboard's Refresh buttons (or
+/// `POST /api/model-catalog/refresh`) trigger calls. The dashboard has no
+/// authentication, binds `127.0.0.1` only and allows any CORS origin, so any
+/// local process or open browser tab can request a refresh (bounded by a
+/// per-upstream single-flight guard, a 10 s manual throttle and
+/// `min_retry_secs`); see README "Model catalog".
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ModelCatalogConfig {
+    pub refresh: CatalogRefreshSetting,
+    /// Timer period when `refresh = "interval"`; values below 300 clamp to 300.
+    pub interval_secs: u64,
+    /// Minimum seconds between automatic attempts at one upstream, measured
+    /// from the last attempt (success or failure).
+    pub min_retry_secs: u64,
+    /// `?ifStale=true` refreshes only entries older than this.
+    pub stale_after_secs: u64,
+}
+
+impl Default for ModelCatalogConfig {
+    fn default() -> Self {
+        Self {
+            refresh: CatalogRefreshSetting::OnDemand,
+            interval_secs: DEFAULT_CATALOG_INTERVAL_SECS,
+            min_retry_secs: 300,
+            stale_after_secs: 1800,
+        }
+    }
+}
+
+impl ModelCatalogConfig {
+    #[must_use]
+    pub fn refresh_mode(&self) -> CatalogRefreshMode {
+        match self.refresh {
+            CatalogRefreshSetting::OnDemand => CatalogRefreshMode::OnDemand,
+            CatalogRefreshSetting::Off => CatalogRefreshMode::Off,
+            CatalogRefreshSetting::Interval => {
+                if self.interval_secs < MIN_CATALOG_INTERVAL_SECS {
+                    tracing::warn!(
+                        configured = self.interval_secs,
+                        clamped = MIN_CATALOG_INTERVAL_SECS,
+                        "model_catalog.interval_secs below minimum; clamped"
+                    );
+                }
+                CatalogRefreshMode::Interval {
+                    secs: self.interval_secs.max(MIN_CATALOG_INTERVAL_SECS),
+                }
+            }
+        }
+    }
 }
 
 fn default_port() -> u16 {
@@ -486,6 +564,7 @@ impl Default for Config {
             cost_metrics: CostMetricsConfig::default(),
             server_tools: crate::server_tools::ServerToolsConfig::default(),
             response_cache: crate::memory::cache::ResponseCacheConfig::default(),
+            model_catalog: ModelCatalogConfig::default(),
         }
     }
 }

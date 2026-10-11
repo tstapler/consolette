@@ -3,6 +3,18 @@ import { CommonModule } from '@angular/common';
 import { RequestTraceData } from '../../../core/models/telemetry.models';
 import { NA_REASON_TEXTS, naReason } from '../../../core/models/na-reason';
 import { copyText } from '../../../core/util/copy-text';
+import { CHIP_LEGEND, chipMeaning, fmt, isNum, routeChip, statusParts, statusSubLabel, tokensAfterText } from '../../../core/models/trace-labels';
+
+export { CHIP_LEGEND, statusSubLabel };
+
+/** Raised when the operator opens the drawer from a row. `origin` is the control that regains focus on close. */
+export interface InspectRequest {
+  trace: RequestTraceData;
+  origin: HTMLElement | null;
+  scrollToAttempts: boolean;
+}
+
+const MIN_TARGET = 'min-width:24px;min-height:24px';
 
 /** Task 2.1.6f flips this off and deletes the note and its spec. */
 export const TRACE_COVERAGE_NOTE_ENABLED = true;
@@ -10,24 +22,6 @@ const MAX_ROWS = 100;
 const DASH_LEGEND_LINE = '- = not applicable; hover a dash or open the legend for the reason';
 const COVERAGE_NOTE =
   'Rows cover requests that reach routing. Requests rejected before routing, cache hits and multi-round search requests are not shown as one row yet.';
-
-const STATUS_WORDS: Record<number, string> = {
-  200: 'OK', 400: 'Bad request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not found',
-  408: 'Timeout', 422: 'Rejected', 429: 'Rate limited', 499: 'Client closed', 500: 'Server error',
-  502: 'Failed', 503: 'Unavailable', 504: 'Timed out', 529: 'Overloaded',
-};
-
-export const CHIP_LEGEND: ReadonlyArray<{ chip: string; meaning: string }> = [
-  { chip: 'pinned', meaning: 'a session pinned this conversation to one upstream' },
-  { chip: 'strategy', meaning: 'the routing strategy picked this upstream (name shown in the drawer)' },
-  { chip: 'explore', meaning: 'an occasional exploration pick to test another upstream' },
-  { chip: 'fallback', meaning: 'an earlier upstream failed, so the next one was tried' },
-  { chip: 'held', meaning: 'waited for a rate-limit cooldown, then retried' },
-  { chip: 'default', meaning: 'no special rule; the default route' },
-  { chip: 'cache', meaning: 'answered from the response cache' },
-  { chip: 'local', meaning: 'answered by a local model' },
-  { chip: 'cancelled', meaning: 'the client closed the connection' },
-];
 
 interface Cell { text: string; reason: string | null; }
 
@@ -46,20 +40,15 @@ interface Row {
   statusTitle: string | null;
   subLabel: string | null;
   chip: string | null;
+  routeModels: string;
+  routeModelsTitle: string;
+  routeProvider: string | null;
+  attemptsBadge: string | null;
+  roundsBadge: string | null;
   naDescription: string;
 }
 
-const fmt = (n: number): string => n.toLocaleString('en-US');
-const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const NOT_RECORDED = 'n/a (not recorded)';
-
-/** Sub-label for a successful row that followed a failed attempt; derived, no wire field. */
-export function statusSubLabel(t: RequestTraceData): string | null {
-  const attempts = t.attempts;
-  if (!attempts || attempts.length <= 1) return null;
-  if (isNum(t.statusCode) && t.statusCode >= 400) return null;
-  return attempts[attempts.length - 1].upstream !== attempts[0].upstream ? 'fell back' : 'retried';
-}
 
 @Component({
   selector: 'app-recent-trace-table',
@@ -82,13 +71,13 @@ export function statusSubLabel(t: RequestTraceData): string | null {
       </div>
 
       <div class="overflow-x-auto" role="region" aria-label="Live request traces, scroll horizontally" tabindex="0">
-        <table class="w-full text-left text-xs text-neutral-300">
+        <table data-trace-table tabindex="-1" class="w-full text-left text-xs text-neutral-300">
           <caption class="sr-only">Live request traces</caption>
           <thead class="bg-neutral-950 text-neutral-400 uppercase text-[11px] tracking-wider border-b border-neutral-800">
             <tr>
               <th scope="col" class="py-3 px-4">Time</th>
               <th scope="col" class="py-3 px-4">Request ID</th>
-              <th scope="col" class="py-3 px-4">Provider / Model</th>
+              <th scope="col" class="py-3 px-4">Route</th>
               <th scope="col" class="py-3 px-4">Latency (to headers)</th>
               <th scope="col" class="py-3 px-4">First byte</th>
               <th scope="col" class="py-3 px-4">Tokens before</th>
@@ -103,16 +92,23 @@ export function statusSubLabel(t: RequestTraceData): string | null {
               <th scope="row" class="py-3 px-4 font-mono font-medium text-white whitespace-nowrap text-left">
                 <span class="inline-flex items-center gap-1.5">
                   <span data-id-text [title]="row.trace.requestId">{{ failedCopyId === row.key ? row.trace.requestId : row.shortId }}</span>
-                  <button type="button" [attr.data-copy-id]="row.key" (click)="copyId(row)"
+                  <button type="button" [attr.data-copy-id]="row.key" (click)="copyId(row)" style="${MIN_TARGET}"
                     class="px-1.5 py-0.5 text-[11px] font-normal bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded border border-neutral-700 focus-visible:outline focus-visible:outline-2"
                     [attr.aria-label]="'Copy request ID ' + row.trace.requestId">Copy</button>
                 </span>
               </th>
               <td class="py-3 px-4 whitespace-nowrap">
-                <div class="flex items-center gap-1.5">
-                  <span class="font-medium text-neutral-200">{{ row.trace.provider }}</span>
-                  <span class="px-1.5 py-0.5 text-[11px] font-mono bg-neutral-800 text-cyan-400 rounded border border-neutral-700">{{ row.trace.model }}</span>
-                  <span *ngIf="row.chip" class="px-1.5 py-0.5 text-[11px] bg-neutral-800 text-neutral-300 rounded border border-neutral-700" [title]="chipMeaning(row.chip)">{{ row.chip }}</span>
+                <div data-route class="flex flex-col gap-1">
+                  <span data-route-models class="px-1.5 py-0.5 text-[11px] font-mono bg-neutral-800 text-cyan-400 rounded border border-neutral-700 max-w-[16rem] truncate inline-block" [title]="row.routeModelsTitle">{{ row.routeModels }}</span>
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <span *ngIf="row.routeProvider" data-route-provider class="font-medium text-neutral-200">{{ row.routeProvider }}</span>
+                    <span *ngIf="row.chip" data-chip class="px-1.5 py-0.5 text-[11px] bg-neutral-800 text-neutral-300 rounded border border-neutral-700" [title]="chipMeaning(row.chip)">{{ row.chip }}</span>
+                    <button *ngIf="row.attemptsBadge" type="button" data-attempts-badge (click)="onInspect(row.trace, $event, true)"
+                      style="${MIN_TARGET}"
+                      class="px-1.5 py-0.5 text-[11px] bg-neutral-800 hover:bg-neutral-700 text-amber-300 rounded border border-neutral-700 focus-visible:outline focus-visible:outline-2"
+                      [attr.aria-label]="'Inspect trace ' + row.shortId + ', ' + row.attemptsBadge">{{ row.attemptsBadge }}</button>
+                    <span *ngIf="row.roundsBadge" data-rounds-badge class="px-1.5 py-0.5 text-[11px] bg-neutral-800 text-neutral-300 rounded border border-neutral-700">{{ row.roundsBadge }}</span>
+                  </div>
                 </div>
               </td>
               <td class="py-3 px-4 font-mono text-neutral-300 whitespace-nowrap">
@@ -134,7 +130,7 @@ export function statusSubLabel(t: RequestTraceData): string | null {
                 <div *ngIf="row.subLabel" class="text-[11px] text-neutral-400 mt-0.5">{{ row.subLabel }}</div>
               </td>
               <td class="py-3 px-4 text-right whitespace-nowrap">
-                <button type="button" data-inspect (click)="onInspect(row.trace)"
+                <button type="button" data-inspect (click)="onInspect(row.trace, $event, false)" style="${MIN_TARGET}"
                   [attr.aria-label]="'Inspect trace ' + row.shortId"
                   [attr.aria-describedby]="row.naDescription ? 'na-' + row.key : null"
                   class="px-2.5 py-1 text-[11px] font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded border border-neutral-700 transition-colors focus-visible:outline focus-visible:outline-2">
@@ -156,7 +152,7 @@ export function statusSubLabel(t: RequestTraceData): string | null {
                     <p>No requests yet. Point a client at this proxy to see traces.</p>
                     <p class="mt-2 flex items-center justify-center gap-2">
                       <code class="font-mono text-neutral-200">{{ proxyUrl }}</code>
-                      <button type="button" (click)="copyProxyUrl()"
+                      <button type="button" (click)="copyProxyUrl()" style="${MIN_TARGET}"
                         class="px-2 py-0.5 text-[11px] bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded border border-neutral-700 focus-visible:outline focus-visible:outline-2">Copy URL</button>
                     </p>
                   </td>
@@ -173,7 +169,7 @@ export function statusSubLabel(t: RequestTraceData): string | null {
       <div class="mt-3 space-y-2 text-[11px] text-neutral-400">
         <p *ngIf="rows.length >= ${MAX_ROWS}">Showing latest ${MAX_ROWS}</p>
         <p>${DASH_LEGEND_LINE}</p>
-        <button type="button" (click)="legendOpen = !legendOpen" [attr.aria-expanded]="legendOpen" aria-controls="trace-legend"
+        <button type="button" (click)="legendOpen = !legendOpen" style="${MIN_TARGET}" [attr.aria-expanded]="legendOpen" aria-controls="trace-legend"
           class="underline focus-visible:outline focus-visible:outline-2">What do these dashes and chips mean?</button>
         <div id="trace-legend" data-legend *ngIf="legendOpen" class="space-y-2">
           <ul class="space-y-0.5">
@@ -203,6 +199,7 @@ export class RecentTraceTableComponent {
   @Input() retryAttempt = 0;
   @Output() inspectPayload = new EventEmitter<RequestTraceData>();
   @Output() selectTrace = new EventEmitter<RequestTraceData>();
+  @Output() inspect = new EventEmitter<InspectRequest>();
 
   public rows: Row[] = [];
   public legendOpen = false;
@@ -228,18 +225,17 @@ export class RecentTraceTableComponent {
     return this.connectionStatus === 'connecting' || this.connectionStatus === 'reconnecting';
   }
 
-  public onInspect(trace: RequestTraceData): void {
+  public onInspect(trace: RequestTraceData, event?: Event, scrollToAttempts = false): void {
     this.inspectPayload.emit(trace);
     this.selectTrace.emit(trace);
+    this.inspect.emit({ trace, origin: (event?.currentTarget as HTMLElement | null) ?? null, scrollToAttempts });
   }
 
   public trackByKey(_: number, row: Row): string {
     return row.key;
   }
 
-  public chipMeaning(chip: string): string {
-    return CHIP_LEGEND.find(c => c.chip === chip)?.meaning ?? chip;
-  }
+  public chipMeaning = chipMeaning;
 
   public async copyId(row: Row): Promise<void> {
     this.copyMessage = '';
@@ -285,8 +281,10 @@ export class RecentTraceTableComponent {
       ? { text: `${fmt(t.tokensBefore)} est.`, reason: null }
       : { text: '', reason: NOT_RECORDED };
     const taReason = naReason(t, 'tokensAfter');
-    const tokensAfter: Cell = { text: taReason === null ? this.tokensAfterText(t) : '', reason: taReason };
-    const { text: statusText, glyph, cls } = this.statusParts(t);
+    const tokensAfter: Cell = { text: taReason === null ? tokensAfterText(t) : '', reason: taReason };
+    const { text: statusText, glyph, cls } = statusParts(t);
+    const route = this.routeParts(t);
+    const attemptCount = t.attempts?.length ?? 0;
     const naParts: string[] = [];
     if (firstByte.reason) naParts.push(`First byte: ${firstByte.reason}.`);
     if (tokensAfter.reason) naParts.push(`Tokens after: ${tokensAfter.reason}.`);
@@ -304,33 +302,21 @@ export class RecentTraceTableComponent {
       statusClass: cls,
       statusTitle: t.stream ? 'status at response headers' : null,
       subLabel: statusSubLabel(t),
-      chip: t.traceKind === 'cache_hit' ? 'cache' : t.traceKind === 'local' ? 'local' : t.statusCode === 499 ? 'cancelled' : null,
+      chip: routeChip(t),
+      routeModels: route.models,
+      routeModelsTitle: route.models,
+      routeProvider: t.traceKind === 'cache_hit' ? null : (t.routedProvider ?? t.provider ?? null),
+      attemptsBadge: attemptCount > 1 ? `x${attemptCount} attempts` : null,
+      roundsBadge: isNum(t.iterations) && t.iterations > 1 ? `${t.iterations} search rounds` : null,
       naDescription: naParts.join(' '),
     };
   }
 
-  private tokensAfterText(t: RequestTraceData): string {
-    const after = t.tokensAfter as number;
-    if (t.compressionStatus !== 'compressed') return `${fmt(after)} est.`;
-    if (!isNum(t.tokensBefore) || t.tokensBefore <= 0 || after >= t.tokensBefore) return `${fmt(after)} est.`;
-    const pct = Math.round(((t.tokensBefore - after) / t.tokensBefore) * 100);
-    return `${fmt(t.tokensBefore)} -> ${fmt(after)} (-${pct}%)`;
-  }
-
-  private statusParts(t: RequestTraceData): { text: string; glyph: string; cls: string } {
-    const code = t.statusCode;
-    if (!isNum(code)) return { text: '—', glyph: '-', cls: 'bg-neutral-800 text-neutral-300 border-neutral-700' };
-    if (t.traceKind === 'cache_hit' && code === 200) {
-      return { text: '200 (cache)', glyph: '✓', cls: 'bg-emerald-950/80 text-emerald-400 border-emerald-800/60' };
-    }
-    const word = STATUS_WORDS[code] ?? (code >= 500 ? 'Server error' : code >= 400 ? 'Client error' : '');
-    const text = word ? `${code} ${word}` : String(code);
-    if (code === 499) return { text, glyph: '-', cls: 'bg-neutral-800 text-neutral-300 border-neutral-700' };
-    if (code >= 200 && code < 300) return { text, glyph: '✓', cls: 'bg-emerald-950/80 text-emerald-400 border-emerald-800/60' };
-    if (code === 429) return { text, glyph: '!', cls: 'bg-amber-950/80 text-amber-400 border-amber-800/60' };
-    if (code >= 400 && code < 500) return { text, glyph: '!', cls: 'bg-yellow-950/80 text-yellow-400 border-yellow-800/60' };
-    if (code >= 500) return { text, glyph: '✕', cls: 'bg-rose-950/80 text-rose-400 border-rose-800/60' };
-    return { text, glyph: '-', cls: 'bg-neutral-800 text-neutral-300 border-neutral-700' };
+  private routeParts(t: RequestTraceData): { models: string } {
+    const routed = t.routedModel ?? t.model;
+    const requested = t.requestedModel;
+    const differs = !!requested && !!routed && requested !== routed;
+    return { models: differs ? `${requested} -> ${routed}` : routed };
   }
 
   private warnIfMalformed(t: RequestTraceData, key: string): void {

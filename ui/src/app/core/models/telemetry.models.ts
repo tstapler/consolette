@@ -15,6 +15,27 @@ export type CompressionStatus = 'off' | 'none' | 'skipped' | 'failed' | 'compres
 export type TraceKind = 'routed' | 'cache_hit' | 'local';
 export type FirstByteState = 'pending' | 'measured' | 'ended_empty' | 'client_closed';
 
+export type RoutedModelSource = 'pinned' | 'passthrough';
+export type RouteReason =
+  | 'session_pin' | 'strategy' | 'exploration' | 'fallback' | 'rate_limit_hold' | 'default' | 'cache' | 'local';
+export type AttemptOutcome =
+  | 'ok' | 'rate_limited' | 'timeout' | 'auth' | 'validation' | 'shape_mismatch' | 'upstream' | 'shed' | 'cancelled';
+export type AttemptErrorClass =
+  | 'auth' | 'rate_limited' | 'overloaded' | 'timeout' | 'server_error'
+  | 'unreachable' | 'client_error' | 'bad_response' | 'shed' | 'cancelled';
+
+/** One upstream try; sanitized by the backend (never an upstream body). */
+export interface AttemptTraceData {
+  iteration: number;
+  upstream: string;
+  model: string | null;
+  outcome: AttemptOutcome;
+  status: number | null;
+  latencyMs: number;
+  errorClass: AttemptErrorClass | null;
+  errorMessage: string | null;
+}
+
 export interface RequestTraceData {
   id: string;
   requestId: string;
@@ -33,8 +54,17 @@ export interface RequestTraceData {
   /** 0 = terminal trace; a lower revision never overwrites a higher one. */
   traceRevision: number;
   firstByteState?: FirstByteState;
-  /** Per-attempt chain; arrives with the attempts work (Epic 2). */
-  attempts?: Array<{ upstream: string }>;
+  /** Absent on events from before the route-mapping work. A `routeReason` outside `RouteReason` renders raw. */
+  requestedModel?: string | null;
+  routedModel?: string | null;
+  routedModelSource?: RoutedModelSource | null;
+  routedProvider?: string | null;
+  routeReason?: RouteReason | string | null;
+  routeStrategy?: string | null;
+  attempts?: AttemptTraceData[];
+  attemptsTruncated?: boolean;
+  /** Search-emulation rounds; 1 for an ordinary request. */
+  iterations?: number;
 }
 
 export interface ErrorLoggedData {

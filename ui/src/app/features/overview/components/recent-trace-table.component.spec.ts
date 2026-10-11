@@ -1,12 +1,17 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { RecentTraceTableComponent, TRACE_COVERAGE_NOTE_ENABLED } from './recent-trace-table.component';
-import { RequestTraceData } from '../../../core/models/telemetry.models';
+import { AttemptTraceData, RequestTraceData } from '../../../core/models/telemetry.models';
+import { CHIP_LEGEND, ROUTE_REASONS } from '../../../core/models/trace-labels';
 import { NA_REASON_TEXTS } from '../../../core/models/na-reason';
 import traceSuccess from '../../../../testing/fixtures/sse/request-trace-success.json';
 import traceFailure from '../../../../testing/fixtures/sse/request-trace-failure.json';
 
 const success = traceSuccess.data as RequestTraceData;
 const failure = traceFailure.data as RequestTraceData;
+
+export function att(upstream: string, over: Partial<AttemptTraceData> = {}): AttemptTraceData {
+  return { iteration: 0, upstream, model: null, outcome: 'ok', status: 200, latencyMs: 10, errorClass: null, errorMessage: null, ...over };
+}
 
 function make(over: Partial<RequestTraceData> = {}): RequestTraceData {
   return { ...success, ...over };
@@ -76,7 +81,7 @@ describe('RecentTraceTableComponent (TC-UNIT-17)', () => {
   });
 
   it('status cell shows cache and cancelled variants and fell back / retried sub-labels', () => {
-    const attempt = (upstream: string) => ({ upstream });
+    const attempt = (upstream: string) => att(upstream);
     render([
       make({ requestId: 'a', id: 'a', traceKind: 'cache_hit' }),
       make({ requestId: 'b', id: 'b', statusCode: 499 }),
@@ -278,6 +283,105 @@ describe('RecentTraceTableComponent (TC-UNIT-17)', () => {
     expect(TRACE_COVERAGE_NOTE_ENABLED).toBeTrue();
     render([success]);
     expect(text(el)).toContain('Rows cover requests that reach routing. Requests rejected before routing, cache hits and multi-round search requests are not shown as one row yet.');
+  });
+
+  describe('route cell (Story 2.1.4)', () => {
+    const route = (e: Element) => e.querySelector('[data-route]') as HTMLElement;
+    const routed = (over: Partial<RequestTraceData>) =>
+      make({ requestedModel: 'gpt-4o', routedModel: 'gpt-4o-mini', routedProvider: 'openrouter', routedModelSource: 'pinned', routeReason: 'fallback', ...over });
+
+    it('route_cell_should_show_arrow_and_provider_when_names_differ_and_single_name_when_equal', () => {
+      render([routed({}), routed({ requestId: 'eq', id: 'eq', routedModel: 'gpt-4o', routedModelSource: 'passthrough' }),
+        routed({ requestId: 'pt', id: 'pt', routedModel: 'gpt-4o', routedModelSource: 'passthrough', routedProvider: 'openai' })]);
+      const [a, b, c] = rows().map(r => route(r));
+      expect(text(a.querySelector('[data-route-models]') as Element)).toBe('gpt-4o -> gpt-4o-mini');
+      expect(text(a.querySelector('[data-route-provider]') as Element)).toBe('openrouter');
+      expect(a.querySelector('[data-route-models]')?.getAttribute('title')).toBe('gpt-4o -> gpt-4o-mini');
+      expect(text(b.querySelector('[data-route-models]') as Element)).toBe('gpt-4o');
+      expect(text(c.querySelector('[data-route-models]') as Element)).not.toContain('->');
+      expect(text(c.querySelector('[data-route-provider]') as Element)).toBe('openai');
+    });
+
+    it('route_chip_text_should_map_each_wire_reason_exactly_and_status_cell_should_derive_fell_back_vs_retried', () => {
+      const expected: Record<string, string> = {
+        session_pin: 'pinned', strategy: 'strategy', exploration: 'explore', fallback: 'fallback',
+        rate_limit_hold: 'held', default: 'default', cache: 'cache', local: 'local',
+      };
+      render([...Object.keys(expected), 'brand_new_reason'].map(r => routed({ requestId: r, id: r, routeReason: r })));
+      const chips = rows().map(r => text(r.querySelector('[data-chip]') as Element));
+      expect(chips).toEqual([...Object.values(expected), 'brand_new_reason']);
+      render([
+        routed({ requestId: 'f', id: 'f', attempts: [att('anthropic', { status: 529, outcome: 'upstream' }), att('openrouter')] }),
+        routed({ requestId: 'r', id: 'r', attempts: [att('anthropic', { status: 429, outcome: 'rate_limited' }), att('anthropic')] }),
+        routed({ requestId: 'x', id: 'x', statusCode: 502, attempts: [att('anthropic'), att('openrouter')] }),
+      ]);
+      expect(text(rows()[0].querySelector('[data-status]') as Element)).toContain('fell back');
+      expect(text(rows()[1].querySelector('[data-status]') as Element)).toContain('retried');
+      const failed = text(rows()[2].querySelector('[data-status]') as Element);
+      expect(failed).toContain('502');
+      expect(failed).not.toMatch(/fell back|retried/);
+    });
+
+    it('route_cell_should_show_fallback_chip_x3_badge_and_search_rounds_badge', () => {
+      const three = [att('a', { outcome: 'upstream', status: 529 }), att('b', { outcome: 'upstream', status: 529 }), att('c')];
+      render([routed({ attempts: three }), routed({ requestId: 'one', id: 'one', attempts: [att('a')], iterations: 3 })]);
+      const first = rows()[0];
+      expect(text(first.querySelector('[data-chip]') as Element)).toBe('fallback');
+      const badge = first.querySelector('button[data-attempts-badge]') as HTMLButtonElement;
+      expect(text(badge)).toBe('x3 attempts');
+      expect(first.querySelector('[data-rounds-badge]')).toBeNull();
+      const second = rows()[1];
+      expect(second.querySelector('button[data-attempts-badge]')).toBeNull();
+      expect(text(second.querySelector('[data-rounds-badge]') as Element)).toBe('3 search rounds');
+    });
+
+    it('attempts badge emits an inspect request that asks for the ATTEMPTS scroll, plain Inspect does not', () => {
+      render([routed({ attempts: [att('a', { outcome: 'upstream', status: 529 }), att('b')] })]);
+      const seen: Array<{ attempts: boolean }> = [];
+      component.inspect.subscribe(e => seen.push({ attempts: e.scrollToAttempts }));
+      (rows()[0].querySelector('button[data-attempts-badge]') as HTMLButtonElement).click();
+      (rows()[0].querySelector('button[data-inspect]') as HTMLButtonElement).click();
+      expect(seen).toEqual([{ attempts: true }, { attempts: false }]);
+    });
+
+    it('route_cell_should_show_cache_local_and_cancelled_chips_without_provider_line', () => {
+      render([
+        make({ requestId: 'c', id: 'c', traceKind: 'cache_hit', routeReason: 'cache' }),
+        make({ requestId: 'l', id: 'l', traceKind: 'local', routeReason: 'local' }),
+        make({ requestId: 'x', id: 'x', statusCode: 499, routeReason: 'fallback' }),
+      ]);
+      const chip = (i: number) => text(rows()[i].querySelector('[data-chip]') as Element);
+      expect([chip(0), chip(1), chip(2)]).toEqual(['cache', 'local', 'cancelled']);
+      expect(rows()[0].querySelector('[data-route-provider]')).toBeNull();
+    });
+
+    it('every_wire_route_reason_should_have_chip_title_and_legend_row_with_plain_language_text', () => {
+      const keys = Object.keys(ROUTE_REASONS);
+      expect(keys.length).toBe(8);
+      render(keys.map(r => routed({ requestId: r, id: r, routeReason: r })));
+      keys.forEach((k, i) => {
+        const chipEl = rows()[i].querySelector('[data-chip]') as HTMLElement;
+        expect(chipEl.getAttribute('title')).toBe(ROUTE_REASONS[k].legend);
+        expect(CHIP_LEGEND.some(c => c.chip === ROUTE_REASONS[k].chip && c.meaning === ROUTE_REASONS[k].legend)).toBeTrue();
+      });
+      expect(CHIP_LEGEND.some(c => c.chip === 'cancelled')).toBeTrue();
+      const btn = Array.from(el.querySelectorAll('button')).find(b => b.textContent?.includes('What do these dashes and chips mean?')) as HTMLButtonElement;
+      btn.click();
+      fixture.detectChanges();
+      const legend = text(el.querySelector('[data-legend]') as Element);
+      CHIP_LEGEND.forEach(c => expect(legend).toContain(c.meaning));
+    });
+
+    it('table_controls_should_be_at_least_24x24_and_table_element_should_be_focus_fallback_target', () => {
+      render([routed({ attempts: [att('a', { outcome: 'upstream', status: 529 }), att('b')] })]);
+      el.querySelectorAll('button').forEach(b => {
+        const r = b.getBoundingClientRect();
+        expect(r.width).withContext(b.textContent ?? '').toBeGreaterThanOrEqual(24);
+        expect(r.height).withContext(b.textContent ?? '').toBeGreaterThanOrEqual(24);
+      });
+      const table = el.querySelector('table[data-trace-table]') as HTMLElement;
+      expect(table.getAttribute('tabindex')).toBe('-1');
+    });
   });
 
   it('should emit inspectPayload and selectTrace events when Inspect button is clicked', () => {

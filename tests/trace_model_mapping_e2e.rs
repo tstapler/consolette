@@ -280,13 +280,13 @@ fn search_request(model: &str) -> Value {
 
 /// Cacheable request unique per run, so a stale row in the on-disk response cache
 /// (`~/.claude/consolette/response-cache.sqlite`) cannot turn the first send into a hit.
-fn cacheable_request() -> Value {
+fn cacheable_request(model: &str) -> Value {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     json!({
-        "model": "claude-sonnet-4",
+        "model": model,
         "max_tokens": 16,
         "messages": [{"role": "user", "content": format!("cache probe {nonce}")}]
     })
@@ -349,16 +349,12 @@ model = "gpt-5.1"
     }
     let mut sse = server.open_sse().await;
 
-    let cacheable = cacheable_request();
+    let cacheable = cacheable_request("claude-sonnet-4");
     let requests = [
         search_request("claude-sonnet-4"),
         cacheable.clone(),
         cacheable,
-        json!({
-            "model": "local/ollama/llama3.2",
-            "max_tokens": 16,
-            "messages": [{"role": "user", "content": "hello"}]
-        }),
+        cacheable_request("local/ollama/llama3.2"),
     ];
     for request in &requests {
         let (status, body) = send(&server, request).await;

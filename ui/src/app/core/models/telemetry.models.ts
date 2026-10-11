@@ -1,3 +1,4 @@
+import { ModelCatalogChangedData } from './model-catalog.models';
 /** Field names mirror the backend wire contract, pinned by `src/testing/fixtures/sse/*.json` (ADR-001). */
 export interface MetricsTickData {
   rpm: number;
@@ -87,6 +88,7 @@ export type DashboardEvent =
   | { type: 'RequestTrace'; data: RequestTraceData }
   | { type: 'ErrorLogged'; data: ErrorLoggedData }
   | { type: 'ConfigChanged'; data: ConfigChangedData }
+  | { type: 'ModelCatalogChanged'; data: ModelCatalogChangedData }
   | { type: 'system_lag'; data: { message: string; skipped: number } };
 
 export interface SessionData {

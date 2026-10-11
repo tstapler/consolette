@@ -73,7 +73,7 @@ export class SseService {
       };
 
       // Listen to named custom events if emitted by SSE server
-      ['MetricsTick', 'RequestTrace', 'ErrorLogged', 'ConfigChanged', 'system_lag'].forEach((eventType) => {
+      ['MetricsTick', 'RequestTrace', 'ErrorLogged', 'ConfigChanged', 'ModelCatalogChanged', 'system_lag'].forEach((eventType) => {
         this.eventSource?.addEventListener(eventType, (event: MessageEvent) => {
           try {
             const data = JSON.parse(event.data);

@@ -1,4 +1,5 @@
-import { Injectable, inject, signal, computed, DestroyRef } from '@angular/core';
+import { Injectable, inject, signal, computed, DestroyRef, Injector } from '@angular/core';
+import { ModelCatalogStore } from './model-catalog.store';
 import { SseService } from '../services/sse.service';
 import { MetricsTickData, RequestTraceData, DashboardEvent } from '../models/telemetry.models';
 
@@ -12,6 +13,7 @@ export interface MetricsStoreOptions {
 })
 export class MetricsStore {
   private readonly sseService = inject(SseService);
+  private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef, { optional: true });
 
   private readonly maxTracesLimit: number;
@@ -56,6 +58,9 @@ export class MetricsStore {
       this.pushTick(event.data);
     } else if (event.type === 'RequestTrace') {
       this.pushTrace(event.data);
+    } else if (event.type === 'ModelCatalogChanged') {
+      // Resolved lazily so stores that never see this event need no HttpClient.
+      this.injector.get(ModelCatalogStore).onCatalogChanged();
     }
   }
 

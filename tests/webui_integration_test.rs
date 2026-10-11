@@ -199,6 +199,66 @@ fn fixture_files_should_be_reachable_via_include_str_when_cargo_test_runs() {
     }
 }
 
+#[test]
+fn model_catalog_fixture_should_match_the_rust_wire_shape() {
+    use consolette::routing::model_catalog::{
+        CatalogError, CatalogErrorKind, ConfigWarning, ModelEntry, UpstreamModels,
+    };
+    use std::collections::BTreeSet;
+    fn keys(v: &serde_json::Value) -> BTreeSet<String> {
+        v.as_object().unwrap().keys().cloned().collect()
+    }
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../ui/src/testing/fixtures/api/model-catalog.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        keys(&fixture),
+        BTreeSet::from(["upstreams".to_string(), "configWarnings".to_string()])
+    );
+    let entry_keys = keys(&serde_json::to_value(UpstreamModels::loading()).unwrap());
+    let error_keys = keys(
+        &serde_json::to_value(CatalogError {
+            kind: CatalogErrorKind::Auth,
+            status: Some(403),
+            message: String::new(),
+        })
+        .unwrap(),
+    );
+    let model_keys = keys(
+        &serde_json::to_value(ModelEntry {
+            id: String::new(),
+            owned_by: None,
+        })
+        .unwrap(),
+    );
+    let warning_keys = keys(
+        &serde_json::to_value(ConfigWarning {
+            upstream: String::new(),
+            model: String::new(),
+            referenced_by: String::new(),
+        })
+        .unwrap(),
+    );
+    let states = ["loading", "ok", "stale", "error", "unsupported"];
+    let mut seen_states = BTreeSet::new();
+    for (name, up) in fixture["upstreams"].as_object().unwrap() {
+        assert_eq!(keys(up), entry_keys, "{name} entry keys drifted");
+        assert!(states.contains(&up["state"].as_str().unwrap()), "{name}");
+        seen_states.insert(up["state"].as_str().unwrap().to_string());
+        for m in up["models"].as_array().unwrap() {
+            assert_eq!(keys(m), model_keys, "{name} model keys drifted");
+        }
+        if !up["error"].is_null() {
+            assert_eq!(keys(&up["error"]), error_keys, "{name} error keys drifted");
+        }
+    }
+    assert_eq!(seen_states.len(), states.len(), "fixture covers every state");
+    for w in fixture["configWarnings"].as_array().unwrap() {
+        assert_eq!(keys(w), warning_keys);
+    }
+}
+
 #[tokio::test]
 async fn metrics_recent_requests_should_keep_legacy_keys_and_add_attempts_and_route_reason() {
     use std::time::Duration;

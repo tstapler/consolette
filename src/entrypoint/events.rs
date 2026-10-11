@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(event, deserialized);
     }
 
-    const FIXTURES: [(&str, &str); 6] = [
+    const FIXTURES: [(&str, &str); 7] = [
         (
             "request-trace-success-compat.json",
             include_str!("../../ui/src/testing/fixtures/sse/request-trace-success-compat.json"),
@@ -345,6 +345,10 @@ mod tests {
         (
             "config-changed.json",
             include_str!("../../ui/src/testing/fixtures/sse/config-changed.json"),
+        ),
+        (
+            "model-catalog-changed.json",
+            include_str!("../../ui/src/testing/fixtures/sse/model-catalog-changed.json"),
         ),
     ];
 
@@ -444,13 +448,11 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&event_json(&event, false)).unwrap();
 
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "type": "ModelCatalogChanged",
-                "data": {"timestamp": "2026-10-10T18:10:03.000000+00:00", "upstream": "bedrock"}
-            })
-        );
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../ui/src/testing/fixtures/sse/model-catalog-changed.json"
+        ))
+        .unwrap();
+        assert_eq!(json, fixture);
     }
 
     #[test]

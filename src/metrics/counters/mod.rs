@@ -49,6 +49,9 @@ pub struct UpstreamCounters {
 #[derive(Default)]
 pub struct ProxyMetrics {
     // ---- Request counters ----
+    // Upstream attempts plus cache hits, not client requests: a 529 -> 429 -> 200 failover is
+    // one trace but raises `requests_total` by 3 and `errors_total` by 2. Per-client-request
+    // numbers come from traces (see `metrics::trace_error_rate`).
     pub requests_total: AtomicU64,
     pub requests_success: AtomicU64,
     pub errors_total: AtomicU64,

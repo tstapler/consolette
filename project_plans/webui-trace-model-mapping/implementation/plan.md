@@ -353,7 +353,7 @@ Tasks:
 - A trace is emitted on every terminal path of one `dispatch` (compat wrapper) call.
   - *Given* a `Router` with two fake upstreams both returning `RateLimited` under `#[tokio::test(start_paused = true)]` with the rate-limit cooldown set above `MAX_HOLD_WAIT_SECS` (so `hold_for_rate_limit_cooldown`, `router/mod.rs:707-718`, does not wait ~45 s), *When* `dispatch` is called with `model: "claude-sonnet-4"`, *Then* exactly one `RequestTrace` arrives with `statusCode: 429` (`dispatch` returns `last_error`, here `RateLimited`) and `requestId` equal to the ring-buffer entry id.
   - *Given* one upstream returning `Validation(_, 400)`, *Then* one trace `statusCode: 400` and the caller still receives the `Err`.
-  - *Given* one upstream returning Ok, *Then* exactly one trace `statusCode: 200` (not two).
+  - *Given* one upstream returning Ok, *Then* exactly one trace per client request, `statusCode: 200` (not two).
 - Finish contract (type-enforced, ADR-002 item 3): `finish`/`finish_cache_hit`/`finish_error` are the only normal exits. **The wrapper owns the scope as a local variable; nothing else ever owns it.** Handlers are split into a thin wrapper and an inner `async fn(&mut TraceScope, ..) -> HandlerResult { response, outcome }` that only borrows it (no `Arc`, no clone; the emulation loop borrows it through `ScopedDispatch`, Story 2.1.6). The wrapper runs, in this order: `let result = inner(&mut scope, ..).await; scope.finish(result.outcome); scope.mark_handler_returned();` and then returns `result.response`; the scope is dropped after `finish` (state `Finished`, `Drop` emits nothing). If axum drops the wrapper future before `finish`, the inner future and every borrow drop first (locals drop in reverse order), then the scope drops with `handler_returned == false` and emits `cancelled`. Every return path (400 validation, translation error, emulation round-2 failure, a failed `run_emulation_loop`) carries an outcome by type.
   - *Given* a handler that returns a 400 body before dispatch, *Then* one trace with `statusCode: 400`, not 499; same for an emulation round-2 dispatch failure and a `chat_completions` translation error (one test per handler).
 - `Drop` distinguishes three cases.
@@ -1012,7 +1012,7 @@ Tasks (sum 0.3 + 0.4 + 0.3 = 1.0 d):
 **Acceptance Criteria**:
 - Fallback chain end to end.
   - *Given* an in-process axum fake upstream A returning 529 and B returning a valid Anthropic response, with a route `[A, B]`, *When* `POST /v1/messages` with `model: "claude-haiku-4-5"` is sent and the SSE stream read, *Then* one `RequestTrace` has `statusCode: 200`, `routedProvider: "B"`, `routeReason: "fallback"`, 2 attempts with A `upstream 529`; `/metrics` `requests_total` rose by 2 (per attempt, Story 2.1.6) while the dashboard shows 1 trace.
-- Emulation loop, cache hit and local each produce one trace (smoke-level repeat of Story 2.1.6 through the HTTP stack).
+- Emulation loop, cache hit and local each produce one trace per client request (smoke-level repeat of Story 2.1.6 through the HTTP stack).
   - *Given* four client requests, *Then* the SSE stream carries exactly 4 `RequestTrace` events, one per client request:
 
     | # | Client request | `traceKind` | Notes |
@@ -1022,7 +1022,7 @@ Tasks (sum 0.3 + 0.4 + 0.3 = 1.0 d):
     | 3 | same cacheable request, second send | `cache_hit` | no attempts |
     | 4 | local-catalog model | `local` | `routedProvider: "local"` |
 - Total failure traced.
-  - *Given* both upstreams 500, *Then* one trace with a 5xx `statusCode`, `attempts.length == 2`, and the client gets the error.
+  - *Given* both upstreams 500, *Then* one trace per client request with a 5xx `statusCode`, `attempts.length == 2`, and the client gets the error.
 - Client abort through the real server is already proven by Task 1.1.3k (week 1-2), not re-implemented here.
   - *Given* the Story 1.1.3 test `tests/trace_client_abort_e2e.rs` (fake upstream `Script::hang()`, raw client aborts after 200 ms), *Then* once Task 2.1.2b2 has landed it also asserts attempts exactly `[<upstream>/cancelled]` with `latencyMs > 0`; Story 5.1.1 only re-runs it as part of the full gate and adds no second copy. (`hang_after_headers()` belongs to the deferred Epic 6 first-byte tests.)
 - Catalog end to end.

@@ -604,3 +604,92 @@ pub async fn run_lag_monitor(metrics: Arc<MetricsCollector>) {
         sleep(Duration::from_millis(990)).await;
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Error rate per client request
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Error rate over finished traces, per client request (not per upstream attempt).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TraceErrorRate {
+    /// Routed and local traces that were not cancelled by the client.
+    pub requests: u64,
+    /// Of those, the ones with `status_code >= 400`.
+    pub errors: u64,
+    /// Client-closed (499) traces, reported apart from the rate.
+    pub cancelled: u64,
+    /// `errors / requests`, `0.0` for an empty window.
+    pub rate: f64,
+}
+
+/// Counts `status_code >= 400 && != 499` over routed and local traces. Cache hits are left
+/// out of the denominator (no upstream was tried) and cancelled requests are neither error
+/// nor success; unfinished entries (status 0) are skipped.
+#[must_use]
+pub fn trace_error_rate(traces: &[RequestDetail]) -> TraceErrorRate {
+    use crate::entrypoint::events::TraceKind;
+    const CANCELLED: u16 = 499;
+    let (mut requests, mut errors, mut cancelled) = (0_u64, 0_u64, 0_u64);
+    for trace in traces {
+        if trace.trace_kind == TraceKind::CacheHit || trace.status_code == 0 {
+            continue;
+        }
+        if trace.status_code == CANCELLED {
+            cancelled += 1;
+            continue;
+        }
+        requests += 1;
+        if trace.status_code >= 400 {
+            errors += 1;
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let rate = if requests == 0 {
+        0.0
+    } else {
+        errors as f64 / requests as f64
+    };
+    TraceErrorRate {
+        requests,
+        errors,
+        cancelled,
+        rate,
+    }
+}
+
+#[cfg(test)]
+mod error_rate_tests {
+    use super::*;
+    use crate::entrypoint::events::TraceKind;
+
+    fn trace(kind: TraceKind, status_code: u16) -> RequestDetail {
+        let mut detail =
+            RequestDetail::from_body("id".to_string(), false, 0, &serde_json::json!({}), None);
+        detail.trace_kind = kind;
+        detail.status_code = status_code;
+        detail
+    }
+
+    #[test]
+    fn error_rate_should_exclude_cache_hits_and_cancelled_from_numerator_and_denominator() {
+        let mut window: Vec<RequestDetail> =
+            (0..10).map(|_| trace(TraceKind::Routed, 200)).collect();
+        window.extend((0..2).map(|_| trace(TraceKind::CacheHit, 200)));
+        window.push(trace(TraceKind::Routed, 499));
+        window.push(trace(TraceKind::Routed, 503));
+
+        let rate = trace_error_rate(&window);
+
+        assert_eq!(rate.requests, 11);
+        assert_eq!(rate.errors, 1);
+        assert_eq!(rate.cancelled, 1);
+        assert!((rate.rate - 1.0 / 11.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn error_rate_should_count_local_traces_and_be_zero_for_an_empty_window() {
+        let rate = trace_error_rate(&[trace(TraceKind::Local, 502), trace(TraceKind::Local, 200)]);
+        assert_eq!((rate.requests, rate.errors), (2, 1));
+        assert!(trace_error_rate(&[]).rate.abs() < f64::EPSILON);
+    }
+}

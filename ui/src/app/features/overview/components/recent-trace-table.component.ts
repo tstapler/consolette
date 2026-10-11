@@ -16,12 +16,8 @@ export interface InspectRequest {
 
 const MIN_TARGET = 'min-width:24px;min-height:24px';
 
-/** Task 2.1.6f flips this off and deletes the note and its spec. */
-export const TRACE_COVERAGE_NOTE_ENABLED = true;
 const MAX_ROWS = 100;
 const DASH_LEGEND_LINE = '- = not applicable; hover a dash or open the legend for the reason';
-const COVERAGE_NOTE =
-  'Rows cover requests that reach routing. Requests rejected before routing, cache hits and multi-round search requests are not shown as one row yet.';
 
 interface Cell { text: string; reason: string | null; }
 
@@ -179,7 +175,6 @@ const NOT_RECORDED = 'n/a (not recorded)';
             <li *ngFor="let c of chipLegend"><span class="font-mono text-neutral-200">{{ c.chip }}</span> <span>{{ c.meaning }}</span></li>
           </ul>
         </div>
-        <p *ngIf="coverageNoteEnabled" data-coverage-note>${COVERAGE_NOTE}</p>
       </div>
       <div class="sr-only" role="status" aria-live="polite" data-copy-status>{{ copyMessage }}</div>
     </div>
@@ -208,7 +203,6 @@ export class RecentTraceTableComponent {
   public readonly skeletonRows = [0, 1, 2];
   public readonly reasonLegend = NA_REASON_TEXTS;
   public readonly chipLegend = CHIP_LEGEND;
-  public readonly coverageNoteEnabled = TRACE_COVERAGE_NOTE_ENABLED;
   public readonly proxyUrl = window.location.origin;
   private readonly warned = new Set<string>();
   private source: RequestTraceData[] = [];

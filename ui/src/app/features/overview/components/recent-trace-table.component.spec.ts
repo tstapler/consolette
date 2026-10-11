@@ -1,5 +1,5 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { RecentTraceTableComponent, TRACE_COVERAGE_NOTE_ENABLED } from './recent-trace-table.component';
+import { RecentTraceTableComponent } from './recent-trace-table.component';
 import { AttemptTraceData, RequestTraceData } from '../../../core/models/telemetry.models';
 import { CHIP_LEGEND, ROUTE_REASONS } from '../../../core/models/trace-labels';
 import { NA_REASON_TEXTS } from '../../../core/models/na-reason';
@@ -277,12 +277,6 @@ describe('RecentTraceTableComponent (TC-UNIT-17)', () => {
       const stops = r.querySelectorAll('button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
       expect(stops.length).toBeLessThanOrEqual(3);
     });
-  });
-
-  it('footer_should_show_coverage_note_in_epic_1_build_and_tests_should_assert_handler_400_has_no_trace_until_2_1_6b', () => {
-    expect(TRACE_COVERAGE_NOTE_ENABLED).toBeTrue();
-    render([success]);
-    expect(text(el)).toContain('Rows cover requests that reach routing. Requests rejected before routing, cache hits and multi-round search requests are not shown as one row yet.');
   });
 
   describe('route cell (Story 2.1.4)', () => {

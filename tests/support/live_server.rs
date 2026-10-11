@@ -27,20 +27,29 @@ impl Drop for LiveServer {
 impl LiveServer {
     /// Serves one route `default` over a single upstream at `upstream_base_url`.
     pub async fn start(upstream_base_url: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let conf_d = dir.path().join("conf.d");
-        std::fs::create_dir_all(&conf_d).unwrap();
-        std::fs::write(
-            conf_d.join("00-live.toml"),
-            format!(
-                r#"
-local_discovery = false
-health_check_interval_secs = 0
+        Self::start_config(&format!(
+            r#"
+{}
+[[routes]]
+name = "default"
+strategy = "fallback"
 
-[[upstreams]]
+[[routes.upstreams]]
 name = "fake"
+"#,
+            Self::anthropic_upstream("fake", upstream_base_url)
+        ))
+        .await
+    }
+
+    /// `[[upstreams]]` TOML block for an Anthropic-kind upstream with an inline key.
+    pub fn anthropic_upstream(name: &str, base_url: &str) -> String {
+        format!(
+            r#"
+[[upstreams]]
+name = "{name}"
 kind = "anthropic"
-base_url = "{upstream_base_url}"
+base_url = "{base_url}"
 
 [upstreams.auth]
 type = "apikey"
@@ -48,15 +57,38 @@ type = "apikey"
 [upstreams.auth.key]
 source = "inline"
 value = "sk-test"
-
-[[routes]]
-name = "default"
-strategy = "fallback"
-
-[[routes.upstreams]]
-name = "fake"
 "#
-            ),
+        )
+    }
+
+    /// `[[upstreams]]` TOML block for an OpenAI-kind upstream with an inline bearer token.
+    pub fn openai_upstream(name: &str, base_url: &str) -> String {
+        format!(
+            r#"
+[[upstreams]]
+name = "{name}"
+kind = "openai"
+base_url = "{base_url}"
+
+[upstreams.auth]
+type = "bearer"
+
+[upstreams.auth.token]
+source = "inline"
+value = "sk-test"
+"#
+        )
+    }
+
+    /// Serves the given `conf.d` TOML (upstreams, routes, extra tables); the
+    /// harness prepends `local_discovery = false` and `health_check_interval_secs = 0`.
+    pub async fn start_config(toml_body: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_d = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        std::fs::write(
+            conf_d.join("00-live.toml"),
+            format!("local_discovery = false\nhealth_check_interval_secs = 0\n{toml_body}"),
         )
         .unwrap();
         let config = consolette::config::load(dir.path()).unwrap();
@@ -73,6 +105,11 @@ name = "fake"
             task,
             _config_dir: dir,
         }
+    }
+
+    /// Directory holding `conf.d`, for tests that need to drop files beside the config.
+    pub fn config_dir(&self) -> &std::path::Path {
+        self._config_dir.path()
     }
 
     /// Opens the dashboard SSE stream and returns once response headers arrive
@@ -108,10 +145,18 @@ name = "fake"
 
     /// `GET /metrics` as JSON over a fresh connection.
     pub async fn metrics(&self) -> serde_json::Value {
+        self.request_json("GET", "/metrics").await
+    }
+
+    /// Bodyless `method path` over a fresh `Connection: close` socket; the body parsed as JSON.
+    pub async fn request_json(&self, method: &str, path: &str) -> serde_json::Value {
         let mut sock = TcpStream::connect(self.addr).await.unwrap();
-        sock.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        sock.write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
         let mut raw = String::new();
         sock.read_to_string(&mut raw).await.unwrap();
         let body = raw.split_once("\r\n\r\n").unwrap().1;
@@ -120,6 +165,53 @@ name = "fake"
         let end = body.rfind('}').unwrap();
         serde_json::from_str(&body[start..=end]).unwrap()
     }
+}
+
+/// Reads a response off `sock` until the server closes or `within` elapses;
+/// returns `(status, body)`. Chunked bodies are returned undecoded-but-JSON-extractable via
+/// [`response_json`].
+pub async fn read_response(sock: &mut TcpStream, within: Duration) -> (u16, String) {
+    let deadline = Instant::now() + within;
+    let mut raw = String::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+            let len = head.lines().find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap())
+            });
+            let chunked_done = head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+                && body.ends_with("0\r\n\r\n");
+            if len.is_some_and(|n| body.len() >= n) || chunked_done {
+                break;
+            }
+        }
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_else(|| panic!("response timed out; got so far: {raw}"));
+        match tokio::time::timeout(left, sock.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => raw.push_str(&String::from_utf8_lossy(&chunk[..n])),
+            Ok(_) => break,
+            Err(_) => panic!("response timed out; got so far: {raw}"),
+        }
+    }
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in: {raw}"));
+    (status, body.to_string())
+}
+
+/// Outermost JSON object in a (possibly chunk-framed) body.
+pub fn response_json(body: &str) -> serde_json::Value {
+    let start = body.find('{').unwrap();
+    let end = body.rfind('}').unwrap();
+    serde_json::from_str(&body[start..=end]).unwrap()
 }
 
 pub struct SseClient {

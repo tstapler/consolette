@@ -1,5 +1,6 @@
-//! Live check for Story 1.1.3 (Task 1.1.3g): a request to an unreachable
-//! upstream produces a trace row with a real 502/503 status, not an always-200.
+//! Request -> trace -> catalog end to end through the real server and fake upstreams
+//! (Story 5.1.1), plus the Story 1.1.3 live check (Task 1.1.3g): a request to an
+//! unreachable upstream produces a trace row with a real 502/503 status, not an always-200.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)] // test crate: a panic is the failure signal
 
@@ -7,8 +8,9 @@ mod support;
 
 use std::time::Duration;
 
-use support::fake_upstream::{FakeUpstream, Script};
-use support::live_server::LiveServer;
+use serde_json::{json, Value};
+use support::fake_upstream::{anthropic_message, FakeUpstream, Script, Step};
+use support::live_server::{read_response, response_json, LiveServer};
 use tokio::io::AsyncReadExt;
 
 #[tokio::test]
@@ -66,4 +68,165 @@ async fn sse_trace_should_arrive_within_100ms_of_response_completion_on_localhos
     assert_eq!(traces[0]["data"]["requestedModel"], "claude-sonnet-4");
     assert_eq!(traces[0]["data"]["routedProvider"], "fake");
     assert_eq!(traces[0]["data"]["attempts"][0]["outcome"], "ok");
+}
+
+const REPLY_WITHIN: Duration = Duration::from_secs(10);
+
+fn haiku_request() -> Value {
+    json!({
+        "model": "claude-haiku-4-5",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+}
+
+/// Sends `body` to `/v1/messages` and returns `(status, parsed JSON body)`.
+async fn send(server: &LiveServer, body: &Value) -> (u16, Value) {
+    let mut client = server.post_messages(body).await;
+    let (status, raw) = read_response(&mut client, REPLY_WITHIN).await;
+    (status, response_json(&raw))
+}
+
+/// `/metrics` `summary.total_requests`, which is the `requests_total` counter.
+async fn requests_total(server: &LiveServer) -> u64 {
+    server.metrics().await["summary"]["total_requests"]
+        .as_u64()
+        .unwrap()
+}
+
+fn two_upstream_route(a: &FakeUpstream, b: &FakeUpstream) -> String {
+    format!(
+        r#"{}{}
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "A"
+
+[[routes.upstreams]]
+name = "B"
+"#,
+        LiveServer::anthropic_upstream("A", &a.base_url()),
+        LiveServer::anthropic_upstream("B", &b.base_url()),
+    )
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn fallback_chain_should_emit_one_trace_routed_provider_B_reason_fallback_two_attempts_requests_total_plus_2(
+) {
+    let a = FakeUpstream::start(Script::sequence([Step::Status(529)])).await;
+    let b = FakeUpstream::start(Script::sequence([Step::Ok(anthropic_message())])).await;
+    let server = LiveServer::start_config(&two_upstream_route(&a, &b)).await;
+    let mut sse = server.open_sse().await;
+    let before = requests_total(&server).await;
+
+    let (status, _) = send(&server, &haiku_request()).await;
+
+    assert_eq!(status, 200);
+    let traces = sse
+        .request_traces(Duration::from_secs(5), Duration::from_millis(300))
+        .await;
+    assert_eq!(traces.len(), 1, "exactly one trace: {traces:?}");
+    let t = &traces[0]["data"];
+    assert_eq!(t["statusCode"], 200, "{t}");
+    assert_eq!(t["routedProvider"], "B", "{t}");
+    assert_eq!(t["routeReason"], "fallback", "{t}");
+    let attempts = t["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0]["upstream"], "A");
+    assert_eq!(
+        attempts[0]["outcome"], "rate_limited",
+        "529 maps to rate_limited"
+    );
+    // The provider folds 529 into its rate-limit error, so the attempt records 429, not 529.
+    assert_eq!(attempts[0]["status"], 429);
+    assert_eq!(attempts[0]["errorClass"], "rate_limited");
+    assert_eq!(
+        attempts[0]["errorMessage"],
+        "Upstream rate limit (HTTP 429)"
+    );
+    assert_eq!(attempts[1]["upstream"], "B");
+    assert_eq!(attempts[1]["outcome"], "ok");
+
+    let after = requests_total(&server).await;
+    assert_eq!(after - before, 2, "requests_total counts per attempt");
+    assert_eq!(server.state.metrics.get_recent_requests(10).len(), 1);
+}
+
+#[tokio::test]
+async fn total_failure_should_emit_one_5xx_trace_with_two_attempts_and_return_error_to_client() {
+    let a = FakeUpstream::start(Script::sequence([Step::Status(500)])).await;
+    let b = FakeUpstream::start(Script::sequence([Step::Status(500)])).await;
+    let server = LiveServer::start_config(&two_upstream_route(&a, &b)).await;
+    let mut sse = server.open_sse().await;
+
+    let (status, _) = send(&server, &haiku_request()).await;
+
+    assert!(status >= 500, "client must get the error, got {status}");
+    let traces = sse
+        .request_traces(Duration::from_secs(5), Duration::from_millis(300))
+        .await;
+    assert_eq!(traces.len(), 1, "one trace per client request: {traces:?}");
+    let t = &traces[0]["data"];
+    let trace_status = t["statusCode"].as_u64().unwrap();
+    assert!((500..600).contains(&trace_status), "{t}");
+    assert_eq!(u64::from(status), trace_status, "client and trace agree");
+    assert_eq!(t["attempts"].as_array().unwrap().len(), 2, "{t}");
+}
+
+#[tokio::test]
+async fn refresh_then_get_should_show_state_ok_with_fake_upstream_ids() {
+    let upstream = FakeUpstream::start(Script::models(["claude-fake-a", "claude-fake-b"])).await;
+    let server = LiveServer::start(&upstream.base_url()).await;
+
+    let ack = server
+        .request_json("POST", "/api/model-catalog/refresh")
+        .await;
+    assert_eq!(ack["upstreams"]["fake"]["state"], "loading", "{ack}");
+
+    // The refresh runs in the background; poll rather than sleep a fixed time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let entry = loop {
+        let catalog = server.request_json("GET", "/api/model-catalog").await;
+        let entry = catalog["upstreams"]["fake"].clone();
+        if entry["state"] == "ok" || std::time::Instant::now() > deadline {
+            break entry;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(entry["state"], "ok", "{entry}");
+    let ids: Vec<&str> = entry["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["claude-fake-a", "claude-fake-b"]);
+}
+
+/// REQ-1: the raw SSE frame carries camelCase keys and an `id`, never snake_case.
+#[tokio::test]
+async fn sse_frame_should_use_camel_case_keys_and_id_when_request_sent_through_running_server() {
+    let upstream = FakeUpstream::start(Script::models(Vec::<String>::new())).await;
+    let server = LiveServer::start(&upstream.base_url()).await;
+    let mut sse = server.open_sse().await;
+
+    let (status, _) = send(&server, &haiku_request()).await;
+    assert_eq!(status, 200);
+
+    let raw = sse
+        .collect_until(Duration::from_secs(5), "\"type\":\"RequestTrace\"")
+        .await;
+    let frame = raw
+        .lines()
+        .find(|l| l.starts_with("data:") && l.contains("RequestTrace"))
+        .unwrap_or_else(|| panic!("no RequestTrace frame in: {raw}"));
+    let data: Value = serde_json::from_str(frame.trim_start_matches("data:").trim()).unwrap();
+    assert!(data["data"]["requestId"].is_string(), "{frame}");
+    assert_eq!(data["data"]["id"], data["data"]["requestId"], "{frame}");
+    assert!(!frame.contains("request_id"), "{frame}");
+    assert!(!frame.contains("status_code"), "{frame}");
 }

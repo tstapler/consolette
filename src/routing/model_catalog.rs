@@ -644,11 +644,8 @@ pub fn classify(err: &ProviderError) -> CatalogError {
             "Upstream did not answer in time".to_string(),
         ),
         ProviderError::Upstream { status, .. } => classify_status(*status),
-        ProviderError::Validation(_, status) => (
-            CatalogErrorKind::Upstream,
-            Some(*status),
-            format!("Upstream rejected the request ({status})"),
-        ),
+        // Anthropic reports every 4xx (401/403/429 included) as `Validation`.
+        ProviderError::Validation(_, status) => classify_status(*status),
         ProviderError::ResponseShapeMismatch(_) => (
             CatalogErrorKind::UnexpectedResponse,
             None,
@@ -788,6 +785,22 @@ mod tests {
         entry.apply(RefreshResult::Failed(err), stamp(0));
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("SENTINEL"), "{json}");
+    }
+
+    #[test]
+    fn classify_should_treat_validation_401_and_403_as_auth_because_anthropic_maps_all_4xx_to_validation(
+    ) {
+        for status in [401, 403] {
+            let classified = classify(&ProviderError::Validation("SENTINEL".into(), status));
+
+            assert_eq!(classified.kind, CatalogErrorKind::Auth);
+            assert_eq!(classified.status, Some(status));
+            assert!(!classified.message.contains("SENTINEL"));
+        }
+        assert_eq!(
+            classify(&ProviderError::Validation("x".into(), 400)).kind,
+            CatalogErrorKind::Upstream
+        );
     }
 
     #[test]

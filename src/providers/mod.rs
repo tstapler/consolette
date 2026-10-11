@@ -161,6 +161,32 @@ impl ProviderError {
     }
 }
 
+impl From<&ProviderError> for crate::metrics::trace::AttemptErrorClass {
+    /// Closed class from the variant and status only; never reads error text.
+    fn from(err: &ProviderError) -> Self {
+        use crate::metrics::trace::AttemptErrorClass as C;
+        match err {
+            ProviderError::RateLimited | ProviderError::RateLimitedWithRetry { .. } => {
+                C::RateLimited
+            }
+            ProviderError::Timeout => C::Timeout,
+            ProviderError::Auth(_) => C::Auth,
+            ProviderError::Validation(..) | ProviderError::ModelUnsupported(_) => C::ClientError,
+            ProviderError::ResponseShapeMismatch(_) => C::BadResponse,
+            ProviderError::Upstream { status: 0, .. } => C::Unreachable,
+            ProviderError::Upstream {
+                status: 503 | 529, ..
+            } => C::Overloaded,
+            // `Exhausted` is never an attempt; mapped defensively.
+            ProviderError::Upstream {
+                status: 500..=599, ..
+            }
+            | ProviderError::Exhausted => C::ServerError,
+            ProviderError::Upstream { .. } => C::ClientError,
+        }
+    }
+}
+
 impl From<&ProviderError> for crate::metrics::trace::AttemptOutcome {
     /// Classifies an error as an attempt outcome; carries no response body.
     fn from(err: &ProviderError) -> Self {
@@ -1559,6 +1585,105 @@ mod tests {
             ProviderError::Exhausted => 7,
             ProviderError::ResponseShapeMismatch(_) => 8,
         }
+    }
+
+    fn upstream_err(status: u16) -> ProviderError {
+        ProviderError::Upstream {
+            status,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn attempt_error_class_should_map_every_provider_error_variant_and_status_per_glossary_table() {
+        use crate::metrics::trace::AttemptErrorClass as C;
+        let table: Vec<(ProviderError, C)> = vec![
+            (ProviderError::RateLimited, C::RateLimited),
+            (
+                ProviderError::RateLimitedWithRetry { retry_after: 30 },
+                C::RateLimited,
+            ),
+            (ProviderError::Auth("no".to_string()), C::Auth),
+            (
+                ProviderError::Validation("bad".to_string(), 422),
+                C::ClientError,
+            ),
+            (ProviderError::Timeout, C::Timeout),
+            (
+                ProviderError::ModelUnsupported("m".to_string()),
+                C::ClientError,
+            ),
+            (upstream_err(0), C::Unreachable),
+            (upstream_err(529), C::Overloaded),
+            (upstream_err(503), C::Overloaded),
+            (upstream_err(500), C::ServerError),
+            (upstream_err(502), C::ServerError),
+            (upstream_err(404), C::ClientError),
+            (ProviderError::Exhausted, C::ServerError),
+            (
+                ProviderError::ResponseShapeMismatch("x".to_string()),
+                C::BadResponse,
+            ),
+        ];
+        for (err, expected) in &table {
+            assert_eq!(C::from(err), *expected, "{err:?}");
+        }
+        let covered: std::collections::BTreeSet<usize> =
+            table.iter().map(|(e, _)| variant_slot(e)).collect();
+        assert_eq!(
+            covered.len(),
+            9,
+            "table must cover every ProviderError variant"
+        );
+    }
+
+    #[test]
+    fn attempt_trace_json_should_not_contain_sentinel_for_any_provider_error_variant_body_or_message(
+    ) {
+        use crate::entrypoint::events::AttemptTrace;
+        use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, AttemptRecord};
+        let errors = vec![
+            ProviderError::Upstream {
+                status: 500,
+                body: "sk-SENTINEL".to_string(),
+            },
+            ProviderError::Auth("sk-SENTINEL".to_string()),
+            ProviderError::Validation("sk-SENTINEL".to_string(), 422),
+            ProviderError::ResponseShapeMismatch("sk-SENTINEL".to_string()),
+            ProviderError::ModelUnsupported("sk-SENTINEL".to_string()),
+            ProviderError::Upstream {
+                status: 0,
+                body: "arn:aws:iam::123456789012:role/x".to_string(),
+            },
+        ];
+        for err in &errors {
+            let record = AttemptRecord {
+                iteration: 0,
+                upstream: "up".into(),
+                model: None,
+                outcome: AttemptOutcome::from(err),
+                error_class: Some(AttemptErrorClass::from(err)),
+                status: Some(err.trace_status()),
+                latency_ms: 3,
+            };
+            let json = serde_json::to_string(&AttemptTrace::from(&record)).unwrap();
+            assert!(!json.contains("SENTINEL"), "{err:?} leaked: {json}");
+            assert!(!json.contains("123456789012"), "{err:?} leaked: {json}");
+        }
+        let record = AttemptRecord {
+            iteration: 0,
+            upstream: "up".into(),
+            model: None,
+            outcome: AttemptOutcome::from(&errors[0]),
+            error_class: Some(AttemptErrorClass::from(&errors[0])),
+            status: Some(errors[0].trace_status()),
+            latency_ms: 3,
+        };
+        let json = serde_json::to_value(AttemptTrace::from(&record)).unwrap();
+        assert_eq!(json["outcome"], "upstream");
+        assert_eq!(json["status"], 500);
+        assert_eq!(json["errorClass"], "server_error");
+        assert_eq!(json["errorMessage"], "Upstream server error (HTTP 500)");
     }
 
     #[test]

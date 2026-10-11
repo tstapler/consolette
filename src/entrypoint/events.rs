@@ -13,6 +13,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use crate::entrypoint::EntrypointState;
+use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, AttemptRecord};
 use crate::metrics::RequestDetail;
 
 /// Wire contract is camelCase and pinned by `ui/src/testing/fixtures/sse/*.json` (ADR-001).
@@ -55,6 +56,62 @@ pub enum FirstByteState {
     Measured,
     EndedEmpty,
     ClientClosed,
+}
+
+/// Wire form of one upstream attempt. `error_message` comes from a fixed phrase per class plus
+/// the numeric status, so no upstream text can reach the event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptTrace {
+    pub iteration: u8,
+    pub upstream: String,
+    pub model: Option<String>,
+    pub outcome: AttemptOutcome,
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    pub error_class: Option<AttemptErrorClass>,
+    pub error_message: Option<String>,
+}
+
+/// Fixed phrase per class and whether the numeric status is appended.
+fn error_phrase(class: AttemptErrorClass) -> (&'static str, bool) {
+    match class {
+        AttemptErrorClass::Auth => ("Upstream rejected credentials", true),
+        AttemptErrorClass::RateLimited => ("Upstream rate limit", true),
+        AttemptErrorClass::Overloaded => ("Upstream overloaded", true),
+        AttemptErrorClass::Timeout => ("Upstream timed out", true),
+        AttemptErrorClass::ServerError => ("Upstream server error", true),
+        AttemptErrorClass::Unreachable => ("Upstream unreachable", false),
+        AttemptErrorClass::ClientError => ("Upstream rejected the request", true),
+        AttemptErrorClass::BadResponse => ("Upstream response not understood", true),
+        AttemptErrorClass::Shed => ("Skipped by admission control", false),
+        AttemptErrorClass::Cancelled => (
+            "Client closed the request before the upstream answered",
+            false,
+        ),
+    }
+}
+
+impl From<&AttemptRecord> for AttemptTrace {
+    fn from(record: &AttemptRecord) -> Self {
+        let error_message = record.error_class.map(|class| {
+            let (phrase, with_status) = error_phrase(class);
+            match record.status {
+                Some(status) if with_status => format!("{phrase} (HTTP {status})"),
+                _ => phrase.to_string(),
+            }
+        });
+        Self {
+            iteration: record.iteration,
+            upstream: record.upstream.to_string(),
+            model: record.model.clone(),
+            outcome: record.outcome,
+            status: record.status,
+            latency_ms: record.latency_ms,
+            error_class: record.error_class,
+            error_message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -384,5 +441,55 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&event_json(&event, true)).expect("json");
         assert_eq!(json, fixture_value("metrics-tick.json"));
+    }
+
+    #[test]
+    fn attempt_trace_should_serialize_outcome_status_error_class_and_fixed_phrase_message_with_nulls_for_ok_attempt(
+    ) {
+        use crate::metrics::trace::{AttemptErrorClass as C, AttemptOutcome as O, AttemptRecord};
+        let record = |outcome, error_class, status, latency_ms| AttemptRecord {
+            iteration: 0,
+            upstream: "anthropic".into(),
+            model: Some("claude-haiku-4-5".to_string()),
+            outcome,
+            error_class,
+            status,
+            latency_ms,
+        };
+        let failed = serde_json::to_value(AttemptTrace::from(&record(
+            O::Upstream,
+            Some(C::Overloaded),
+            Some(529),
+            120,
+        )))
+        .expect("serialize");
+        assert_eq!(
+            failed,
+            serde_json::json!({
+                "iteration": 0,
+                "upstream": "anthropic",
+                "model": "claude-haiku-4-5",
+                "outcome": "upstream",
+                "status": 529,
+                "latencyMs": 120,
+                "errorClass": "overloaded",
+                "errorMessage": "Upstream overloaded (HTTP 529)",
+            })
+        );
+        let ok = serde_json::to_value(AttemptTrace::from(&record(O::Ok, None, Some(200), 80)))
+            .expect("serialize");
+        assert!(ok["errorClass"].is_null() && ok["errorMessage"].is_null());
+        let shed =
+            serde_json::to_value(AttemptTrace::from(&record(O::Shed, Some(C::Shed), None, 0)))
+                .expect("serialize");
+        assert_eq!(shed["errorMessage"], "Skipped by admission control");
+        let unreachable = serde_json::to_value(AttemptTrace::from(&record(
+            O::Upstream,
+            Some(C::Unreachable),
+            Some(502),
+            5,
+        )))
+        .expect("serialize");
+        assert_eq!(unreachable["errorMessage"], "Upstream unreachable");
     }
 }

@@ -4,6 +4,7 @@
 pub mod counters;
 pub mod error_tracker;
 pub mod histogram;
+pub mod ids;
 pub mod trace;
 
 use std::collections::VecDeque;

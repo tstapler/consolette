@@ -12,7 +12,9 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use super::ids::UpstreamName;
 use super::{MetricsCollector, RequestDetail, RequestTimingUpdate, ScopeFinish};
+use crate::entrypoint::events::TraceKind;
 
 /// How one upstream attempt ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,15 +27,169 @@ pub enum AttemptOutcome {
     Validation,
     ShapeMismatch,
     Upstream,
+    Shed,
     Cancelled,
 }
 
-/// One upstream attempt of a request (minimal form; Epic 2 extends it).
+/// Closed, sanitized failure class of an attempt; derived from the error variant and status,
+/// never from error text, so it cannot carry upstream content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptErrorClass {
+    Auth,
+    RateLimited,
+    Overloaded,
+    Timeout,
+    ServerError,
+    Unreachable,
+    ClientError,
+    BadResponse,
+    Shed,
+    Cancelled,
+}
+
+/// One upstream attempt of a request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptRecord {
-    pub upstream: String,
+    pub iteration: u8,
+    pub upstream: UpstreamName,
+    pub model: Option<String>,
     pub outcome: AttemptOutcome,
+    /// `None` for an `Ok` attempt.
+    pub error_class: Option<AttemptErrorClass>,
+    pub status: Option<u16>,
     pub latency_ms: u64,
+}
+
+/// Most attempts kept per request; later ones are dropped and flagged.
+pub const MAX_ATTEMPTS: usize = 16;
+
+/// Bounded attempt list owned by one scope (mutated under `&mut`, no lock).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttemptLog {
+    records: Vec<AttemptRecord>,
+    truncated: bool,
+    iterations: u8,
+}
+
+impl AttemptLog {
+    pub fn push(&mut self, record: AttemptRecord) {
+        if self.records.len() < MAX_ATTEMPTS {
+            self.records.push(record);
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    #[must_use]
+    pub fn records(&self) -> &[AttemptRecord] {
+        &self.records
+    }
+
+    #[must_use]
+    pub fn iterations(&self) -> u8 {
+        self.iterations
+    }
+}
+
+/// Why the request went where it did; one row chip per request (ADR-004 item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteReason {
+    SessionPin,
+    /// Carries the `RoutingStrategy::name()` that chose the upstream.
+    Strategy(&'static str),
+    Exploration,
+    Fallback,
+    RateLimitHold,
+    Default,
+    Cache,
+    Local,
+}
+
+/// Plain values `RouteReason::for_request` decides from; no router or strategy types.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteInputs<'a> {
+    pub kind: TraceKind,
+    pub session_pinned: bool,
+    pub strategy_name: &'static str,
+    pub exploration: bool,
+    pub hold_retries: u8,
+    pub attempts: &'a [AttemptRecord],
+}
+
+/// The ordered `fallback` strategy (and an unnamed one) is the default route, not a decision.
+const DEFAULT_ROUTE_STRATEGY: &str = "fallback";
+
+impl RouteReason {
+    /// Precedence: Cache/Local > SessionPin > Exploration > Fallback > RateLimitHold > Strategy > Default.
+    #[must_use]
+    pub fn for_request(inputs: &RouteInputs<'_>) -> Self {
+        match inputs.kind {
+            TraceKind::CacheHit => return Self::Cache,
+            TraceKind::Local => return Self::Local,
+            TraceKind::Routed => {}
+        }
+        // Earlier attempts always failed or were shed, since the loop stops at the first success.
+        let followed_a_failure = inputs.attempts.len() > 1;
+        if inputs.session_pinned {
+            Self::SessionPin
+        } else if inputs.exploration {
+            Self::Exploration
+        } else if followed_a_failure {
+            Self::Fallback
+        } else if inputs.hold_retries > 0 {
+            Self::RateLimitHold
+        } else if inputs.strategy_name.is_empty() || inputs.strategy_name == DEFAULT_ROUTE_STRATEGY
+        {
+            Self::Default
+        } else {
+            Self::Strategy(inputs.strategy_name)
+        }
+    }
+
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::SessionPin => "session_pin",
+            Self::Strategy(_) => "strategy",
+            Self::Exploration => "exploration",
+            Self::Fallback => "fallback",
+            Self::RateLimitHold => "rate_limit_hold",
+            Self::Default => "default",
+            Self::Cache => "cache",
+            Self::Local => "local",
+        }
+    }
+
+    /// The strategy name, set only for [`Self::Strategy`].
+    #[must_use]
+    pub fn strategy(self) -> Option<&'static str> {
+        match self {
+            Self::Strategy(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for RouteReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire())
+    }
 }
 
 /// What a request ended with; carries the HTTP status of its terminal trace.
@@ -81,7 +237,7 @@ pub struct TraceScope {
     state: ScopeState,
     handler_returned: bool,
     started: Instant,
-    attempts: Vec<AttemptRecord>,
+    attempts: AttemptLog,
     provider: String,
     selected_model: Option<String>,
     selected_model_was_exploration: Option<bool>,
@@ -111,7 +267,7 @@ impl TraceScope {
             state: ScopeState::Active,
             handler_returned: false,
             started: Instant::now(),
-            attempts: Vec::new(),
+            attempts: AttemptLog::default(),
             provider: String::new(),
             selected_model: None,
             selected_model_was_exploration: None,
@@ -125,7 +281,7 @@ impl TraceScope {
 
     #[must_use]
     pub fn attempts(&self) -> &[AttemptRecord] {
-        &self.attempts
+        self.attempts.records()
     }
 
     /// Records the candidate just chosen; the last selection wins across retries.
@@ -229,6 +385,172 @@ impl Drop for TraceScope {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
+    fn attempt(upstream: &str, outcome: AttemptOutcome) -> AttemptRecord {
+        AttemptRecord {
+            iteration: 0,
+            upstream: upstream.into(),
+            model: None,
+            outcome,
+            error_class: None,
+            status: None,
+            latency_ms: 0,
+        }
+    }
+
+    #[test]
+    fn attempt_log_should_cap_at_16_keep_first_16_in_order_and_flag_truncation() {
+        let mut log = AttemptLog::default();
+        assert!(!log.truncated());
+        for i in 0..20_u64 {
+            let mut record = attempt("bedrock", AttemptOutcome::RateLimited);
+            record.status = Some(429);
+            record.latency_ms = i;
+            log.push(record);
+        }
+        assert_eq!(log.len(), 16);
+        assert!(log.truncated());
+        let latencies: Vec<u64> = log.records().iter().map(|r| r.latency_ms).collect();
+        assert_eq!(latencies, (0..16).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn attempt_log_should_never_exceed_16_entries_under_20_pushes() {
+        let mut log = AttemptLog::default();
+        for _ in 0..20 {
+            log.push(attempt("a", AttemptOutcome::Ok));
+            assert!(log.len() <= MAX_ATTEMPTS);
+        }
+        assert_eq!(MAX_ATTEMPTS, 16);
+    }
+
+    fn inputs(attempts: &[AttemptRecord]) -> RouteInputs<'_> {
+        RouteInputs {
+            kind: TraceKind::Routed,
+            session_pinned: false,
+            strategy_name: "weighted",
+            exploration: false,
+            hold_retries: 0,
+            attempts,
+        }
+    }
+
+    #[test]
+    fn route_reason_for_request_should_follow_precedence_cache_local_pin_explore_fallback_hold_strategy_default(
+    ) {
+        let ok = [attempt("a", AttemptOutcome::Ok)];
+        let failed_then_ok = [
+            attempt("a", AttemptOutcome::RateLimited),
+            attempt("b", AttemptOutcome::Ok),
+        ];
+        let shed_then_ok = [
+            attempt("a", AttemptOutcome::Shed),
+            attempt("b", AttemptOutcome::Ok),
+        ];
+        // Cache and Local beat everything else.
+        for (kind, want) in [
+            (TraceKind::CacheHit, RouteReason::Cache),
+            (TraceKind::Local, RouteReason::Local),
+        ] {
+            let all_flags = RouteInputs {
+                kind,
+                session_pinned: true,
+                exploration: true,
+                hold_retries: 2,
+                ..inputs(&failed_then_ok)
+            };
+            assert_eq!(RouteReason::for_request(&all_flags), want);
+        }
+        let pinned = RouteInputs {
+            session_pinned: true,
+            exploration: true,
+            ..inputs(&failed_then_ok)
+        };
+        assert_eq!(RouteReason::for_request(&pinned), RouteReason::SessionPin);
+        let exploring = RouteInputs {
+            exploration: true,
+            ..inputs(&failed_then_ok)
+        };
+        assert_eq!(
+            RouteReason::for_request(&exploring),
+            RouteReason::Exploration
+        );
+        assert_eq!(
+            RouteReason::for_request(&inputs(&failed_then_ok)),
+            RouteReason::Fallback
+        );
+        assert_eq!(
+            RouteReason::for_request(&inputs(&shed_then_ok)),
+            RouteReason::Fallback
+        );
+        // Hold with no failed attempt is exactly RateLimitHold; with one it is Fallback.
+        let held = RouteInputs {
+            hold_retries: 2,
+            ..inputs(&ok)
+        };
+        assert_eq!(RouteReason::for_request(&held), RouteReason::RateLimitHold);
+        let held_after_failure = RouteInputs {
+            hold_retries: 2,
+            ..inputs(&failed_then_ok)
+        };
+        assert_eq!(
+            RouteReason::for_request(&held_after_failure),
+            RouteReason::Fallback
+        );
+        // A single failed attempt has no successor, so it is not a fallback.
+        let lone_failure = [attempt("a", AttemptOutcome::Upstream)];
+        assert_eq!(
+            RouteReason::for_request(&inputs(&lone_failure)),
+            RouteReason::Strategy("weighted")
+        );
+        assert_eq!(
+            RouteReason::for_request(&inputs(&ok)),
+            RouteReason::Strategy("weighted")
+        );
+        // The ordered fallback strategy is the default route, an empty name too.
+        for name in ["fallback", ""] {
+            let ordered = RouteInputs {
+                strategy_name: name,
+                ..inputs(&ok)
+            };
+            assert_eq!(RouteReason::for_request(&ordered), RouteReason::Default);
+        }
+    }
+
+    /// Exhaustive on purpose: a new `RouteReason` variant fails to compile here.
+    fn expected_wire(reason: RouteReason) -> (&'static str, Option<&'static str>) {
+        match reason {
+            RouteReason::SessionPin => ("session_pin", None),
+            RouteReason::Strategy(name) => ("strategy", Some(name)),
+            RouteReason::Exploration => ("exploration", None),
+            RouteReason::Fallback => ("fallback", None),
+            RouteReason::RateLimitHold => ("rate_limit_hold", None),
+            RouteReason::Default => ("default", None),
+            RouteReason::Cache => ("cache", None),
+            RouteReason::Local => ("local", None),
+        }
+    }
+
+    #[test]
+    fn route_reason_should_serialize_to_exact_wire_strings_session_pin_strategy_exploration_fallback_rate_limit_hold_default_cache_local_via_exhaustive_helper(
+    ) {
+        let all = [
+            RouteReason::SessionPin,
+            RouteReason::Strategy("weighted"),
+            RouteReason::Exploration,
+            RouteReason::Fallback,
+            RouteReason::RateLimitHold,
+            RouteReason::Default,
+            RouteReason::Cache,
+            RouteReason::Local,
+        ];
+        for reason in all {
+            let (wire, strategy) = expected_wire(reason);
+            assert_eq!(serde_json::to_value(reason).unwrap(), wire);
+            assert_eq!(reason.wire(), wire);
+            assert_eq!(reason.strategy(), strategy);
+        }
+    }
+
     use super::*;
     use crate::entrypoint::events::{DashboardEvent, RequestTraceData};
 
@@ -303,11 +625,7 @@ mod tests {
     #[test]
     fn drop_should_emit_499_and_count_cancelled_when_unfinished_and_handler_not_returned() {
         let (metrics, mut rx, mut scope) = scope_with_events();
-        scope.record_attempt(AttemptRecord {
-            upstream: "a".into(),
-            outcome: AttemptOutcome::RateLimited,
-            latency_ms: 3,
-        });
+        scope.record_attempt(attempt("a", AttemptOutcome::RateLimited));
         drop(scope);
 
         let t = traces(&mut rx);
@@ -350,11 +668,7 @@ mod tests {
     #[test]
     fn unfinished_scope_should_keep_recorded_attempts_without_adding_cancelled_one() {
         let (_metrics, _rx, mut scope) = scope_with_events();
-        let failed = AttemptRecord {
-            upstream: "a".into(),
-            outcome: AttemptOutcome::Upstream,
-            latency_ms: 1,
-        };
+        let failed = attempt("a", AttemptOutcome::Upstream);
         scope.record_attempt(failed.clone());
         assert_eq!(scope.attempts(), [failed]);
     }
@@ -369,11 +683,7 @@ mod tests {
         let shared = tokio::sync::Mutex::new(scope);
         {
             let mut guard = shared.lock().await;
-            guard.record_attempt(AttemptRecord {
-                upstream: "round-1".into(),
-                outcome: AttemptOutcome::Upstream,
-                latency_ms: 1,
-            });
+            guard.record_attempt(attempt("round-1", AttemptOutcome::Upstream));
         }
         let _held = shared.lock().await;
         then.await
@@ -505,11 +815,7 @@ mod tests {
     ) {
         for panicking in [false, true] {
             let (metrics, mut rx, mut scope) = scope_with_events();
-            let attempt = AttemptRecord {
-                upstream: "a".into(),
-                outcome: AttemptOutcome::Timeout,
-                latency_ms: 9,
-            };
+            let attempt = attempt("a", AttemptOutcome::Timeout);
             scope.record_attempt(attempt.clone());
             let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen_in = std::sync::Arc::clone(&seen);

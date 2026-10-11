@@ -18,7 +18,9 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
-use crate::metrics::trace::{AttemptOutcome, AttemptRecord, RequestOutcome, TraceScope};
+use crate::metrics::trace::{
+    AttemptErrorClass, AttemptOutcome, AttemptRecord, RequestOutcome, TraceScope,
+};
 use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
@@ -1120,8 +1122,12 @@ fn attempt_record(
     error: Option<&ProviderError>,
 ) -> AttemptRecord {
     AttemptRecord {
-        upstream: chosen.name.clone(),
+        iteration: 0,
+        upstream: chosen.name.as_str().into(),
+        model: chosen.model.clone(),
         outcome: error.map_or(AttemptOutcome::Ok, AttemptOutcome::from),
+        error_class: error.map(AttemptErrorClass::from),
+        status: error.map(ProviderError::trace_status),
         latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }
 }

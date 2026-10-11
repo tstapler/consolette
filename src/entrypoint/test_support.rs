@@ -78,5 +78,9 @@ pub(crate) async fn state_with_router(
         web_ui: crate::config::schema::WebUiMode::Angular,
         compat_snake_case: false,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),
+        catalog: crate::routing::model_catalog::ModelCatalog::new(
+            crate::config::schema::ModelCatalogConfig::default(),
+            None,
+        ),
     }
 }

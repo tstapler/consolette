@@ -143,6 +143,12 @@ impl SseClient {
         true
     }
 
+    /// Reads until `needle` appears (or `within` elapses) and returns every byte received so far.
+    pub async fn collect_until(&mut self, within: Duration, needle: &str) -> String {
+        let _ = self.read_until(within, |b| b.contains(needle)).await;
+        self.buf.clone()
+    }
+
     /// Waits up to `within` for the first `RequestTrace` payload and returns it,
     /// then keeps listening `settle` longer to collect any extra traces.
     pub async fn request_traces(

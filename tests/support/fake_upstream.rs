@@ -32,12 +32,16 @@ pub enum Step {
     Stream(Vec<String>, Duration),
     /// Wait `Duration` before sending the inner step's headers.
     Delayed(Duration, Box<Step>),
+    /// Status with a verbatim plain-text body (to plant secret sentinels in error bodies).
+    StatusBody(u16, String),
 }
 
 #[derive(Clone, Debug)]
 pub struct Script {
     steps: Vec<Step>,
     models: Vec<String>,
+    /// When set, `GET /v1/models` renders this step instead of the model list.
+    models_step: Option<Step>,
 }
 
 /// Result of [`Script::delay_headers`]; finish with [`DelayedHeaders::then`].
@@ -54,6 +58,7 @@ impl Script {
         Self {
             steps: steps.into_iter().collect(),
             models: Vec::new(),
+            models_step: None,
         }
     }
 
@@ -69,7 +74,14 @@ impl Script {
         Self {
             steps: vec![Step::Ok(anthropic_message())],
             models: ids.into_iter().map(Into::into).collect(),
+            models_step: None,
         }
+    }
+
+    /// Makes `GET /v1/models` behave as `step` (hang, error status, ...).
+    pub fn with_models_step(mut self, step: Step) -> Self {
+        self.models_step = Some(step);
+        self
     }
 
     pub fn stream_chunks<S: Into<String>>(
@@ -117,6 +129,7 @@ struct Shared {
 struct AppState {
     shared: Arc<Mutex<Shared>>,
     models: Arc<Vec<String>>,
+    models_step: Arc<Option<Step>>,
 }
 
 pub struct FakeUpstream {
@@ -145,6 +158,7 @@ impl FakeUpstream {
         let state = AppState {
             shared: shared.clone(),
             models: Arc::new(script.models),
+            models_step: Arc::new(script.models_step),
         };
         let app = Router::new().fallback(handle).with_state(state);
         let task = tokio::spawn(async move {
@@ -213,6 +227,9 @@ async fn handle(State(state): State<AppState>, req: Request<Body>) -> Response {
     record(&state.shared, &parts.headers, &bytes);
 
     if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
+        if let Some(step) = state.models_step.as_ref() {
+            return render(step.clone()).await;
+        }
         let data: Vec<Value> = state
             .models
             .iter()
@@ -256,6 +273,10 @@ async fn render(step: Step) -> Response {
             json_response(s, &error_body(code), Some(secs))
         }
         Step::Ok(v) => json_response(StatusCode::OK, &v, None),
+        Step::StatusBody(code, text) => Response::builder()
+            .status(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+            .body(Body::from(text))
+            .expect("response"),
         Step::Hang => std::future::pending().await,
         Step::HangAfterHeaders => Response::builder()
             .status(StatusCode::OK)

@@ -15,6 +15,7 @@ pub mod errors;
 pub mod events;
 pub mod landing;
 pub mod messages;
+pub mod models;
 pub mod observability;
 pub mod openai_stream;
 #[cfg(test)]
@@ -36,6 +37,7 @@ use crate::cost_metrics::tracker::CostTracker;
 use crate::memory::cache::ResponseCache;
 use crate::metrics::MetricsCollector;
 use crate::routing::capability::{CapabilityCache, EVAL_TTL_SECS};
+use crate::routing::model_catalog::{run_refresh_loop, ModelCatalog};
 use crate::routing::router::Router as DispatchRouter;
 use crate::routing::session_overrides::SessionOverrideStore;
 use crate::server_tools::{McpSearchPool, ServerToolsRuntime};
@@ -110,6 +112,9 @@ pub struct EntrypointState {
     pub compat_snake_case: bool,
     /// Thread-safe lock for atomic configuration updates and disk persistence.
     pub config_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Cached per-upstream model lists (`GET /api/model-catalog`); refreshed only on request
+    /// unless `[model_catalog]` opts into a timer.
+    pub catalog: Arc<ModelCatalog>,
 }
 
 impl EntrypointState {
@@ -165,6 +170,7 @@ impl EntrypointState {
         )?);
         let (event_tx, _) = tokio::sync::broadcast::channel(1024);
         metrics.set_event_tx(event_tx.clone());
+        let catalog = build_model_catalog(config, &dispatch_router, &event_tx);
 
         let ticker_tx = event_tx.clone();
         let ticker_metrics = Arc::clone(&metrics);
@@ -253,8 +259,55 @@ impl EntrypointState {
             web_ui: config.web_ui,
             compat_snake_case: config.compat_snake_case,
             config_lock: Arc::new(tokio::sync::Mutex::new(())),
+            catalog,
         })
     }
+}
+
+/// Seeds the catalog with the router's upstreams (all `Loading`, no call made) and, only if
+/// `[model_catalog]` opts into `interval`, starts the timer.
+fn build_model_catalog(
+    config: &Config,
+    dispatch_router: &Arc<ArcSwap<DispatchRouter>>,
+    event_tx: &tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
+) -> Arc<ModelCatalog> {
+    let notify_tx = event_tx.clone();
+    let catalog = ModelCatalog::new(
+        config.model_catalog.clone(),
+        Some(Arc::new(move |upstream| {
+            let _ = notify_tx.send(
+                crate::entrypoint::events::DashboardEvent::ModelCatalogChanged(
+                    crate::entrypoint::events::ModelCatalogChangedData {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        upstream: upstream.to_string(),
+                    },
+                ),
+            );
+        })),
+    );
+    let names: Vec<_> = dispatch_router
+        .load()
+        .providers_named()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    catalog.prune(&names);
+    if let crate::config::schema::CatalogRefreshMode::Interval { secs } =
+        config.model_catalog.refresh_mode()
+    {
+        let router = Arc::downgrade(dispatch_router);
+        tokio::spawn(run_refresh_loop(
+            Arc::downgrade(&catalog),
+            secs,
+            move || {
+                router
+                    .upgrade()
+                    .map(|r| r.load().providers_named())
+                    .unwrap_or_default()
+            },
+        ));
+    }
+    catalog
 }
 
 /// Builds the axum `Router` exposing the landing page and the entrypoint
@@ -329,6 +382,14 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             axum::routing::get(observability::get_request_body),
         )
         .route("/api/models", axum::routing::get(api::get_models))
+        .route(
+            "/api/model-catalog",
+            axum::routing::get(models::get_model_catalog),
+        )
+        .route(
+            "/api/model-catalog/refresh",
+            axum::routing::post(models::post_model_catalog_refresh),
+        )
         .route(
             "/api/route",
             axum::routing::get(api::get_route).post(api::post_route),

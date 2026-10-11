@@ -26,6 +26,7 @@ pub async fn get_metrics(State(state): State<EntrypointState>) -> impl IntoRespo
     result["cooldowns"] = state.dispatch_router.load().cooldown_snapshot();
     result["capability"] = state.dispatch_router.load().capability_snapshot();
     result["response_cache"] = state.response_cache.stats_json();
+    result["model_catalog"] = state.catalog.stats_json();
     // Story 5.1.2: present only for a route whose strategy overrides
     // `observability_snapshot()` (currently just `OpenrouterScoringStrategy`)
     // — omitted entirely (not `null`) otherwise.

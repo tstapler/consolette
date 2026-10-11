@@ -40,11 +40,11 @@ import { InspectDrawerComponent } from './components/inspect-drawer.component';
       <!-- KPI Summary Cards Grid -->
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <app-metric-kpi-card
-          title="Requests Per Min"
+          title="Upstream Attempts Per Min"
           [value]="metricsStore.rpm()"
-          unit="RPM"
+          unit="attempts/min"
           formatType="number"
-          subtitle="Real-time proxy throughput"
+          subtitle="Counts every upstream attempt, not client requests"
         ></app-metric-kpi-card>
 
         <app-metric-kpi-card

@@ -36,6 +36,13 @@ describe('OverviewDashboardComponent', () => {
     fixture.detectChanges();
   });
 
+  it('labels the /metrics-derived rate as upstream attempts, not client requests', () => {
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Upstream Attempts Per Min');
+    expect(text).toContain('Counts every upstream attempt, not client requests');
+    expect(text).not.toContain('Requests Per Min');
+  });
+
   it('should create the component', () => {
     expect(component).toBeTruthy();
   });

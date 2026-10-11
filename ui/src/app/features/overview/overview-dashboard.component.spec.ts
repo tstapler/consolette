@@ -70,4 +70,21 @@ describe('OverviewDashboardComponent', () => {
     expect(compiled.textContent).toContain('150ms');
     expect(compiled.textContent).toContain('35.5%');
   });
+
+  it('Inspect opens the in-page drawer for that trace instead of navigating to sessions', () => {
+    component.metricsStore.handleDashboardEvent({
+      type: 'RequestTrace',
+      data: {
+        id: 'req_1', requestId: 'req_1', timestamp: '2026-10-10T18:09:53+00:00', provider: 'anthropic', model: 'm',
+        timeToHeadersMs: 5, firstByteMs: null, totalMs: null, tokensBefore: 10, tokensAfter: null,
+        compressionStatus: 'off', stream: false, traceKind: 'routed', statusCode: 200, traceRevision: 0,
+      },
+    });
+    fixture.detectChanges();
+    const el = fixture.nativeElement as HTMLElement;
+    (el.querySelector('button[data-inspect]') as HTMLButtonElement).click();
+    fixture.detectChanges();
+    expect(el.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(document.activeElement?.id).toBe('inspect-drawer-heading');
+  });
 });

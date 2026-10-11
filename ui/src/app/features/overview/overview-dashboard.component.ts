@@ -1,12 +1,11 @@
 import { Component, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { Router } from '@angular/router';
 import { MetricsStore } from '../../core/stores/metrics.store';
 import { MetricKpiCardComponent } from './components/metric-kpi-card.component';
 import { ProviderHealthGridComponent } from './components/provider-health-grid.component';
 import { RpmTrendChartComponent } from './components/rpm-trend-chart.component';
 import { RecentTraceTableComponent } from './components/recent-trace-table.component';
-import { RequestTraceData } from '../../core/models/telemetry.models';
+import { InspectDrawerComponent } from './components/inspect-drawer.component';
 
 @Component({
   selector: 'app-overview-dashboard',
@@ -16,7 +15,8 @@ import { RequestTraceData } from '../../core/models/telemetry.models';
     MetricKpiCardComponent,
     ProviderHealthGridComponent,
     RpmTrendChartComponent,
-    RecentTraceTableComponent
+    RecentTraceTableComponent,
+    InspectDrawerComponent
   ],
   template: `
     <div class="space-y-6">
@@ -88,18 +88,13 @@ import { RequestTraceData } from '../../core/models/telemetry.models';
         [traces]="metricsStore.recentTraces()"
         [connectionStatus]="metricsStore.connectionStatus()"
         [retryAttempt]="metricsStore.retryCount()"
-        (inspectPayload)="onInspectTrace($event)"
+        (inspect)="drawer.open($event.trace, $event.origin, $event.scrollToAttempts)"
       ></app-recent-trace-table>
+
+      <app-inspect-drawer #drawer [traces]="metricsStore.recentTraces()"></app-inspect-drawer>
     </div>
   `
 })
 export class OverviewDashboardComponent {
   public readonly metricsStore = inject(MetricsStore);
-  private readonly router = inject(Router, { optional: true });
-
-  public onInspectTrace(trace: RequestTraceData): void {
-    if (this.router) {
-      this.router.navigate(['/sessions'], { queryParams: { requestId: trace.requestId || trace.id } });
-    }
-  }
 }

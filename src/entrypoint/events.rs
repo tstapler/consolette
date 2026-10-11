@@ -217,6 +217,15 @@ pub struct ConfigChangedData {
     pub strategy: String,
 }
 
+/// One upstream's catalog entry changed (a refresh finished); the UI refetches
+/// `GET /api/model-catalog`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogChangedData {
+    pub timestamp: String,
+    pub upstream: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 // Short-lived broadcast items; boxing `RequestTrace` would ripple through every consumer for no gain.
@@ -226,6 +235,7 @@ pub enum DashboardEvent {
     RequestTrace(RequestTraceData),
     ErrorLogged(ErrorLoggedData),
     ConfigChanged(ConfigChangedData),
+    ModelCatalogChanged(ModelCatalogChangedData),
 }
 
 /// Legacy snake_case key -> camelCase source key, for the one-release `compat_snake_case` rollback.
@@ -426,6 +436,24 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_changed_should_serialize_camel_case_with_type_envelope() {
+        let event = DashboardEvent::ModelCatalogChanged(ModelCatalogChangedData {
+            timestamp: "2026-10-10T18:10:03.000000+00:00".to_string(),
+            upstream: "bedrock".to_string(),
+        });
+
+        let json: serde_json::Value = serde_json::from_str(&event_json(&event, false)).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "ModelCatalogChanged",
+                "data": {"timestamp": "2026-10-10T18:10:03.000000+00:00", "upstream": "bedrock"}
+            })
+        );
+    }
+
+    #[test]
     fn every_dashboard_event_variant_should_serialize_non_empty_json_with_type_tag() {
         let events = [
             DashboardEvent::MetricsTick(MetricsTickData {
@@ -448,6 +476,10 @@ mod tests {
                 timestamp: String::new(),
                 route_name: String::new(),
                 strategy: String::new(),
+            }),
+            DashboardEvent::ModelCatalogChanged(ModelCatalogChangedData {
+                timestamp: String::new(),
+                upstream: String::new(),
             }),
         ];
         for event in &events {

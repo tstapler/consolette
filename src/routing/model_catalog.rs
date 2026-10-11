@@ -6,11 +6,19 @@
 //! reaches the browser is a kind, a status and a fixed phrase; upstream bodies
 //! (which can echo keys or account ARNs) are logged at `debug` only.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::providers::{ModelInfo, ProviderError};
+use crate::config::schema::{CatalogRefreshMode, ModelCatalogConfig};
+use crate::metrics::ids::UpstreamName;
+use crate::providers::{ModelInfo, Provider, ProviderError};
 
 /// Most ids sent per upstream; the rest are counted in `total_count`.
 pub const MAX_MODELS_SENT: usize = 1000;
@@ -158,6 +166,404 @@ impl UpstreamModels {
                 self.error = Some(classify(&err));
             }
         }
+    }
+}
+
+/// Hard stop for one upstream's `list_models` call.
+pub const PER_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+/// Minimum gap between manual refreshes of one upstream.
+pub const MANUAL_THROTTLE: Duration = Duration::from_secs(10);
+
+pub type NamedProvider = (UpstreamName, Arc<dyn Provider>);
+/// Called once per finished refresh, after the in-flight guard is released.
+pub type Notifier = Arc<dyn Fn(&UpstreamName) + Send + Sync>;
+
+/// What asked for a refresh; decides which skip rules apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// A click: bypasses the retry floor, auth backoff and staleness, not the throttle.
+    Manual,
+    /// `?ifStale=true`: only `Loading` or old entries, subject to floor and backoff.
+    IfStale,
+    /// The opt-in timer: every upstream, subject to floor and backoff.
+    Interval,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Target<'a> {
+    All,
+    One(&'a UpstreamName),
+}
+
+/// Response fields every refresh request carries next to the snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshAck {
+    pub refreshing: bool,
+    pub coalesced: bool,
+    pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnknownUpstream;
+
+/// The ack plus the background batch (awaited by tests, dropped by handlers).
+pub struct RefreshStarted {
+    pub ack: RefreshAck,
+    pub task: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogSnapshot {
+    pub upstreams: BTreeMap<String, UpstreamModels>,
+}
+
+struct State {
+    current: Vec<UpstreamName>,
+    entries: HashMap<UpstreamName, UpstreamModels>,
+}
+
+/// Marks one upstream as refreshing for exactly as long as it lives, so a
+/// panic or an aborted task can never leave the flag stuck.
+struct InFlight {
+    name: UpstreamName,
+    set: Arc<Mutex<HashSet<UpstreamName>>>,
+}
+
+impl InFlight {
+    fn claim(set: &Arc<Mutex<HashSet<UpstreamName>>>, name: &UpstreamName) -> Option<Self> {
+        lock(set).insert(name.clone()).then(|| Self {
+            name: name.clone(),
+            set: Arc::clone(set),
+        })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        lock(&self.set).remove(&self.name);
+    }
+}
+
+/// Aborts the wrapped task when dropped, so a timed-out or cancelled
+/// `list_models` call cannot keep running detached.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+enum Decision {
+    Start,
+    Skip,
+    Throttled(u64),
+}
+
+pub struct ModelCatalog {
+    settings: ModelCatalogConfig,
+    mode: CatalogRefreshMode,
+    state: Mutex<State>,
+    in_flight: Arc<Mutex<HashSet<UpstreamName>>>,
+    coalesced_total: AtomicU64,
+    notifier: Option<Notifier>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whole seconds, rounded up.
+fn ceil_secs(d: Duration) -> u64 {
+    d.as_secs() + u64::from(d.subsec_nanos() > 0)
+}
+
+impl ModelCatalog {
+    #[must_use]
+    pub fn new(settings: ModelCatalogConfig, notifier: Option<Notifier>) -> Arc<Self> {
+        let mode = settings.refresh_mode();
+        Arc::new(Self {
+            settings,
+            mode,
+            state: Mutex::new(State {
+                current: Vec::new(),
+                entries: HashMap::new(),
+            }),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            coalesced_total: AtomicU64::new(0),
+            notifier,
+        })
+    }
+
+    /// Makes `names` the current upstream set: removes the rest, adds
+    /// `Loading` entries for new ones. A refresh still running for a removed
+    /// name cannot resurrect it (`apply_result` checks `current`).
+    pub fn prune(&self, names: &[UpstreamName]) {
+        let mut state = lock(&self.state);
+        state.entries.retain(|name, _| names.contains(name));
+        for name in names {
+            state
+                .entries
+                .entry(name.clone())
+                .or_insert_with(UpstreamModels::loading);
+        }
+        state.current = names.to_vec();
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> CatalogSnapshot {
+        let in_flight = lock(&self.in_flight).clone();
+        let state = lock(&self.state);
+        let upstreams = state
+            .current
+            .iter()
+            .filter_map(|name| {
+                let mut entry = state.entries.get(name)?.clone();
+                entry.refreshing = in_flight.contains(name);
+                Some((name.to_string(), entry))
+            })
+            .collect();
+        CatalogSnapshot { upstreams }
+    }
+
+    #[must_use]
+    pub fn coalesced_total(&self) -> u64 {
+        self.coalesced_total.load(Ordering::Relaxed)
+    }
+
+    /// Counter and per-upstream summary for `GET /metrics`.
+    #[must_use]
+    pub fn stats_json(&self) -> serde_json::Value {
+        let upstreams: serde_json::Map<String, serde_json::Value> = self
+            .snapshot()
+            .upstreams
+            .into_iter()
+            .map(|(name, entry)| {
+                let summary = serde_json::json!({
+                    "state": entry.state,
+                    "refreshedAt": entry.refreshed_at,
+                    "errorKind": entry.error.map(|e| e.kind),
+                });
+                (name, summary)
+            })
+            .collect();
+        serde_json::json!({
+            "catalog_refresh_coalesced_total": self.coalesced_total(),
+            "upstreams": upstreams,
+        })
+    }
+
+    fn decide(&self, entry: &UpstreamModels, trigger: Trigger, now: Instant) -> Decision {
+        let since_attempt = entry
+            .last_attempt
+            .map(|at| now.saturating_duration_since(at));
+        if trigger == Trigger::Manual {
+            return match since_attempt {
+                Some(elapsed) if elapsed < MANUAL_THROTTLE => {
+                    Decision::Throttled(ceil_secs(MANUAL_THROTTLE - elapsed))
+                }
+                _ => Decision::Start,
+            };
+        }
+        let auth_failed = entry
+            .error
+            .as_ref()
+            .is_some_and(|e| e.kind == CatalogErrorKind::Auth);
+        let floor = Duration::from_secs(self.settings.min_retry_secs);
+        if auth_failed
+            || entry.state == CatalogState::Unsupported
+            || since_attempt.is_some_and(|elapsed| elapsed < floor)
+        {
+            return Decision::Skip;
+        }
+        let fresh = trigger == Trigger::IfStale
+            && entry.state == CatalogState::Ok
+            && entry.last_success.is_some_and(|at| {
+                now.saturating_duration_since(at)
+                    <= Duration::from_secs(self.settings.stale_after_secs)
+            });
+        if fresh {
+            Decision::Skip
+        } else {
+            Decision::Start
+        }
+    }
+
+    /// Decides per targeted upstream (start / coalesce / throttle / skip) and
+    /// starts one background batch for the ones to run.
+    ///
+    /// # Errors
+    ///
+    /// `UnknownUpstream` when `target` names an upstream not in `providers`.
+    pub fn request_refresh(
+        self: &Arc<Self>,
+        providers: &[NamedProvider],
+        target: Target<'_>,
+        trigger: Trigger,
+    ) -> Result<RefreshStarted, UnknownUpstream> {
+        let targets: Vec<&NamedProvider> = match target {
+            Target::All => providers.iter().collect(),
+            Target::One(wanted) => providers.iter().filter(|(n, _)| n == wanted).collect(),
+        };
+        if targets.is_empty() && matches!(target, Target::One(_)) {
+            return Err(UnknownUpstream);
+        }
+        let automatic_ignored = self.mode == CatalogRefreshMode::Off && trigger != Trigger::Manual;
+        let now = Instant::now();
+        let mut started = Vec::new();
+        let mut already_running = 0usize;
+        let mut retry_after: Option<u64> = None;
+        for (name, provider) in targets {
+            if lock(&self.in_flight).contains(name) {
+                already_running += 1;
+                continue;
+            }
+            if automatic_ignored {
+                continue;
+            }
+            let decision = match lock(&self.state).entries.get(name) {
+                Some(entry) => self.decide(entry, trigger, now),
+                None => continue,
+            };
+            match decision {
+                Decision::Skip => {}
+                Decision::Throttled(secs) => {
+                    retry_after = Some(retry_after.map_or(secs, |prev| prev.min(secs)));
+                }
+                Decision::Start => match InFlight::claim(&self.in_flight, name) {
+                    Some(guard) => started.push((name.clone(), Arc::clone(provider), guard)),
+                    None => already_running += 1,
+                },
+            }
+        }
+        let coalesced = started.is_empty() && already_running > 0;
+        if coalesced {
+            self.coalesced_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let ack = RefreshAck {
+            refreshing: !started.is_empty() || already_running > 0,
+            coalesced,
+            retry_after_secs: retry_after,
+        };
+        let task = (!started.is_empty()).then(|| tokio::spawn(Arc::clone(self).run_batch(started)));
+        Ok(RefreshStarted { ack, task })
+    }
+
+    /// Manual refresh of every upstream, awaited to completion.
+    pub async fn refresh_all(self: &Arc<Self>, providers: &[NamedProvider]) -> RefreshAck {
+        let Ok(started) = self.request_refresh(providers, Target::All, Trigger::Manual) else {
+            return RefreshAck::default();
+        };
+        if let Some(task) = started.task {
+            let _ = task.await;
+        }
+        started.ack
+    }
+
+    async fn run_batch(self: Arc<Self>, started: Vec<(UpstreamName, Arc<dyn Provider>, InFlight)>) {
+        let mut set = tokio::task::JoinSet::new();
+        for (name, provider, guard) in started {
+            set.spawn(Arc::clone(&self).run_one(name, provider, guard));
+        }
+        while set.join_next().await.is_some() {}
+    }
+
+    async fn run_one(
+        self: Arc<Self>,
+        name: UpstreamName,
+        provider: Arc<dyn Provider>,
+        guard: InFlight,
+    ) {
+        let began = Instant::now();
+        let result = match list_with_timeout(provider, PER_UPSTREAM_TIMEOUT).await {
+            Ok(models) => RefreshResult::Models(models),
+            Err(err) => RefreshResult::Failed(err),
+        };
+        let duration_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        log_refresh(&name, &result, duration_ms);
+        self.apply_result(&name, result, Stamp::now());
+        drop(guard);
+        if let Some(notify) = &self.notifier {
+            notify(&name);
+        }
+    }
+
+    /// Writes `result` only while `name` is still a current upstream (the
+    /// check and the write share one lock, so a prune cannot interleave).
+    fn apply_result(&self, name: &UpstreamName, result: RefreshResult, at: Stamp) -> bool {
+        let mut state = lock(&self.state);
+        if !state.current.contains(name) {
+            return false;
+        }
+        state.entries.get_mut(name).is_some_and(|entry| {
+            entry.apply(result, at);
+            true
+        })
+    }
+}
+
+/// Exactly one log line per refresh; never model ids or error text.
+fn log_refresh(name: &UpstreamName, result: &RefreshResult, duration_ms: u64) {
+    match result {
+        RefreshResult::Models(models) => tracing::info!(
+            upstream = %name,
+            outcome = "ok",
+            model_count = models.len(),
+            duration_ms,
+            "model catalog refreshed"
+        ),
+        RefreshResult::Failed(ProviderError::ModelUnsupported(_)) => tracing::info!(
+            upstream = %name,
+            outcome = "unsupported",
+            duration_ms,
+            "model catalog refresh: listing unsupported"
+        ),
+        RefreshResult::Failed(err) => {
+            let classified = classify(err);
+            tracing::warn!(
+                upstream = %name,
+                outcome = "error",
+                kind = ?classified.kind,
+                status = ?classified.status,
+                duration_ms,
+                "model catalog refresh failed"
+            );
+        }
+    }
+}
+
+/// Runs `list_models` in its own task so a panic is contained and a timeout
+/// really stops the call.
+async fn list_with_timeout(
+    provider: Arc<dyn Provider>,
+    limit: Duration,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let mut task = AbortOnDrop(tokio::spawn(async move { provider.list_models().await }));
+    match tokio::time::timeout(limit, &mut task.0).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ProviderError::Upstream {
+            status: 0,
+            body: "list_models task failed".to_string(),
+        }),
+        Err(_) => Err(ProviderError::Timeout),
+    }
+}
+
+/// Opt-in timer: one `Interval` refresh every `secs`, starting immediately,
+/// until the catalog is dropped.
+pub async fn run_refresh_loop(
+    catalog: std::sync::Weak<ModelCatalog>,
+    secs: u64,
+    providers: impl Fn() -> Vec<NamedProvider> + Send + 'static,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let Some(catalog) = catalog.upgrade() else {
+            return;
+        };
+        let _ = catalog.request_refresh(&providers(), Target::All, Trigger::Interval);
     }
 }
 
@@ -382,5 +788,537 @@ mod tests {
                 "{json}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+// Test names are pre-designed in validation.md and keep `ifStale`/`lastAttemptAt` verbatim.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    non_snake_case
+)]
+mod refresh_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::config::schema::CatalogRefreshSetting;
+
+    #[derive(Clone)]
+    enum Behavior {
+        Models(Vec<&'static str>),
+        Fail(fn() -> ProviderError),
+        Delay(Duration, Vec<&'static str>),
+        Hang,
+        Gated(Arc<Notify>, Vec<&'static str>),
+        Panic,
+    }
+
+    struct FakeProvider {
+        calls: Arc<AtomicUsize>,
+        behavior: Behavior,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FakeProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        async fn send(
+            &self,
+            _body: serde_json::Value,
+            _headers: http::HeaderMap,
+            _stream: bool,
+        ) -> Result<crate::providers::ProviderResponse, ProviderError> {
+            Err(ProviderError::Exhausted)
+        }
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let to_infos = |ids: &[&str]| {
+                ids.iter()
+                    .map(|id| ModelInfo {
+                        id: (*id).to_string(),
+                        owned_by: None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            match &self.behavior {
+                Behavior::Models(ids) => Ok(to_infos(ids)),
+                Behavior::Fail(make) => Err(make()),
+                Behavior::Delay(d, ids) => {
+                    tokio::time::sleep(*d).await;
+                    Ok(to_infos(ids))
+                }
+                Behavior::Hang => std::future::pending().await,
+                Behavior::Gated(gate, ids) => {
+                    gate.notified().await;
+                    Ok(to_infos(ids))
+                }
+                Behavior::Panic => panic!("fake list_models panic"),
+            }
+        }
+    }
+
+    fn fake(behavior: Behavior) -> (Arc<AtomicUsize>, Arc<dyn Provider>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(FakeProvider {
+            calls: Arc::clone(&calls),
+            behavior,
+        });
+        (calls, provider)
+    }
+
+    fn name(n: &str) -> UpstreamName {
+        UpstreamName::from(n)
+    }
+
+    fn catalog_with(settings: ModelCatalogConfig, upstreams: &[&str]) -> Arc<ModelCatalog> {
+        let catalog = ModelCatalog::new(settings, None);
+        let names: Vec<UpstreamName> = upstreams.iter().map(|n| name(n)).collect();
+        catalog.prune(&names);
+        catalog
+    }
+
+    fn state_of(catalog: &ModelCatalog, upstream: &str) -> CatalogState {
+        catalog.snapshot().upstreams[upstream].state
+    }
+
+    async fn finish(started: RefreshStarted) -> RefreshAck {
+        if let Some(task) = started.task {
+            task.await.unwrap();
+        }
+        started.ack
+    }
+
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn auth_error() -> ProviderError {
+        ProviderError::Upstream {
+            status: 401,
+            body: "no".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_demand_mode_should_make_no_list_models_call_at_startup_or_hot_swap_or_get() {
+        let (calls, provider) = fake(Behavior::Models(vec!["m"]));
+        let providers = vec![(name("a"), provider)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
+
+        catalog.prune(&[name("a")]);
+        for _ in 0..50 {
+            let _ = catalog.snapshot();
+        }
+        tokio::time::advance(Duration::from_secs(3600)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state_of(&catalog, "a"), CatalogState::Loading);
+        drop(providers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ten_concurrent_ifStale_posts_should_call_list_models_once_and_count_9_coalesced() {
+        let gate = Arc::new(Notify::new());
+        let (calls, provider) = fake(Behavior::Gated(Arc::clone(&gate), vec!["m"]));
+        let providers = vec![(name("a"), provider)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
+
+        let mut starts = Vec::new();
+        for _ in 0..10 {
+            starts.push(
+                catalog
+                    .request_refresh(&providers, Target::All, Trigger::IfStale)
+                    .unwrap(),
+            );
+        }
+        tokio::task::yield_now().await;
+        assert!(starts.iter().all(|s| s.ack.refreshing));
+        assert!(catalog.snapshot().upstreams["a"].refreshing);
+        gate.notify_one();
+        let mut acks = Vec::new();
+        for s in starts {
+            acks.push(finish(s).await);
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(catalog.coalesced_total(), 9);
+        assert_eq!(acks.iter().filter(|a| a.coalesced).count(), 9);
+        assert_eq!(state_of(&catalog, "a"), CatalogState::Ok);
+        assert!(!catalog.snapshot().upstreams["a"].refreshing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refreshing_flag_should_reset_after_list_models_panics_or_task_aborted() {
+        let (_, panicking) = fake(Behavior::Panic);
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
+        let providers = vec![(name("a"), panicking)];
+
+        let started = catalog
+            .request_refresh(&providers, Target::All, Trigger::Manual)
+            .unwrap();
+        finish(started).await;
+        assert!(!catalog.snapshot().upstreams["a"].refreshing);
+        assert_eq!(state_of(&catalog, "a"), CatalogState::Error);
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let (calls, hanging) = fake(Behavior::Hang);
+        let providers = vec![(name("a"), hanging)];
+        let started = catalog
+            .request_refresh(&providers, Target::All, Trigger::Manual)
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(catalog.snapshot().upstreams["a"].refreshing);
+        let task = started.task.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(!catalog.snapshot().upstreams["a"].refreshing);
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let again = catalog
+            .request_refresh(&providers, Target::All, Trigger::Manual)
+            .unwrap();
+        assert!(again.ack.refreshing && !again.ack.coalesced);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_one_should_call_only_named_upstream_and_coalesce_when_in_flight() {
+        let gate = Arc::new(Notify::new());
+        let (a_calls, a) = fake(Behavior::Models(vec!["x"]));
+        let (b_calls, b) = fake(Behavior::Gated(Arc::clone(&gate), vec!["y"]));
+        let providers = vec![(name("a"), a), (name("b"), b)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b"]);
+
+        let first = catalog
+            .request_refresh(&providers, Target::One(&name("b")), Trigger::Manual)
+            .unwrap();
+        tokio::task::yield_now().await;
+        let second = catalog
+            .request_refresh(&providers, Target::One(&name("b")), Trigger::Manual)
+            .unwrap();
+        let unknown =
+            catalog.request_refresh(&providers, Target::One(&name("nope")), Trigger::Manual);
+
+        assert!(first.ack.refreshing && !first.ack.coalesced);
+        assert!(second.ack.coalesced && second.task.is_none());
+        assert!(matches!(unknown, Err(UnknownUpstream)));
+        gate.notify_one();
+        finish(first).await;
+        assert_eq!(a_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(b_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_floor_should_skip_at_60s_and_run_at_301s_measured_from_lastAttemptAt() {
+        let (calls, provider) = fake(Behavior::Fail(|| ProviderError::Timeout));
+        let providers = vec![(name("a"), provider)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
+        finish(
+            catalog
+                .request_refresh(&providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let skipped = catalog
+            .request_refresh(&providers, Target::All, Trigger::IfStale)
+            .unwrap();
+        assert!(!skipped.ack.refreshing && skipped.task.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(241)).await;
+        finish(
+            catalog
+                .request_refresh(&providers, Target::All, Trigger::IfStale)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auth_failure_should_skip_automatic_refresh_until_manual() {
+        let (calls, provider) = fake(Behavior::Fail(auth_error));
+        let providers = vec![(name("a"), provider)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
+        finish(
+            catalog
+                .request_refresh(&providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        for trigger in [Trigger::IfStale, Trigger::Interval] {
+            let started = catalog
+                .request_refresh(&providers, Target::All, trigger)
+                .unwrap();
+            assert!(started.task.is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        finish(
+            catalog
+                .request_refresh(&providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn off_mode_should_refresh_only_on_manual_post_without_ifStale() {
+        let (calls, provider) = fake(Behavior::Models(vec!["m"]));
+        let providers = vec![(name("a"), provider)];
+        let settings = ModelCatalogConfig {
+            refresh: CatalogRefreshSetting::Off,
+            ..ModelCatalogConfig::default()
+        };
+        let catalog = catalog_with(settings, &["a"]);
+
+        let ignored = catalog
+            .request_refresh(&providers, Target::All, Trigger::IfStale)
+            .unwrap();
+        assert!(ignored.task.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        finish(
+            catalog
+                .request_refresh(&providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interval_mode_should_clamp_below_300s_and_refresh_on_timer() {
+        let (calls, provider) = fake(Behavior::Models(vec!["m"]));
+        let settings = ModelCatalogConfig {
+            refresh: CatalogRefreshSetting::Interval,
+            interval_secs: 60,
+            ..ModelCatalogConfig::default()
+        };
+        let CatalogRefreshMode::Interval { secs } = settings.refresh_mode() else {
+            panic!("interval expected");
+        };
+        assert_eq!(secs, 300);
+        let catalog = catalog_with(settings, &["a"]);
+        let providers = vec![(name("a"), provider)];
+        let loop_task = tokio::spawn(run_refresh_loop(
+            Arc::downgrade(&catalog),
+            secs,
+            move || providers.clone(),
+        ));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(299)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        drop(catalog);
+        tokio::time::advance(Duration::from_secs(301)).await;
+        loop_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_all_should_finish_two_ok_at_1s_and_timeout_third_at_10s_under_paused_time() {
+        let (_, a) = fake(Behavior::Delay(Duration::from_secs(1), vec!["a1"]));
+        let (_, b) = fake(Behavior::Delay(Duration::from_secs(1), vec!["b1"]));
+        let (_, c) = fake(Behavior::Hang);
+        let providers = vec![(name("a"), a), (name("b"), b), (name("c"), c)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b", "c"]);
+        let start = Instant::now();
+
+        let probe = Arc::clone(&catalog);
+        let watcher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            (
+                state_of(&probe, "a"),
+                state_of(&probe, "b"),
+                state_of(&probe, "c"),
+            )
+        });
+        catalog.refresh_all(&providers).await;
+
+        assert_eq!(
+            watcher.await.unwrap(),
+            (CatalogState::Ok, CatalogState::Ok, CatalogState::Loading)
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        let snapshot = catalog.snapshot();
+        let c = &snapshot.upstreams["c"];
+        assert_eq!(c.state, CatalogState::Error);
+        assert_eq!(c.error.as_ref().unwrap().kind, CatalogErrorKind::Timeout);
+        assert_eq!(snapshot.upstreams["a"].models.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_refresh_should_return_retryAfterSecs_7_when_last_attempt_3s_ago() {
+        let (a_calls, a) = fake(Behavior::Models(vec!["x"]));
+        let (b_calls, b) = fake(Behavior::Models(vec!["y"]));
+        let providers = vec![(name("a"), a), (name("b"), b)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b"]);
+        finish(
+            catalog
+                .request_refresh(&providers, Target::One(&name("a")), Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+
+        let single = catalog
+            .request_refresh(&providers, Target::One(&name("a")), Trigger::Manual)
+            .unwrap();
+        assert_eq!(single.ack.retry_after_secs, Some(7));
+        assert!(single.task.is_none() && !single.ack.refreshing);
+
+        let all = catalog
+            .request_refresh(&providers, Target::All, Trigger::Manual)
+            .unwrap();
+        let ack = finish(all).await;
+        assert_eq!(ack.retry_after_secs, Some(7));
+        assert_eq!(a_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(b_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_should_prevent_in_flight_refresh_resurrecting_removed_upstream() {
+        let gate = Arc::new(Notify::new());
+        let (_, c) = fake(Behavior::Gated(Arc::clone(&gate), vec!["m"]));
+        let providers = vec![(name("c"), c)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b", "c"]);
+        let started = catalog
+            .request_refresh(&providers, Target::One(&name("c")), Trigger::Manual)
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        catalog.prune(&[name("a"), name("b")]);
+        gate.notify_one();
+        finish(started).await;
+
+        assert!(!catalog.snapshot().upstreams.contains_key("c"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_should_remove_c_keep_a_b_and_make_no_calls_on_hot_swap() {
+        let (calls, provider) = fake(Behavior::Models(vec!["m"]));
+        drop(provider);
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b", "c"]);
+
+        catalog.prune(&[name("a"), name("b")]);
+
+        let keys: Vec<String> = catalog.snapshot().upstreams.keys().cloned().collect();
+        assert_eq!(keys, ["a", "b"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    impl LogBuf {
+        fn lines_with(&self, level: &str) -> Vec<String> {
+            String::from_utf8_lossy(&lock(&self.0))
+                .lines()
+                .filter(|l| l.contains(level) && l.contains("model catalog refresh"))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        (buf, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_should_emit_one_info_log_with_upstream_outcome_ok_model_count_duration_and_no_model_ids(
+    ) {
+        let (buf, _guard) = capture_logs();
+        let (_, provider) = fake(Behavior::Models(vec!["secret-model-id-1", "m2"]));
+        let providers = vec![(name("a"), provider)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
+
+        catalog.refresh_all(&providers).await;
+
+        let info = buf.lines_with("INFO");
+        assert_eq!(info.len(), 1, "{info:?}");
+        for needle in [
+            "upstream=a",
+            "outcome=\"ok\"",
+            "model_count=2",
+            "duration_ms=",
+        ] {
+            assert!(info[0].contains(needle), "{needle} missing in {}", info[0]);
+        }
+        assert!(!info[0].contains("secret-model-id-1"));
+        assert!(buf.lines_with("WARN").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_should_emit_one_warn_with_upstream_outcome_error_kind_status_duration_and_no_info_line_and_full_error_at_debug(
+    ) {
+        let (buf, _guard) = capture_logs();
+        let (_, provider) = fake(Behavior::Fail(|| ProviderError::Upstream {
+            status: 401,
+            body: "SENTINEL-body".into(),
+        }));
+        let providers = vec![(name("a"), provider)];
+        let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
+
+        catalog.refresh_all(&providers).await;
+
+        let warn = buf.lines_with("WARN");
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        for needle in [
+            "upstream=a",
+            "outcome=\"error\"",
+            "kind=Auth",
+            "status=Some(401)",
+            "duration_ms=",
+        ] {
+            assert!(warn[0].contains(needle), "{needle} missing in {}", warn[0]);
+        }
+        assert!(!warn[0].contains("SENTINEL"));
+        assert!(buf.lines_with("INFO").is_empty());
+        let all = String::from_utf8_lossy(&lock(&buf.0)).to_string();
+        assert!(all.contains("DEBUG") && all.contains("SENTINEL-body"));
     }
 }

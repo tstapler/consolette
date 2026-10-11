@@ -29,6 +29,11 @@ pub struct UpstreamRef {
 pub trait RoutingStrategy: Send + Sync {
     fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef>;
 
+    /// Short stable name shown on a trace as the strategy that picked the route.
+    fn name(&self) -> &'static str {
+        "custom"
+    }
+
     /// Runs once per `Router::dispatch` call, before the health filter,
     /// transforming the static candidate list. Default: identity.
     /// `OpenrouterScoringStrategy` overrides this to fan the one static
@@ -74,6 +79,10 @@ pub trait RoutingStrategy: Send + Sync {
 pub struct FallbackStrategy;
 
 impl RoutingStrategy for FallbackStrategy {
+    fn name(&self) -> &'static str {
+        "fallback"
+    }
+
     fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef> {
         healthy.first().cloned()
     }
@@ -85,6 +94,10 @@ impl RoutingStrategy for FallbackStrategy {
 pub struct WeightedStrategy;
 
 impl RoutingStrategy for WeightedStrategy {
+    fn name(&self) -> &'static str {
+        "weighted"
+    }
+
     fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef> {
         if healthy.is_empty() {
             return None;
@@ -160,5 +173,18 @@ mod tests {
         let candidates = vec![upstream(0, "a", 1.0), upstream(1, "b", 1.0)];
         let expanded = FallbackStrategy.expand_candidates(candidates.clone());
         assert_eq!(expanded, candidates);
+    }
+
+    #[test]
+    fn routing_strategy_name_should_return_fallback_weighted_and_default_custom() {
+        struct Anonymous;
+        impl RoutingStrategy for Anonymous {
+            fn select(&self, healthy: &[UpstreamRef]) -> Option<UpstreamRef> {
+                healthy.first().cloned()
+            }
+        }
+        assert_eq!(FallbackStrategy.name(), "fallback");
+        assert_eq!(WeightedStrategy.name(), "weighted");
+        assert_eq!(Anonymous.name(), "custom");
     }
 }

@@ -379,6 +379,10 @@ impl OpenrouterScoringStrategy {
 }
 
 impl RoutingStrategy for OpenrouterScoringStrategy {
+    fn name(&self) -> &'static str {
+        "openrouter_scored"
+    }
+
     /// Epsilon-greedy selection (Story 4.2.2, ADR-003): 90% of the time,
     /// the highest-composite candidate wins (first-in-list on ties — `.max_by`
     /// returns the *last* max on ties in Rust's stdlib, so ties are broken

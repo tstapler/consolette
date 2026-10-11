@@ -460,6 +460,7 @@ impl Router {
     /// the client named the model explicitly, so there is nothing to select.
     async fn dispatch_local(
         &self,
+        scope: &mut TraceScope,
         target: LocalTarget,
         mut body: serde_json::Value,
         headers: HeaderMap,
@@ -494,8 +495,11 @@ impl Router {
                 p
             }
         };
+        scope.begin_local_attempt(&target.model);
         body["model"] = serde_json::Value::String(target.model);
-        provider.send(body, headers, stream).await
+        let result = provider.send(body, headers, stream).await;
+        scope.complete_local_attempt(result.as_ref().err());
+        result
     }
 
     /// Swaps in a shared capability-verdict cache, replacing the empty one
@@ -665,7 +669,6 @@ impl Router {
     /// This is the compat wrapper over [`Self::dispatch_traced`]: it owns a
     /// [`TraceScope`] for the request, so every terminal path (success,
     /// error, or the future being dropped) emits exactly one `RequestTrace`.
-    /// Local-catalog models bypass the scope (no trace until Story 2.1.6b).
     ///
     /// # Errors
     ///
@@ -678,9 +681,6 @@ impl Router {
         stream: bool,
         est_tokens: u32,
     ) -> Result<ProviderResponse, ProviderError> {
-        if let Some(target) = self.local_target(&body) {
-            return self.dispatch_local(target, body, headers, stream).await;
-        }
         let mut scope = TraceScope::begin(&self.metrics, &body, stream, u64::from(est_tokens));
         let result = self
             .dispatch_traced(&mut scope, body, headers, stream, est_tokens)
@@ -712,7 +712,9 @@ impl Router {
         est_tokens: u32,
     ) -> Result<ProviderResponse, ProviderError> {
         if let Some(target) = self.local_target(&body) {
-            return self.dispatch_local(target, body, headers, stream).await;
+            return self
+                .dispatch_local(scope, target, body, headers, stream)
+                .await;
         }
         let session_id = extract_session_id(&body);
         let (candidates, pinned) = self.effective_candidates(session_id.as_deref());
@@ -763,7 +765,7 @@ impl Router {
             match self.admission.admit(&chosen.name, est_tokens).await {
                 Admit::Allowed | Admit::Delayed(_) => {}
                 Admit::Shed => {
-                    scope.begin_attempt(&chosen.name, chosen.model.as_deref(), 0);
+                    scope.begin_attempt(&chosen.name, chosen.model.as_deref(), scope.iteration());
                     scope.complete_attempt(
                         AttemptOutcome::Shed,
                         Some(AttemptErrorClass::Shed),
@@ -787,7 +789,7 @@ impl Router {
                 request_body[MODEL_FAMILY_BODY_KEY] = serde_json::Value::String(family.clone());
             }
             let attempt_started = std::time::Instant::now();
-            scope.begin_attempt(&chosen.name, chosen.model.as_deref(), 0);
+            scope.begin_attempt(&chosen.name, chosen.model.as_deref(), scope.iteration());
             let outcome = provider.send(request_body, headers.clone(), stream).await;
 
             match outcome {

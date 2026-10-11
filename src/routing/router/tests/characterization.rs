@@ -298,9 +298,9 @@ async fn dispatch_characterization_should_match_recorded_provider_selected_model
     assert_eq!(
         local_catalog_model().await,
         Observed {
-            ring_entries: 0,
+            ring_entries: 1,
             ..observed(None, 0, 0, "err:upstream")
         },
-        "local-catalog model bypasses the ring buffer and fallback providers"
+        "local-catalog model is traced (Story 2.1.6) but bypasses the fallback providers"
     );
 }

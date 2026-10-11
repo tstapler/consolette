@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,8 +19,10 @@ use crate::cost_metrics::types::RequestId;
 use crate::entrypoint::cost_tee::{begin_cost_tracking, CostTrackingStream};
 use crate::entrypoint::errors::map_provider_error_anthropic;
 use crate::entrypoint::EntrypointState;
+use crate::metrics::trace::{RequestOutcome, TraceScope};
 use crate::providers::{ProviderError, ProviderResponse};
-use crate::server_tools::{run_loop, synthesize_sse, LoopOutcome};
+use crate::routing::router::Router;
+use crate::server_tools::{run_loop, synthesize_sse, Dispatch, LoopOutcome};
 use crate::session_compaction::SessionKey;
 
 /// Rough char-count heuristic for estimating input tokens ahead of
@@ -102,7 +105,45 @@ pub async fn post_v1_messages(
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
     clamp_context_budget(&mut body);
+    // The scope opens after clamping, so the original body kept in the ring buffer is the
+    // post-clamp body, and it owns the request's single trace.
+    let stream = request_stream_flag(&body);
+    let est_tokens = estimate_tokens(&body);
+    let mut scope = TraceScope::begin(&state.metrics, &body, stream, u64::from(est_tokens));
+    let result = messages_inner(&mut scope, state, headers, body).await;
+    scope.finish(result.outcome);
+    scope.mark_handler_returned();
+    result.response
+}
 
+/// What a handler body returns to its wrapper: the response plus the outcome its trace ends with.
+pub(crate) struct HandlerResult {
+    pub(crate) response: Response,
+    pub(crate) outcome: RequestOutcome,
+}
+
+impl HandlerResult {
+    pub(crate) fn ok(response: Response) -> Self {
+        Self {
+            response,
+            outcome: RequestOutcome::ok(),
+        }
+    }
+
+    pub(crate) fn failed(response: Response, error: &ProviderError) -> Self {
+        Self {
+            response,
+            outcome: RequestOutcome::status(error.trace_status()),
+        }
+    }
+}
+
+async fn messages_inner(
+    scope: &mut TraceScope,
+    state: EntrypointState,
+    headers: HeaderMap,
+    body: serde_json::Value,
+) -> HandlerResult {
     // Syntax variance telemetry (ADR-001): flag unmapped headers or body keys
     let mut variances = crate::syntax_variance::inspect_headers(&headers);
     variances.extend(crate::syntax_variance::inspect_request_body(&body));
@@ -133,7 +174,8 @@ pub async fn post_v1_messages(
             // so it must bump `requests_total` here or the dashboard would
             // silently undercount traffic once the cache starts hitting.
             state.metrics.counters.record_cache_hit();
-            return (StatusCode::OK, Json(cached)).into_response();
+            scope.finish_cache_hit();
+            return HandlerResult::ok((StatusCode::OK, Json(cached)).into_response());
         }
     }
 
@@ -144,23 +186,26 @@ pub async fn post_v1_messages(
     // single-shot path. Requests without server defs fall through to
     // today's path byte-identically (S-3).
     if state.server_tools.should_emulate(&body) {
-        return handle_emulated_search(EmulatedSearchParams {
-            state,
-            body,
-            headers,
-            model,
-            session_key,
-            request_id,
-            est_tokens,
-            stream,
-        })
+        return handle_emulated_search(
+            scope,
+            EmulatedSearchParams {
+                state,
+                body,
+                headers,
+                model,
+                session_key,
+                request_id,
+                est_tokens,
+                stream,
+            },
+        )
         .await;
     }
 
     let result = state
         .dispatch_router
         .load()
-        .dispatch(body, headers, stream, est_tokens)
+        .dispatch_traced(scope, body, headers, stream, est_tokens)
         .await;
     handle_direct_dispatch(
         &state,
@@ -193,13 +238,22 @@ async fn handle_direct_dispatch(
     state: &EntrypointState,
     ctx: DirectDispatchContext,
     result: Result<ProviderResponse, ProviderError>,
-) -> Response {
+) -> HandlerResult {
     match result {
-        Ok(ProviderResponse::Full(json)) => direct_full_response(state, ctx, json).await,
-        Ok(ProviderResponse::Stream(s)) => {
-            direct_stream_response(state, ctx.model, ctx.session_key, ctx.request_id, s)
+        Ok(ProviderResponse::Full(json)) => {
+            HandlerResult::ok(direct_full_response(state, ctx, json).await)
         }
-        Err(e) => direct_error_response(state, &ctx.session_key, ctx.request_id, &e).await,
+        Ok(ProviderResponse::Stream(s)) => HandlerResult::ok(direct_stream_response(
+            state,
+            ctx.model,
+            ctx.session_key,
+            ctx.request_id,
+            s,
+        )),
+        Err(e) => HandlerResult::failed(
+            direct_error_response(state, &ctx.session_key, ctx.request_id, &e).await,
+            &e,
+        ),
     }
 }
 
@@ -302,7 +356,10 @@ struct EmulatedSearchParams {
 /// above (idempotent replace; final == sum of parts). On the Stream path the
 /// `CostTrackingStream` tee re-records the identical total parsed from the
 /// synthesized `message_delta` usage — single-count by construction (C4).
-async fn handle_emulated_search(params: EmulatedSearchParams) -> Response {
+async fn handle_emulated_search(
+    scope: &mut TraceScope,
+    params: EmulatedSearchParams,
+) -> HandlerResult {
     let EmulatedSearchParams {
         state,
         body,
@@ -319,21 +376,22 @@ async fn handle_emulated_search(params: EmulatedSearchParams) -> Response {
         headers: &headers,
         est_tokens,
     };
-    let outcome = match run_emulation_loop(&state, loop_request, &session_key, request_id).await {
-        Ok(outcome) => outcome,
-        Err(response) => return *response,
-    };
+    let outcome =
+        match run_emulation_loop(scope, &state, loop_request, &session_key, request_id).await {
+            Ok(outcome) => outcome,
+            Err(failed) => return *failed,
+        };
 
     record_emulation_outcome(&state, &session_key, request_id, &model, &outcome).await;
 
-    if stream {
+    HandlerResult::ok(if stream {
         // Buffered V1 (pre-mortem failure 3): time-to-first-byte degrades to
         // time-to-final-answer for search turns only. Non-search streams are
         // untouched (they never enter this branch).
         stream_response(&state, model, session_key, request_id, &outcome.message)
     } else {
         full_response(outcome.message)
-    }
+    })
 }
 
 /// Records the emulation loop's cost usage and tool-call metrics, and logs
@@ -359,8 +417,8 @@ async fn record_emulation_outcome(
     log_emulation_caveats(outcome);
 }
 
-/// The per-request inputs `run_emulation_loop` needs to build its dispatch
-/// closure — bundled (Fowler's introduce-parameter-object) so the function
+/// The per-request inputs `run_emulation_loop` needs to build its scoped
+/// dispatch — bundled (Fowler's introduce-parameter-object) so the function
 /// stays under the project's 5-parameter guideline.
 struct EmulationLoopRequest<'a> {
     body: &'a serde_json::Value,
@@ -368,15 +426,83 @@ struct EmulationLoopRequest<'a> {
     est_tokens: u32,
 }
 
+/// One emulation-loop dispatch path that traces every round into the request's single scope.
+///
+/// A struct rather than a closure: the blanket `Dispatch` impl for closures needs a `'static`
+/// future, but this borrows the scope. The mutex is held for one whole round, so rounds never
+/// interleave their attempts.
+struct ScopedDispatch<'s> {
+    router: Arc<Router>,
+    headers: HeaderMap,
+    est_tokens: u32,
+    next_iteration: AtomicU8,
+    scope: tokio::sync::Mutex<&'s mut TraceScope>,
+}
+
+impl<'s> ScopedDispatch<'s> {
+    fn new(
+        router: Arc<Router>,
+        headers: HeaderMap,
+        est_tokens: u32,
+        scope: &'s mut TraceScope,
+    ) -> Self {
+        Self {
+            router,
+            headers,
+            est_tokens,
+            next_iteration: AtomicU8::new(0),
+            scope: tokio::sync::Mutex::new(scope),
+        }
+    }
+}
+
+impl Dispatch for ScopedDispatch<'_> {
+    fn dispatch<'a>(
+        &'a self,
+        body: serde_json::Value,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut scope = self.scope.lock().await;
+            let iteration = self
+                .next_iteration
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_add(1))
+                })
+                .unwrap_or_else(|previous| previous);
+            scope.set_iteration(iteration);
+            let result = self
+                .router
+                .dispatch_traced(
+                    &mut scope,
+                    body,
+                    self.headers.clone(),
+                    false,
+                    self.est_tokens,
+                )
+                .await;
+            match result {
+                Ok(ProviderResponse::Full(json)) => Ok(json),
+                Ok(ProviderResponse::Stream(_)) => Err(ProviderError::ResponseShapeMismatch(
+                    "emulation loop dispatched with stream=false but got a stream".to_string(),
+                )),
+                Err(e) => Err(e),
+            }
+        })
+    }
+}
+
 /// Snapshots the dispatch router and runs the bounded server-tool emulation
 /// loop (C1/C3, see module docs above), mapping a genuine dispatch failure
 /// straight to its already-recorded-failed error response.
 async fn run_emulation_loop(
+    scope: &mut TraceScope,
     state: &EntrypointState,
     request: EmulationLoopRequest<'_>,
     session_key: &SessionKey,
     request_id: RequestId,
-) -> Result<LoopOutcome, Box<Response>> {
+) -> Result<LoopOutcome, Box<HandlerResult>> {
     let EmulationLoopRequest {
         body,
         headers,
@@ -389,26 +515,15 @@ async fn run_emulation_loop(
     // search-augmented turns, so admission control may under-count long
     // search sessions. Documented, not gated in V1.
     let router = state.dispatch_router.load_full();
-    let dispatch = |next: serde_json::Value| {
-        let router = Arc::clone(&router);
-        let headers = headers.clone();
-        async move {
-            match router.dispatch(next, headers, false, est_tokens).await {
-                Ok(ProviderResponse::Full(json)) => Ok(json),
-                Ok(ProviderResponse::Stream(_)) => Err(ProviderError::ResponseShapeMismatch(
-                    "emulation loop dispatched with stream=false but got a stream".to_string(),
-                )),
-                Err(e) => Err(e),
-            }
-        }
-    };
+    let dispatch = ScopedDispatch::new(router, headers.clone(), est_tokens, scope);
 
     let limits = state.server_tools.config.loop_limits();
     match run_loop(body, &dispatch, &*state.search_pool, &limits).await {
         Ok(outcome) => Ok(outcome),
-        Err(e) => Err(Box::new(
+        Err(e) => Err(Box::new(HandlerResult::failed(
             record_failure_and_error_response(state, session_key, request_id, &e).await,
-        )),
+            &e,
+        ))),
     }
 }
 

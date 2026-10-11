@@ -188,6 +188,14 @@ impl From<&ProviderError> for crate::metrics::trace::AttemptErrorClass {
 }
 
 impl crate::metrics::trace::TraceScope {
+    /// Closes the local attempt; a failed local call leaves no provider on the trace.
+    pub fn complete_local_attempt(&mut self, error: Option<&ProviderError>) {
+        if error.is_some() {
+            self.record_provider("");
+        }
+        self.complete_attempt_result(error);
+    }
+
     /// Closes the open attempt for an upstream result; outcome, class and status all come
     /// from the same `error`.
     pub fn complete_attempt_result(&mut self, error: Option<&ProviderError>) {

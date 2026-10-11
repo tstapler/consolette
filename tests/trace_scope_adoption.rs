@@ -11,25 +11,21 @@
 //! `TraceScope`, unless it is on a literal allowlist below. Code under
 //! `#[cfg(test)] mod ...`, `src/bin/` and `tests` directories is ignored.
 //!
-//! How the allowlist shrinks: the five `PENDING_HANDLER_ADOPTION` entries are
-//! the ingress handlers that adopt a `TraceScope` in Story 2.1.6b. Delete each
-//! entry in the same commit that adopts the scope in that function. A stale
-//! entry (no longer matching any site) fails the test, so the list cannot rot.
-//! When the list is empty, delete the constant. `COMPAT_WRAPPER` is permanent:
-//! the `Router::dispatch` wrapper that Task 1.1.3e1 creates; it may be absent
-//! until then.
+//! Allowlists: the handlers adopted their scope in Story 2.1.6 (wrapper plus inner
+//! function; `post_v1_messages` and `post_v1_chat_completions` now mention
+//! `TraceScope` themselves). What remains is permanent. `COMPAT_WRAPPER` is the
+//! `Router::dispatch` wrapper that begins and finishes its own scope.
+//! `SCOPE_HOLDERS` are helpers that reach the scope through `self` or are only
+//! called from a function that owns it. A stale entry (no longer matching any
+//! scope-less site) fails the test, so the lists cannot rot.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// (file, enclosing fn): ingress handlers without a trace scope until Story 2.1.6b.
-const PENDING_HANDLER_ADOPTION: &[(&str, &str)] = &[
-    (
-        "src/entrypoint/chat_completions.rs",
-        "post_v1_chat_completions",
-    ),
-    ("src/entrypoint/messages/mod.rs", "post_v1_messages"),
-    ("src/entrypoint/messages/mod.rs", "run_emulation_loop"),
+/// (file, enclosing fn): helpers without `TraceScope` in their text that still run inside
+/// a scope owned by the handler wrapper.
+const SCOPE_HOLDERS: &[(&str, &str)] = &[
+    ("src/entrypoint/messages/mod.rs", "dispatch"),
     ("src/entrypoint/messages/mod.rs", "direct_stream_response"),
     ("src/entrypoint/messages/mod.rs", "stream_response"),
 ];
@@ -205,9 +201,7 @@ fn every_dispatch_caller_and_cost_tracking_stream_new_should_be_inside_a_trace_s
 
     let violations: Vec<String> = sites
         .iter()
-        .filter(|s| {
-            !s.has_scope && !listed(COMPAT_WRAPPER, s) && !listed(PENDING_HANDLER_ADOPTION, s)
-        })
+        .filter(|s| !s.has_scope && !listed(COMPAT_WRAPPER, s) && !listed(SCOPE_HOLDERS, s))
         .map(|s| {
             format!(
                 "{}:{} in fn `{}` dispatches or builds a CostTrackingStream without a TraceScope",
@@ -217,7 +211,7 @@ fn every_dispatch_caller_and_cost_tracking_stream_new_should_be_inside_a_trace_s
         .collect();
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 
-    let stale: Vec<String> = PENDING_HANDLER_ADOPTION
+    let stale: Vec<String> = SCOPE_HOLDERS
         .iter()
         .filter(|(f, n)| {
             !sites

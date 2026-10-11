@@ -74,6 +74,7 @@ pub struct AttemptLog {
 
 impl AttemptLog {
     pub fn push(&mut self, record: AttemptRecord) {
+        self.iterations = self.iterations.max(record.iteration.saturating_add(1));
         if self.records.len() < MAX_ATTEMPTS {
             self.records.push(record);
         } else {
@@ -240,6 +241,8 @@ enum ScopeState {
 }
 
 const OK_STATUS: u16 = 200;
+/// Upstream name recorded for the attempt of a local-model request.
+const LOCAL_UPSTREAM: &str = "local";
 const CANCELLED_STATUS: u16 = 499;
 const UNFINISHED_STATUS: u16 = 500;
 
@@ -260,6 +263,8 @@ pub struct TraceScope {
     /// The scope's own copy of the ring-buffer entry; `finish` completes it and writes it back once.
     detail: RequestDetail,
     pending: Option<PendingAttempt>,
+    /// Emulation-loop round that the next attempt belongs to (0 for a plain request).
+    iteration: u8,
     hold_retries: u8,
     session_pinned: bool,
     strategy_name: &'static str,
@@ -296,6 +301,7 @@ impl TraceScope {
             selected_model_was_exploration: None,
             detail,
             pending: None,
+            iteration: 0,
             hold_retries: 0,
             session_pinned: false,
             strategy_name: "",
@@ -349,6 +355,29 @@ impl TraceScope {
             iteration,
             started: tokio::time::Instant::now(),
         });
+    }
+
+    #[must_use]
+    pub fn iteration(&self) -> u8 {
+        self.iteration
+    }
+
+    /// Tags the attempts of the next dispatch with an emulation-loop round.
+    pub fn set_iteration(&mut self, iteration: u8) {
+        self.iteration = iteration;
+    }
+
+    /// Opens the single attempt of a local-model request and marks the trace local.
+    pub fn begin_local_attempt(&mut self, model: &str) {
+        self.detail.trace_kind = TraceKind::Local;
+        self.record_provider(LOCAL_UPSTREAM);
+        self.begin_attempt(LOCAL_UPSTREAM, Some(model), self.iteration);
+    }
+
+    /// Terminal exit for a response-cache hit: no upstream was called.
+    pub fn finish_cache_hit(&mut self) {
+        self.detail.trace_kind = TraceKind::CacheHit;
+        self.emit(OK_STATUS);
     }
 
     /// Closes the open attempt into the log; a shed has no upstream call, so zero latency.

@@ -16,7 +16,7 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::config::schema::{CatalogRefreshMode, ModelCatalogConfig};
+use crate::config::schema::{CatalogRefreshMode, Config, ModelCatalogConfig, UpstreamKind};
 use crate::metrics::ids::UpstreamName;
 use crate::providers::{ModelInfo, Provider, ProviderError};
 
@@ -565,6 +565,61 @@ pub async fn run_refresh_loop(
         };
         let _ = catalog.request_refresh(&providers(), Target::All, Trigger::Interval);
     }
+}
+
+/// A pinned model the upstream's catalog does not list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigWarning {
+    pub upstream: String,
+    pub model: String,
+    pub referenced_by: String,
+}
+
+/// Models pinned on the primary route (`config.routes.first()`, as
+/// `select_primary_route` picks it) that a loaded catalog does not list.
+/// Not checked: other routes, `model_family` refs, fallback targets outside
+/// this route, and upstreams that are loading, errored, unsupported or whose
+/// list was truncated (absence proves nothing there).
+#[must_use]
+pub fn config_warnings(config: &Config, snapshot: &CatalogSnapshot) -> Vec<ConfigWarning> {
+    let Some(route) = config.routes.first() else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for (index, reference) in route.upstreams.iter().enumerate() {
+        let (Some(model), None) = (&reference.model, &reference.model_family) else {
+            continue;
+        };
+        let Some(entry) = snapshot.upstreams.get(&reference.name) else {
+            continue;
+        };
+        let listing_is_complete =
+            matches!(entry.state, CatalogState::Ok | CatalogState::Stale) && !entry.truncated;
+        if !listing_is_complete {
+            continue;
+        }
+        let is_bedrock = config
+            .upstreams
+            .iter()
+            .any(|u| u.name == reference.name && matches!(u.kind, UpstreamKind::Bedrock { .. }));
+        let key = |id: &str| {
+            if is_bedrock {
+                crate::providers::bedrock::BedrockProvider::normalize_model(id)
+            } else {
+                id.to_string()
+            }
+        };
+        let wanted = key(model);
+        if !entry.models.iter().any(|m| key(&m.id) == wanted) {
+            warnings.push(ConfigWarning {
+                upstream: reference.name.clone(),
+                model: model.clone(),
+                referenced_by: format!("route {} upstream {index}", route.name),
+            });
+        }
+    }
+    warnings
 }
 
 /// Maps a provider error to the only error data the browser may see.
@@ -1320,5 +1375,151 @@ mod refresh_tests {
         assert!(buf.lines_with("INFO").is_empty());
         let all = String::from_utf8_lossy(&lock(&buf.0)).to_string();
         assert!(all.contains("DEBUG") && all.contains("SENTINEL-body"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod warning_tests {
+    use super::*;
+    use crate::config::schema::{Route, RouteUpstreamRef, Strategy, Upstream};
+
+    fn config_with(
+        upstreams: &[(&str, UpstreamKind)],
+        refs: Vec<(&str, Option<&str>, Option<&str>)>,
+    ) -> Config {
+        Config {
+            upstreams: upstreams
+                .iter()
+                .map(|(name, kind)| Upstream {
+                    name: (*name).to_string(),
+                    kind: kind.clone(),
+                    auth: None,
+                })
+                .collect(),
+            routes: vec![Route {
+                name: "main".to_string(),
+                strategy: Strategy::Fallback,
+                upstreams: refs
+                    .into_iter()
+                    .map(|(name, model, family)| RouteUpstreamRef {
+                        name: name.to_string(),
+                        weight: None,
+                        model: model.map(str::to_string),
+                        model_family: family.map(str::to_string),
+                    })
+                    .collect(),
+            }],
+            ..Config::default()
+        }
+    }
+
+    fn openai() -> UpstreamKind {
+        UpstreamKind::Openai {
+            base_url: "https://example.invalid".to_string(),
+        }
+    }
+
+    fn bedrock() -> UpstreamKind {
+        UpstreamKind::Bedrock {
+            aws_region: None,
+            aws_profile: None,
+            max_retries: None,
+        }
+    }
+
+    fn snapshot_with(entries: Vec<(&str, UpstreamModels)>) -> CatalogSnapshot {
+        CatalogSnapshot {
+            upstreams: entries
+                .into_iter()
+                .map(|(n, e)| (n.to_string(), e))
+                .collect(),
+        }
+    }
+
+    fn ok_entry(ids: &[&str]) -> UpstreamModels {
+        let mut entry = UpstreamModels::loading();
+        let infos = ids
+            .iter()
+            .map(|id| ModelInfo {
+                id: (*id).to_string(),
+                owned_by: None,
+            })
+            .collect();
+        entry.apply(RefreshResult::Models(infos), Stamp::now());
+        entry
+    }
+
+    #[tokio::test]
+    async fn config_warnings_should_report_pinned_model_missing_upstream() {
+        let config = config_with(
+            &[("openai", openai())],
+            vec![("openai", Some("gpt-5-turbo"), None)],
+        );
+        let snapshot = snapshot_with(vec![("openai", ok_entry(&["gpt-5", "gpt-4o"]))]);
+
+        let warnings = config_warnings(&config, &snapshot);
+
+        assert_eq!(
+            serde_json::to_value(&warnings).unwrap(),
+            serde_json::json!([{
+                "upstream": "openai",
+                "model": "gpt-5-turbo",
+                "referencedBy": "route main upstream 0"
+            }])
+        );
+        let listed = config_with(
+            &[("openai", openai())],
+            vec![("openai", Some("gpt-5"), None)],
+        );
+        assert!(config_warnings(&listed, &snapshot).is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_warnings_should_skip_error_loading_and_family_upstreams() {
+        let config = config_with(
+            &[
+                ("openai", openai()),
+                ("anthropic", openai()),
+                ("gemini", openai()),
+                ("big", openai()),
+            ],
+            vec![
+                ("openai", None, Some("gpt-5")),
+                ("anthropic", Some("missing-a"), None),
+                ("gemini", Some("missing-g"), None),
+                ("big", Some("missing-b"), None),
+            ],
+        );
+        let mut errored = UpstreamModels::loading();
+        errored.apply(RefreshResult::Failed(ProviderError::Timeout), Stamp::now());
+        let many: Vec<String> = (0..1200).map(|i| format!("m{i}")).collect();
+        let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let snapshot = snapshot_with(vec![
+            ("openai", ok_entry(&["gpt-5"])),
+            ("anthropic", errored),
+            ("gemini", UpstreamModels::loading()),
+            ("big", ok_entry(&many_refs)),
+        ]);
+
+        assert!(config_warnings(&config, &snapshot).is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_warnings_should_compare_bedrock_ids_after_normalize_model() {
+        let config = config_with(
+            &[("bedrock", bedrock())],
+            vec![(
+                "bedrock",
+                Some("us.anthropic.claude-3-5-sonnet-20241022-v1:0"),
+                None,
+            )],
+        );
+        let snapshot = snapshot_with(vec![(
+            "bedrock",
+            ok_entry(&["anthropic.claude-3-5-sonnet-20241022-v1:0"]),
+        )]);
+
+        assert!(config_warnings(&config, &snapshot).is_empty());
     }
 }

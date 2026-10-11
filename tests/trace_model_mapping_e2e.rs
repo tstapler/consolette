@@ -230,3 +230,164 @@ async fn sse_frame_should_use_camel_case_keys_and_id_when_request_sent_through_r
     assert!(!frame.contains("request_id"), "{frame}");
     assert!(!frame.contains("status_code"), "{frame}");
 }
+
+/// Minimal stdio MCP server offering `brave_web_search`, so the emulation loop's search
+/// backend is real child-process I/O without needing the `stapler-mcp` binary.
+const FAKE_SEARCH_BACKEND: &str = r#"#!/usr/bin/env python3
+import json, sys
+
+def reply(msg_id, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, msg_id = msg.get("method"), msg.get("id")
+    if msg_id is None:
+        continue
+    if method == "initialize":
+        reply(msg_id, {"protocolVersion": msg["params"]["protocolVersion"],
+                       "capabilities": {"tools": {}},
+                       "serverInfo": {"name": "fake-search", "version": "0"}})
+    elif method == "tools/list":
+        reply(msg_id, {"tools": [{"name": "brave_web_search",
+                                  "inputSchema": {"type": "object"}}]})
+    elif method == "tools/call":
+        hits = {"results": [{"title": "Rust news", "url": "https://example.com/rust",
+                             "description": "async closures shipped"}]}
+        reply(msg_id, {"content": [{"type": "text", "text": json.dumps(hits)}],
+                       "isError": False})
+    else:
+        reply(msg_id, {})
+"#;
+
+fn openai_completion(message: Value, finish_reason: &str) -> Value {
+    json!({
+        "id": "chatcmpl-fake", "object": "chat.completion", "model": "fake-model",
+        "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+}
+
+fn search_request(model: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "What is new in Rust?"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+    })
+}
+
+/// Cacheable request unique per run, so a stale row in the on-disk response cache
+/// (`~/.claude/consolette/response-cache.sqlite`) cannot turn the first send into a hit.
+fn cacheable_request() -> Value {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": format!("cache probe {nonce}")}]
+    })
+}
+
+#[tokio::test]
+async fn four_client_requests_should_emit_exactly_four_traces_with_expected_kinds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tools = tempfile::tempdir().unwrap();
+    let backend = tools.path().join("fake-search-backend");
+    std::fs::write(&backend, FAKE_SEARCH_BACKEND).unwrap();
+    std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Dispatch 1 asks for a search, dispatch 2 answers; every later dispatch answers plainly.
+    let tool_call = openai_completion(
+        json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "web_search", "arguments": "{\"query\":\"Rust news\"}"}}]}),
+        "tool_calls",
+    );
+    let answer = openai_completion(json!({"role": "assistant", "content": "answer"}), "stop");
+    let upstream = FakeUpstream::start(Script::sequence([
+        Step::Ok(tool_call),
+        Step::Ok(answer.clone()),
+        Step::Ok(answer.clone()),
+    ]))
+    .await;
+    let local = FakeUpstream::start(Script::sequence([Step::Ok(answer)])).await;
+
+    let server = LiveServer::start_config(&format!(
+        r#"{}
+[server_tools]
+backend_path = "{}"
+
+[response_cache]
+enabled = true
+
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "oa"
+model = "gpt-5.1"
+"#,
+        LiveServer::openai_upstream("oa", &upstream.base_url()),
+        backend.display()
+    ))
+    .await;
+    {
+        use consolette::providers::local_discovery::{Endpoint, LocalBackend};
+        server.state.dispatch_router.load().local_catalog().set(
+            LocalBackend::Ollama,
+            Some(Endpoint {
+                base_url: local.base_url(),
+                models: vec!["llama3.2".to_string()],
+            }),
+        );
+    }
+    let mut sse = server.open_sse().await;
+
+    let cacheable = cacheable_request();
+    let requests = [
+        search_request("claude-sonnet-4"),
+        cacheable.clone(),
+        cacheable,
+        json!({
+            "model": "local/ollama/llama3.2",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    ];
+    for request in &requests {
+        let (status, body) = send(&server, request).await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    let traces = sse
+        .request_traces(Duration::from_secs(5), Duration::from_millis(500))
+        .await;
+    assert_eq!(traces.len(), 4, "one trace per client request: {traces:?}");
+    let data: Vec<&Value> = traces.iter().map(|t| &t["data"]).collect();
+
+    assert_eq!(data[0]["traceKind"], "routed", "{}", data[0]);
+    assert_eq!(data[0]["iterations"], 2, "{}", data[0]);
+    assert_eq!(
+        data[0]["attempts"].as_array().unwrap().len(),
+        2,
+        "{}",
+        data[0]
+    );
+    assert_eq!(data[1]["traceKind"], "routed", "cache miss: {}", data[1]);
+    assert_eq!(data[1]["iterations"], 1, "{}", data[1]);
+    assert_eq!(data[2]["traceKind"], "cache_hit", "{}", data[2]);
+    assert!(
+        data[2]["attempts"].as_array().unwrap().is_empty(),
+        "{}",
+        data[2]
+    );
+    assert_eq!(data[3]["traceKind"], "local", "{}", data[3]);
+    assert_eq!(data[3]["routedProvider"], "local", "{}", data[3]);
+    assert_eq!(server.state.metrics.get_recent_requests(10).len(), 4);
+}

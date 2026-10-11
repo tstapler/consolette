@@ -13,7 +13,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use super::ids::UpstreamName;
-use super::{MetricsCollector, RequestDetail, RequestTimingUpdate, ScopeFinish};
+use super::{MetricsCollector, RequestDetail};
 use crate::entrypoint::events::TraceKind;
 
 /// How one upstream attempt ended.
@@ -192,6 +192,22 @@ impl Serialize for RouteReason {
     }
 }
 
+/// Whether the routed model came from the route's pin or the client's own name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutedModelSource {
+    Pinned,
+    Passthrough,
+}
+
+/// An attempt whose upstream call is in flight; it has no outcome until the call returns.
+struct PendingAttempt {
+    upstream: UpstreamName,
+    model: Option<String>,
+    iteration: u8,
+    started: tokio::time::Instant,
+}
+
 /// What a request ended with; carries the HTTP status of its terminal trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestOutcome {
@@ -241,6 +257,12 @@ pub struct TraceScope {
     provider: String,
     selected_model: Option<String>,
     selected_model_was_exploration: Option<bool>,
+    /// The scope's own copy of the ring-buffer entry; `finish` completes it and writes it back once.
+    detail: RequestDetail,
+    pending: Option<PendingAttempt>,
+    hold_retries: u8,
+    session_pinned: bool,
+    strategy_name: &'static str,
 }
 
 impl TraceScope {
@@ -253,13 +275,14 @@ impl TraceScope {
         tokens_before: u64,
     ) -> Self {
         let request_id = uuid::Uuid::new_v4().to_string();
-        metrics.push_request(RequestDetail::from_body(
+        let detail = RequestDetail::from_body(
             request_id.clone(),
             stream,
             tokens_before,
             body,
             crate::session::extract_session_id(body),
-        ));
+        );
+        metrics.push_request(detail.clone());
         metrics.push_original_body(request_id.clone(), body.clone());
         Self {
             metrics: Arc::clone(metrics),
@@ -271,6 +294,11 @@ impl TraceScope {
             provider: String::new(),
             selected_model: None,
             selected_model_was_exploration: None,
+            detail,
+            pending: None,
+            hold_retries: 0,
+            session_pinned: false,
+            strategy_name: "",
         }
     }
 
@@ -298,6 +326,57 @@ impl TraceScope {
         self.attempts.push(attempt);
     }
 
+    /// Inputs to the route reason that are known before any attempt.
+    pub fn record_route(&mut self, session_pinned: bool, strategy_name: &'static str) {
+        self.session_pinned = session_pinned;
+        self.strategy_name = strategy_name;
+    }
+
+    #[must_use]
+    pub fn hold_retries(&self) -> u32 {
+        u32::from(self.hold_retries)
+    }
+
+    pub fn note_hold_retry(&mut self) {
+        self.hold_retries = self.hold_retries.saturating_add(1);
+    }
+
+    /// Opens an attempt before its upstream call, so a dropped request still records it.
+    pub fn begin_attempt(&mut self, upstream: &str, model: Option<&str>, iteration: u8) {
+        self.pending = Some(PendingAttempt {
+            upstream: upstream.into(),
+            model: model.map(str::to_string),
+            iteration,
+            started: tokio::time::Instant::now(),
+        });
+    }
+
+    /// Closes the open attempt into the log; a shed has no upstream call, so zero latency.
+    pub fn complete_attempt(
+        &mut self,
+        outcome: AttemptOutcome,
+        error_class: Option<AttemptErrorClass>,
+        status: Option<u16>,
+    ) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let latency_ms = if outcome == AttemptOutcome::Shed {
+            0
+        } else {
+            elapsed_ms(pending.started)
+        };
+        self.record_attempt(AttemptRecord {
+            iteration: pending.iteration,
+            upstream: pending.upstream,
+            model: pending.model,
+            outcome,
+            error_class,
+            status,
+            latency_ms,
+        });
+    }
+
     /// Names the upstream that produced the response (left empty on failure).
     pub fn record_provider(&mut self, provider: &str) {
         self.provider = provider.to_string();
@@ -314,33 +393,70 @@ impl TraceScope {
         self.handler_returned = true;
     }
 
+    /// A still-open attempt means the upstream never answered (the future was dropped).
+    fn cancel_pending_attempt(&mut self) {
+        if self.pending.is_some() {
+            self.complete_attempt(
+                AttemptOutcome::Cancelled,
+                Some(AttemptErrorClass::Cancelled),
+                None,
+            );
+        }
+    }
+
     fn emit(&mut self, status_code: u16) {
         if self.state == ScopeState::Finished {
             return;
         }
         self.state = ScopeState::Finished;
         let duration_ms = self.started.elapsed().as_secs_f64() * 1000.0;
-        let first_byte_ms = if self.provider.is_empty() {
+        let reason = RouteReason::for_request(&RouteInputs {
+            kind: self.detail.trace_kind,
+            session_pinned: self.session_pinned,
+            strategy_name: self.strategy_name,
+            exploration: self.selected_model_was_exploration == Some(true),
+            hold_retries: self.hold_retries,
+            attempts: self.attempts.records(),
+        });
+        let last_attempt = self.attempts.records().last();
+        let routed_model = match (&self.selected_model, &self.detail.requested_model) {
+            (Some(pinned), _) => Some((pinned.clone(), RoutedModelSource::Pinned)),
+            (None, Some(asked)) if last_attempt.is_some() => {
+                Some((asked.clone(), RoutedModelSource::Passthrough))
+            }
+            _ => None,
+        };
+        let d = &mut self.detail;
+        d.provider.clone_from(&self.provider);
+        d.duration_ms = (duration_ms * 10.0).round() / 10.0;
+        d.first_byte_ms = if self.provider.is_empty() {
             0.0
         } else {
-            duration_ms
+            d.duration_ms
         };
-        self.metrics.finish_scope(
-            &self.request_id,
-            ScopeFinish {
-                status_code,
-                timing: RequestTimingUpdate {
-                    provider: &self.provider,
-                    duration_ms,
-                    first_byte_ms,
-                    bedrock_invocation_ms: 0,
-                    bedrock_first_byte_ms: 0,
-                },
-                selected_model: self.selected_model.take(),
-                selected_model_was_exploration: self.selected_model_was_exploration,
-            },
-        );
+        d.selected_model = self.selected_model.take();
+        d.selected_model_was_exploration = self.selected_model_was_exploration;
+        d.status_code = status_code;
+        d.routed_provider = last_attempt.map(|a| a.upstream.to_string());
+        (d.routed_model, d.routed_model_source) = match routed_model {
+            Some((model, source)) => (Some(model), Some(source)),
+            None => (None, None),
+        };
+        d.route_reason = Some(reason.wire().to_string());
+        d.route_strategy = reason.strategy().map(str::to_string);
+        d.attempts = self.attempts.records().to_vec();
+        d.attempts_truncated = self.attempts.truncated();
+        d.iterations = self.attempts.iterations().max(1);
+        d.hold_retries = self.hold_retries;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let total_ms = duration_ms.max(0.0) as u64;
+        d.total_ms = Some(total_ms);
+        self.metrics.finish_detail(&self.detail);
     }
+}
+
+fn elapsed_ms(started: tokio::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -361,6 +477,7 @@ impl Drop for TraceScope {
         if self.state == ScopeState::Finished {
             return;
         }
+        self.cancel_pending_attempt();
         let counters = &self.metrics.counters;
         if self.handler_returned || std::thread::panicking() {
             counters
@@ -947,5 +1064,290 @@ mod tests {
                 .count();
             assert_eq!(hits, 0);
         }
+    }
+
+    fn drive_two_attempt_chain(scope: &mut TraceScope) {
+        scope.begin_attempt("openrouter", Some("gpt-4o-mini"), 0);
+        scope.complete_attempt(
+            AttemptOutcome::Upstream,
+            Some(AttemptErrorClass::Overloaded),
+            Some(529),
+        );
+        scope.begin_attempt("openrouter", Some("gpt-4o-mini"), 0);
+        scope.complete_attempt(AttemptOutcome::Ok, None, Some(200));
+        scope.record_selection(Some("gpt-4o-mini".to_string()), None);
+        scope.record_provider("openrouter");
+    }
+
+    #[test]
+    fn finish_should_serialize_requested_routed_pinned_provider_reason_and_two_attempts() {
+        let metrics = MetricsCollector::new();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        metrics.set_event_tx(tx);
+        let mut scope =
+            TraceScope::begin(&metrics, &serde_json::json!({"model": "gpt-4o"}), false, 7);
+        scope.record_route(false, "fallback");
+        drive_two_attempt_chain(&mut scope);
+        scope.finish(RequestOutcome::ok());
+
+        let json = serde_json::to_value(&traces(&mut rx)[0]).unwrap();
+        assert_eq!(json["requestedModel"], "gpt-4o");
+        assert_eq!(json["routedModel"], "gpt-4o-mini");
+        assert_eq!(json["routedModelSource"], "pinned");
+        assert_eq!(json["routedProvider"], "openrouter");
+        assert_eq!(json["routeReason"], "fallback");
+        assert!(json["routeStrategy"].is_null());
+        assert_eq!(json["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(json["attempts"][0]["errorClass"], "overloaded");
+        assert_eq!(
+            json["attempts"][0]["errorMessage"],
+            "Upstream overloaded (HTTP 529)"
+        );
+        assert!(json["attempts"][1]["errorClass"].is_null());
+        assert!(json["attempts"][1]["errorMessage"].is_null());
+        assert_eq!(json["attemptsTruncated"], false);
+        assert_eq!(json["iterations"], 1);
+        assert!(json["totalMs"].is_u64());
+    }
+
+    #[test]
+    fn finish_should_serialize_strategy_name_and_rate_limit_hold_reasons() {
+        let metrics = MetricsCollector::new();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        metrics.set_event_tx(tx);
+        let mut scope = TraceScope::begin(&metrics, &serde_json::json!({"model": "m"}), false, 7);
+        scope.record_route(false, "weighted");
+        scope.begin_attempt("a", None, 0);
+        scope.complete_attempt(AttemptOutcome::Ok, None, Some(200));
+        scope.finish(RequestOutcome::ok());
+        let mut held = TraceScope::begin(&metrics, &serde_json::json!({"model": "m"}), false, 7);
+        held.record_route(false, "fallback");
+        held.note_hold_retry();
+        held.begin_attempt("a", None, 0);
+        held.complete_attempt(AttemptOutcome::Ok, None, Some(200));
+        held.finish(RequestOutcome::ok());
+
+        let t = traces(&mut rx);
+        let strategy = serde_json::to_value(&t[0]).unwrap();
+        assert_eq!(strategy["routeReason"], "strategy");
+        assert_eq!(strategy["routeStrategy"], "weighted");
+        let hold = serde_json::to_value(&t[1]).unwrap();
+        assert_eq!(hold["routeReason"], "rate_limit_hold");
+        assert!(hold["routeStrategy"].is_null());
+    }
+
+    #[test]
+    fn finish_should_label_passthrough_when_route_not_pinned() {
+        let metrics = MetricsCollector::new();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        metrics.set_event_tx(tx);
+        let mut scope = TraceScope::begin(
+            &metrics,
+            &serde_json::json!({"model": "claude-haiku-4-5"}),
+            false,
+            7,
+        );
+        scope.begin_attempt("anthropic", None, 0);
+        scope.complete_attempt(AttemptOutcome::Ok, None, Some(200));
+        scope.record_provider("anthropic");
+        scope.finish(RequestOutcome::ok());
+
+        let json = serde_json::to_value(&traces(&mut rx)[0]).unwrap();
+        assert_eq!(json["routedModel"], "claude-haiku-4-5");
+        assert_eq!(json["routedModelSource"], "passthrough");
+        assert_eq!(json["routedProvider"], "anthropic");
+    }
+
+    #[test]
+    fn finish_should_map_missing_model_placeholder_to_no_requested_model() {
+        let metrics = MetricsCollector::new();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        metrics.set_event_tx(tx);
+        let mut scope = TraceScope::begin(&metrics, &serde_json::json!({}), false, 7);
+        scope.finish(RequestOutcome::status(502));
+        let json = serde_json::to_value(&traces(&mut rx)[0]).unwrap();
+        assert!(json["requestedModel"].is_null());
+        assert!(json["routedModel"].is_null());
+    }
+
+    #[test]
+    fn finish_should_use_scope_local_detail_and_count_evicted_when_ring_buffer_entry_evicted() {
+        let (metrics, mut rx, mut scope) = scope_with_events();
+        scope.begin_attempt("a", None, 0);
+        scope.complete_attempt(AttemptOutcome::Ok, None, Some(200));
+        for i in 0..100 {
+            metrics.push_request(RequestDetail::from_body(
+                format!("filler-{i}"),
+                false,
+                0,
+                &serde_json::json!({}),
+                None,
+            ));
+        }
+        let id = scope.request_id().to_string();
+        scope.finish(RequestOutcome::ok());
+
+        let t = traces(&mut rx);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].request_id, id);
+        assert_eq!(t[0].attempts.len(), 1);
+        assert_eq!(t[0].status_code, 200);
+        assert!(metrics
+            .get_recent_requests(100)
+            .iter()
+            .all(|r| r.request_id != id));
+        assert_eq!(
+            counter(&metrics, |m| &m.counters.trace_finish_evicted_total),
+            1
+        );
+        assert_eq!(counter(&metrics, |m| &m.counters.trace_finish_total), 1);
+    }
+
+    #[tokio::test]
+    async fn finish_should_deliver_event_to_subscriber_within_100ms() {
+        let (_metrics, mut rx, mut scope) = scope_with_events();
+        scope.finish(RequestOutcome::ok());
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, DashboardEvent::RequestTrace(_)));
+    }
+
+    #[test]
+    fn finish_should_not_block_when_event_receiver_lagging_or_absent() {
+        let metrics = MetricsCollector::new();
+        let mut absent = TraceScope::begin(&metrics, &serde_json::json!({}), false, 0);
+        absent.finish(RequestOutcome::ok());
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        metrics.set_event_tx(tx);
+        for _ in 0..5 {
+            let mut scope = TraceScope::begin(&metrics, &serde_json::json!({}), false, 0);
+            scope.finish(RequestOutcome::ok());
+        }
+        drop(rx);
+        assert_eq!(counter(&metrics, |m| &m.counters.trace_finish_total), 6);
+    }
+
+    #[test]
+    fn three_attempt_dispatch_should_perform_exactly_one_replace_request_plus_begin_push() {
+        let metrics = MetricsCollector::new();
+        let mut scope = TraceScope::begin(&metrics, &serde_json::json!({"model": "m"}), false, 0);
+        for _ in 0..3 {
+            scope.begin_attempt("a", None, 0);
+            scope.complete_attempt(
+                AttemptOutcome::Timeout,
+                Some(AttemptErrorClass::Timeout),
+                Some(504),
+            );
+        }
+        assert_eq!(metrics.replace_request_count(), 0, "no per-attempt writes");
+        scope.finish(RequestOutcome::status(504));
+        assert_eq!(metrics.replace_request_count(), 1);
+        assert_eq!(metrics.push_request_count(), 1);
+    }
+
+    #[test]
+    fn dropping_scope_with_pending_attempt_should_record_cancelled_attempt() {
+        let (_metrics, mut rx, mut scope) = scope_with_events();
+        scope.begin_attempt("a", Some("m"), 0);
+        drop(scope);
+        let t = traces(&mut rx);
+        assert_eq!(t[0].attempts.len(), 1);
+        assert_eq!(t[0].attempts[0].outcome, AttemptOutcome::Cancelled);
+        assert_eq!(
+            t[0].attempts[0].error_class,
+            Some(AttemptErrorClass::Cancelled)
+        );
+        assert_eq!(t[0].attempts[0].status, None);
+    }
+
+    struct ScriptedProvider(std::sync::atomic::AtomicU32);
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+        async fn send(
+            &self,
+            _body: serde_json::Value,
+            _headers: http::HeaderMap,
+            _stream: bool,
+        ) -> Result<crate::providers::ProviderResponse, crate::providers::ProviderError> {
+            // Timeouts do not trip a cooldown, so every dispatch sees the same chain.
+            if self.0.fetch_add(1, Ordering::Relaxed) % 3 == 2 {
+                Ok(crate::providers::ProviderResponse::Full(
+                    serde_json::json!({"ok": true}),
+                ))
+            } else {
+                Err(crate::providers::ProviderError::Timeout)
+            }
+        }
+        async fn list_models(
+            &self,
+        ) -> Result<Vec<crate::providers::ModelInfo>, crate::providers::ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct Allow;
+    #[async_trait::async_trait]
+    impl crate::ratelimit::AdmissionControl for Allow {
+        async fn admit(&self, _upstream: &str, _est_tokens: u32) -> crate::ratelimit::Admit {
+            crate::ratelimit::Admit::Allowed
+        }
+    }
+
+    #[tokio::test]
+    async fn two_thousand_three_attempt_dispatches_should_finish_within_10s_and_keep_ring_buffer_and_attempt_log_bounded(
+    ) {
+        use crate::routing::router::{Router, RouterDeps};
+        use crate::routing::strategy::{FallbackStrategy, UpstreamRef};
+        let metrics = MetricsCollector::new();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        metrics.set_event_tx(tx);
+        let candidates = (0..3)
+            .map(|index| UpstreamRef {
+                index,
+                name: format!("u{index}"),
+                weight: 1.0,
+                model: None,
+                model_family: None,
+            })
+            .collect();
+        let provider = std::sync::Arc::new(ScriptedProvider(std::sync::atomic::AtomicU32::new(0)));
+        let router = Router::new(RouterDeps {
+            candidates,
+            providers: vec![provider.clone(), provider.clone(), provider],
+            strategy: std::sync::Arc::new(FallbackStrategy),
+            health: std::sync::Arc::new(crate::routing::health::HealthRegistry::new(300)),
+            admission: std::sync::Arc::new(Allow),
+            metrics: std::sync::Arc::clone(&metrics),
+        });
+
+        let started = Instant::now();
+        for _ in 0..2_000 {
+            let res = router
+                .dispatch(
+                    serde_json::json!({"model": "m"}),
+                    http::HeaderMap::new(),
+                    false,
+                    0,
+                )
+                .await;
+            assert!(res.is_ok());
+            // The two timeouts would otherwise open their breakers after a few rounds.
+            router.health.record_success(0);
+            router.health.record_success(1);
+            while rx.try_recv().is_ok() {}
+        }
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let recent = metrics.get_recent_requests(1_000);
+        assert!(recent.len() <= 100);
+        assert!(recent
+            .iter()
+            .all(|r| r.attempts.len() == 3 && r.attempts.len() <= MAX_ATTEMPTS));
     }
 }

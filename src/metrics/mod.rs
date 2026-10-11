@@ -74,13 +74,45 @@ pub struct RequestDetail {
     /// `TraceScope` finishes (or drops).
     #[serde(default)]
     pub status_code: u16,
+    /// The client's `body["model"]` verbatim; `None` when the request named none.
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub routed_model: Option<String>,
+    #[serde(default)]
+    pub routed_model_source: Option<trace::RoutedModelSource>,
+    #[serde(default)]
+    pub routed_provider: Option<String>,
+    /// `RouteReason` wire string, set when the request's terminal trace is written.
+    #[serde(default)]
+    pub route_reason: Option<String>,
+    #[serde(default)]
+    pub route_strategy: Option<String>,
+    #[serde(default)]
+    pub attempts: Vec<trace::AttemptRecord>,
+    #[serde(default)]
+    pub attempts_truncated: bool,
+    #[serde(default)]
+    pub iterations: u8,
+    #[serde(default)]
+    pub hold_retries: u8,
+    #[serde(default)]
+    pub trace_kind: crate::entrypoint::events::TraceKind,
+    #[serde(default)]
+    pub compression_status: crate::entrypoint::events::CompressionStatus,
+    #[serde(default)]
+    pub trace_revision: u8,
+    #[serde(default)]
+    pub first_byte_state: Option<crate::entrypoint::events::FirstByteState>,
+    #[serde(default)]
+    pub total_ms: Option<u64>,
 }
 
 impl RequestDetail {
     /// Builds the initial ring-buffer entry for an incoming request, before
     /// dispatch has picked an upstream: `provider` starts empty and timing
     /// fields start at zero, filled in later via
-    /// [`MetricsCollector::finish_scope`] once the request's `TraceScope` finishes.
+    /// [`MetricsCollector::finish_detail`] once the request's `TraceScope` finishes.
     /// `message_count`/`msg_types`/`has_context_management` are derived from
     /// the Anthropic-shaped request `body` (already true for both
     /// `/v1/messages` and `/v1/chat/completions`, since the latter is
@@ -116,6 +148,24 @@ impl RequestDetail {
             selected_model: None,
             selected_model_was_exploration: None,
             status_code: 0,
+            requested_model: body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            routed_model: None,
+            routed_model_source: None,
+            routed_provider: None,
+            route_reason: None,
+            route_strategy: None,
+            attempts: Vec::new(),
+            attempts_truncated: false,
+            iterations: 0,
+            hold_retries: 0,
+            trace_kind: crate::entrypoint::events::TraceKind::default(),
+            compression_status: crate::entrypoint::events::CompressionStatus::default(),
+            trace_revision: 0,
+            first_byte_state: None,
+            total_ms: None,
         }
     }
 }
@@ -204,26 +254,10 @@ pub struct MetricsCollector {
     current_lag_ms: Mutex<f64>,
     pub event_tx:
         Mutex<Option<tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>>>,
-}
-
-/// Timing fields recorded once a dispatch attempt completes (Fowler's
-/// introduce-parameter-object — same pattern as `routing::router::
-/// RouterDeps`), passed to [`MetricsCollector::finish_scope`].
-#[derive(Clone, Copy)]
-pub struct RequestTimingUpdate<'a> {
-    pub provider: &'a str,
-    pub duration_ms: f64,
-    pub first_byte_ms: f64,
-    pub bedrock_invocation_ms: u64,
-    pub bedrock_first_byte_ms: u64,
-}
-
-/// Terminal state `TraceScope` hands to [`MetricsCollector::finish_scope`].
-pub(crate) struct ScopeFinish<'a> {
-    pub status_code: u16,
-    pub timing: RequestTimingUpdate<'a>,
-    pub selected_model: Option<String>,
-    pub selected_model_was_exploration: Option<bool>,
+    #[cfg(test)]
+    push_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    replace_calls: std::sync::atomic::AtomicU64,
 }
 
 impl MetricsCollector {
@@ -239,6 +273,10 @@ impl MetricsCollector {
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
             event_tx: Mutex::new(None),
+            #[cfg(test)]
+            push_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            replace_calls: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -256,6 +294,9 @@ impl MetricsCollector {
 
     /// Push a new request detail to the ring buffer (capped at 100 entries).
     pub fn push_request(&self, detail: RequestDetail) {
+        #[cfg(test)]
+        self.push_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut buf = self
             .recent_requests
             .lock()
@@ -266,47 +307,55 @@ impl MetricsCollector {
         buf.push_front(detail);
     }
 
-    /// Shared in-place-mutate-by-id pattern behind `finish_scope`: a
-    /// no-op once the request has aged out of the 100-entry ring buffer.
-    fn mutate_request(&self, request_id: &str, f: impl FnOnce(&mut RequestDetail)) {
+    /// Overwrites the ring-buffer entry with the scope's final copy; `false` when
+    /// the entry has already aged out.
+    fn replace_request(&self, detail: &RequestDetail) -> bool {
+        #[cfg(test)]
+        self.replace_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut buf = self
             .recent_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(r) = buf.iter_mut().find(|r| r.request_id == request_id) {
-            f(r);
-        }
+        buf.iter_mut()
+            .find(|r| r.request_id == detail.request_id)
+            .map(|r| *r = detail.clone())
+            .is_some()
     }
 
-    /// Writes a request's terminal state into its ring-buffer entry and emits
-    /// exactly one `RequestTrace`. Called only from `TraceScope::finish` and
-    /// its `Drop`, so it must stay poison-safe and non-panicking. A request
-    /// that has aged out of the ring buffer emits nothing.
-    pub(crate) fn finish_scope(&self, request_id: &str, update: ScopeFinish<'_>) {
-        let mut trace_event = None;
-        self.mutate_request(request_id, |r| {
-            let timing = update.timing;
-            r.provider = timing.provider.to_string();
-            r.duration_ms = (timing.duration_ms * 10.0).round() / 10.0;
-            r.first_byte_ms = (timing.first_byte_ms * 10.0).round() / 10.0;
-            r.bedrock_invocation_ms = timing.bedrock_invocation_ms;
-            r.bedrock_first_byte_ms = timing.bedrock_first_byte_ms;
-            r.selected_model = update.selected_model;
-            r.selected_model_was_exploration = update.selected_model_was_exploration;
-            r.status_code = update.status_code;
-            trace_event = Some(crate::entrypoint::events::RequestTraceData::from_detail(r));
-        });
+    #[cfg(test)]
+    pub(crate) fn push_request_count(&self) -> u64 {
+        self.push_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
 
-        if let Some(trace) = trace_event {
-            let guard = self
-                .event_tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(ref tx) = *guard {
-                let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
-                    trace,
-                ));
-            }
+    #[cfg(test)]
+    pub(crate) fn replace_request_count(&self) -> u64 {
+        self.replace_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Writes a request's terminal state (one ring-buffer replace) and emits exactly one
+    /// `RequestTrace` built from `detail`, even if the ring-buffer entry was evicted.
+    /// Called only from `TraceScope::finish` and its `Drop`, so it must stay poison-safe
+    /// and non-panicking.
+    pub(crate) fn finish_detail(&self, detail: &RequestDetail) {
+        self.counters
+            .trace_finish_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.replace_request(detail) {
+            self.counters
+                .trace_finish_evicted_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(request_id = %detail.request_id, "trace finished after ring-buffer eviction");
+        }
+        let guard = self
+            .event_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref tx) = *guard {
+            let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
+                crate::entrypoint::events::RequestTraceData::from_detail(detail),
+            ));
         }
     }
 
@@ -519,6 +568,10 @@ impl Default for MetricsCollector {
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
             event_tx: Mutex::new(None),
+            #[cfg(test)]
+            push_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            replace_calls: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

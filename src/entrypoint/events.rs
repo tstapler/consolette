@@ -13,7 +13,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use crate::entrypoint::EntrypointState;
-use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, AttemptRecord};
+use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, AttemptRecord, RoutedModelSource};
 use crate::metrics::RequestDetail;
 
 /// Wire contract is camelCase and pinned by `ui/src/testing/fixtures/sse/*.json` (ADR-001).
@@ -29,9 +29,10 @@ pub struct MetricsTickData {
 
 /// Outcome of the ingress compression step. This project only ever sends `Off`; the
 /// other variants are reserved for the deferred compression-wiring follow-up (ADR-005).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionStatus {
+    #[default]
     Off,
     None,
     Skipped,
@@ -40,9 +41,10 @@ pub enum CompressionStatus {
 }
 
 /// Which path produced the trace.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceKind {
+    #[default]
     Routed,
     CacheHit,
     Local,
@@ -136,6 +138,26 @@ pub struct RequestTraceData {
     pub trace_revision: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_byte_state: Option<FirstByteState>,
+    /// The raw model the client asked for; `None` when the request named none.
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub routed_model: Option<String>,
+    #[serde(default)]
+    pub routed_model_source: Option<RoutedModelSource>,
+    #[serde(default)]
+    pub routed_provider: Option<String>,
+    #[serde(default)]
+    pub route_reason: Option<String>,
+    /// `RoutingStrategy::name()`, set only when `route_reason` is `strategy`.
+    #[serde(default)]
+    pub route_strategy: Option<String>,
+    #[serde(default)]
+    pub attempts: Vec<AttemptTrace>,
+    #[serde(default)]
+    pub attempts_truncated: bool,
+    #[serde(default)]
+    pub iterations: u8,
 }
 
 impl RequestTraceData {
@@ -154,15 +176,24 @@ impl RequestTraceData {
             model: detail.model.clone(),
             time_to_headers_ms,
             first_byte_ms: None,
-            total_ms: None,
+            total_ms: detail.total_ms,
             tokens_before: detail.tokens_before,
             tokens_after: None,
-            compression_status: CompressionStatus::Off,
+            compression_status: detail.compression_status,
             stream: detail.stream,
-            trace_kind: TraceKind::Routed,
+            trace_kind: detail.trace_kind,
             status_code: detail.status_code,
-            trace_revision: 0,
-            first_byte_state: None,
+            trace_revision: detail.trace_revision,
+            first_byte_state: detail.first_byte_state,
+            requested_model: detail.requested_model.clone(),
+            routed_model: detail.routed_model.clone(),
+            routed_model_source: detail.routed_model_source,
+            routed_provider: detail.routed_provider.clone(),
+            route_reason: detail.route_reason.clone(),
+            route_strategy: detail.route_strategy.clone(),
+            attempts: detail.attempts.iter().map(AttemptTrace::from).collect(),
+            attempts_truncated: detail.attempts_truncated,
+            iterations: detail.iterations,
         }
     }
 }
@@ -188,6 +219,8 @@ pub struct ConfigChangedData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
+// Short-lived broadcast items; boxing `RequestTrace` would ripple through every consumer for no gain.
+#[allow(clippy::large_enum_variant)]
 pub enum DashboardEvent {
     MetricsTick(MetricsTickData),
     RequestTrace(RequestTraceData),
@@ -340,6 +373,27 @@ mod tests {
             selected_model: None,
             selected_model_was_exploration: None,
             status_code: 200,
+            routed_model: Some("claude-haiku-4-5".to_string()),
+            routed_model_source: Some(crate::metrics::trace::RoutedModelSource::Passthrough),
+            routed_provider: Some("anthropic".to_string()),
+            route_reason: Some("default".to_string()),
+            attempts: vec![AttemptRecord {
+                iteration: 0,
+                upstream: "anthropic".into(),
+                model: None,
+                outcome: AttemptOutcome::Ok,
+                error_class: None,
+                status: Some(200),
+                latency_ms: 40,
+            }],
+            iterations: 1,
+            ..RequestDetail::from_body(
+                String::new(),
+                false,
+                0,
+                &serde_json::json!({"model": "claude-haiku-4-5"}),
+                None,
+            )
         }
     }
 
@@ -354,24 +408,7 @@ mod tests {
 
     #[test]
     fn request_trace_should_serialize_camel_case_equal_to_fixture_when_success() {
-        let data = RequestTraceData {
-            id: "req_123".to_string(),
-            request_id: "req_123".to_string(),
-            timestamp: "2026-10-10T18:09:53.222465+00:00".to_string(),
-            provider: "anthropic".to_string(),
-            model: "claude-haiku-4-5".to_string(),
-            time_to_headers_ms: 42,
-            first_byte_ms: None,
-            total_ms: None,
-            tokens_before: 1870,
-            tokens_after: None,
-            compression_status: CompressionStatus::Off,
-            stream: false,
-            trace_kind: TraceKind::Routed,
-            status_code: 200,
-            trace_revision: 0,
-            first_byte_state: None,
-        };
+        let data = RequestTraceData::from_detail(&sample_detail());
         let json = serde_json::to_value(DashboardEvent::RequestTrace(data)).expect("serialize");
         assert_eq!(json, fixture_value("request-trace-success.json"));
     }
@@ -491,5 +528,35 @@ mod tests {
         )))
         .expect("serialize");
         assert_eq!(unreachable["errorMessage"], "Upstream unreachable");
+    }
+
+    /// Walks `src/` and fails if any non-test code outside this file builds the struct literally.
+    #[test]
+    fn request_trace_data_from_detail_should_be_only_constructor_in_non_test_code() {
+        fn visit(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, hits);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !path.ends_with("entrypoint/events.rs")
+                {
+                    let text = std::fs::read_to_string(&path).expect("read");
+                    let non_test = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    if non_test.contains("RequestTraceData {") {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        visit(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut hits,
+        );
+        assert!(
+            hits.is_empty(),
+            "literal RequestTraceData outside events.rs: {hits:?}"
+        );
     }
 }

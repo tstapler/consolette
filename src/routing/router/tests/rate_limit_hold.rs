@@ -239,3 +239,39 @@ async fn dispatch_should_emit_499_when_dropped_during_hold() {
     assert_eq!(traces.len(), 1, "{traces:?}");
     assert_eq!(traces[0].status_code, 499);
 }
+
+/// Re-trips `idx` shortly after the first hold begins, so the request holds
+/// twice with no failed attempt in between (health uses real `Instant`s).
+fn retrip_after_first_hold(health: &Arc<HealthRegistry>) {
+    let health = Arc::clone(health);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        health.trip(0, Some(Duration::from_millis(1200)));
+    });
+}
+
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_report_route_reason_rate_limit_hold_and_hold_retries_2_when_hold_then_success(
+) {
+    let provider: Arc<dyn Provider> = Arc::new(AlwaysOkProvider {
+        name: "only",
+        call_count: Arc::new(AtomicU32::new(0)),
+    });
+    let health = Arc::new(HealthRegistry::new(300));
+    health.trip(0, Some(Duration::from_millis(1050)));
+    retrip_after_first_hold(&health);
+    let router = single_candidate_router(provider, health);
+    let mut rx = subscribe_events(&router.metrics);
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok(), "{:?}", res.err().map(|e| e.to_string()));
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].attempts.len(), 1);
+    assert_eq!(traces[0].route_reason.as_deref(), Some("rate_limit_hold"));
+    assert_eq!(router.metrics.get_recent_requests(1)[0].hold_retries, 2);
+}

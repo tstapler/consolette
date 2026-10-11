@@ -18,9 +18,7 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
-use crate::metrics::trace::{
-    AttemptErrorClass, AttemptOutcome, AttemptRecord, RequestOutcome, TraceScope,
-};
+use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, RequestOutcome, TraceScope};
 use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
@@ -600,9 +598,9 @@ impl Router {
     /// silently falling over to a different one. Falls back to the normal
     /// candidates if the pinned upstream isn't in this route at all (e.g. a
     /// route change removed it).
-    fn effective_candidates(&self, session_id: Option<&str>) -> Vec<UpstreamRef> {
+    fn effective_candidates(&self, session_id: Option<&str>) -> (Vec<UpstreamRef>, bool) {
         let Some(over) = session_id.and_then(|sid| self.session_overrides.get(sid)) else {
-            return self.candidates.clone();
+            return (self.candidates.clone(), false);
         };
         let Some(pinned) = self.candidates.iter().find(|c| c.name == over.upstream) else {
             tracing::warn!(
@@ -610,15 +608,16 @@ impl Router {
                 upstream = %over.upstream,
                 "session-pinned upstream not in current route; falling back to normal routing"
             );
-            return self.candidates.clone();
+            return (self.candidates.clone(), false);
         };
-        vec![UpstreamRef {
+        let pin = UpstreamRef {
             index: pinned.index,
             name: pinned.name.clone(),
             weight: pinned.weight,
             model: over.model.clone().or_else(|| pinned.model.clone()),
             model_family: pinned.model_family.clone(),
-        }]
+        };
+        (vec![pin], true)
     }
 
     /// Healthy candidates not yet tried for this request, minus
@@ -716,7 +715,8 @@ impl Router {
             return self.dispatch_local(target, body, headers, stream).await;
         }
         let session_id = extract_session_id(&body);
-        let candidates = self.effective_candidates(session_id.as_deref());
+        let (candidates, pinned) = self.effective_candidates(session_id.as_deref());
+        scope.record_route(pinned, self.strategy.name());
         let candidates = self.strategy.expand_candidates(candidates);
         self.dispatch_attempts(scope, &candidates, body, headers, stream, est_tokens)
             .await
@@ -740,18 +740,13 @@ impl Router {
             .unwrap_or("unknown")
             .to_string();
 
-        let mut hold_retries: u32 = 0;
-
         loop {
             let healthy = self.admitted_candidates(candidates, &already_tried);
 
             let Some(chosen) = self.strategy.select(&healthy) else {
                 // Insulate agents from temporary rate-limit cooldowns: if
                 // all candidates are in short cooldown, hold and retry.
-                if self
-                    .hold_for_rate_limit_cooldown(candidates, &mut hold_retries)
-                    .await
-                {
+                if self.hold_for_rate_limit_cooldown(candidates, scope).await {
                     already_tried.clear();
                     continue;
                 }
@@ -768,6 +763,12 @@ impl Router {
             match self.admission.admit(&chosen.name, est_tokens).await {
                 Admit::Allowed | Admit::Delayed(_) => {}
                 Admit::Shed => {
+                    scope.begin_attempt(&chosen.name, chosen.model.as_deref(), 0);
+                    scope.complete_attempt(
+                        AttemptOutcome::Shed,
+                        Some(AttemptErrorClass::Shed),
+                        None,
+                    );
                     last_error = Some(ProviderError::RateLimited);
                     continue;
                 }
@@ -786,23 +787,24 @@ impl Router {
                 request_body[MODEL_FAMILY_BODY_KEY] = serde_json::Value::String(family.clone());
             }
             let attempt_started = std::time::Instant::now();
+            scope.begin_attempt(&chosen.name, chosen.model.as_deref(), 0);
             let outcome = provider.send(request_body, headers.clone(), stream).await;
 
             match outcome {
                 Ok(response) => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
-                    scope.record_attempt(attempt_record(&chosen, attempt_started, None));
+                    scope.complete_attempt_result(None);
                     scope.record_provider(&chosen.name);
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
-                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
+                    scope.complete_attempt_result(Some(&e));
                     return Err(e);
                 }
                 Err(e) if e.is_rate_limited() => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
-                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
+                    scope.complete_attempt_result(Some(&e));
                     self.maybe_trip_rate_limit(candidates, &already_tried, &chosen, &e);
                     last_error = Some(e);
                 }
@@ -814,7 +816,7 @@ impl Router {
                     // permanently-broken Gemini endpoint isn't retried on
                     // every request forever.
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
-                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
+                    scope.complete_attempt_result(Some(&e));
                     self.health.trip(
                         chosen.index,
                         Some(Duration::from_secs(
@@ -825,7 +827,7 @@ impl Router {
                 }
                 Err(e) => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
-                    scope.record_attempt(attempt_record(&chosen, attempt_started, Some(&e)));
+                    scope.complete_attempt_result(Some(&e));
                     last_error = Some(e);
                 }
             }
@@ -854,9 +856,9 @@ impl Router {
     async fn hold_for_rate_limit_cooldown(
         &self,
         candidates: &[UpstreamRef],
-        hold_retries: &mut u32,
+        scope: &mut TraceScope,
     ) -> bool {
-        if *hold_retries >= MAX_HOLD_RETRIES {
+        if scope.hold_retries() >= MAX_HOLD_RETRIES {
             return false;
         }
         let Some(wait_secs) = candidates
@@ -873,12 +875,12 @@ impl Router {
         tracing::info!(
             "All upstream candidates rate-limited / cooling down. Holding request for {}s to insulate agent (attempt {}/{})...",
             wait_secs,
-            *hold_retries + 1,
+            scope.hold_retries() + 1,
             MAX_HOLD_RETRIES
         );
         tokio::time::sleep(Duration::from_secs(wait_secs) + Duration::from_millis(HOLD_JITTER_MS))
             .await;
-        *hold_retries += 1;
+        scope.note_hold_retry();
         true
     }
 
@@ -1113,22 +1115,6 @@ impl Router {
             }
             _ => {}
         }
-    }
-}
-
-fn attempt_record(
-    chosen: &UpstreamRef,
-    started: std::time::Instant,
-    error: Option<&ProviderError>,
-) -> AttemptRecord {
-    AttemptRecord {
-        iteration: 0,
-        upstream: chosen.name.as_str().into(),
-        model: chosen.model.clone(),
-        outcome: error.map_or(AttemptOutcome::Ok, AttemptOutcome::from),
-        error_class: error.map(AttemptErrorClass::from),
-        status: error.map(ProviderError::trace_status),
-        latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }
 }
 

@@ -187,6 +187,22 @@ impl From<&ProviderError> for crate::metrics::trace::AttemptErrorClass {
     }
 }
 
+impl crate::metrics::trace::TraceScope {
+    /// Closes the open attempt for an upstream result; outcome, class and status all come
+    /// from the same `error`.
+    pub fn complete_attempt_result(&mut self, error: Option<&ProviderError>) {
+        use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome};
+        match error {
+            None => self.complete_attempt(AttemptOutcome::Ok, None, Some(200)),
+            Some(e) => self.complete_attempt(
+                AttemptOutcome::from(e),
+                Some(AttemptErrorClass::from(e)),
+                Some(e.trace_status()),
+            ),
+        }
+    }
+}
+
 impl From<&ProviderError> for crate::metrics::trace::AttemptOutcome {
     /// Classifies an error as an attempt outcome; carries no response body.
     fn from(err: &ProviderError) -> Self {

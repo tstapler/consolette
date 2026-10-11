@@ -481,3 +481,40 @@ async fn dispatch_should_emit_one_499_trace_when_upstream_hangs_and_future_dropp
     assert_eq!(traces[0].status_code, 499);
     assert_eq!(metrics.get_recent_requests(10).len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_499_with_single_cancelled_attempt_latency_ge_5s_when_upstream_hangs_and_future_dropped(
+) {
+    use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome};
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(HangingProvider)];
+    let router = fallback_router_with_metrics(vec![upstream(0, "hang")], providers, &metrics);
+
+    let dispatch = router.dispatch(serde_json::json!({}), HeaderMap::new(), false, 0);
+    let timed_out = tokio::time::timeout(Duration::from_secs(5), dispatch).await;
+
+    assert!(timed_out.is_err());
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 499);
+    let attempts = &traces[0].attempts;
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Cancelled);
+    assert_eq!(attempts[0].error_class, Some(AttemptErrorClass::Cancelled));
+    assert_eq!(attempts[0].status, None);
+    assert!(attempts[0].latency_ms >= 5000, "{}", attempts[0].latency_ms);
+}
+
+/// Line count of `router/mod.rs` before Story 2.1.2 (git `e7c85c1`).
+const ROUTER_MOD_RS_LINES_BEFORE_ATTEMPT_CAPTURE: usize = 1130;
+
+#[test]
+fn router_mod_rs_should_not_grow_net_lines_after_attempt_capture() {
+    let lines = include_str!("../mod.rs").lines().count();
+    assert!(
+        lines <= ROUTER_MOD_RS_LINES_BEFORE_ATTEMPT_CAPTURE,
+        "router/mod.rs grew to {lines} lines; keep reason/outcome logic in metrics/trace.rs"
+    );
+}

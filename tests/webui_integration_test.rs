@@ -2,6 +2,8 @@
 //! and REST API endpoints (Epic 7, Tasks 7.2.1 & 7.2.2).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod support;
+
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
@@ -195,4 +197,37 @@ fn fixture_files_should_be_reachable_via_include_str_when_cargo_test_runs() {
         let value: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert!(value["type"].is_string());
     }
+}
+
+#[tokio::test]
+async fn metrics_recent_requests_should_keep_legacy_keys_and_add_attempts_and_route_reason() {
+    use std::time::Duration;
+    use support::fake_upstream::{FakeUpstream, Script};
+    use support::live_server::LiveServer;
+    let upstream = FakeUpstream::start(Script::models(Vec::<String>::new())).await;
+    let server = LiveServer::start(&upstream.base_url()).await;
+    let mut sse = server.open_sse().await;
+    let _client = server
+        .post_messages(&serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+    let traces = sse
+        .request_traces(Duration::from_secs(5), Duration::from_millis(200))
+        .await;
+    assert_eq!(traces.len(), 1, "{traces:?}");
+
+    let metrics = server.metrics().await;
+    let recent = &metrics["recent_requests"][0];
+    assert!(recent["request_id"].is_string(), "{recent}");
+    assert!(recent["duration_ms"].is_number(), "{recent}");
+    assert_eq!(recent["model"], "claude-sonnet-4");
+    assert_eq!(
+        recent["attempts"].as_array().map(Vec::len),
+        Some(1),
+        "{recent}"
+    );
+    assert_eq!(recent["route_reason"], "default", "{recent}");
 }

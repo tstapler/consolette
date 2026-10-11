@@ -45,3 +45,33 @@ async fn client_abort_should_emit_one_499_trace_with_ring_buffer_entry_and_count
     assert_eq!(metrics["trace_cancelled_total"], 1, "{metrics}");
     assert_eq!(metrics["trace_unfinished_total"], 0, "{metrics}");
 }
+
+#[tokio::test]
+async fn client_abort_should_also_record_single_cancelled_attempt_once_2_1_2b2_lands() {
+    let upstream = FakeUpstream::start(Script::hang()).await;
+    let server = LiveServer::start(&upstream.base_url()).await;
+    let mut sse = server.open_sse().await;
+
+    let client = server
+        .post_messages(&serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(client);
+
+    let traces = sse
+        .request_traces(Duration::from_secs(2), Duration::from_millis(300))
+        .await;
+    assert_eq!(traces.len(), 1, "exactly one trace: {traces:?}");
+    let attempts = traces[0]["data"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["outcome"], "cancelled");
+    assert_eq!(attempts[0]["errorClass"], "cancelled");
+    assert!(
+        attempts[0]["latencyMs"].as_u64().unwrap() >= 150,
+        "{attempts:?}"
+    );
+}

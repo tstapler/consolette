@@ -18,6 +18,7 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
+use crate::metrics::ids::UpstreamName;
 use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, RequestOutcome, TraceScope};
 use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
@@ -74,6 +75,10 @@ pub struct Router {
     local_catalog: Arc<LocalCatalog>,
     /// Lazily-built providers for discovered local endpoints, keyed by base URL.
     local_providers: dashmap::DashMap<String, Arc<dyn Provider>>,
+    /// Config-order names of `providers`, set by `from_config` via
+    /// `with_provider_names` (kept out of `RouterDeps`, which tests build in
+    /// dozens of places). Empty when unset.
+    provider_names: Vec<UpstreamName>,
 }
 
 /// The four non-`openrouter`-kind upstreams: a plain `Arc<dyn Provider>`,
@@ -439,6 +444,7 @@ impl Router {
             )),
             local_catalog: LocalCatalog::new(),
             local_providers: dashmap::DashMap::new(),
+            provider_names: Vec::new(),
         }
     }
 
@@ -502,6 +508,31 @@ impl Router {
         result
     }
 
+    /// Attaches config-order upstream names to `providers` (see `providers_named`).
+    #[must_use]
+    pub fn with_provider_names(mut self, names: Vec<UpstreamName>) -> Self {
+        self.provider_names = names;
+        self
+    }
+
+    /// `(name, provider)` pairs in config order; empty when names were never set.
+    #[must_use]
+    pub fn providers_named(&self) -> Vec<(UpstreamName, Arc<dyn Provider>)> {
+        if self.provider_names.len() != self.providers.len() {
+            tracing::debug!(
+                names = self.provider_names.len(),
+                providers = self.providers.len(),
+                "provider names unset or mismatched; providers_named is empty"
+            );
+            return Vec::new();
+        }
+        self.provider_names
+            .iter()
+            .cloned()
+            .zip(self.providers.iter().map(Arc::clone))
+            .collect()
+    }
+
     /// Swaps in a shared capability-verdict cache, replacing the empty one
     /// `Router::new`/`from_config` starts with. Same carry-across contract
     /// as `with_session_overrides`: `api::post_route` passes the
@@ -559,6 +590,10 @@ impl Router {
 
         let (providers, openrouter_providers) =
             build_providers(config, Arc::clone(&metrics.counters)).await?;
+        let provider_names: Vec<UpstreamName> = providers
+            .iter()
+            .map(|(name, _)| UpstreamName::from(name.as_str()))
+            .collect();
         let providers: Vec<Arc<dyn Provider>> = providers
             .into_iter()
             .map(|(_, provider)| provider)
@@ -590,7 +625,8 @@ impl Router {
             health,
             admission,
             metrics,
-        }))
+        })
+        .with_provider_names(provider_names))
     }
 
     /// This dispatch's candidate list: the route's normal `self.candidates`,

@@ -617,7 +617,7 @@ name = "anthropic"
             }],
         };
 
-        post_route(State(state.clone()), Json(route)).await.unwrap();
+        let _applied = post_route(State(state.clone()), Json(route)).await.unwrap();
 
         let snapshot = state.catalog.snapshot();
         let after: Vec<&String> = snapshot.upstreams.keys().collect();

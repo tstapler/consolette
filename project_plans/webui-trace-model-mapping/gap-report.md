@@ -160,3 +160,25 @@ New or deferred items:
 | E-26 legend term/definition separator (S3) | quick win in 5.1.4b |
 | E-27 legacy `/api/models` leaks raw upstream body (S3) | backlog (migrate callers to the sanitized catalog) |
 | E-28 Models warning styling, live region (S3) | verify in 4.1.7c, else backlog |
+
+## Epic 4 outcome (Story 4.1.7 accessibility pass)
+
+Run date: 2026-10-12. Measured in headless Chrome (puppeteer) against `CONSOLETTE_REQUIRE_UI=1 cargo build` of the working tree at `d243858`, fake upstreams as in the exploratory pass, scripts `/tmp/expl/{m2,z1,r1,ct,e28}.mjs` (throwaway). Commits: `6419f2d` E-26, `a73e5b5` E-23, `3fcf348` a11y-checks + Karma builder, `399c240` live region/Pause/hold, `71071e3` the main a11y pass, `6e4d253` E-28, `a976a85` chart motion, `d243858` reflow fix.
+
+| ID | Status | Evidence (before -> after) |
+|----|--------|----------------------------|
+| E-01 | fixed `71071e3` | Close/Copy/heading hit-tested as the header at y=20 -> drawer at `top-16`; `elementFromPoint` returns the control itself at 1440 and 320 px (y=84), focus lands on the heading at y=84. Spec uses `elementFromPoint` against a replica header. |
+| E-04 | fixed `71071e3` | rows had no tab stop -> each row has a `<button>` (130x24, ringed); spec selects a session via keyboard-focusable control. |
+| E-07 | fixed `71071e3` | default ring 3.25:1 page / 2.44:1 card / 2.53:1 button -> global `:focus-visible` 2px `#7dd3fc`; 145 sampled tab stops over 5 routes: 0 without ring, min 11.65:1 on page, 8.77:1 on card. |
+| E-08 | fixed `71071e3` | Config inputs no indicator -> same ring (38 Config tab stops, 0 without). Inputs also got label `for`/`id` (they had no accessible name). |
+| E-09 | fixed `71071e3`, `a976a85` | 5 pulse dots and 0.3 s transitions under `reduce` -> 0 running animations, transitions 1e-05 s. `animate-*` is now `motion-safe:`; latency chart `animation:false` under reduce (unit spec; canvas not sampled in a browser; RPM chart was already `false`). |
+| E-10 | fixed `71071e3` | sliders 8 px, checkbox 13x13 -> 24 px; 0 of 145 tab stops under 24x24. |
+| E-11 | fixed `71071e3` | neutral-500 3.78, slate-500 3.76, Apply 3.62 -> neutral/slate-400 and cyan-700; page scan of 5 routes finds no text under 4.5:1 except the gradient wordmark (transparent clip text, false positive). Stale rows dimmed by colour token (`.stale-rows`), not opacity. |
+| E-12 | fixed `71071e3` (judgement) | 9 key presses -> 5 (skip link, Enter, Copy, Inspect, Enter). Residual: Copy still precedes Inspect; mouse path is still 2 interactions. |
+| E-23 | fixed `a73e5b5` | cache hit reads `Answered for <model> (cache hit; no upstream ran)`; `session_pin` source says the model came from the session's pin. |
+| E-24 | fixed `71071e3`, `d243858` | 320 px: nav `display:none`, page overflow 745 px (Overview) / 112 px -> menu button with 5-link panel, overflow 0 on Overview, Models, Config, Sessions; 640 px css: 419 px -> 0; header badge right edge 308 px. Root cause of the page-level overflow was absolute `sr-only` spans escaping the unpositioned scroll region (`d243858`). |
+| E-25 | fixed `71071e3` | bars/dots vanished under forced-colors -> bordered, `CanvasText` fill under `@media (forced-colors: active)` (screenshot `/tmp/expl/r1-forced-colors-drawer.png` shows bar, dots, ring); sidebar is sticky (top 64 px after a 600 px scroll). Residual: only emulated forced-colors (light) in headless Chrome. |
+| E-26 | fixed `6419f2d` | term and definition now separated by ` - `. |
+| E-28 | fixed `6e4d253` | VERIFIED defect: status region empty after Refresh. Now `Refreshing models` then `Refresh finished: 2 of 3 upstreams ok` (browser: finished message present 50 ms after click); pinned warning has a visible `Warning` label (spec; the live run had no warnings so the label was not seen in the browser). |
+
+Not done / residual: no screen-reader pass (VoiceOver/NVDA); chart canvas animation under reduce checked by spec only; forced-colors dark scheme and real Windows High Contrast not tried; dimmed-row contrast is spec-measured, not re-sampled in the browser; Karma now runs on `@angular/build:karma` (the webpack builder never applied Tailwind v4, so earlier specs saw unstyled DOM).

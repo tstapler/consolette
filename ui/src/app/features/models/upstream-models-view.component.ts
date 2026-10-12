@@ -1,4 +1,4 @@
-import { Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import { Component, OnDestroy, OnInit, computed, effect, inject, signal, untracked } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import { ModelCatalogStore } from '../../core/stores/model-catalog.store';
@@ -51,7 +51,7 @@ const ANNOUNCE_DELAY_MS = 300;
       </div>
 
       <div *ngIf="store.isLoading() && !store.catalog()" data-skeleton role="status" class="space-y-2">
-        <div class="h-16 rounded-lg bg-neutral-900 animate-pulse"></div>
+        <div class="h-16 rounded-lg bg-neutral-900 motion-safe:animate-pulse"></div>
         <span class="sr-only">Loading the model catalog</span>
       </div>
 
@@ -93,7 +93,7 @@ const ANNOUNCE_DELAY_MS = 300;
               refreshed <time [attr.datetime]="at">{{ age(at) }}</time>
             </span>
             <span *ngIf="cat.upstreams[name].error as e" class="text-sm text-rose-300" [attr.title]="e.message">{{ errorLabel(e) }}</span>
-            <span *ngIf="cat.upstreams[name].refreshing" data-spinner class="text-xs text-cyan-300 animate-pulse">Refreshing...</span>
+            <span *ngIf="cat.upstreams[name].refreshing" data-spinner class="text-xs text-cyan-300 motion-safe:animate-pulse">Refreshing...</span>
             <span *ngIf="store.notice(name) as n" class="text-xs text-amber-300">{{ n }}</span>
             <button
               type="button"
@@ -135,7 +135,8 @@ const ANNOUNCE_DELAY_MS = 300;
 
         <section data-config-warnings class="border border-neutral-800 rounded-xl bg-neutral-900 p-4 space-y-2">
           <h2 class="font-semibold text-white">
-            <span aria-hidden="true">{{ cat.configWarnings.length > 0 ? '!' : '✓' }}</span>
+            <span *ngIf="cat.configWarnings.length > 0" data-warning-label class="px-1.5 py-0.5 mr-1 text-xs font-semibold rounded border border-amber-500 text-amber-300"><span aria-hidden="true">! </span>Warning</span>
+            <span *ngIf="cat.configWarnings.length === 0" aria-hidden="true">✓</span>
             Referenced by config but not listed upstream ({{ cat.configWarnings.length }})
           </h2>
           <ul *ngIf="cat.configWarnings.length > 0" class="text-sm font-mono space-y-1">
@@ -170,6 +171,26 @@ export class UpstreamModelsViewComponent implements OnInit, OnDestroy {
   });
   protected readonly totalMatches = computed(() =>
     this.names().reduce((sum, n) => sum + this.matches(n).length, 0));
+
+  private wasBusy = false;
+
+  constructor() {
+    // Polite status region: say when a refresh starts and how it ended (UX-22), not only search results.
+    effect(() => {
+      const busy = this.anyBusy();
+      const cat = this.store.catalog();
+      untracked(() => {
+        if (busy && !this.wasBusy) {
+          this.announcement.set('Refreshing models');
+        } else if (!busy && this.wasBusy) {
+          const entries = Object.values(cat?.upstreams ?? {});
+          const ok = entries.filter((u) => upstreamDisplayState(u) === 'ok').length;
+          this.announcement.set(`Refresh finished: ${ok} of ${entries.length} upstreams ok`);
+        }
+        this.wasBusy = busy;
+      });
+    });
+  }
 
   ngOnInit(): void {
     this.store.load();

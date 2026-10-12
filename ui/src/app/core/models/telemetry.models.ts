@@ -119,12 +119,12 @@ export interface BenchmarkData {
   durationP90?: number;
   durationP95?: number;
   durationP99?: number;
-  speedTokSec: number;
-  successRatePercent: number;
-  errorRate?: number;
-  costPer1k: number;
+  speedTokSec: number | null;
+  successRatePercent: number | null;
+  errorRate?: number | null;
+  costPer1k: number | null;
   tokensSavedPercent: number;
-  aiderScore?: number;
+  aiderScore?: number | null;
 }
 
 export interface ConfigData {

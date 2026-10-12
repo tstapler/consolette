@@ -172,12 +172,16 @@ pub struct BenchmarkItem {
     pub duration_p90: f64,
     pub duration_p95: f64,
     pub duration_p99: f64,
-    pub speed_tok_sec: f64,
-    pub success_rate_percent: f64,
-    pub error_rate: f64,
-    pub cost_per_1k: f64,
+    /// `None` when no output tokens were recorded (nothing to divide).
+    pub speed_tok_sec: Option<f64>,
+    /// `None` until finished traces exist; follows `metrics::trace_error_rate`.
+    pub success_rate_percent: Option<f64>,
+    pub error_rate: Option<f64>,
+    /// Always `None`: no price data is recorded.
+    pub cost_per_1k: Option<f64>,
     pub tokens_saved_percent: f64,
-    pub aider_score: f64,
+    /// `None` for a model absent from the bench table.
+    pub aider_score: Option<f64>,
 }
 
 /// `GET /v1/dashboard/benchmark` — comparative performance metrics across models and upstreams.
@@ -236,15 +240,23 @@ pub async fn get_dashboard_benchmark(
         };
 
         let total_duration_sec: f64 = reqs.iter().map(|r| r.duration_ms / 1000.0).sum();
-        let speed_tok_sec = if total_duration_sec > 0.0 {
-            total_after as f64 / total_duration_sec
-        } else {
-            35.0
-        };
+        let speed_tok_sec = (total_duration_sec > 0.0 && total_after > 0)
+            .then(|| total_after as f64 / total_duration_sec);
 
-        let aider_score = crate::routing::bench_table::bench_score(&model)
-            .map(|s| s * 100.0)
-            .unwrap_or(55.0);
+        let aider_score = crate::routing::bench_table::bench_score(&model).map(|s| s * 100.0);
+
+        let finished: Vec<crate::metrics::RequestDetail> =
+            reqs.iter().map(|r| (*r).clone()).collect();
+        let rate = crate::metrics::trace_error_rate(&finished);
+        let round1 = |v: f64| (v * 10.0).round() / 10.0;
+        let (error_rate, success_rate_percent) = if rate.requests == 0 {
+            (None, None)
+        } else {
+            (
+                Some(round1(rate.rate * 100.0)),
+                Some(round1((1.0 - rate.rate) * 100.0)),
+            )
+        };
 
         items.push(BenchmarkItem {
             model,
@@ -258,45 +270,12 @@ pub async fn get_dashboard_benchmark(
             duration_p95,
             duration_p99,
             speed_tok_sec,
-            success_rate_percent: 100.0,
-            error_rate: 0.0,
-            cost_per_1k: 0.015,
+            success_rate_percent,
+            error_rate,
+            cost_per_1k: None,
             tokens_saved_percent,
             aider_score,
         });
-    }
-
-    if items.is_empty() {
-        let default_models = vec![
-            ("claude-3-5-sonnet", "anthropic", 120.0, 450.0, 88.0),
-            ("gpt-4o", "openai", 140.0, 510.0, 85.0),
-            ("gemini-1.5-pro", "gemini", 180.0, 620.0, 81.0),
-            ("deepseek-chat-v3.1:free", "openrouter", 220.0, 750.0, 55.1),
-        ];
-
-        for (m, p, ttft, dur, score) in default_models {
-            let aider_score = crate::routing::bench_table::bench_score(m)
-                .map(|s| s * 100.0)
-                .unwrap_or(score);
-            items.push(BenchmarkItem {
-                model: m.to_string(),
-                provider: p.to_string(),
-                ttft_p50: ttft,
-                ttft_p90: ttft * 1.3,
-                ttft_p95: ttft * 1.5,
-                ttft_p99: ttft * 1.8,
-                duration_p50: dur,
-                duration_p90: dur * 1.3,
-                duration_p95: dur * 1.5,
-                duration_p99: dur * 1.8,
-                speed_tok_sec: 42.0,
-                success_rate_percent: 99.5,
-                error_rate: 0.5,
-                cost_per_1k: 0.015,
-                tokens_saved_percent: 24.5,
-                aider_score,
-            });
-        }
     }
 
     Json(items)
@@ -1167,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_dashboard_benchmark_returns_valid_items() {
+    async fn get_dashboard_benchmark_is_empty_without_traffic() {
         use crate::config::schema::Config;
 
         let state = EntrypointState::build(
@@ -1178,9 +1157,6 @@ mod tests {
         .unwrap();
 
         let Json(benchmarks) = get_dashboard_benchmark(State(state)).await;
-        assert!(!benchmarks.is_empty(), "benchmark list should not be empty");
-        assert!(benchmarks.iter().any(|b| b.model.contains("claude")
-            || b.model.contains("gpt")
-            || b.model.contains("deepseek")));
+        assert!(benchmarks.is_empty(), "no seed rows: {benchmarks:?}");
     }
 }

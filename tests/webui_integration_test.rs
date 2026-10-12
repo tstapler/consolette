@@ -181,6 +181,60 @@ async fn test_dashboard_benchmark_api() {
     assert!(json.is_array());
 }
 
+async fn get_json(app: &axum::Router, uri: &str) -> serde_json::Value {
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn benchmark_endpoint_should_return_empty_array_and_null_rates_when_no_traffic_or_no_failures(
+) {
+    let dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let state = create_test_state(dir.path()).await;
+    let metrics = state.metrics.clone();
+    let app = entrypoint_router(state);
+
+    // No traffic: no seed rows.
+    assert_eq!(
+        get_json(&app, "/v1/dashboard/benchmark").await,
+        serde_json::json!([])
+    );
+
+    // Requests still in flight (status 0): nothing to base a rate or a cost on.
+    let body = serde_json::json!({"model": "claude-sonnet-4", "messages": []});
+    let mut inflight =
+        consolette::metrics::RequestDetail::from_body("req_a".into(), false, 10, &body, None);
+    inflight.provider = "anthropic".into();
+    metrics.push_request(inflight);
+    let rows = get_json(&app, "/v1/dashboard/benchmark").await;
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    for key in [
+        "successRatePercent",
+        "errorRate",
+        "costPer1k",
+        "speedTokSec",
+    ] {
+        assert!(rows[0][key].is_null(), "{key} must be null: {rows}");
+    }
+    assert!(rows[0]["aiderScore"].is_null(), "{rows}");
+
+    // A finished 200 and a finished 500: the rate follows the trace statuses.
+    for (id, status) in [("req_b", 200_u16), ("req_c", 500)] {
+        let mut d =
+            consolette::metrics::RequestDetail::from_body(id.into(), false, 10, &body, None);
+        d.provider = "anthropic".into();
+        d.status_code = status;
+        metrics.push_request(d);
+    }
+    let rows = get_json(&app, "/v1/dashboard/benchmark").await;
+    assert_eq!(rows[0]["errorRate"], 50.0, "{rows}");
+    assert_eq!(rows[0]["successRatePercent"], 50.0, "{rows}");
+    assert!(rows[0]["costPer1k"].is_null(), "{rows}");
+}
+
 #[tokio::test]
 async fn test_dashboard_config_api_get_and_put() {
     let dir = tempfile::tempdir().expect("Failed to create tempdir");
@@ -284,7 +338,11 @@ fn model_catalog_fixture_should_match_the_rust_wire_shape() {
             assert_eq!(keys(&up["error"]), error_keys, "{name} error keys drifted");
         }
     }
-    assert_eq!(seen_states.len(), states.len(), "fixture covers every state");
+    assert_eq!(
+        seen_states.len(),
+        states.len(),
+        "fixture covers every state"
+    );
     for w in fixture["configWarnings"].as_array().unwrap() {
         assert_eq!(keys(w), warning_keys);
     }

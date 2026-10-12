@@ -102,7 +102,8 @@ export interface SessionData {
   savedTokens?: number;
   timelineSteps?: { name: string; durationMs: number; status: 'ok' | 'warning' | 'error' | 'skipped' }[];
   turnCount: number;
-  tokenSavingsPercent: number;
+  /** null when tokens_after was never recorded (compression off). */
+  tokenSavingsPercent: number | null;
   lastActiveTimestamp: string;
   pinned: boolean;
   model: string;

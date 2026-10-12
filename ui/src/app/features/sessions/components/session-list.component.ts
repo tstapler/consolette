@@ -54,7 +54,7 @@ import { SessionData } from '../../../core/models/telemetry.models';
                   {{ session.turnCount }}
                 </td>
                 <td class="px-4 py-3 text-right font-mono font-medium text-emerald-400">
-                  {{ session.tokenSavingsPercent | number:'1.1-1' }}%
+                  {{ session.tokenSavingsPercent === null ? '\u2013' : (session.tokenSavingsPercent | number:'1.1-1') + '%' }}
                 </td>
                 <td class="px-4 py-3 text-xs text-slate-400">
                   {{ session.lastActiveTimestamp }}

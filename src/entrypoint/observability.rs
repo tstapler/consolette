@@ -58,7 +58,8 @@ pub struct SessionSummary {
     #[serde(rename = "sessionId", alias = "session_id")]
     pub session_id: String,
     pub turn_count: u32,
-    pub token_savings_percent: f64,
+    /// `None` when `tokens_after` was never recorded (compression is off), not 100.
+    pub token_savings_percent: Option<f64>,
     pub last_active_timestamp: String,
     #[serde(rename = "lastActive", alias = "last_active")]
     pub last_active: String,
@@ -101,12 +102,13 @@ pub async fn get_dashboard_sessions(
         let tokens_before_sum: u64 = reqs.iter().map(|r| r.tokens_before).sum();
         let tokens_after_sum: u64 = reqs.iter().map(|r| r.tokens_after).sum();
 
-        let token_savings_percent = if tokens_before_sum > 0 {
+        // tokens_after stays 0 while compression is off; that is "not recorded", not a 100% saving.
+        let token_savings_percent = if tokens_before_sum > 0 && tokens_after_sum > 0 {
             let saved = tokens_before_sum.saturating_sub(tokens_after_sum);
             let pct = (saved as f64 / tokens_before_sum as f64) * 100.0;
-            (pct * 10.0).round() / 10.0
+            Some((pct * 10.0).round() / 10.0)
         } else {
-            0.0
+            None
         };
 
         let pin = state.session_overrides.get(&sess_id);
@@ -788,6 +790,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_dashboard_sessions_should_report_no_savings_when_tokens_after_was_never_recorded()
+    {
+        let state = state_with_cached_body("req-1", serde_json::json!({})).await;
+        let body = serde_json::json!({"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "hi"}]});
+        let detail = crate::metrics::RequestDetail::from_body(
+            "req-1".to_string(),
+            false,
+            100,
+            &body,
+            Some("sess-none".to_string()),
+        );
+        assert_eq!(
+            detail.tokens_after, 0,
+            "precondition: tokens_after unrecorded"
+        );
+        state.metrics.push_request(detail);
+
+        let Json(sessions) = get_dashboard_sessions(
+            State(state),
+            Query(SessionsQueryParams {
+                limit: Some(10),
+                cursor: None,
+                search: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(sessions[0].token_savings_percent, None);
+        let wire = serde_json::to_value(&sessions[0]).unwrap();
+        assert!(wire["tokenSavingsPercent"].is_null(), "{wire}");
+    }
+
+    #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn get_dashboard_sessions_returns_active_sessions() {
         let state = state_with_cached_body("req-1", serde_json::json!({})).await;
@@ -816,7 +851,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-abc");
         assert_eq!(sessions[0].turn_count, 1);
-        assert!((sessions[0].token_savings_percent - 40.0).abs() < f64::EPSILON);
+        assert_eq!(sessions[0].token_savings_percent, Some(40.0));
         assert_eq!(sessions[0].provider, "anthropic");
     }
 

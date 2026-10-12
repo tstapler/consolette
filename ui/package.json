@@ -6,7 +6,8 @@
     "start": "ng serve",
     "build": "ng build --base-href /dashboard/",
     "watch": "ng build --watch --configuration development",
-    "test": "ng test"
+    "test": "ng test",
+    "e2e": "node e2e/overview-smoke.mjs"
   },
   "private": true,
   "dependencies": {

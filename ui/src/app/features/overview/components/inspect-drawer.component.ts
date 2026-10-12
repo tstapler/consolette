@@ -160,10 +160,10 @@ function groupRounds(items: AttemptItem[], iterations: number): Round[] {
           <p *ngIf="v.attemptsNote" data-attempts-note>{{ v.attemptsNote }}</p>
           <p *ngIf="v.truncated" data-truncated>showing first 16 attempts</p>
           <p data-attempt-summary class="sr-only">{{ v.summary }}</p>
-          <ng-container *ngFor="let round of v.rounds">
+          <ng-container *ngFor="let round of v.rounds; trackBy: trackRound">
             <h4 *ngIf="round.heading" data-round class="text-[11px] text-neutral-400">{{ round.heading }}</h4>
             <ol data-attempt-list class="space-y-1">
-              <li *ngFor="let it of round.items">
+              <li *ngFor="let it of round.items; trackBy: trackItem">
                 <button type="button" data-attempt [attr.aria-pressed]="it.index === selectedAttempt" (click)="selectAttempt(it.index)" style="${MIN_TARGET}"
                   class="w-full text-left px-2 py-1 rounded border font-mono focus-visible:outline focus-visible:outline-2"
                   [ngClass]="it.index === selectedAttempt ? 'border-cyan-600 bg-neutral-800' : 'border-neutral-800 hover:bg-neutral-800/60'">
@@ -216,11 +216,22 @@ export class InspectDrawerComponent implements OnInit {
   public readonly headingId = 'inspect-drawer-heading';
   public readonly chipMeaning = chipMeaning;
   public readonly errorLabel = errorLabel;
+  public readonly trackRound = (index: number, round: Round): string => round.heading ?? `round-${index}`;
+  public readonly trackItem = (_: number, item: AttemptItem): number => item.index;
   private announcement = '';
   private snapshot: RequestTraceData | null = null;
   private source: RequestTraceData[] = [];
   private origin: HTMLElement | null = null;
   private inerted: HTMLElement[] = [];
+  private destroyed = false;
+
+  constructor() {
+    // Leaving the narrow-mode sheet open must not strand the app shell as inert.
+    this.destroyRef.onDestroy(() => {
+      this.destroyed = true;
+      this.clearInert();
+    });
+  }
 
   @Input() set traces(value: RequestTraceData[]) {
     this.source = value ?? [];
@@ -291,6 +302,7 @@ export class InspectDrawerComponent implements OnInit {
   public async copyId(): Promise<void> {
     if (!this.selectedId) return;
     const ok = await copyText(this.selectedId);
+    if (this.destroyed) return;
     this.announcement = ok ? 'Copied request ID' : 'Copy failed - select the ID and copy it manually';
     this.cdr.detectChanges();
   }
@@ -359,6 +371,8 @@ export class InspectDrawerComponent implements OnInit {
   private refreshSnapshot(): void {
     if (!this.selectedId) return;
     const found = this.source.find(t => this.idOf(t) === this.selectedId);
+    // Same object and still live: rebuilding would only churn the DOM (and drop focus).
+    if (found && found === this.snapshot && !this.evicted) return;
     if (found) {
       this.snapshot = found;
       this.evicted = false;

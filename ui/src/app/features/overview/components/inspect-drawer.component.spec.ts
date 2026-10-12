@@ -348,6 +348,31 @@ describe('InspectDrawerComponent', () => {
     expect(q('[role="dialog"]')).toBeNull();
   });
 
+  it('drawer_should_clear_inert_from_the_page_when_destroyed_while_the_narrow_sheet_is_open', () => {
+    const outside = document.createElement('div');
+    document.body.appendChild(outside);
+    pageNodes.push(outside);
+    widthSpy.and.returnValue(640);
+    openOn(trace());
+    expect(outside.hasAttribute('inert')).toBeTrue();
+    fixture.destroy();
+    expect(outside.hasAttribute('inert')).toBeFalse();
+    expect(tableEl.hasAttribute('inert')).toBeFalse();
+  });
+
+  it('drawer_should_keep_the_same_attempt_button_node_when_an_unrelated_trace_is_pushed', () => {
+    const t = trace();
+    openOn(t);
+    const before = attemptButtons();
+    expect(before.length).toBeGreaterThan(0);
+    before[0].focus();
+    drawer.traces = [trace({ requestId: 'other-request-id' } as Partial<RequestTraceData>), t];
+    fixture.detectChanges();
+    const after = attemptButtons();
+    expect(after[0]).toBe(before[0]);
+    expect(document.activeElement).toBe(before[0]);
+  });
+
   it('inspect_should_show_failed_attempt_error_class_label_message_and_latency_within_two_steps', () => {
     openOn(failureFixture as RequestTraceData);
     const detail = text(q('[data-attempt-detail]'));

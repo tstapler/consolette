@@ -1,3 +1,4 @@
+import { HttpClient } from '@angular/common/http';
 import { Injectable, inject, signal, computed, DestroyRef, Injector } from '@angular/core';
 import { ModelCatalogStore } from './model-catalog.store';
 import { ConfigStore } from './config.store';
@@ -5,6 +6,7 @@ import { SseService } from '../services/sse.service';
 import { MetricsTickData, RequestTraceData, DashboardEvent, ErrorLoggedData } from '../models/telemetry.models';
 
 const MAX_RECENT_ERRORS = 20;
+const BACKFILL_LIMIT = 50;
 
 export interface MetricsStoreOptions {
   maxTraces?: number;
@@ -17,6 +19,8 @@ export interface MetricsStoreOptions {
 export class MetricsStore {
   private readonly sseService = inject(SseService);
   private readonly injector = inject(Injector);
+  // Optional so stores built without HTTP wiring (isolated specs) simply skip backfill.
+  private readonly http = inject(HttpClient, { optional: true });
   private readonly destroyRef = inject(DestroyRef, { optional: true });
 
   private readonly maxTracesLimit: number;
@@ -56,8 +60,11 @@ export class MetricsStore {
       this.handleDashboardEvent(event);
     });
 
+    const reconnectSub = this.sseService.reconnected$.subscribe(() => this.backfillTraces());
+    this.backfillTraces();
     if (this.destroyRef) {
       this.destroyRef.onDestroy(() => {
+        reconnectSub.unsubscribe();
         sub.unsubscribe();
       });
     }
@@ -70,6 +77,7 @@ export class MetricsStore {
   public handleDashboardEvent(event: DashboardEvent): void {
     if (event.type === 'system_lag') {
       this.lagSkippedSignal.set(event.data.skipped);
+      this.backfillTraces();
       return;
     }
     this.lagSkippedSignal.set(null);
@@ -85,6 +93,34 @@ export class MetricsStore {
       // Resolved lazily so stores that never see this event need no HttpClient.
       this.injector.get(ModelCatalogStore).onCatalogChanged();
     }
+  }
+
+  /** Recovers history after a page load, lag or reconnect; see `mergeBackfill` for the merge rule. */
+  public backfillTraces(): void {
+    this.http
+      ?.get<RequestTraceData[]>(`/v1/dashboard/traces?limit=${BACKFILL_LIMIT}`)
+      .subscribe({
+        next: (rows) => this.mergeBackfill(rows),
+        error: () => undefined, // live events still flow; the next reconnect retries
+      });
+  }
+
+  // Equal-or-higher traceRevision wins per requestId (so an older snapshot never overwrites a
+  // newer live row); unseen rows are added and the result is ordered newest first by timestamp.
+  private mergeBackfill(rows: RequestTraceData[]): void {
+    this.recentTracesSignal.update((existing) => {
+      const merged = existing.slice();
+      for (const row of rows) {
+        const idx = merged.findIndex((t) => t.requestId === row.requestId);
+        if (idx === -1) {
+          merged.push(row);
+        } else if (row.traceRevision >= merged[idx].traceRevision) {
+          merged[idx] = row;
+        }
+      }
+      merged.sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
+      return merged.slice(0, this.maxTracesLimit);
+    });
   }
 
   private pushError(error: ErrorLoggedData): void {

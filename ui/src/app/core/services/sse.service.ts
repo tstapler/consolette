@@ -30,6 +30,10 @@ export class SseService {
   public readonly isConnected = computed(() => this.statusSignal() === 'connected');
 
   public readonly events$: Observable<DashboardEvent> = this.eventsSubject.asObservable();
+  private readonly reconnectedSubject = new Subject<void>();
+  /** Fires when a stream opens after a drop, so consumers can backfill what they missed. */
+  public readonly reconnected$: Observable<void> = this.reconnectedSubject.asObservable();
+  private recovering = false;
 
   private url = '/v1/dashboard/events';
   private initialBackoffMs = 1000;
@@ -59,6 +63,7 @@ export class SseService {
 
   /** Manual recovery after retries are exhausted: fresh counter, immediate attempt. */
   public reconnect(): void {
+    this.recovering = true;
     this.clearReconnectTimer();
     this.retryCountSignal.set(0);
     this.statusSignal.set('connecting');
@@ -93,6 +98,10 @@ export class SseService {
         this.statusSignal.set('connected');
         this.retryCountSignal.set(0);
         this.armStaleWatchdog();
+        if (this.recovering) {
+          this.recovering = false;
+          this.reconnectedSubject.next();
+        }
       };
 
       this.eventSource.onmessage = (event: MessageEvent) => {
@@ -128,6 +137,7 @@ export class SseService {
 
   public handleErrorAndReconnect(): void {
     this.closeExistingSource();
+    this.recovering = true;
 
     const currentRetry = this.retryCountSignal();
     if (currentRetry >= this.maxRetryAttempts) {

@@ -37,7 +37,11 @@ describe('UpstreamModelsViewComponent', () => {
     http = TestBed.inject(HttpTestingController);
   });
 
-  afterEach(() => http.verify());
+  afterEach(() => {
+    // The view's MetricsStore backfills traces on construction; unrelated to what is asserted here.
+    http.match('/v1/dashboard/traces?limit=50').forEach((r) => r.flush([]));
+    http.verify();
+  });
 
   function open(c: any = catalog()): void {
     fx = TestBed.createComponent(UpstreamModelsViewComponent);

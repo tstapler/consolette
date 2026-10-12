@@ -23,6 +23,7 @@ describe('OverviewDashboardComponent', () => {
     reconnectSpy = jasmine.createSpy('reconnect');
     const mockSseService = {
       events$: mockSseEvents$.asObservable(),
+      reconnected$: new Subject<void>().asObservable(),
       connectionStatus: statusSignal.asReadonly(),
       retryCount: () => 0,
       reconnect: reconnectSpy

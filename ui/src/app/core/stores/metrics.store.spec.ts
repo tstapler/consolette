@@ -1,4 +1,6 @@
 import { TestBed } from '@angular/core/testing';
+import { provideHttpClient } from '@angular/common/http';
+import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { MetricsStore } from './metrics.store';
 import { ConfigStore } from './config.store';
 import { SseService } from '../services/sse.service';
@@ -20,7 +22,7 @@ describe('MetricsStore (TC-UNIT-10)', () => {
       return inst;
     } as any);
     TestBed.configureTestingModule({
-      providers: [MetricsStore, { provide: ConfigStore, useValue: configStoreSpy }]
+      providers: [MetricsStore, provideHttpClient(), provideHttpClientTesting(), { provide: ConfigStore, useValue: configStoreSpy }]
     });
     store = TestBed.inject(MetricsStore);
   });
@@ -170,5 +172,47 @@ describe('MetricsStore (TC-UNIT-10)', () => {
     spyOn(sse, 'reconnect');
     store.reconnect();
     expect(sse.reconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('store_should_seed_from_backfill_once_and_merge_by_revision_without_duplicates_after_reconnect', () => {
+    const http = TestBed.inject(HttpTestingController);
+    const base = traceSuccess.data as unknown as RequestTraceData;
+    const row = (id: string, ts: string, extra: Partial<RequestTraceData> = {}): RequestTraceData =>
+      ({ ...base, id, requestId: id, timestamp: ts, ...extra });
+
+    // Page load: exactly one backfill call, newest first, seeds the empty table.
+    const first = http.expectOne('/v1/dashboard/traces?limit=50');
+    first.flush([row('req_b', '2026-10-10T18:00:02+00:00'), row('req_a', '2026-10-10T18:00:01+00:00')]);
+    expect(store.recentTraces().map((t) => t.requestId)).toEqual(['req_b', 'req_a']);
+    http.expectNone('/v1/dashboard/traces?limit=50');
+
+    // A live row at revision 1 must survive an older revision-0 snapshot from the next backfill.
+    store.pushTrace(row('req_b', '2026-10-10T18:00:02+00:00', { traceRevision: 1, firstByteMs: 450 }));
+    store.pushTrace(row('req_c', '2026-10-10T18:00:03+00:00'));
+
+    // Reconnect after system_lag: backfill again, no duplicates, no downgrade, missed row appears in order.
+    deliver({ type: 'system_lag', data: { skipped: 5 } });
+    http.expectOne('/v1/dashboard/traces?limit=50').flush([
+      row('req_d', '2026-10-10T18:00:04+00:00'),
+      row('req_c', '2026-10-10T18:00:03+00:00'),
+      row('req_b', '2026-10-10T18:00:02+00:00', { traceRevision: 0, firstByteMs: null }),
+      row('req_a', '2026-10-10T18:00:01+00:00'),
+    ]);
+    expect(store.recentTraces().map((t) => t.requestId)).toEqual(['req_d', 'req_c', 'req_b', 'req_a']);
+    expect(store.recentTraces()[2].firstByteMs).toBe(450);
+  });
+
+  it('should backfill again after the SSE service reports a reconnect', () => {
+    const http = TestBed.inject(HttpTestingController);
+    http.expectOne('/v1/dashboard/traces?limit=50').flush([]);
+    TestBed.inject(SseService).connect({ url: '/test/events' });
+    instances[0].onopen();
+    http.expectNone('/v1/dashboard/traces?limit=50');
+
+    instances[0].onerror();
+    (TestBed.inject(SseService) as any).initEventSource();
+    instances[1].onopen();
+    http.expectOne('/v1/dashboard/traces?limit=50').flush([]);
+    TestBed.inject(SseService).disconnect();
   });
 });

@@ -165,6 +165,7 @@ describe('ModelCatalogStore', () => {
 
   it('metricsStore_should_dispatch_ModelCatalogChanged_to_one_refetch', () => {
     TestBed.inject(MetricsStore);
+    http.expectOne('/v1/dashboard/traces?limit=50').flush([]);
     store.load();
     http.expectOne(URL).flush(catalog());
     const sse = TestBed.inject(SseService);

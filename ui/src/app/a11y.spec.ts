@@ -83,6 +83,9 @@ describe('accessibility (Story 4.1.7)', () => {
       expect(region.tabIndex).toBe(0);
       expect(region.scrollWidth).toBeGreaterThan(region.clientWidth);
       expect(host.scrollWidth).withContext('the card itself must not overflow').toBeLessThanOrEqual(320);
+      // sr-only spans are position:absolute; without a positioned scroll region they escape its clip and widen the page (E-24).
+      const doc = document.documentElement;
+      expect(doc.scrollWidth).withContext('page-level horizontal scroll').toBeLessThanOrEqual(doc.clientWidth);
     });
 
     it('models_list_wraps_a_120_character_model_id_without_horizontal_scroll', async () => {

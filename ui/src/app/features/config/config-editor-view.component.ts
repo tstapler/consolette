@@ -20,13 +20,13 @@ import { ConfigDiffModalComponent } from './components/config-diff-modal.compone
   template: `
     <div class="space-y-6">
       <!-- Header Bar -->
-      <div class="flex items-center justify-between">
+      <div class="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 class="text-2xl font-bold tracking-tight text-white">Dynamic Proxy Configuration</h1>
           <p class="text-xs text-slate-400">Manage upstreams, weights, failover cascades, and rate limit policies with zero-downtime hot reloading.</p>
         </div>
 
-        <div class="flex items-center space-x-3">
+        <div class="flex flex-wrap items-center gap-3">
           <button
             type="button"
             (click)="openDiffModal()"

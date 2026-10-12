@@ -75,7 +75,7 @@ const NOT_RECORDED = 'n/a (not recorded)';
         Live feed interrupted - reconnecting (attempt {{ retryAttempt }})
       </div>
 
-      <div class="overflow-x-auto" role="region" aria-label="Live request traces, scroll horizontally" tabindex="0" data-skip-target
+      <div class="relative overflow-x-auto" role="region" aria-label="Live request traces, scroll horizontally" tabindex="0" data-skip-target
         (focusin)="onFocusIn()" (focusout)="onFocusOut($event)">
         <table data-trace-table tabindex="-1" class="w-full text-left text-xs text-neutral-300">
           <caption class="sr-only">Live request traces</caption>

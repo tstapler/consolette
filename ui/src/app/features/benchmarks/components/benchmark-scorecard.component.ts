@@ -55,7 +55,7 @@ export type SortDirection = 'asc' | 'desc';
                   </span>
                 </td>
                 <td class="py-3 px-4 text-right font-mono text-xs text-neutral-200">
-                  {{ row.ttftP50 || 0 }}ms <span class="text-neutral-500">/ {{ row.ttftP99 || 0 }}ms</span>
+                  <span data-ttft-na title="not measured">&#8211;</span><span class="sr-only">n/a (not measured)</span>
                 </td>
                 <td class="py-3 px-4 text-right font-mono text-xs text-neutral-200">
                   {{ row.durationP50 || row.ttftP50 || 0 }}ms

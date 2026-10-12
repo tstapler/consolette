@@ -20,6 +20,7 @@ pub mod observability;
 pub mod openai_stream;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod traces;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -346,6 +347,10 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
         .route(
             "/v1/dashboard/events",
             axum::routing::get(events::handle_sse_events),
+        )
+        .route(
+            "/v1/dashboard/traces",
+            axum::routing::get(traces::get_dashboard_traces),
         )
         .route(
             "/v1/dashboard/sessions",

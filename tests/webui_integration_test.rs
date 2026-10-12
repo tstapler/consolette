@@ -820,3 +820,48 @@ async fn get_config_should_report_anthropic_base_url_and_no_rpm_shed() {
     );
     assert!(cfg["rateLimits"].get("rpm").is_none(), "{cfg}");
 }
+
+#[tokio::test]
+async fn get_traces_should_return_newest_first_array_shaped_like_sse_fixture() {
+    let dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let state = create_test_state(dir.path()).await;
+    let body = serde_json::json!({"model": "claude-sonnet-4", "messages": []});
+    for id in ["req_first001", "req_second02", "req_third003"] {
+        state
+            .metrics
+            .push_request(consolette::metrics::RequestDetail::from_body(
+                id.to_string(),
+                false,
+                10,
+                &body,
+                None,
+            ));
+    }
+    let app = entrypoint_router(state);
+
+    let json = get_json(&app, "/v1/dashboard/traces?limit=50").await;
+
+    let rows = json.as_array().expect("array body");
+    assert_eq!(rows.len(), 3, "{json}");
+    let ids: Vec<&str> = rows
+        .iter()
+        .map(|r| r["requestId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["req_third003", "req_second02", "req_first001"]);
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../ui/src/testing/fixtures/sse/request-trace-success.json"
+    ))
+    .unwrap();
+    let fixture_keys: std::collections::BTreeSet<&String> =
+        fixture["data"].as_object().unwrap().keys().collect();
+    for row in rows {
+        let keys: std::collections::BTreeSet<&String> = row.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys, fixture_keys,
+            "backfill row must match the SSE wire shape"
+        );
+    }
+
+    let limited = get_json(&app, "/v1/dashboard/traces?limit=2").await;
+    assert_eq!(limited.as_array().unwrap().len(), 2);
+}

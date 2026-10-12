@@ -82,7 +82,6 @@ import { ConfigDiffModalComponent } from './components/config-diff-modal.compone
       <!-- Rate Limits -->
       <app-rate-limit-config
         [rateLimits]="draftRateLimits()"
-        (rateLimitsChange)="onRateLimitsChange($event)"
       />
 
       <!-- Diff Preview Modal -->
@@ -133,21 +132,14 @@ export class ConfigEditorViewComponent implements OnInit {
         name,
         apiKey: p.apiKey,
         baseUrl: p.baseUrl,
-        weight: p.weight !== undefined ? p.weight : 0
+        weight: p.weight
       }));
       this.providerItems.set(items);
     } else {
-      this.providerItems.set([
-        { name: 'anthropic', apiKey: 'sk-ant-...****', weight: 50 },
-        { name: 'openai', apiKey: 'sk-...****', baseUrl: 'https://api.openai.com/v1', weight: 50 }
-      ]);
+      this.providerItems.set([]);
     }
 
-    if (active.fallbackCascade) {
-      this.cascadeItems.set(active.fallbackCascade);
-    } else {
-      this.cascadeItems.set(['anthropic', 'openai']);
-    }
+    this.cascadeItems.set(active.fallbackCascade ?? []);
 
     if (active.rateLimits) {
       this.draftRateLimits.set(active.rateLimits);
@@ -158,7 +150,7 @@ export class ConfigEditorViewComponent implements OnInit {
     const providersMap: Record<string, { apiKey?: string; baseUrl?: string; weight?: number }> = {};
     for (const p of this.providerItems()) {
       providersMap[p.name] = {
-        apiKey: p.apiKey,
+        apiKey: p.newApiKey ?? p.apiKey,
         baseUrl: p.baseUrl,
         weight: p.weight
       };
@@ -180,17 +172,32 @@ export class ConfigEditorViewComponent implements OnInit {
     this.cascadeItems.set(newCascade);
   }
 
-  public onRateLimitsChange(newRateLimits: RateLimitValues): void {
-    this.draftRateLimits.set(newRateLimits);
-  }
-
   public openDiffModal(): void {
     this.isDiffModalOpen.set(true);
   }
 
+  /** The PUT body: only fields the operator changed. Rate limits are read-only and never sent. */
+  public changesPayload(): ConfigData {
+    const active = this.configStore.config()?.providers ?? {};
+    const providers: NonNullable<ConfigData['providers']> = {};
+    for (const p of this.providerItems()) {
+      const original = active[p.name];
+      const entry: { apiKey?: string; baseUrl?: string; weight?: number } = {};
+      if (p.newApiKey) entry.apiKey = p.newApiKey;
+      if (p.baseUrl && p.baseUrl !== original?.baseUrl) entry.baseUrl = p.baseUrl;
+      if (p.weight !== undefined && p.weight !== original?.weight) entry.weight = p.weight;
+      providers[p.name] = entry;
+    }
+    const payload: ConfigData = {
+      webUi: this.configStore.config()?.webUi || 'angular',
+      providers
+    };
+    if (this.cascadeItems().length > 0) payload.fallbackCascade = this.cascadeItems();
+    return payload;
+  }
+
   public onApplyConfig(): void {
-    const draft = this.currentDraft();
-    this.configStore.applyConfig(draft);
+    this.configStore.applyConfig(this.changesPayload());
   }
 
   public onConfirmApply(): void {

@@ -396,6 +396,47 @@ pub fn validate_base_url(url_str: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The `base_url` of upstream kinds that have one.
+fn upstream_base_url(kind: &crate::config::schema::UpstreamKind) -> Option<&str> {
+    use crate::config::schema::UpstreamKind;
+    match kind {
+        UpstreamKind::Anthropic { base_url } | UpstreamKind::Openai { base_url } => {
+            Some(base_url.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn upstream_base_url_mut(kind: &mut crate::config::schema::UpstreamKind) -> Option<&mut String> {
+    use crate::config::schema::UpstreamKind;
+    match kind {
+        UpstreamKind::Anthropic { base_url } | UpstreamKind::Openai { base_url } => Some(base_url),
+        _ => None,
+    }
+}
+
+/// Auth after the operator typed a new key: keeps the existing variant (and `Apikey`
+/// header) so a Bearer upstream stays Bearer; an upstream with no inline-key auth
+/// gets `Apikey` + `x-api-key`.
+fn auth_with_new_key(
+    existing: Option<&crate::config::schema::AuthMethod>,
+    new_key: String,
+) -> crate::config::schema::AuthMethod {
+    use crate::config::schema::{AuthMethod, SecretRef};
+    let secret = SecretRef::Inline { value: new_key };
+    match existing {
+        Some(AuthMethod::Bearer { .. }) => AuthMethod::Bearer { token: secret },
+        Some(AuthMethod::Apikey { header, .. }) => AuthMethod::Apikey {
+            key: secret,
+            header: header.clone(),
+        },
+        _ => AuthMethod::Apikey {
+            key: secret,
+            header: "x-api-key".to_string(),
+        },
+    }
+}
+
 /// `GET /v1/dashboard/config` — active runtime configuration with API keys masked.
 pub async fn get_dashboard_config(
     State(state): State<EntrypointState>,
@@ -426,7 +467,7 @@ pub async fn get_dashboard_config(
                 _ => {}
             }
         }
-        if let crate::config::schema::UpstreamKind::Openai { base_url } = &upstream.kind {
+        if let Some(base_url) = upstream_base_url(&upstream.kind) {
             p_obj.insert("baseUrl".to_string(), serde_json::json!(base_url));
             p_obj.insert("base_url".to_string(), serde_json::json!(base_url));
         }
@@ -446,8 +487,9 @@ pub async fn get_dashboard_config(
         .map(|r| r.upstreams.iter().map(|u| u.name.clone()).collect())
         .unwrap_or_default();
 
+    // Read-only: limits live in the route file and PUT does not persist them (E-14).
     let rate_limits = serde_json::json!({
-        "rpm": config.ratelimit.defaults.on_breach,
+        "onBreach": config.ratelimit.defaults.on_breach,
         "maxDelayMs": config.ratelimit.defaults.max_delay_ms,
     });
 
@@ -506,22 +548,30 @@ pub async fn put_dashboard_config(
             let base_url_opt = p_val
                 .get("baseUrl")
                 .or_else(|| p_val.get("base_url"))
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|u| !u.is_empty());
 
             if let Some(b_url) = base_url_opt {
-                validate_base_url(b_url).map_err(|err| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": err })),
-                    )
-                })?;
-                if let Some(upstream) = current_config
+                let upstream = current_config
                     .upstreams
                     .iter_mut()
-                    .find(|u| u.name == *p_name)
-                {
-                    if let crate::config::schema::UpstreamKind::Openai { base_url } =
-                        &mut upstream.kind
+                    .find(|u| u.name == *p_name);
+                // An unchanged URL is not re-validated, so one legacy `http://` upstream
+                // cannot reject the whole save (E-15).
+                let unchanged = upstream
+                    .as_ref()
+                    .and_then(|u| upstream_base_url(&u.kind))
+                    .is_some_and(|current| current == b_url);
+                if !unchanged {
+                    validate_base_url(b_url).map_err(|err| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": format!("{p_name}: {err}") })),
+                        )
+                    })?;
+                    if let Some(base_url) =
+                        upstream.and_then(|u| upstream_base_url_mut(&mut u.kind))
                     {
                         *base_url = b_url.to_string();
                     }
@@ -531,42 +581,20 @@ pub async fn put_dashboard_config(
             let api_key_opt = p_val
                 .get("apiKey")
                 .or_else(|| p_val.get("api_key"))
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .filter(|k| !k.is_empty() && !is_masked_key(k));
 
+            // A masked key is the GET echo, not a new secret: leave auth untouched.
             if let Some(api_key) = api_key_opt {
-                let effective_key = if is_masked_key(api_key) {
-                    current_config
-                        .upstreams
-                        .iter()
-                        .find(|u| u.name == *p_name)
-                        .and_then(|u| match &u.auth {
-                            Some(crate::config::schema::AuthMethod::Apikey { key, .. })
-                            | Some(crate::config::schema::AuthMethod::Bearer { token: key }) => {
-                                match key {
-                                    crate::config::schema::SecretRef::Inline { value } => {
-                                        Some(value.clone())
-                                    }
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| api_key.to_string())
-                } else {
-                    api_key.to_string()
-                };
-
                 if let Some(upstream) = current_config
                     .upstreams
                     .iter_mut()
                     .find(|u| u.name == *p_name)
                 {
-                    upstream.auth = Some(crate::config::schema::AuthMethod::Apikey {
-                        key: crate::config::schema::SecretRef::Inline {
-                            value: effective_key,
-                        },
-                        header: "x-api-key".to_string(),
-                    });
+                    upstream.auth = Some(auth_with_new_key(
+                        upstream.auth.as_ref(),
+                        api_key.to_string(),
+                    ));
                 }
             }
 

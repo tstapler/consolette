@@ -649,3 +649,174 @@ async fn metrics_should_report_model_catalog_section_with_coalesced_counter_and_
         "loading"
     );
 }
+
+// ---- Story 4.1.3: Config PUT keeps auth intact ----
+
+use support::live_server::{read_response, LiveServer};
+
+/// One anthropic-kind upstream `fake` on a fallback route, with `auth_toml` as its auth block.
+async fn config_server(fake: &FakeUpstream, auth_toml: &str) -> LiveServer {
+    LiveServer::start_config(&format!(
+        r#"
+[[upstreams]]
+name = "fake"
+kind = "anthropic"
+base_url = "{}"
+{auth_toml}
+
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "fake"
+weight = 1.0
+"#,
+        fake.base_url()
+    ))
+    .await
+}
+
+async fn put_config(
+    server: &LiveServer,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/v1/dashboard/config")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = entrypoint_router(server.state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// Sends one message and returns the headers the fake upstream saw for it.
+async fn upstream_headers_after_message(
+    server: &LiveServer,
+    fake: &FakeUpstream,
+) -> support::fake_upstream::RecordedHeaders {
+    let before = fake.received_headers().len();
+    let mut sock = server
+        .post_messages(&serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": format!("hi {before}")}]
+        }))
+        .await;
+    let _ = read_response(&mut sock, std::time::Duration::from_secs(5)).await;
+    fake.received_headers()
+        .pop()
+        .expect("upstream saw a request")
+}
+
+const BEARER_AUTH: &str =
+    "[upstreams.auth]\ntype = \"bearer\"\n[upstreams.auth.token]\nsource = \"inline\"\nvalue = \"sk-orig-bearer\"\n";
+const APIKEY_AUTH: &str = "[upstreams.auth]\ntype = \"apikey\"\nheader = \"x-custom-key\"\n[upstreams.auth.key]\nsource = \"inline\"\nvalue = \"sk-orig-apikey\"\n";
+
+#[tokio::test]
+async fn put_config_should_preserve_bearer_auth_when_only_weight_changes() {
+    let fake = FakeUpstream::start(Script::models(Vec::<String>::new())).await;
+    let server = config_server(&fake, BEARER_AUTH).await;
+    let cfg = server.request_json("GET", "/v1/dashboard/config").await;
+    let masked = cfg["providers"]["fake"]["apiKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // What the editor sends: the masked key echo and the unchanged base URL, new weight.
+    let (status, body) = put_config(
+        &server,
+        serde_json::json!({"providers": {"fake": {
+            "apiKey": masked, "baseUrl": fake.base_url(), "weight": 100
+        }}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let headers = upstream_headers_after_message(&server, &fake).await;
+    assert_eq!(headers.get("authorization"), "Bearer sk-orig-bearer");
+    assert!(
+        !headers.has("x-api-key"),
+        "Bearer must not become x-api-key"
+    );
+}
+
+#[tokio::test]
+async fn put_config_should_round_trip_every_auth_variant_with_a_new_key() {
+    // (auth block, header carrying the key, expected value prefix)
+    let cases = [
+        (BEARER_AUTH, "authorization", "Bearer sk-new"),
+        (APIKEY_AUTH, "x-custom-key", "sk-new"),
+        ("", "x-api-key", "sk-new"),
+    ];
+    for (auth, header_name, expected) in cases {
+        let fake = FakeUpstream::start(Script::models(Vec::<String>::new())).await;
+        let server = config_server(&fake, auth).await;
+        let (status, body) = put_config(
+            &server,
+            serde_json::json!({"providers": {"fake": {"apiKey": "sk-new"}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let headers = upstream_headers_after_message(&server, &fake).await;
+        assert_eq!(headers.get(header_name), expected, "auth block: {auth}");
+    }
+}
+
+#[tokio::test]
+async fn put_config_should_accept_unchanged_http_base_url_and_empty_base_url() {
+    let fake = FakeUpstream::start(Script::models(Vec::<String>::new())).await;
+    let server = config_server(&fake, BEARER_AUTH).await;
+    assert!(fake.base_url().starts_with("http://"));
+
+    let (status, body) = put_config(
+        &server,
+        serde_json::json!({"providers": {"fake": {"baseUrl": fake.base_url(), "weight": 100}}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unchanged http URL must not 400: {body}"
+    );
+
+    let (status, body) = put_config(
+        &server,
+        serde_json::json!({"providers": {"fake": {"baseUrl": ""}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = put_config(
+        &server,
+        serde_json::json!({"providers": {"fake": {"baseUrl": "http://example.com/v1"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Scheme must be HTTPS"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn get_config_should_report_anthropic_base_url_and_no_rpm_shed() {
+    let fake = FakeUpstream::start(Script::models(Vec::<String>::new())).await;
+    let server = config_server(&fake, BEARER_AUTH).await;
+    let cfg = server.request_json("GET", "/v1/dashboard/config").await;
+    assert_eq!(
+        cfg["providers"]["fake"]["baseUrl"],
+        fake.base_url(),
+        "{cfg}"
+    );
+    assert!(cfg["rateLimits"].get("rpm").is_none(), "{cfg}");
+}

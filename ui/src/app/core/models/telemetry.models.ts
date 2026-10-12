@@ -130,6 +130,6 @@ export interface BenchmarkData {
 export interface ConfigData {
   webUi?: 'angular' | 'legacy';
   providers?: Record<string, { apiKey?: string; baseUrl?: string; weight?: number }>;
-  rateLimits?: { rpm?: number; tpm?: number; concurrent?: number };
+  rateLimits?: { rpm?: number; tpm?: number; concurrent?: number; onBreach?: string; maxDelayMs?: number };
   fallbackCascade?: string[];
 }

@@ -4,10 +4,15 @@ import { FormsModule } from '@angular/forms';
 
 export interface ProviderConfigItem {
   name: string;
+  /** Masked key echoed by GET; display only. */
   apiKey?: string;
+  /** Key typed by the operator; the only key that is ever sent. */
+  newApiKey?: string;
   baseUrl?: string;
   weight?: number;
 }
+
+const isMaskedKey = (key: string): boolean => key.includes('...') || key.includes('****');
 
 @Component({
   selector: 'app-routing-config',
@@ -22,16 +27,23 @@ export interface ProviderConfigItem {
         </div>
         <div class="px-3 py-1 text-xs font-mono rounded-full border"
              [ngClass]="totalWeight === 100 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border-amber-500/30'">
-          Total Weight: {{ totalWeight }}%
+          @if (hasWeights) {
+            Total Weight: {{ totalWeight }}%
+          } @else {
+            Weights not set (fallback order)
+          }
         </div>
       </div>
 
       <div class="space-y-4">
+        @if (providers().length === 0) {
+          <p class="text-sm text-slate-400">No providers configured. Add upstreams in the route file.</p>
+        }
         @for (provider of providers(); track provider.name) {
           <div class="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
             <div class="flex items-center justify-between">
               <span class="font-medium text-slate-200 capitalize">{{ provider.name }}</span>
-              <span class="text-xs font-mono text-cyan-400 font-bold">{{ provider.weight || 0 }}%</span>
+              <span class="text-xs font-mono text-cyan-400 font-bold">{{ provider.weight === undefined ? '\u2013' : provider.weight + '%' }}</span>
             </div>
 
             <!-- Weight Slider -->
@@ -54,9 +66,9 @@ export interface ProviderConfigItem {
                 <label class="block text-xs font-medium text-slate-400 mb-1">API Key</label>
                 <input
                   type="text"
-                  [ngModel]="provider.apiKey || ''"
+                  [ngModel]="provider.newApiKey || ''"
                   (ngModelChange)="onApiKeyChange(provider.name, $event)"
-                  placeholder="sk-...****"
+                  [placeholder]="provider.apiKey || 'Enter a new key'"
                   class="w-full bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 rounded px-3 py-1.5 focus:border-cyan-500 focus:outline-none"
                   [attr.data-testid]="'apikey-' + provider.name"
                 />
@@ -85,6 +97,10 @@ export class RoutingConfigComponent {
   public providers = input<ProviderConfigItem[]>([]);
   public providersChange = output<ProviderConfigItem[]>();
 
+  get hasWeights(): boolean {
+    return this.providers().some((p) => p.weight !== undefined);
+  }
+
   get totalWeight(): number {
     return this.providers().reduce((sum, p) => sum + (p.weight || 0), 0);
   }
@@ -97,8 +113,10 @@ export class RoutingConfigComponent {
   }
 
   public onApiKeyChange(name: string, newKey: string): void {
+    // Typed text replaces nothing: the mask stays in the placeholder, so it can never be appended to.
+    const typed = newKey && !isMaskedKey(newKey) ? newKey : undefined;
     const updated = this.providers().map((p) =>
-      p.name === name ? { ...p, apiKey: newKey } : p
+      p.name === name ? { ...p, newApiKey: typed } : p
     );
     this.providersChange.emit(updated);
   }

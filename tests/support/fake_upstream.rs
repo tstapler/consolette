@@ -196,6 +196,11 @@ impl RecordedHeaders {
             .map(|(_, v)| v.as_str())
             .unwrap_or_else(|| panic!("header {name} not recorded"))
     }
+
+    /// Whether header `name` (case-insensitive) was recorded.
+    pub fn has(&self, name: &str) -> bool {
+        self.0.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    }
 }
 
 fn record(shared: &Mutex<Shared>, headers: &HeaderMap, body: &[u8]) {

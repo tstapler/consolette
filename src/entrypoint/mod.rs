@@ -461,11 +461,29 @@ pub async fn serve_entrypoint_with_shutdown(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "consolette http-entrypoint listening");
     let router = entrypoint_router(state);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    let shutdown_started = Arc::new(tokio::sync::Notify::new());
+    let notify_started = Arc::clone(&shutdown_started);
+    let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown.await;
+        notify_started.notify_one();
+    });
+    // Graceful shutdown waits on every open connection, and a dashboard SSE
+    // stream never ends on its own, so cap the drain.
+    tokio::select! {
+        result = serve => result?,
+        () = async {
+            shutdown_started.notified().await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => tracing::warn!(
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "shutdown grace elapsed with connections still open; exiting"
+        ),
+    }
     Ok(())
 }
+
+/// How long in-flight requests may drain after a shutdown signal.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// # Panics
 ///
@@ -729,6 +747,51 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "server did not shut down within timeout");
         assert!(result.unwrap().unwrap().is_ok());
+    }
+
+    /// E-02: an open dashboard SSE stream used to hold graceful shutdown open
+    /// forever, so a restarted proxy left the old process serving a dead feed
+    /// to the browser, which never saw a disconnect.
+    #[tokio::test]
+    async fn shutdown_should_complete_even_while_a_dashboard_sse_client_is_connected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let reservation = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = rx.await;
+        };
+        let handle = tokio::spawn(serve_entrypoint_with_shutdown(addr.port(), state, shutdown));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /v1/dashboard/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut head = [0_u8; 64];
+        let n = client.read(&mut head).await.unwrap();
+        assert!(String::from_utf8_lossy(&head[..n]).contains("200"));
+
+        tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "server stayed up after shutdown because an SSE stream was still open"
+        );
     }
 
     #[tokio::test]

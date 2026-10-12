@@ -36,6 +36,8 @@ interface DrawerView {
   firstByte: string | null;
   requested: string | null;
   routed: string;
+  routedLabel: string;
+  noUpstream: boolean;
   modelSource: string | null;
   why: string;
   chip: string | null;
@@ -146,7 +148,7 @@ function groupRounds(items: AttemptItem[], iterations: number): Round[] {
         <section aria-labelledby="route-h" class="space-y-1">
           <h3 id="route-h" class="uppercase tracking-wider text-[11px] text-neutral-400">Route</h3>
           <p *ngIf="v.requested" data-requested>Requested <span class="font-mono text-neutral-100">{{ v.requested }}</span></p>
-          <p data-routed>Routed <span class="font-mono text-neutral-100">{{ v.routed }}</span></p>
+          <p data-routed>{{ v.routedLabel }} <span class="font-mono text-neutral-100">{{ v.routed }}</span><ng-container *ngIf="v.noUpstream"> (cache hit; no upstream ran)</ng-container></p>
           <p *ngIf="v.modelSource" data-model-source>{{ v.modelSource }}</p>
           <p data-why>Why
             <span *ngIf="v.chip" class="px-1.5 py-0.5 text-[11px] bg-neutral-800 rounded border border-neutral-700" [title]="chipMeaning(v.chip)">{{ v.chip }}</span>
@@ -399,6 +401,8 @@ export class InspectDrawerComponent implements OnInit {
       firstByte: fb === null && isNum(t.firstByteMs) ? `${t.firstByteMs}ms` : null,
       requested,
       routed: noUpstream ? routedModel : `${provider} / ${routedModel}`,
+      routedLabel: noUpstream ? 'Answered for' : 'Routed',
+      noUpstream,
       modelSource: modelSourceText(t),
       why: whyText(t),
       chip: routeChip(t),

@@ -105,6 +105,9 @@ export function whyText(t: RequestTraceData): string {
 /** Model-source line, or null when the trace has no source (cache, local, older events). */
 export function modelSourceText(t: RequestTraceData): string | null {
   const provider = t.routedProvider ?? t.provider;
+  if (t.routeReason === 'session_pin') {
+    return `session pin: the model came from this session's pin, not from the client's ${t.requestedModel ?? 'requested model'}`;
+  }
   if (t.routedModelSource === 'pinned') {
     return `pinned: ${provider}'s configured model replaces the client's ${t.requestedModel ?? 'requested model'}`;
   }

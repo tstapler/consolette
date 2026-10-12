@@ -235,6 +235,21 @@ describe('InspectDrawerComponent', () => {
     expect(text(q('[data-status-note]'))).toContain('status at response headers');
   });
 
+  it('cache_hit_should_not_claim_a_routed_upstream_model_because_no_upstream_ran_E23', () => {
+    openOn(trace({ traceKind: 'cache_hit', routeReason: 'cache', attempts: [], requestedModel: 'claude-sonnet-4', routedModel: 'claude-sonnet-4', routedModelSource: null }));
+    const routed = text(q('[data-routed]'));
+    expect(routed).not.toContain('Routed');
+    expect(routed).toContain('claude-sonnet-4');
+    expect(routed).toContain('no upstream ran');
+  });
+
+  it('session_pinned_request_should_say_the_model_came_from_the_session_pin_not_the_configured_route_E23', () => {
+    openOn(trace({ routeReason: 'session_pin', routedModelSource: 'pinned', routedProvider: 'steady', requestedModel: 'claude-sonnet-4', routedModel: 'gpt-5.2' }));
+    const src = text(q('[data-model-source]'));
+    expect(src).toContain("session's pin");
+    expect(src).not.toContain('configured model');
+  });
+
   it('why_block_should_show_model_source_pinned_or_passthrough_with_routed_upstream_and_exact_why_text_for_all_eight_reasons_and_cancelled', () => {
     const t = trace();
     openOn(t);

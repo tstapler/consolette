@@ -108,6 +108,9 @@ pub struct RequestDetail {
     pub total_ms: Option<u64>,
 }
 
+/// Client-supplied `model` is untrusted; cap what the ring buffer and SSE keep.
+const MAX_REQUESTED_MODEL_CHARS: usize = 256;
+
 impl RequestDetail {
     /// Builds the initial ring-buffer entry for an incoming request, before
     /// dispatch has picked an upstream: `provider` starts empty and timing
@@ -151,7 +154,7 @@ impl RequestDetail {
             requested_model: body
                 .get("model")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+                .map(|m| m.chars().take(MAX_REQUESTED_MODEL_CHARS).collect()),
             routed_model: None,
             routed_model_source: None,
             routed_provider: None,
@@ -654,6 +657,30 @@ pub fn trace_error_rate(traces: &[RequestDetail]) -> TraceErrorRate {
         errors,
         cancelled,
         rate,
+    }
+}
+
+#[cfg(test)]
+mod requested_model_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn from_body_should_truncate_requested_model_to_256_chars_on_a_char_boundary() {
+        let long = "é".repeat(300);
+        let body = serde_json::json!({ "model": long });
+        let detail = RequestDetail::from_body("id".to_string(), false, 0, &body, None);
+        let kept = detail.requested_model.unwrap();
+        assert_eq!(kept.chars().count(), 256);
+        assert!(long.starts_with(&kept));
+        let short = RequestDetail::from_body(
+            "id".to_string(),
+            false,
+            0,
+            &serde_json::json!({ "model": "gpt-4o" }),
+            None,
+        );
+        assert_eq!(short.requested_model.as_deref(), Some("gpt-4o"));
     }
 }
 

@@ -1,4 +1,4 @@
-import { ChangeDetectorRef, Component, EventEmitter, Input, Output, inject } from '@angular/core';
+import { ChangeDetectorRef, Component, ElementRef, EventEmitter, Input, Output, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RequestTraceData } from '../../../core/models/telemetry.models';
 import { NA_REASON_TEXTS, naReason } from '../../../core/models/na-reason';
@@ -17,6 +17,9 @@ export interface InspectRequest {
 const MIN_TARGET = 'min-width:24px;min-height:24px';
 
 const MAX_ROWS = 100;
+const ANNOUNCE_INTERVAL_MS = 1000;
+const noun = (n: number): string => (n === 1 ? 'trace' : 'traces');
+const keyOf = (t: RequestTraceData): string => String(t.requestId ?? t.id ?? `${t.timestamp}-${t.provider}`);
 const DASH_LEGEND_LINE = '- = not applicable; hover a dash or open the legend for the reason';
 
 interface Cell { text: string; reason: string | null; }
@@ -57,16 +60,23 @@ const NOT_RECORDED = 'n/a (not recorded)';
           <h3 class="text-sm font-semibold text-white tracking-wide uppercase">Live Request Traces</h3>
           <p class="text-xs text-neutral-400 mt-0.5">Real-time SSE proxy request telemetry feed</p>
         </div>
-        <span class="text-xs font-mono px-2.5 py-1 bg-neutral-800 text-neutral-300 rounded-full border border-neutral-700">
-          {{ rows.length }} Traces
-        </span>
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          <button *ngIf="heldCount > 0" type="button" data-show-held (click)="showHeld()" style="${MIN_TARGET}"
+            class="px-2.5 py-1 text-[11px] font-medium bg-cyan-900 hover:bg-cyan-800 text-cyan-50 rounded border border-cyan-700">Show {{ heldCount }} new</button>
+          <button type="button" data-pause (click)="togglePause()" style="${MIN_TARGET}"
+            class="px-2.5 py-1 text-[11px] font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded border border-neutral-700">{{ paused ? 'Resume' : 'Pause' }}</button>
+          <span class="text-xs font-mono px-2.5 py-1 bg-neutral-800 text-neutral-300 rounded-full border border-neutral-700">
+            {{ rows.length }} Traces
+          </span>
+        </div>
       </div>
 
       <div data-banner role="status" *ngIf="connectionStatus === 'reconnecting'" class="mb-3 text-xs text-amber-400 border border-amber-800/60 rounded px-3 py-2">
         Live feed interrupted - reconnecting (attempt {{ retryAttempt }})
       </div>
 
-      <div class="overflow-x-auto" role="region" aria-label="Live request traces, scroll horizontally" tabindex="0">
+      <div class="overflow-x-auto" role="region" aria-label="Live request traces, scroll horizontally" tabindex="0" data-skip-target
+        (focusin)="onFocusIn()" (focusout)="onFocusOut($event)">
         <table data-trace-table tabindex="-1" class="w-full text-left text-xs text-neutral-300">
           <caption class="sr-only">Live request traces</caption>
           <thead class="bg-neutral-950 text-neutral-400 uppercase text-[11px] tracking-wider border-b border-neutral-800">
@@ -82,7 +92,7 @@ const NOT_RECORDED = 'n/a (not recorded)';
               <th scope="col" class="py-3 px-4 text-right">Actions</th>
             </tr>
           </thead>
-          <tbody class="divide-y divide-neutral-800/60" [attr.data-rows-dimmed]="connectionStatus === 'reconnecting' ? '' : null" [class.opacity-50]="connectionStatus === 'reconnecting'">
+          <tbody class="divide-y divide-neutral-800/60" [attr.data-rows-dimmed]="connectionStatus === 'reconnecting' ? '' : null" [class.stale-rows]="connectionStatus === 'reconnecting'">
             <tr data-row *ngFor="let row of rows; trackBy: trackByKey" class="hover:bg-neutral-800/40 transition-colors">
               <td class="py-3 px-4 font-mono text-neutral-400 whitespace-nowrap">{{ row.time }}</td>
               <th scope="row" class="py-3 px-4 font-mono font-medium text-white whitespace-nowrap text-left">
@@ -138,7 +148,7 @@ const NOT_RECORDED = 'n/a (not recorded)';
             <ng-container *ngIf="rows.length === 0">
               <ng-container *ngIf="showSkeleton; else emptyOrDisconnected">
                 <tr data-skeleton *ngFor="let _ of skeletonRows" aria-hidden="true">
-                  <td colspan="9" class="py-3 px-4"><div class="h-3 rounded bg-neutral-800 animate-pulse"></div></td>
+                  <td colspan="9" class="py-3 px-4"><div class="h-3 rounded bg-neutral-800 motion-safe:animate-pulse"></div></td>
                 </tr>
                 <tr><td colspan="9" class="py-3 text-center text-neutral-400">Connecting to live feed...</td></tr>
               </ng-container>
@@ -177,6 +187,7 @@ const NOT_RECORDED = 'n/a (not recorded)';
         </div>
       </div>
       <div class="sr-only" role="status" aria-live="polite" data-copy-status>{{ copyMessage }}</div>
+      <div class="sr-only" role="status" aria-live="polite" data-trace-status>{{ announcement }}</div>
     </div>
 
     <ng-template #cell let-c="c" let-col="col">
@@ -189,6 +200,7 @@ const NOT_RECORDED = 'n/a (not recorded)';
 })
 export class RecentTraceTableComponent {
   private readonly cdr = inject(ChangeDetectorRef);
+  private readonly host = inject(ElementRef);
 
   @Input() connectionStatus: 'connecting' | 'connected' | 'reconnecting' | 'disconnected' = 'connected';
   @Input() retryAttempt = 0;
@@ -207,12 +219,119 @@ export class RecentTraceTableComponent {
   private readonly warned = new Set<string>();
   private source: RequestTraceData[] = [];
 
+  public paused = false;
+  public heldCount = 0;
+  public announcement = '';
+  private focusInside = false;
+  private seenFirstBatch = false;
+  private lastAnnounced = 0;
+  private announceTimer: ReturnType<typeof setTimeout> | null = null;
+  private queuedAnnouncement: string | null = null;
+  private arrivedSinceAnnounce = 0;
+
   @Input() set traces(value: RequestTraceData[]) {
     this.source = value ?? [];
-    this.rows = this.source.slice(0, MAX_ROWS).map(t => this.toRow(t));
+    this.apply();
   }
   get traces(): RequestTraceData[] {
     return this.source;
+  }
+
+  private get holding(): boolean {
+    return this.paused || this.focusInside;
+  }
+
+  public togglePause(): void {
+    this.paused = !this.paused;
+    this.flushIfFree();
+  }
+
+  public showHeld(): void {
+    this.showSource();
+    this.announce(`${this.arrivedSinceAnnounce} new ${noun(this.arrivedSinceAnnounce)}`);
+    this.arrivedSinceAnnounce = 0;
+    // The button disappears when the rows are inserted; keep keyboard focus in the table instead of dropping it to the page.
+    this.regionEl()?.focus();
+  }
+
+  public onFocusIn(): void {
+    this.focusInside = true;
+  }
+
+  public onFocusOut(event: FocusEvent): void {
+    const region = event.currentTarget as HTMLElement;
+    if (event.relatedTarget instanceof Node && region.contains(event.relatedTarget)) return;
+    this.focusInside = false;
+    this.flushIfFree();
+  }
+
+  private regionEl(): HTMLElement | null {
+    return (this.host.nativeElement as HTMLElement).querySelector('[role="region"]');
+  }
+
+  private flushIfFree(): void {
+    if (this.holding || this.heldCount === 0) return;
+    this.showSource();
+    this.announce(`${this.arrivedSinceAnnounce} new ${noun(this.arrivedSinceAnnounce)}`);
+    this.arrivedSinceAnnounce = 0;
+  }
+
+  private showSource(): void {
+    this.rows = this.source.slice(0, MAX_ROWS).map(t => this.toRow(t));
+    this.heldCount = 0;
+  }
+
+  /** New rows are inserted unless the operator is working in the table (UX-23); rows already shown always update in place. */
+  private apply(): void {
+    const shown = new Set(this.rows.map(r => r.key));
+    const fresh = this.source.filter(t => !shown.has(keyOf(t)));
+    if (!this.holding) {
+      this.showSource();
+      if (fresh.length > 0 && this.seenFirstBatch) {
+        this.arrivedSinceAnnounce += fresh.length;
+        this.announce(`${this.arrivedSinceAnnounce} new ${noun(this.arrivedSinceAnnounce)}`, true);
+      }
+      if (fresh.length > 0) this.seenFirstBatch = true;
+      return;
+    }
+    const byKey = new Map(this.source.map(t => [keyOf(t), t]));
+    this.rows = this.rows.map(r => { const t = byKey.get(r.key); return t ? this.toRow(t) : r; });
+    if (fresh.length !== this.heldCount) {
+      this.arrivedSinceAnnounce += Math.max(0, fresh.length - this.heldCount);
+      this.heldCount = fresh.length;
+      this.announce(`${fresh.length} new ${noun(fresh.length)} waiting`);
+    }
+  }
+
+  /** At most one message per second; the latest wins. `batch` waits a full second so a burst reads as one message. */
+  private announce(message: string, batch = false): void {
+    const now = Date.now();
+    if (batch) {
+      this.queuedAnnouncement = message;
+      if (this.announceTimer === null) this.announceTimer = setTimeout(() => this.drainAnnouncement(), ANNOUNCE_INTERVAL_MS);
+      return;
+    }
+    if (this.announceTimer === null && now - this.lastAnnounced >= ANNOUNCE_INTERVAL_MS) {
+      this.setAnnouncement(message);
+      return;
+    }
+    this.queuedAnnouncement = message;
+    this.announceTimer ??= setTimeout(() => this.drainAnnouncement(), Math.max(0, ANNOUNCE_INTERVAL_MS - (now - this.lastAnnounced)));
+  }
+
+  private drainAnnouncement(): void {
+    this.announceTimer = null;
+    if (this.queuedAnnouncement !== null) {
+      this.setAnnouncement(this.queuedAnnouncement);
+      this.queuedAnnouncement = null;
+      if (!this.holding) this.arrivedSinceAnnounce = 0;
+    }
+    this.cdr.detectChanges();
+  }
+
+  private setAnnouncement(message: string): void {
+    this.announcement = message;
+    this.lastAnnounced = Date.now();
   }
 
   public get showSkeleton(): boolean {
@@ -264,7 +383,7 @@ export class RecentTraceTableComponent {
   }
 
   private toRow(t: RequestTraceData): Row {
-    const key = String(t.requestId ?? t.id ?? `${t.timestamp}-${t.provider}`);
+    const key = keyOf(t);
     this.warnIfMalformed(t, key);
     const latency: Cell = isNum(t.timeToHeadersMs)
       ? { text: `${t.timeToHeadersMs}ms`, reason: null }

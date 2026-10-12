@@ -169,10 +169,10 @@ const NOT_RECORDED = 'n/a (not recorded)';
           class="underline focus-visible:outline focus-visible:outline-2">What do these dashes and chips mean?</button>
         <div id="trace-legend" data-legend *ngIf="legendOpen" class="space-y-2">
           <ul class="space-y-0.5">
-            <li *ngFor="let r of reasonLegend"><span class="font-mono text-neutral-200">{{ r.text }}</span> <span>{{ r.meaning }}</span></li>
+            <li *ngFor="let r of reasonLegend"><span class="font-mono text-neutral-200">{{ r.text }}</span> - <span>{{ r.meaning }}</span></li>
           </ul>
           <ul class="space-y-0.5">
-            <li *ngFor="let c of chipLegend"><span class="font-mono text-neutral-200">{{ c.chip }}</span> <span>{{ c.meaning }}</span></li>
+            <li *ngFor="let c of chipLegend"><span class="font-mono text-neutral-200">{{ c.chip }}</span> - <span>{{ c.meaning }}</span></li>
           </ul>
         </div>
       </div>

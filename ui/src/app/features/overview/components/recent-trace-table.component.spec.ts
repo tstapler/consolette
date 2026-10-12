@@ -265,6 +265,15 @@ describe('RecentTraceTableComponent (TC-UNIT-17)', () => {
     expect(r1.querySelector('button[data-inspect]')?.hasAttribute('aria-describedby')).toBeFalse();
   });
 
+  it('legend_entries_should_separate_term_from_definition_with_a_visible_separator_E26', () => {
+    render([success]);
+    (Array.from(el.querySelectorAll('button')).find(b => /legend|dashes/i.test(b.textContent ?? '')) as HTMLButtonElement).click();
+    fixture.detectChanges();
+    const items = Array.from(el.querySelectorAll('[data-legend] li'));
+    expect(items.length).toBeGreaterThan(0);
+    items.forEach(li => expect(text(li)).toMatch(/\S (-|:|\u2013|\u2014) \S/));
+  });
+
   it('footer_dash_legend_line_should_appear_exactly_once', () => {
     render([success, failure]);
     const needle = '- = not applicable; hover a dash or open the legend for the reason';

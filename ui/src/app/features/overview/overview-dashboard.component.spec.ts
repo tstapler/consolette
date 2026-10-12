@@ -3,6 +3,7 @@ import { OverviewDashboardComponent } from './overview-dashboard.component';
 import { MetricsStore } from '../../core/stores/metrics.store';
 import { SseService } from '../../core/services/sse.service';
 import { BehaviorSubject, Subject } from 'rxjs';
+import { signal } from '@angular/core';
 import { DashboardEvent } from '../../core/models/telemetry.models';
 import { provideRouter } from '@angular/router';
 
@@ -10,16 +11,21 @@ describe('OverviewDashboardComponent', () => {
   let component: OverviewDashboardComponent;
   let fixture: ComponentFixture<OverviewDashboardComponent>;
   let mockSseEvents$: Subject<DashboardEvent>;
+  let statusSignal: ReturnType<typeof signal<string>>;
+  let reconnectSpy: jasmine.Spy;
   let mockConnectionStatusSignal: BehaviorSubject<'Connected' | 'Reconnecting' | 'Disconnected'>;
 
   beforeEach(async () => {
     mockSseEvents$ = new Subject<DashboardEvent>();
     mockConnectionStatusSignal = new BehaviorSubject<'Connected' | 'Reconnecting' | 'Disconnected'>('Connected');
 
+    statusSignal = signal<string>('connected');
+    reconnectSpy = jasmine.createSpy('reconnect');
     const mockSseService = {
       events$: mockSseEvents$.asObservable(),
-      connectionStatus: () => 'Connected',
-      retryCount: () => 0
+      connectionStatus: statusSignal.asReadonly(),
+      retryCount: () => 0,
+      reconnect: reconnectSpy
     };
 
     await TestBed.configureTestingModule({
@@ -114,5 +120,53 @@ describe('OverviewDashboardComponent', () => {
     fixture.detectChanges();
     expect(el.querySelector('[role="dialog"]')).not.toBeNull();
     expect(document.activeElement?.id).toBe('inspect-drawer-heading');
+  });
+
+  it('shows a feed-lagging status chip for system_lag and clears it on the next event', () => {
+    component.metricsStore.handleDashboardEvent({ type: 'system_lag', data: { skipped: 37 } });
+    fixture.detectChanges();
+    const el = fixture.nativeElement as HTMLElement;
+    const chip = el.querySelector('[data-lag-chip]');
+    expect(chip?.getAttribute('role')).toBe('status');
+    expect(chip?.textContent).toContain('feed lagging - 37 events skipped');
+
+    component.metricsStore.handleDashboardEvent({
+      type: 'MetricsTick',
+      data: { rpm: 1, totalRequests: 1, totalTokensSaved: 0, currentLagMs: 0 },
+    });
+    fixture.detectChanges();
+    expect(el.querySelector('[data-lag-chip]')).toBeNull();
+  });
+
+  it('shows a stale-data alert with a Reconnect button once retries are exhausted', () => {
+    const el = fixture.nativeElement as HTMLElement;
+    expect(el.querySelector('[data-disconnected-alert]')).toBeNull();
+
+    statusSignal.set('disconnected');
+    fixture.detectChanges();
+    const alert = el.querySelector('[data-disconnected-alert]');
+    expect(alert?.getAttribute('role')).toBe('alert');
+    expect(alert?.textContent).toContain('Live feed disconnected. Data below is stale.');
+    (alert?.querySelector('button') as HTMLButtonElement).click();
+    expect(reconnectSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('lists recent errors with an empty state and a latest-20 footer', () => {
+    const el = fixture.nativeElement as HTMLElement;
+    expect(el.querySelector('[data-recent-errors]')?.textContent).toContain('No errors since this page loaded.');
+
+    for (let i = 1; i <= 21; i++) {
+      component.metricsStore.handleDashboardEvent({
+        type: 'ErrorLogged',
+        data: { timestamp: '2026-10-10T18:10:02+00:00', provider: 'openrouter', model: 'm', errorType: 'rate_limited', statusCode: 429, message: `msg${i}` },
+      });
+    }
+    fixture.detectChanges();
+    const section = el.querySelector('[data-recent-errors]') as HTMLElement;
+    expect(section.querySelectorAll('li').length).toBe(20);
+    expect(section.textContent).toContain('Showing latest 20');
+    expect(section.querySelector('li')?.textContent).toContain('msg21');
+    expect(section.textContent).not.toContain('No errors since this page loaded.');
+    expect(section.getAttribute('aria-live')).toBeNull();
   });
 });

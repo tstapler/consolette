@@ -1,5 +1,6 @@
 import { TestBed } from '@angular/core/testing';
 import { MetricsStore } from './metrics.store';
+import { ConfigStore } from './config.store';
 import { SseService } from '../services/sse.service';
 import { DashboardEvent, RequestTraceData, MetricsTickData } from '../models/telemetry.models';
 import traceSuccess from '../../../testing/fixtures/sse/request-trace-success.json';
@@ -8,16 +9,18 @@ import metricsTickFixture from '../../../testing/fixtures/sse/metrics-tick.json'
 describe('MetricsStore (TC-UNIT-10)', () => {
   let store: MetricsStore;
   let instances: any[];
+  const configStoreSpy = jasmine.createSpyObj<ConfigStore>('ConfigStore', ['loadConfig']);
 
   beforeEach(() => {
     instances = [];
+    configStoreSpy.loadConfig.calls.reset();
     spyOn(window as any, 'EventSource').and.callFake(function (this: any, url: string) {
       const inst = { url, close: () => undefined, addEventListener: jasmine.createSpy('addEventListener'), onopen: null, onmessage: null, onerror: null };
       instances.push(inst);
       return inst;
     } as any);
     TestBed.configureTestingModule({
-      providers: [MetricsStore]
+      providers: [MetricsStore, { provide: ConfigStore, useValue: configStoreSpy }]
     });
     store = TestBed.inject(MetricsStore);
   });
@@ -132,5 +135,40 @@ describe('MetricsStore (TC-UNIT-10)', () => {
     expect(store.timeSeriesPoints()[719].rpm).toBe(800);
     expect(store.metrics()?.rpm).toBe(800);
     expect(store.isContended()).toBeTrue();
+  });
+
+  it('system_lag should set the skipped count and the next non-lag event should clear it', () => {
+    deliver({ type: 'system_lag', data: { skipped: 37 } });
+    expect(store.lagSkipped()).toBe(37);
+
+    deliver(metricsTickFixture);
+    expect(store.lagSkipped()).toBeNull();
+  });
+
+  it('ConfigChanged should reload the config exactly once', () => {
+    deliver({ type: 'ConfigChanged', data: { timestamp: 't', routeName: 'default', strategy: 'weighted' } });
+    expect(configStoreSpy.loadConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('ErrorLogged should keep the latest 20 newest first and flag overflow', () => {
+    expect(store.recentErrors()).toEqual([]);
+    expect(store.errorsOverflowed()).toBeFalse();
+    for (let i = 1; i <= 21; i++) {
+      deliver({
+        type: 'ErrorLogged',
+        data: { timestamp: `t${i}`, provider: 'openrouter', model: 'm', errorType: 'rate_limited', statusCode: 429, message: `e${i}` },
+      });
+    }
+    expect(store.recentErrors().length).toBe(20);
+    expect(store.recentErrors()[0].message).toBe('e21');
+    expect(store.recentErrors()[19].message).toBe('e2');
+    expect(store.errorsOverflowed()).toBeTrue();
+  });
+
+  it('reconnect should delegate to the SSE service', () => {
+    const sse = TestBed.inject(SseService);
+    spyOn(sse, 'reconnect');
+    store.reconnect();
+    expect(sse.reconnect).toHaveBeenCalledTimes(1);
   });
 });

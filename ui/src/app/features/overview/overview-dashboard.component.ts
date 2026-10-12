@@ -37,6 +37,27 @@ import { InspectDrawerComponent } from './components/inspect-drawer.component';
         </div>
       </div>
 
+      <div
+        *ngIf="metricsStore.connectionStatus() === 'disconnected'"
+        data-disconnected-alert
+        role="alert"
+        class="flex items-center justify-between gap-3 text-sm text-rose-300 border border-rose-800/60 bg-rose-950/40 rounded px-3 py-2"
+      >
+        <span>Live feed disconnected. Data below is stale.</span>
+        <button
+          type="button"
+          class="px-3 py-1 text-xs font-semibold rounded border border-rose-700 text-rose-200 hover:bg-rose-900/50 focus-visible:outline-2 focus-visible:outline-offset-2"
+          (click)="metricsStore.reconnect()"
+        >Reconnect</button>
+      </div>
+
+      <div
+        *ngIf="metricsStore.lagSkipped() !== null"
+        data-lag-chip
+        role="status"
+        class="text-xs text-amber-300 border border-amber-800/60 bg-amber-950/40 rounded px-3 py-1 w-fit"
+      >feed lagging - {{ metricsStore.lagSkipped() }} events skipped</div>
+
       <!-- KPI Summary Cards Grid -->
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         <app-metric-kpi-card
@@ -98,6 +119,21 @@ import { InspectDrawerComponent } from './components/inspect-drawer.component';
         [retryAttempt]="metricsStore.retryCount()"
         (inspect)="drawer.open($event.trace, $event.origin, $event.scrollToAttempts)"
       ></app-recent-trace-table>
+
+      <section data-recent-errors class="bg-neutral-900 border border-neutral-800 rounded-xl p-5">
+        <h3 class="text-sm font-semibold text-white tracking-wide uppercase">Recent errors</h3>
+        <p class="text-xs text-neutral-400 mt-1">Upstream errors since this page loaded, newest first.</p>
+        <p *ngIf="metricsStore.recentErrors().length === 0" class="mt-3 text-sm text-neutral-400">No errors since this page loaded.</p>
+        <ul *ngIf="metricsStore.recentErrors().length > 0" class="mt-3 space-y-1 text-sm text-neutral-200">
+          <li *ngFor="let err of metricsStore.recentErrors()" class="flex flex-wrap gap-x-2">
+            <span aria-hidden="true" class="text-rose-400">&#9888;</span>
+            <span class="font-mono text-xs text-neutral-400">{{ err.timestamp | date:'mediumTime' }}</span>
+            <span>{{ err.provider }} {{ err.errorType }}<ng-container *ngIf="err.statusCode !== null"> ({{ err.statusCode }})</ng-container></span>
+            <span class="text-neutral-400">{{ err.message }}</span>
+          </li>
+        </ul>
+        <p *ngIf="metricsStore.errorsOverflowed()" class="mt-2 text-xs text-neutral-400">Showing latest 20</p>
+      </section>
 
       <app-inspect-drawer #drawer [traces]="metricsStore.recentTraces()"></app-inspect-drawer>
     </div>

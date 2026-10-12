@@ -90,7 +90,7 @@ export type DashboardEvent =
   | { type: 'ErrorLogged'; data: ErrorLoggedData }
   | { type: 'ConfigChanged'; data: ConfigChangedData }
   | { type: 'ModelCatalogChanged'; data: ModelCatalogChangedData }
-  | { type: 'system_lag'; data: { message: string; skipped: number } };
+  | { type: 'system_lag'; data: { skipped: number; message?: string } };
 
 export interface SessionData {
   id: string;

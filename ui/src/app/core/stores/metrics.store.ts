@@ -1,7 +1,10 @@
 import { Injectable, inject, signal, computed, DestroyRef, Injector } from '@angular/core';
 import { ModelCatalogStore } from './model-catalog.store';
+import { ConfigStore } from './config.store';
 import { SseService } from '../services/sse.service';
-import { MetricsTickData, RequestTraceData, DashboardEvent } from '../models/telemetry.models';
+import { MetricsTickData, RequestTraceData, DashboardEvent, ErrorLoggedData } from '../models/telemetry.models';
+
+const MAX_RECENT_ERRORS = 20;
 
 export interface MetricsStoreOptions {
   maxTraces?: number;
@@ -26,6 +29,12 @@ export class MetricsStore {
   public readonly metrics = this.metricsSignal.asReadonly();
   public readonly recentTraces = this.recentTracesSignal.asReadonly();
   public readonly timeSeriesPoints = this.timeSeriesPointsSignal.asReadonly();
+  private readonly lagSkippedSignal = signal<number | null>(null);
+  private readonly recentErrorsSignal = signal<ErrorLoggedData[]>([]);
+  private readonly errorsOverflowedSignal = signal<boolean>(false);
+  public readonly lagSkipped = this.lagSkippedSignal.asReadonly();
+  public readonly recentErrors = this.recentErrorsSignal.asReadonly();
+  public readonly errorsOverflowed = this.errorsOverflowedSignal.asReadonly();
   public readonly connectionStatus = this.sseService.connectionStatus;
   public readonly retryCount = this.sseService.retryCount;
 
@@ -54,15 +63,36 @@ export class MetricsStore {
     }
   }
 
+  public reconnect(): void {
+    this.sseService.reconnect();
+  }
+
   public handleDashboardEvent(event: DashboardEvent): void {
+    if (event.type === 'system_lag') {
+      this.lagSkippedSignal.set(event.data.skipped);
+      return;
+    }
+    this.lagSkippedSignal.set(null);
     if (event.type === 'MetricsTick') {
       this.pushTick(event.data);
     } else if (event.type === 'RequestTrace') {
       this.pushTrace(event.data);
+    } else if (event.type === 'ErrorLogged') {
+      this.pushError(event.data);
+    } else if (event.type === 'ConfigChanged') {
+      this.injector.get(ConfigStore).loadConfig();
     } else if (event.type === 'ModelCatalogChanged') {
       // Resolved lazily so stores that never see this event need no HttpClient.
       this.injector.get(ModelCatalogStore).onCatalogChanged();
     }
+  }
+
+  private pushError(error: ErrorLoggedData): void {
+    const next = [error, ...this.recentErrorsSignal()];
+    if (next.length > MAX_RECENT_ERRORS) {
+      this.errorsOverflowedSignal.set(true);
+    }
+    this.recentErrorsSignal.set(next.slice(0, MAX_RECENT_ERRORS));
   }
 
   public pushTrace(trace: RequestTraceData): void {
@@ -95,5 +125,8 @@ export class MetricsStore {
     this.metricsSignal.set(null);
     this.recentTracesSignal.set([]);
     this.timeSeriesPointsSignal.set([]);
+    this.lagSkippedSignal.set(null);
+    this.recentErrorsSignal.set([]);
+    this.errorsOverflowedSignal.set(false);
   }
 }

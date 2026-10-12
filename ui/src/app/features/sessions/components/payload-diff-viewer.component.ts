@@ -48,7 +48,7 @@ export interface SideBySidePair {
         <div class="grid grid-cols-2 gap-2 font-mono text-xs overflow-x-auto bg-neutral-950 border border-neutral-800 rounded-md p-2">
           <!-- Left: Original -->
           <div class="border-r border-neutral-800 pr-2">
-            <div class="text-xs uppercase text-slate-500 font-bold mb-2 pb-1 border-b border-neutral-800">
+            <div class="text-xs uppercase text-slate-400 font-bold mb-2 pb-1 border-b border-neutral-800">
               Original Payload
             </div>
             <div class="space-y-0.5">
@@ -59,7 +59,7 @@ export interface SideBySidePair {
                   [class.text-red-400]="pair.left && pair.left.type === 'removed'"
                   [class.text-slate-300]="pair.left && pair.left.type === 'unchanged'"
                 >
-                  <span class="w-8 text-right text-slate-600 select-none pr-2 shrink-0">
+                  <span class="w-8 text-right text-slate-400 select-none pr-2 shrink-0">
                     {{ pair.left ? pair.left.lineNumber : '' }}
                   </span>
                   <span class="break-all">{{ pair.left ? pair.left.content : '' }}</span>
@@ -70,7 +70,7 @@ export interface SideBySidePair {
 
           <!-- Right: Compressed -->
           <div class="pl-2">
-            <div class="text-xs uppercase text-slate-500 font-bold mb-2 pb-1 border-b border-neutral-800">
+            <div class="text-xs uppercase text-slate-400 font-bold mb-2 pb-1 border-b border-neutral-800">
               Compressed Payload
             </div>
             <div class="space-y-0.5">
@@ -81,7 +81,7 @@ export interface SideBySidePair {
                   [class.text-emerald-400]="pair.right && pair.right.type === 'added'"
                   [class.text-slate-300]="pair.right && pair.right.type === 'unchanged'"
                 >
-                  <span class="w-8 text-right text-slate-600 select-none pr-2 shrink-0">
+                  <span class="w-8 text-right text-slate-400 select-none pr-2 shrink-0">
                     {{ pair.right ? pair.right.lineNumber : '' }}
                   </span>
                   <span class="break-all">{{ pair.right ? pair.right.content : '' }}</span>
@@ -95,7 +95,7 @@ export interface SideBySidePair {
       <!-- Inline / Unified View -->
       @if (viewMode() === 'inline') {
         <div class="font-mono text-xs overflow-x-auto bg-neutral-950 border border-neutral-800 rounded-md p-2 space-y-0.5">
-          <div class="text-xs uppercase text-slate-500 font-bold mb-2 pb-1 border-b border-neutral-800">
+          <div class="text-xs uppercase text-slate-400 font-bold mb-2 pb-1 border-b border-neutral-800">
             Unified Diff (+ Added / - Removed)
           </div>
           @for (line of unifiedLines(); track $index) {
@@ -107,10 +107,10 @@ export interface SideBySidePair {
               [class.text-emerald-400]="line.type === 'added'"
               [class.text-slate-300]="line.type === 'unchanged'"
             >
-              <span class="w-8 text-right text-slate-600 select-none pr-1 shrink-0">
+              <span class="w-8 text-right text-slate-400 select-none pr-1 shrink-0">
                 {{ line.originalLineNumber ?? '' }}
               </span>
-              <span class="w-8 text-right text-slate-600 select-none pr-2 shrink-0">
+              <span class="w-8 text-right text-slate-400 select-none pr-2 shrink-0">
                 {{ line.compressedLineNumber ?? '' }}
               </span>
               <span class="w-4 text-center select-none font-bold shrink-0">

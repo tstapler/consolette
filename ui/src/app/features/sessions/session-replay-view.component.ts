@@ -72,7 +72,7 @@ import { TraceTimelineComponent } from './components/trace-timeline.component';
               [compressedPayload]="compressedPayload"
             ></app-payload-diff-viewer>
           } @else {
-            <div class="bg-neutral-900 border border-neutral-800 rounded-lg p-12 text-center text-slate-500 space-y-2">
+            <div class="bg-neutral-900 border border-neutral-800 rounded-lg p-12 text-center text-slate-400 space-y-2">
               <div class="text-lg font-medium text-slate-400">No Session Selected</div>
               <p class="text-sm">Select a session from the list on the left to inspect execution traces and prompt diffs.</p>
             </div>

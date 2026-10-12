@@ -74,7 +74,7 @@ export type SortDirection = 'asc' | 'desc';
               </tr>
             } @empty {
               <tr>
-                <td colspan="7" class="py-8 text-center text-neutral-500 italic">No traffic yet - benchmarks appear after requests flow</td>
+                <td colspan="7" class="py-8 text-center text-neutral-400 italic">No traffic yet - benchmarks appear after requests flow</td>
               </tr>
             }
           </tbody>

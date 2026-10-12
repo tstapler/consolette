@@ -116,8 +116,8 @@ function groupRounds(items: AttemptItem[], iterations: number): Round[] {
   template: `
     <aside *ngIf="selectedId" role="dialog" [attr.aria-modal]="narrow ? 'true' : 'false'" [attr.aria-labelledby]="headingId"
       [attr.data-mode]="narrow ? 'sheet' : 'panel'" (keydown)="onKeydown($event)"
-      class="fixed top-0 bottom-0 z-40 bg-neutral-900 border-l border-neutral-700 text-xs text-neutral-300 shadow-2xl overflow-y-auto overflow-x-hidden p-5 space-y-4 break-words"
-      [ngClass]="narrow ? 'inset-0 w-full' : 'right-0 w-[560px] max-w-full'">
+      class="fixed top-16 bottom-0 z-40 bg-neutral-900 border-l border-neutral-700 text-xs text-neutral-300 shadow-2xl overflow-y-auto overflow-x-hidden p-5 space-y-4 break-words"
+      [ngClass]="narrow ? 'inset-x-0 w-full' : 'right-0 w-[560px] max-w-full'">
       <div class="flex items-start justify-between gap-2">
         <h2 #heading data-drawer-heading [id]="headingId" tabindex="-1" class="text-sm font-semibold text-white focus:outline focus:outline-2 min-w-0"
           [title]="selectedId">Trace {{ idLabel }}</h2>
@@ -169,7 +169,7 @@ function groupRounds(items: AttemptItem[], iterations: number): Round[] {
                   [ngClass]="it.index === selectedAttempt ? 'border-cyan-600 bg-neutral-800' : 'border-neutral-800 hover:bg-neutral-800/60'">
                   <span class="block break-words">{{ it.line }}</span>
                   <span class="block h-1.5 mt-1 relative bg-neutral-800 rounded" aria-hidden="true" data-bar-track>
-                    <span data-bar aria-hidden="true" class="absolute top-0 bottom-0 rounded" [ngClass]="it.failed ? 'bg-rose-500' : 'bg-emerald-500'"
+                    <span data-bar aria-hidden="true" class="absolute top-0 bottom-0 rounded border" [ngClass]="it.failed ? 'bg-rose-500 border-rose-300' : 'bg-emerald-500 border-emerald-300'"
                       [style.left.%]="it.barLeft" [style.width.%]="it.barWidth"></span>
                   </span>
                 </button>

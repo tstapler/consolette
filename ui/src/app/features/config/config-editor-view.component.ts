@@ -39,11 +39,11 @@ import { ConfigDiffModalComponent } from './components/config-diff-modal.compone
             type="button"
             (click)="onApplyConfig()"
             [disabled]="configStore.isSaving()"
-            class="px-4 py-2 text-xs font-medium text-white bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 rounded-lg shadow-lg shadow-cyan-500/20 transition flex items-center space-x-2"
+            class="px-4 py-2 text-xs font-medium text-white bg-cyan-700 hover:bg-cyan-800 disabled:opacity-50 rounded-lg shadow-lg shadow-cyan-500/20 transition flex items-center space-x-2"
             data-testid="apply-config-btn"
           >
             @if (configStore.isSaving()) {
-              <span class="animate-spin text-xs">⏳</span>
+              <span class="motion-safe:animate-spin text-xs">⏳</span>
               <span>Applying...</span>
             } @else {
               <span>Apply Config (Hot Reload)</span>

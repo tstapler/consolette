@@ -55,7 +55,8 @@ const isMaskedKey = (key: string): boolean => key.includes('...') || key.include
                 step="5"
                 [ngModel]="provider.weight || 0"
                 (ngModelChange)="onWeightChange(provider.name, $event)"
-                class="w-full accent-cyan-500 bg-slate-800 rounded-lg h-2 cursor-pointer"
+                class="w-full accent-cyan-500 bg-slate-800 rounded-lg h-6 cursor-pointer"
+                [attr.aria-label]="provider.name + ' weight'"
                 [attr.data-testid]="'slider-' + provider.name"
               />
             </div>
@@ -63,26 +64,28 @@ const isMaskedKey = (key: string): boolean => key.includes('...') || key.include
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2">
               <!-- API Key Input -->
               <div>
-                <label class="block text-xs font-medium text-slate-400 mb-1">API Key</label>
+                <label class="block text-xs font-medium text-slate-400 mb-1" [attr.for]="'apikey-' + provider.name">API Key</label>
                 <input
                   type="text"
+                  [id]="'apikey-' + provider.name"
                   [ngModel]="provider.newApiKey || ''"
                   (ngModelChange)="onApiKeyChange(provider.name, $event)"
                   [placeholder]="provider.apiKey || 'Enter a new key'"
-                  class="w-full bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 rounded px-3 py-1.5 focus:border-cyan-500 focus:outline-none"
+                  class="w-full bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 rounded px-3 py-1.5 focus:border-cyan-500"
                   [attr.data-testid]="'apikey-' + provider.name"
                 />
               </div>
 
               <!-- Base URL Input -->
               <div>
-                <label class="block text-xs font-medium text-slate-400 mb-1">Base URL (HTTPS)</label>
+                <label class="block text-xs font-medium text-slate-400 mb-1" [attr.for]="'baseurl-' + provider.name">Base URL (HTTPS)</label>
                 <input
                   type="text"
+                  [id]="'baseurl-' + provider.name"
                   [ngModel]="provider.baseUrl || ''"
                   (ngModelChange)="onBaseUrlChange(provider.name, $event)"
                   placeholder="https://api.example.com/v1"
-                  class="w-full bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 rounded px-3 py-1.5 focus:border-cyan-500 focus:outline-none"
+                  class="w-full bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 rounded px-3 py-1.5 focus:border-cyan-500"
                   [attr.data-testid]="'baseurl-' + provider.name"
                 />
               </div>

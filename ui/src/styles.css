@@ -21,3 +21,47 @@
     overflow-x: hidden;
   }
 }
+
+/* Story 4.1.7 (UX-18, UX-27, E-25). Unlayered, so it wins over Tailwind's layered utilities and needs no per-control class. */
+
+/* One ring for every control: nav links, buttons, inputs, scroll regions. sky-300 is >= 9:1 on the page, card and button backgrounds. */
+:focus-visible {
+  outline: 2px solid #7dd3fc;
+  outline-offset: 2px;
+}
+
+/* The programmatic-focus targets of the skip link are not controls. */
+main:focus-visible {
+  outline: none;
+}
+
+/* Keep a focused control out from under the sticky 4rem app header. */
+html {
+  scroll-padding-top: 5rem;
+}
+
+/* Stale rows are dimmed with a colour token, never opacity, which would silently lower contrast (6.0:1 on the lightest cell). */
+.stale-rows,
+.stale-rows * {
+  color: #a3a3a3 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Backgrounds are replaced in forced-colors mode; system colours are honoured, so bars and dots keep a visible fill. */
+@media (forced-colors: active) {
+  [data-bar],
+  [data-status-dot] {
+    background-color: CanvasText;
+    border: 1px solid CanvasText;
+  }
+}

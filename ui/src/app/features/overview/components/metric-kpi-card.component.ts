@@ -19,7 +19,7 @@ import { CommonModule } from '@angular/common';
         <span class="text-2xl font-bold text-white tracking-tight">{{ formattedValue }}</span>
         <span *ngIf="unit" class="text-xs font-medium text-neutral-400">{{ unit }}</span>
       </div>
-      <div *ngIf="subtitle" class="mt-1 text-xs text-neutral-500">
+      <div *ngIf="subtitle" class="mt-1 text-xs text-neutral-400">
         {{ subtitle }}
       </div>
     </div>

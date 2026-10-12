@@ -39,7 +39,7 @@ export interface TimelineStep {
               [class.text-red-400]="step.status === 'error'"
               [class.bg-neutral-950]="step.status === 'skipped'"
               [class.border-neutral-700]="step.status === 'skipped'"
-              [class.text-slate-500]="step.status === 'skipped'"
+              [class.text-slate-400]="step.status === 'skipped'"
             >
               @if (step.status === 'ok') { ✓ }
               @else if (step.status === 'warning') { ! }

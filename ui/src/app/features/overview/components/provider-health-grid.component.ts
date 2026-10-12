@@ -32,13 +32,13 @@ export interface ProviderHealthItem {
               class="px-2.5 py-0.5 text-xs font-semibold rounded-full flex items-center gap-1.5"
               [ngClass]="getBadgeClass(provider.status)"
             >
-              <span class="w-1.5 h-1.5 rounded-full" [ngClass]="getDotClass(provider.status)"></span>
+              <span data-status-dot class="w-1.5 h-1.5 rounded-full border" [ngClass]="getDotClass(provider.status)"></span>
               {{ getStatusLabel(provider.status) }}
             </span>
           </div>
 
           <div *ngIf="isCooldown(provider.status)" class="mt-2 text-xs font-mono text-amber-400 flex items-center gap-1">
-            <svg class="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg class="w-3.5 h-3.5 motion-safe:animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
             <span *ngIf="getCooldownRemaining(provider) > 0">Cooldown: {{ getCooldownRemaining(provider) }}s remaining</span>
@@ -169,11 +169,11 @@ export class ProviderHealthGridComponent implements OnChanges, OnDestroy {
 
   public getDotClass(status: string): string {
     const s = status.toLowerCase();
-    if (s === 'healthy' || s === 'active') return 'bg-emerald-400 animate-pulse';
-    if (s === 'degraded') return 'bg-yellow-400';
-    if (this.isCooldown(status)) return 'bg-amber-400 animate-ping';
-    if (s === 'autherror' || s === 'auth error' || s === 'auth_error') return 'bg-rose-400';
-    return 'bg-neutral-400';
+    if (s === 'healthy' || s === 'active') return 'bg-emerald-400 border-emerald-200 motion-safe:animate-pulse';
+    if (s === 'degraded') return 'bg-yellow-400 border-yellow-200';
+    if (this.isCooldown(status)) return 'bg-amber-400 border-amber-200 motion-safe:animate-ping';
+    if (s === 'autherror' || s === 'auth error' || s === 'auth_error') return 'bg-rose-400 border-rose-200';
+    return 'bg-neutral-400 border-neutral-200';
   }
 
   public getCardBorderClass(status: string): string {

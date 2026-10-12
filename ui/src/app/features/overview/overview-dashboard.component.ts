@@ -31,7 +31,7 @@ import { InspectDrawerComponent } from './components/inspect-drawer.component';
             class="px-3 py-1 text-xs font-semibold rounded-full border flex items-center gap-2"
             [ngClass]="metricsStore.connectionStatus() === 'connected' ? 'bg-emerald-950/80 text-emerald-400 border-emerald-800/60' : 'bg-amber-950/80 text-amber-400 border-amber-800/60'"
           >
-            <span class="w-2 h-2 rounded-full" [ngClass]="metricsStore.connectionStatus() === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"></span>
+            <span data-status-dot class="w-2 h-2 rounded-full border" [ngClass]="metricsStore.connectionStatus() === 'connected' ? 'bg-emerald-400 border-emerald-200 motion-safe:animate-pulse' : 'bg-amber-400 border-amber-200'"></span>
             {{ metricsStore.connectionStatus() }}
           </span>
         </div>

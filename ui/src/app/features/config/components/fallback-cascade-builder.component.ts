@@ -28,8 +28,9 @@ import { CommonModule } from '@angular/common';
                 type="button"
                 [disabled]="idx === 0"
                 (click)="moveUp(idx)"
-                class="px-2 py-1 text-xs rounded bg-slate-800 text-slate-300 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed"
+                class="px-2 py-1 text-xs rounded bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed"
                 [attr.data-testid]="'move-up-' + idx"
+                [attr.aria-label]="'Move ' + providerName + ' up'"
               >
                 ▲ Up
               </button>
@@ -37,8 +38,9 @@ import { CommonModule } from '@angular/common';
                 type="button"
                 [disabled]="idx === cascade().length - 1"
                 (click)="moveDown(idx)"
-                class="px-2 py-1 text-xs rounded bg-slate-800 text-slate-300 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed"
+                class="px-2 py-1 text-xs rounded bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed"
                 [attr.data-testid]="'move-down-' + idx"
+                [attr.aria-label]="'Move ' + providerName + ' down'"
               >
                 ▼ Down
               </button>

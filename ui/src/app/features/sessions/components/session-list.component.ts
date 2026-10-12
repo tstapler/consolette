@@ -16,8 +16,9 @@ import { SessionData } from '../../../core/models/telemetry.models';
             type="text"
             [ngModel]="searchQuery()"
             (ngModelChange)="onSearchChange($event)"
+            aria-label="Filter sessions"
             placeholder="Filter by session ID, provider, model..."
-            class="w-full sm:w-64 px-3 py-1.5 text-sm bg-neutral-950 border border-neutral-800 rounded-md text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+            class="w-full sm:w-64 px-3 py-1.5 text-sm bg-neutral-950 border border-neutral-800 rounded-md text-slate-200 placeholder-slate-400 focus:border-cyan-500"
           />
         </div>
       </div>
@@ -26,7 +27,7 @@ import { SessionData } from '../../../core/models/telemetry.models';
         <table class="w-full text-left text-sm text-slate-300">
           <thead class="text-xs uppercase bg-neutral-950 text-slate-400 border-b border-neutral-800">
             <tr>
-              <th class="px-4 py-3">Session ID</th>
+              <th scope="col" class="px-4 py-3">Session ID</th>
               <th class="px-4 py-3">Provider / Model</th>
               <th class="px-4 py-3 text-center">Turns</th>
               <th class="px-4 py-3 text-right">Saved %</th>
@@ -43,12 +44,13 @@ import { SessionData } from '../../../core/models/telemetry.models';
                 [class.border-l-2]="selectedSessionId === session.id"
                 [class.border-cyan-500]="selectedSessionId === session.id"
               >
-                <td class="px-4 py-3 font-mono text-xs font-medium text-cyan-400">
-                  {{ session.id }}
+                <td class="px-4 py-3 font-mono text-xs font-medium">
+                  <button type="button" (click)="selectSession(session); $event.stopPropagation()" [attr.aria-pressed]="selectedSessionId === session.id"
+                    class="min-h-6 min-w-6 text-left text-cyan-400 underline font-mono text-xs font-medium">{{ session.id }}</button>
                 </td>
                 <td class="px-4 py-3">
                   <div class="font-medium text-white">{{ session.model }}</div>
-                  <div class="text-xs text-slate-500 uppercase">{{ session.provider }}</div>
+                  <div class="text-xs text-slate-400 uppercase">{{ session.provider }}</div>
                 </td>
                 <td class="px-4 py-3 text-center font-mono">
                   {{ session.turnCount }}
@@ -74,7 +76,7 @@ import { SessionData } from '../../../core/models/telemetry.models';
             }
             @if (filteredSessions().length === 0) {
               <tr>
-                <td colspan="6" class="px-4 py-8 text-center text-slate-500">
+                <td colspan="6" class="px-4 py-8 text-center text-slate-400">
                   No sessions match the search query.
                 </td>
               </tr>

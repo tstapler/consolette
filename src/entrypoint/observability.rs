@@ -66,6 +66,8 @@ pub struct SessionSummary {
     pub pin_status: Option<crate::routing::session_overrides::SessionOverride>,
     pub model: String,
     pub provider: String,
+    /// Newest ring-buffer request of the session: the id `GET /requests/{id}` accepts.
+    pub latest_request_id: String,
 }
 
 /// `GET /v1/dashboard/sessions` — list sessions with pagination and search parameters.
@@ -124,6 +126,7 @@ pub async fn get_dashboard_sessions(
             pin_status: pin,
             model,
             provider,
+            latest_request_id: latest_req.request_id.clone(),
         });
     }
 

@@ -93,6 +93,13 @@ export type DashboardEvent =
 
 export interface SessionData {
   id: string;
+  /** Newest request of the session; the id `/requests/{id}` takes. */
+  latestRequestId?: string;
+  compressionStatus?: 'off' | 'none';
+  promptTokens?: number;
+  responseTokens?: number;
+  savedTokens?: number;
+  timelineSteps?: { name: string; durationMs: number; status: 'ok' | 'warning' | 'error' | 'skipped' }[];
   turnCount: number;
   tokenSavingsPercent: number;
   lastActiveTimestamp: string;

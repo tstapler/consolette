@@ -59,14 +59,7 @@ export interface TimelineStep {
   `
 })
 export class TraceTimelineComponent {
-  @Input() steps: TimelineStep[] = [
-    { name: 'Ingress', durationMs: 1, status: 'ok' },
-    { name: 'RateLimit', durationMs: 2, status: 'ok' },
-    { name: 'Compression', durationMs: 12, status: 'ok' },
-    { name: 'Router', durationMs: 3, status: 'ok' },
-    { name: 'Provider Dispatch', durationMs: 145, status: 'ok' },
-    { name: 'Egress', durationMs: 2, status: 'ok' }
-  ];
+  @Input() steps: TimelineStep[] = [];
 
   public get totalDurationMs(): number {
     return this.steps.reduce((acc, step) => acc + step.durationMs, 0);

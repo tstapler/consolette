@@ -133,6 +133,37 @@ async fn test_dashboard_sessions_api() {
 }
 
 #[tokio::test]
+#[allow(non_snake_case)]
+async fn sessions_endpoint_should_expose_latestRequestId_and_ui_should_fetch_requests_by_it() {
+    let dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let state = create_test_state(dir.path()).await;
+    let body = serde_json::json!({"model": "claude-sonnet-4", "messages": []});
+    for id in ["req_old00001", "req_77ab01cd"] {
+        state
+            .metrics
+            .push_request(consolette::metrics::RequestDetail::from_body(
+                id.to_string(),
+                false,
+                10,
+                &body,
+                Some("sess-1".to_string()),
+            ));
+    }
+    let app = entrypoint_router(state);
+    let req = Request::builder()
+        .uri("/v1/dashboard/sessions?limit=10")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json[0]["latestRequestId"], "req_77ab01cd", "{json}");
+    assert_eq!(json[0]["id"], "sess-1", "existing keys unchanged: {json}");
+    assert_eq!(json[0]["turnCount"], 2, "{json}");
+}
+
+#[tokio::test]
 async fn test_dashboard_benchmark_api() {
     let dir = tempfile::tempdir().expect("Failed to create tempdir");
     let state = create_test_state(dir.path()).await;

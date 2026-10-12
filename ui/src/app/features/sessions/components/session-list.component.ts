@@ -86,7 +86,15 @@ import { SessionData } from '../../../core/models/telemetry.models';
   `
 })
 export class SessionListComponent {
-  @Input() sessions: SessionData[] = [];
+  private readonly sessionsSignal = signal<SessionData[]>([]);
+
+  // A signal behind the setter: a computed() over a plain field never saw late input (E-03).
+  @Input() set sessions(value: SessionData[] | null | undefined) {
+    this.sessionsSignal.set(value ?? []);
+  }
+  get sessions(): SessionData[] {
+    return this.sessionsSignal();
+  }
   @Input() selectedSessionId: string | null = null;
   @Output() sessionSelected = new EventEmitter<SessionData>();
 
@@ -94,8 +102,9 @@ export class SessionListComponent {
 
   public readonly filteredSessions = computed(() => {
     const q = this.searchQuery().trim().toLowerCase();
-    if (!q) return this.sessions;
-    return this.sessions.filter(
+    const all = this.sessionsSignal();
+    if (!q) return all;
+    return all.filter(
       (s) =>
         s.id.toLowerCase().includes(q) ||
         (s.model && s.model.toLowerCase().includes(q)) ||

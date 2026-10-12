@@ -56,6 +56,18 @@ describe('SessionListComponent', () => {
     expect(component.filteredSessions()[0].id).toBe('sess-2');
   });
 
+  it('should render sessions that arrive after the first render (E-03)', () => {
+    const late = TestBed.createComponent(SessionListComponent);
+    late.detectChanges();
+    expect(late.nativeElement.querySelectorAll('tbody tr td.font-mono').length).toBe(0);
+
+    late.componentRef.setInput('sessions', mockSessions);
+    late.detectChanges();
+
+    expect(late.nativeElement.textContent).toContain('sess-1');
+    expect(late.nativeElement.textContent).toContain('sess-2');
+  });
+
   it('should emit sessionSelected on click', () => {
     spyOn(component.sessionSelected, 'emit');
     component.selectSession(mockSessions[0]);

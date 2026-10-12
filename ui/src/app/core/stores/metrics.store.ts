@@ -34,9 +34,10 @@ export class MetricsStore {
   public readonly isContended = computed(() => (this.metricsSignal()?.currentLagMs ?? 0) > 100);
   public readonly totalRequests = computed(() => this.metricsSignal()?.totalRequests ?? 0);
   public readonly tokensSaved = computed(() => this.metricsSignal()?.totalTokensSaved ?? 0);
-  public readonly tps = computed(() => this.metricsSignal()?.tps ?? 0);
-  public readonly medianTtftMs = computed(() => this.metricsSignal()?.medianTtftMs ?? 0);
-  public readonly tokenSavingsPercent = computed(() => this.metricsSignal()?.tokenSavingsPercent ?? 0);
+  public readonly tps = computed(() => this.metricsSignal()?.tps ?? null);
+  public readonly medianLatencyMs = computed(() => this.metricsSignal()?.medianLatencyMs ?? null);
+  public readonly medianFirstByteMs = computed(() => this.metricsSignal()?.medianFirstByteMs ?? null);
+  public readonly tokenSavingsPercent = computed(() => this.metricsSignal()?.tokenSavingsPercent ?? null);
 
   constructor() {
     this.maxTracesLimit = 500;

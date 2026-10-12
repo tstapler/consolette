@@ -18,14 +18,22 @@ describe('ProviderHealthGridComponent (TC-UNIT-14)', () => {
     expect(component).toBeTruthy();
   });
 
-  it('should render default healthy providers list if no input is passed', () => {
+  it('should say no upstreams reported, not invent provider cards, when nothing is passed', () => {
     component.ngOnChanges({});
     fixture.detectChanges();
 
-    const compiled = fixture.nativeElement as HTMLElement;
-    expect(compiled.textContent).toContain('Anthropic');
-    expect(compiled.textContent).toContain('AWS Bedrock');
-    expect(compiled.textContent).toContain('OpenAI');
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('No upstreams reported');
+    expect(text).not.toContain('Anthropic');
+    expect(text).not.toContain('AWS Bedrock');
+    expect(text).not.toContain('OpenAI');
+  });
+
+  it('should say no upstreams reported for an empty providerHealth map', () => {
+    component.providerHealth = {};
+    component.ngOnChanges({});
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).textContent).toContain('No upstreams reported');
   });
 
   it('should render status badges for Healthy, Degraded, Cooldown, and AuthError states', () => {

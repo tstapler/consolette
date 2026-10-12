@@ -38,7 +38,7 @@ import { InspectDrawerComponent } from './components/inspect-drawer.component';
       </div>
 
       <!-- KPI Summary Cards Grid -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         <app-metric-kpi-card
           title="Upstream Attempts Per Min"
           [value]="metricsStore.rpm()"
@@ -49,23 +49,31 @@ import { InspectDrawerComponent } from './components/inspect-drawer.component';
 
         <app-metric-kpi-card
           title="Tokens Per Second"
-          [value]="metricsStore.tps()"
+          [value]="metricsStore.tps() ?? '\u2013'"
           unit="tok/s"
           formatType="number"
           subtitle="Streaming generation rate"
         ></app-metric-kpi-card>
 
         <app-metric-kpi-card
-          title="Median TTFT"
-          [value]="metricsStore.medianTtftMs()"
+          title="Median latency (to headers)"
+          [value]="metricsStore.medianLatencyMs() ?? '\u2013'"
           unit="ms"
           formatType="ms"
-          subtitle="First byte latency"
+          subtitle="Time until upstream response headers"
+        ></app-metric-kpi-card>
+
+        <app-metric-kpi-card
+          title="Median first byte"
+          [value]="metricsStore.medianFirstByteMs() ?? 'n/a (not measured)'"
+          unit="ms"
+          formatType="ms"
+          subtitle="First body byte latency"
         ></app-metric-kpi-card>
 
         <app-metric-kpi-card
           title="Token Savings"
-          [value]="metricsStore.tokenSavingsPercent()"
+          [value]="metricsStore.tokenSavingsPercent() ?? 'n/a (compression off)'"
           unit="%"
           formatType="percent"
           subtitle="Prompt compression efficiency"

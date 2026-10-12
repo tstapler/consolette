@@ -24,7 +24,58 @@ pub struct MetricsTickData {
     pub total_requests: u64,
     pub total_tokens_saved: u64,
     pub current_lag_ms: f64,
+    /// `healthy | cooldown | unhealthy` per upstream, from the router's breaker state.
     pub provider_health: HashMap<String, String>,
+    /// p50 of upstream time-to-headers; `None` until a sample exists.
+    pub median_latency_ms: Option<f64>,
+    /// `None` until the deferred first-byte measurement exists.
+    pub median_first_byte_ms: Option<f64>,
+    /// `None`: no generation-rate source exists yet.
+    pub tps: Option<f64>,
+    /// `None` while compression is off (the deferred Epic 6 wiring computes it).
+    pub token_savings_percent: Option<f64>,
+}
+
+/// Maps `Router::cooldown_snapshot()` to the tick's per-upstream health labels. An open
+/// circuit or any remaining cooldown is `cooldown`; half-open (probing after failures) is
+/// `unhealthy`; an upstream with no breaker entry is `healthy`.
+#[must_use]
+pub fn provider_health_from_snapshot(
+    snapshot: &serde_json::Value,
+    upstream_names: &[String],
+) -> HashMap<String, String> {
+    upstream_names
+        .iter()
+        .map(|name| {
+            let entry = snapshot.get(name);
+            let remaining = entry
+                .and_then(|e| e.get("remaining_seconds"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let circuit = entry
+                .and_then(|e| e.get("circuit_state"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("closed");
+            let label = if circuit == "open" || remaining > 0 {
+                "cooldown"
+            } else if circuit == "half_open" {
+                "unhealthy"
+            } else {
+                "healthy"
+            };
+            (name.clone(), label.to_string())
+        })
+        .collect()
+}
+
+/// p50 of the rolling duration histogram (time to headers), `None` when it has no samples.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // millisecond medians are far below 2^52
+pub fn median_latency_ms(histogram: &crate::metrics::DurationHistogram) -> Option<f64> {
+    if histogram.sample_count() == 0 {
+        return None;
+    }
+    Some(histogram.percentiles().0 as f64)
 }
 
 /// Outcome of the ingress compression step. This project only ever sends `Off`; the
@@ -310,6 +361,10 @@ mod tests {
             total_tokens_saved: 500,
             current_lag_ms: 2.1,
             provider_health: HashMap::from([("anthropic".to_string(), "healthy".to_string())]),
+            median_latency_ms: Some(800.0),
+            median_first_byte_ms: None,
+            tps: None,
+            token_savings_percent: None,
         });
 
         let json = serde_json::to_string(&event).expect("serialize event");
@@ -464,6 +519,10 @@ mod tests {
                 total_tokens_saved: 0,
                 current_lag_ms: 0.0,
                 provider_health: HashMap::new(),
+                median_latency_ms: None,
+                median_first_byte_ms: None,
+                tps: None,
+                token_savings_percent: None,
             }),
             DashboardEvent::RequestTrace(RequestTraceData::from_detail(&sample_detail())),
             DashboardEvent::ErrorLogged(ErrorLoggedData {
@@ -503,6 +562,37 @@ mod tests {
 
         assert_eq!(compat, fixture_value("request-trace-success-compat.json"));
         assert_eq!(default, fixture_value("request-trace-success.json"));
+    }
+
+    #[test]
+    fn provider_health_should_report_cooldown_for_an_open_circuit_with_remaining_seconds() {
+        let snapshot = serde_json::json!({
+            "bedrock": {"cooling_down": true, "remaining_seconds": 120, "circuit_state": "open"},
+            "steady": {"cooling_down": false, "remaining_seconds": 0, "circuit_state": "closed"},
+            "flaky": {"cooling_down": false, "remaining_seconds": 0, "circuit_state": "half_open"},
+        });
+        let names = ["bedrock", "steady", "flaky", "unrouted"].map(String::from);
+        let health = provider_health_from_snapshot(&snapshot, &names);
+        assert_eq!(health["bedrock"], "cooldown");
+        assert_eq!(health["steady"], "healthy");
+        assert_eq!(health["flaky"], "unhealthy");
+        assert_eq!(
+            health["unrouted"], "healthy",
+            "no breaker state means healthy"
+        );
+    }
+
+    #[test]
+    fn median_latency_should_be_the_histogram_p50_and_none_without_samples() {
+        let histogram = crate::metrics::DurationHistogram::with_default_window();
+        assert_eq!(median_latency_ms(&histogram), None);
+        for _ in 0..10 {
+            histogram.record(400);
+        }
+        for _ in 0..10 {
+            histogram.record(800);
+        }
+        assert_eq!(median_latency_ms(&histogram), Some(800.0));
     }
 
     #[test]

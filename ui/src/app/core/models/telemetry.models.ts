@@ -6,10 +6,11 @@ export interface MetricsTickData {
   totalTokensSaved: number;
   currentLagMs: number;
   providerHealth?: Record<string, string>;
-  // No backend source yet; read by the Overview tiles, which tolerate absence.
-  tps?: number;
-  medianTtftMs?: number;
-  tokenSavingsPercent?: number;
+  // null means "not computable / not measured"; the Overview shows n/a, never 0.
+  medianLatencyMs?: number | null;
+  medianFirstByteMs?: number | null;
+  tps?: number | null;
+  tokenSavingsPercent?: number | null;
 }
 
 export type CompressionStatus = 'off' | 'none' | 'skipped' | 'failed' | 'compressed';

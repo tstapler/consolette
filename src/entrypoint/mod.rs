@@ -188,7 +188,12 @@ impl EntrypointState {
                 })
                 .collect(),
         });
-        let ticker_server_info = Arc::clone(&server_info);
+        let upstream_names: Vec<String> = server_info
+            .upstreams
+            .iter()
+            .map(|u| u.name.clone())
+            .collect();
+        let ticker_router = Arc::clone(&dispatch_router);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -212,10 +217,10 @@ impl EntrypointState {
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let total_tokens_saved = tokens_before.saturating_sub(tokens_after);
                 let current_lag_ms = ticker_metrics.current_lag_ms();
-                let mut provider_health = std::collections::HashMap::new();
-                for upstream in &ticker_server_info.upstreams {
-                    provider_health.insert(upstream.name.clone(), "healthy".to_string());
-                }
+                let provider_health = crate::entrypoint::events::provider_health_from_snapshot(
+                    &ticker_router.load().cooldown_snapshot(),
+                    &upstream_names,
+                );
 
                 let tick_data = crate::entrypoint::events::MetricsTickData {
                     rpm,
@@ -223,6 +228,12 @@ impl EntrypointState {
                     total_tokens_saved,
                     current_lag_ms,
                     provider_health,
+                    median_latency_ms: crate::entrypoint::events::median_latency_ms(
+                        &ticker_metrics.histogram,
+                    ),
+                    median_first_byte_ms: None,
+                    tps: None,
+                    token_savings_percent: None,
                 };
                 let _ = ticker_tx.send(crate::entrypoint::events::DashboardEvent::MetricsTick(
                     tick_data,

@@ -63,7 +63,7 @@ describe('OverviewDashboardComponent', () => {
         totalRequests: 500,
         totalTokensSaved: 10000,
         tps: 45,
-        medianTtftMs: 150,
+        medianLatencyMs: 150,
         tokenSavingsPercent: 35.5,
         currentLagMs: 12
       }
@@ -76,6 +76,27 @@ describe('OverviewDashboardComponent', () => {
     expect(compiled.textContent).toContain('45');
     expect(compiled.textContent).toContain('150ms');
     expect(compiled.textContent).toContain('35.5%');
+  });
+
+  it('labels the latency card "to headers" and shows n/a, not 0, for fields with no source', () => {
+    component.metricsStore.handleDashboardEvent({
+      type: 'MetricsTick',
+      data: {
+        rpm: 3, totalRequests: 9, totalTokensSaved: 0, currentLagMs: 1,
+        medianLatencyMs: 800, medianFirstByteMs: null, tps: null, tokenSavingsPercent: null,
+      },
+    });
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Median latency (to headers)');
+    expect(text).toContain('800ms');
+    expect(text).toContain('n/a (compression off)');
+    expect(text).toContain('n/a (not measured)');
+    expect(text).not.toContain('Median TTFT');
+    expect(text).not.toContain('0.0%');
+    const cards = Array.from((fixture.nativeElement as HTMLElement).querySelectorAll('app-metric-kpi-card'));
+    const tpsCard = cards.find((c) => c.textContent?.includes('Tokens Per Second'));
+    expect(tpsCard?.textContent).toContain('\u2013');
   });
 
   it('Inspect opens the in-page drawer for that trace instead of navigating to sessions', () => {

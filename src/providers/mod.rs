@@ -142,7 +142,8 @@ impl ProviderError {
     #[must_use]
     pub fn trace_status(&self) -> u16 {
         const fn http_status(status: u16, fallback: u16) -> u16 {
-            if status >= 100 && status <= 599 {
+            // 499 is reserved for our own client aborts; 1xx-3xx are not errors.
+            if status >= 400 && status <= 599 && status != 499 {
                 status
             } else {
                 fallback
@@ -182,7 +183,11 @@ impl From<&ProviderError> for crate::metrics::trace::AttemptErrorClass {
                 status: 500..=599, ..
             }
             | ProviderError::Exhausted => C::ServerError,
-            ProviderError::Upstream { .. } => C::ClientError,
+            ProviderError::Upstream {
+                status: 400..=499, ..
+            } => C::ClientError,
+            // A non-error status (e.g. 2xx with an undecodable body) is a bad response.
+            ProviderError::Upstream { .. } => C::BadResponse,
         }
     }
 }
@@ -1643,6 +1648,9 @@ mod tests {
             (upstream_err(500), C::ServerError),
             (upstream_err(502), C::ServerError),
             (upstream_err(404), C::ClientError),
+            (upstream_err(200), C::BadResponse),
+            (upstream_err(302), C::BadResponse),
+            (upstream_err(499), C::ClientError),
             (ProviderError::Exhausted, C::ServerError),
             (
                 ProviderError::ResponseShapeMismatch("x".to_string()),
@@ -1733,6 +1741,27 @@ mod tests {
                     body: String::new(),
                 },
                 529,
+            ),
+            (
+                ProviderError::Upstream {
+                    status: 200,
+                    body: String::new(),
+                },
+                502,
+            ),
+            (
+                ProviderError::Upstream {
+                    status: 302,
+                    body: String::new(),
+                },
+                502,
+            ),
+            (
+                ProviderError::Upstream {
+                    status: 499,
+                    body: String::new(),
+                },
+                502,
             ),
             (ProviderError::Exhausted, 503),
             (ProviderError::ResponseShapeMismatch("x".to_string()), 502),

@@ -23,7 +23,7 @@ use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
-use crate::providers::local_discovery::{LocalCatalog, LocalTarget};
+use crate::providers::local_discovery::LocalCatalog;
 use crate::providers::openai::{OpenaiProvider, MODEL_FAMILY_BODY_KEY};
 use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
@@ -458,53 +458,6 @@ impl Router {
         Arc::clone(&self.local_catalog)
     }
 
-    /// Sends a request for a discovered `local/<backend>/<model>` straight to
-    /// that backend's OpenAI-compatible endpoint, bypassing route candidates:
-    /// the client named the model explicitly, so there is nothing to select.
-    async fn dispatch_local(
-        &self,
-        scope: &mut TraceScope,
-        target: LocalTarget,
-        mut body: serde_json::Value,
-        headers: HeaderMap,
-        stream: bool,
-    ) -> Result<ProviderResponse, ProviderError> {
-        let provider = match self.local_providers.get(&target.base_url) {
-            Some(p) => Arc::clone(&p),
-            None => {
-                let upstream = Arc::new(crate::config::schema::Upstream {
-                    name: format!("local/{}", target.backend.slug()),
-                    kind: UpstreamKind::Openai {
-                        base_url: target.base_url.clone(),
-                    },
-                    // OpenaiProvider requires an auth method; local servers
-                    // ignore the header, so a placeholder bearer suffices.
-                    auth: Some(crate::config::schema::AuthMethod::Bearer {
-                        token: crate::config::schema::SecretRef::Inline {
-                            value: "local".to_string(),
-                        },
-                    }),
-                });
-                let p: Arc<dyn Provider> = Arc::new(OpenaiProvider::new(
-                    upstream,
-                    target.base_url.clone(),
-                    Arc::new(SystemSecretResolver),
-                    Arc::new(ExecCredentialCache::new()),
-                    LOCAL_REQUEST_TIMEOUT_SECS,
-                    Arc::clone(&self.metrics.counters),
-                )?);
-                self.local_providers
-                    .insert(target.base_url.clone(), Arc::clone(&p));
-                p
-            }
-        };
-        scope.begin_local_attempt(&target.model);
-        body["model"] = serde_json::Value::String(target.model);
-        let result = provider.send(body, headers, stream).await;
-        scope.complete_local_attempt(result.as_ref().err());
-        result
-    }
-
     /// Swaps in a shared capability-verdict cache, replacing the empty one
     /// `Router::new`/`from_config` starts with. Same carry-across contract
     /// as `with_session_overrides`: `api::post_route` passes the
@@ -696,11 +649,6 @@ impl Router {
         });
         scope.mark_handler_returned();
         result
-    }
-
-    fn local_target(&self, body: &serde_json::Value) -> Option<LocalTarget> {
-        let model = body.get("model").and_then(serde_json::Value::as_str)?;
-        self.local_catalog.resolve(model)
     }
 
     /// Dispatch against a caller-owned `scope`, which the caller must finish.
@@ -1125,6 +1073,7 @@ impl Router {
     }
 }
 
+mod local_dispatch;
 mod provider_names;
 #[cfg(test)]
 mod tests;

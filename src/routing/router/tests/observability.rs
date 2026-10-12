@@ -507,8 +507,8 @@ async fn dispatch_should_emit_499_with_single_cancelled_attempt_latency_ge_5s_wh
     assert!(attempts[0].latency_ms >= 5000, "{}", attempts[0].latency_ms);
 }
 
-/// Line count of `router/mod.rs` before Story 2.1.2 (git `e7c85c1`).
-const ROUTER_MOD_RS_LINES_BEFORE_ATTEMPT_CAPTURE: usize = 1130;
+/// Line count of `router/mod.rs` on `main` (git `49ec827`), the plan's net-growth <= 0 baseline.
+const ROUTER_MOD_RS_LINES_BEFORE_ATTEMPT_CAPTURE: usize = 1097;
 
 #[test]
 fn router_mod_rs_should_not_grow_net_lines_after_attempt_capture() {

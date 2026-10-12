@@ -66,7 +66,8 @@ const isMaskedKey = (key: string): boolean => key.includes('...') || key.include
               <div>
                 <label class="block text-xs font-medium text-slate-400 mb-1" [attr.for]="'apikey-' + provider.name">API Key</label>
                 <input
-                  type="text"
+                  type="password"
+                  autocomplete="off"
                   [id]="'apikey-' + provider.name"
                   [ngModel]="provider.newApiKey || ''"
                   (ngModelChange)="onApiKeyChange(provider.name, $event)"

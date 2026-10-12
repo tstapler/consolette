@@ -105,4 +105,43 @@ describe('SseService (TC-UNIT-08 & TC-UNIT-09)', () => {
     expect(seen.map((e) => e.type)).toEqual(['RequestTrace', 'RequestTrace', 'MetricsTick', 'ErrorLogged', 'ConfigChanged']);
     expect(seen).toEqual(frames as unknown as DashboardEvent[]);
   });
+
+  // E-02: a connection that goes silent (stopped-but-lingering proxy, half-open socket)
+  // never fires onerror, so the badge used to stay "connected" forever.
+  it('should leave connected and reconnect when the stream goes silent past the stale threshold', fakeAsync(() => {
+    service.connect({ url: '/test/events', initialBackoffMs: 100, staleAfterMs: 5000 });
+    activeMockInstances[0].onopen();
+    expect(service.connectionStatus()).toBe('connected');
+
+    tick(4000);
+    activeMockInstances[0].onmessage({ data: JSON.stringify(metricsTick) });
+    tick(4000);
+    expect(service.connectionStatus()).toBe('connected');
+
+    tick(1000);
+    expect(service.connectionStatus()).toBe('reconnecting');
+    tick(100);
+    expect(window.EventSource).toHaveBeenCalledTimes(2);
+    service.disconnect();
+  }));
+
+  it('should end disconnected after maxRetryAttempts failures and reconnect() should reset the counter and reconnect', fakeAsync(() => {
+    service.connect({ url: '/test/events', initialBackoffMs: 10, maxBackoffMs: 10, maxRetryAttempts: 3 });
+    for (let i = 0; i < 4; i++) {
+      activeMockInstances[activeMockInstances.length - 1].onerror();
+      tick(10);
+    }
+    expect(service.connectionStatus()).toBe('disconnected');
+    expect(service.retryCount()).toBe(3);
+    const before = activeMockInstances.length;
+
+    service.reconnect();
+
+    expect(service.retryCount()).toBe(0);
+    expect(service.connectionStatus()).toBe('connecting');
+    expect(activeMockInstances.length).toBe(before + 1);
+    activeMockInstances[before].onopen();
+    expect(service.connectionStatus()).toBe('connected');
+    service.disconnect();
+  }));
 });

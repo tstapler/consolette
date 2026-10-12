@@ -18,7 +18,7 @@ import { BenchmarkData } from '../../../core/models/telemetry.models';
         <div class="flex items-center space-x-3">
           <label class="flex items-center cursor-pointer space-x-2 text-xs text-neutral-300">
             <span>CDF Mode</span>
-            <input type="checkbox" [checked]="isCdfMode" (change)="toggleCdfMode()" class="toggle-checkbox rounded bg-neutral-800 border-neutral-700 text-cyan-500 focus:ring-cyan-500" />
+            <input type="checkbox" [checked]="isCdfMode" (change)="toggleCdfMode()" class="toggle-checkbox w-6 h-6 rounded bg-neutral-800 border-neutral-700 text-cyan-500" />
           </label>
         </div>
       </div>
@@ -85,6 +85,7 @@ export class LatencyPercentileChartComponent implements OnInit, OnDestroy, OnCha
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        animation: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? false : undefined,
         scales: {
           x: {
             grid: { color: 'rgba(255, 255, 255, 0.05)' },

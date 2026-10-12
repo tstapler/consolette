@@ -35,6 +35,14 @@ describe('LatencyPercentileChartComponent', () => {
     expect(component).toBeTruthy();
   });
 
+  it('chart_animation_is_off_when_the_user_prefers_reduced_motion (UX-27)', () => {
+    const reduce = (q: string) => ({ matches: q.includes('prefers-reduced-motion: reduce'), media: q, addEventListener: () => undefined, removeEventListener: () => undefined }) as unknown as MediaQueryList;
+    spyOn(window, 'matchMedia').and.callFake(reduce);
+    const fx = TestBed.createComponent(LatencyPercentileChartComponent);
+    fx.detectChanges();
+    expect(fx.componentInstance.chartInstance?.options.animation).toBe(false);
+  });
+
   it('should initialize Chart.js instance on init', () => {
     expect(component.chartInstance).not.toBeNull();
   });

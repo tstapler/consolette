@@ -682,7 +682,7 @@ pub async fn put_dashboard_config(
             .with_capability(Arc::clone(&state.capability))
             .with_local_catalog(state.dispatch_router.load().local_catalog());
 
-    state.dispatch_router.store(Arc::new(new_router));
+    state.swap_router(new_router);
 
     let _ = state
         .event_tx
@@ -715,6 +715,36 @@ mod tests {
             .metrics
             .push_original_body(request_id.to_string(), body);
         state
+    }
+
+    #[tokio::test]
+    async fn put_dashboard_config_should_prune_catalog_to_the_swapped_routers_upstreams() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            EntrypointState::build_with_cache_dir(&Config::default(), dir.path(), Some(dir.path()))
+                .await
+                .unwrap();
+        let stale = crate::metrics::ids::UpstreamName::from("removed-upstream");
+        state.catalog.prune(&[stale]);
+        assert!(state
+            .catalog
+            .snapshot()
+            .upstreams
+            .contains_key("removed-upstream"));
+
+        let _ = put_dashboard_config(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+
+        assert!(!state
+            .catalog
+            .snapshot()
+            .upstreams
+            .contains_key("removed-upstream"));
     }
 
     #[tokio::test]

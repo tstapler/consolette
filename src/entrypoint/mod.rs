@@ -119,6 +119,18 @@ pub struct EntrypointState {
 }
 
 impl EntrypointState {
+    /// Installs a rebuilt router and prunes the model catalog to its upstreams
+    /// (ADR-003: every hot-swap must prune, or removed upstreams linger).
+    pub fn swap_router(&self, new_router: DispatchRouter) {
+        let names: Vec<_> = new_router
+            .providers_named()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        self.dispatch_router.store(Arc::new(new_router));
+        self.catalog.prune(&names);
+    }
+
     /// Builds the dispatch router (Task 1.1.1/1.1.2), cost tracker, metrics
     /// collector (Story 6.2 Task 6.2.5), and landing-page server info from a
     /// loaded `Config`. Spawns the background event-loop-lag monitor that
@@ -130,6 +142,21 @@ impl EntrypointState {
     /// dispatch router from `config` (for example, no candidates configured
     /// or a provider fails to initialize).
     pub async fn build(config: &Config, config_dir: &std::path::Path) -> anyhow::Result<Self> {
+        Self::build_with_cache_dir(config, config_dir, None).await
+    }
+
+    /// [`Self::build`] with the SQLite caches (`response-cache`, `omission`)
+    /// rooted in `cache_dir` instead of `~/.claude/consolette`, so tests never
+    /// touch real user state. `None` keeps the default location.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::build`], plus a failure to open either cache.
+    pub async fn build_with_cache_dir(
+        config: &Config,
+        config_dir: &std::path::Path,
+        cache_dir: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
         let metrics = MetricsCollector::new();
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
         let session_overrides = Arc::new(SessionOverrideStore::new());
@@ -164,9 +191,15 @@ impl EntrypointState {
         });
         let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
         let pruning_policy_store = Arc::new(PruningPolicyStore::default());
-        let omission_cache = Arc::new(OmissionCache::open(&OmissionCache::default_cache_path())?);
+        let omission_path = cache_dir.map_or_else(OmissionCache::default_cache_path, |d| {
+            d.join("omission-cache.sqlite")
+        });
+        let response_path = cache_dir.map_or_else(ResponseCache::default_cache_path, |d| {
+            d.join("response-cache.sqlite")
+        });
+        let omission_cache = Arc::new(OmissionCache::open(&omission_path)?);
         let response_cache = Arc::new(ResponseCache::open(
-            &ResponseCache::default_cache_path(),
+            &response_path,
             config.response_cache.clone(),
         )?);
         let (event_tx, _) = tokio::sync::broadcast::channel(1024);

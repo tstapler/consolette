@@ -172,13 +172,7 @@ pub async fn post_route(
         .with_session_overrides(std::sync::Arc::clone(&state.session_overrides))
         .with_capability(std::sync::Arc::clone(&state.capability))
         .with_local_catalog(state.dispatch_router.load().local_catalog());
-    let upstream_names: Vec<_> = new_router
-        .providers_named()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    state.dispatch_router.store(std::sync::Arc::new(new_router));
-    state.catalog.prune(&upstream_names);
+    state.swap_router(new_router);
 
     // Re-evaluate admission against the new pins without blocking the
     // response: a newly pinned model that cannot emit tool calls is

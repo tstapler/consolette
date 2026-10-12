@@ -141,6 +141,17 @@ describe('RecentTraceTableComponent (TC-UNIT-17)', () => {
     expect(el.querySelector('[data-rows-dimmed]')).toBeTruthy();
   });
 
+  it('banner live region persists and is empty while connected so the reconnect text is announced', () => {
+    render([success], 'connected');
+    const region = el.querySelector('[data-banner][role="status"]');
+    expect(region).toBeTruthy();
+    expect(region?.getAttribute('aria-live')).toBe('polite');
+    expect(region?.textContent?.trim()).toBe('');
+    render([success], 'reconnecting');
+    expect(el.querySelector('[data-banner][role="status"]')).toBe(region);
+    expect(region?.textContent).toContain('reconnecting');
+  });
+
   describe('copy', () => {
     afterEach(() => delete (navigator as unknown as Record<string, unknown>)['clipboard']);
     const copyBtn = () => el.querySelector('button[data-copy-id]') as HTMLButtonElement;

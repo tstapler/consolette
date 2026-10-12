@@ -1,4 +1,4 @@
-import { ChangeDetectorRef, Component, ElementRef, EventEmitter, Input, Output, inject } from '@angular/core';
+import { ChangeDetectorRef, Component, DestroyRef, ElementRef, EventEmitter, Input, Output, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RequestTraceData } from '../../../core/models/telemetry.models';
 import { NA_REASON_TEXTS, naReason } from '../../../core/models/na-reason';
@@ -71,8 +71,10 @@ const NOT_RECORDED = 'n/a (not recorded)';
         </div>
       </div>
 
-      <div data-banner role="status" *ngIf="connectionStatus === 'reconnecting'" class="mb-3 text-xs text-amber-400 border border-amber-800/60 rounded px-3 py-2">
-        Live feed interrupted - reconnecting (attempt {{ retryAttempt }})
+      <div data-banner role="status" aria-live="polite">
+        <p *ngIf="connectionStatus === 'reconnecting'" class="mb-3 text-xs text-amber-400 border border-amber-800/60 rounded px-3 py-2">
+          Live feed interrupted - reconnecting (attempt {{ retryAttempt }})
+        </p>
       </div>
 
       <div class="relative overflow-x-auto" role="region" aria-label="Live request traces, scroll horizontally" tabindex="0" data-skip-target
@@ -201,6 +203,13 @@ const NOT_RECORDED = 'n/a (not recorded)';
 export class RecentTraceTableComponent {
   private readonly cdr = inject(ChangeDetectorRef);
   private readonly host = inject(ElementRef);
+
+  constructor() {
+    inject(DestroyRef).onDestroy(() => {
+      if (this.announceTimer !== null) clearTimeout(this.announceTimer);
+      this.announceTimer = null;
+    });
+  }
 
   @Input() connectionStatus: 'connecting' | 'connected' | 'reconnecting' | 'disconnected' = 'connected';
   @Input() retryAttempt = 0;

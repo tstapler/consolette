@@ -92,7 +92,11 @@ value = "sk-test"
         )
         .unwrap();
         let config = consolette::config::load(dir.path()).unwrap();
-        let state = EntrypointState::build(&config, dir.path()).await.unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let state = EntrypointState::build_with_cache_dir(&config, dir.path(), Some(&cache_dir))
+            .await
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = entrypoint_router(state.clone());

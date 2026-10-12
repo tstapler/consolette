@@ -133,3 +133,30 @@ Observed value-risk evidence (design and session observations, not usage):
 - Live-region and held-update behavior (UX-22/UX-23) under a focused row: not exercised.
 - SSE outage behavior in a headed browser, `system_lag` handling in the UI, `ConfigChanged` refresh of the Config page, unreachable-upstream timeout for `/api/models`, wire-model capture at the upstream (scenario 2), three simultaneous tabs: not exercised.
 - Contrast of non-text elements (borders, chart lines) and of dimmed rows: not measured.
+
+## Re-rank (Story 4.1.0)
+
+Scored from the Story 5.1.3 table (14 S1, 8 S2, 6 S3). Rule (Tyler, 2026-10-10): S1 and S2 are fixed, S3 goes to backlog unless it is a trivial wording fix; the Must a11y items in 4.1.7 are uncuttable. Every existing Epic 4 story is backed by at least one verified S1/S2 gap, so none is dropped (no plan cut applies).
+
+| Story | Decision | Evidence | Resize / additions |
+|-------|----------|----------|--------------------|
+| 4.1.1 Session Replay ids / Inspect link | keep, re-size +0.3 d | E-03 (list empty on first load), E-05 (payload 404s) | add E-03 fix (`computed()` over a plain `@Input`) with a regression spec |
+| 4.1.2 Remove fabricated data | keep | E-05, E-06 (both S1) | include Session Replay timeline/token-bar constants (E-05) |
+| 4.1.3 Config Editor | keep, re-size +0.4 d | E-13, E-14 (S1), E-15, E-16 | add: per-provider baseUrl only when changed, show server error reason (E-15); masked key field must not append to the mask, weights from the route (E-16) |
+| 4.1.4 Real health + tick | keep | E-17 (S2), E-18 (S2) | E-18: hide the three permanently-zero KPI cards (or show n/a) instead of 0 |
+| 4.1.5 SSE events / reconnect | keep core | E-02 (S1) | E-02 root cause (client never reconnects, badge stays Connected) is the first task |
+| 4.1.6 Trace backfill | keep | E-20 (S2) | none |
+| 4.1.7 Accessibility | keep in full | E-04, E-07-E-12 (S1), E-24, E-25 | add: Inspect drawer sits under the sticky header (E-01, S1: header z-index vs drawer top offset), session rows keyboard-focusable (E-04), Overview Inspect keyboard path (E-12), reflow nav replacement (E-24), forced-colors bars (E-25), live-region verification (E-28) |
+
+New or deferred items:
+
+| Gap | Disposition |
+|-----|-------------|
+| E-01 drawer under header (S1) | fixed in 4.1.7 |
+| E-19 mid-stream abort recorded as 200, streamed durations (S2) | backlog: needs the deferred Epic 6 stream tee (first-byte/stream-end timing); not implementable honestly without it |
+| E-21 malformed-JSON 400 produces no trace (S2) | backlog (follow-up to Story 1.1.3; needs a pre-handler extractor rejection hook) |
+| E-22 table below the fold (S3) | backlog (layout decision for Tyler) |
+| E-23 drawer wording for cache/pinned (S3) | quick win in 5.1.4b |
+| E-26 legend term/definition separator (S3) | quick win in 5.1.4b |
+| E-27 legacy `/api/models` leaks raw upstream body (S3) | backlog (migrate callers to the sanitized catalog) |
+| E-28 Models warning styling, live region (S3) | verify in 4.1.7c, else backlog |

@@ -183,6 +183,7 @@ impl From<&ProviderError> for crate::metrics::trace::AttemptErrorClass {
                 status: 500..=599, ..
             }
             | ProviderError::Exhausted => C::ServerError,
+            // Upstream 499 is class client_error here, yet `trace_status` maps it to 502 (499 is ours).
             ProviderError::Upstream {
                 status: 400..=499, ..
             } => C::ClientError,

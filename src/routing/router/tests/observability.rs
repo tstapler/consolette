@@ -361,3 +361,300 @@ async fn cooldown_snapshot_should_report_zero_remaining_seconds_for_a_healthy_ca
         serde_json::json!({"circuit_state": "closed", "cooling_down": false, "remaining_seconds": 0})
     );
 }
+
+fn two_rate_limited_router(metrics: &Arc<MetricsCollector>) -> Router {
+    let providers: Vec<Arc<dyn Provider>> = ["a", "b"]
+        .into_iter()
+        .map(|name| {
+            Arc::new(AlwaysErrProvider {
+                name,
+                error: || ProviderError::RateLimited,
+                call_count: Arc::new(AtomicU32::new(0)),
+            }) as Arc<dyn Provider>
+        })
+        .collect();
+    fallback_router_with_metrics(vec![upstream(0, "a"), upstream(1, "b")], providers, metrics)
+}
+
+#[tokio::test(start_paused = true)]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_one_trace_status_429_when_all_upstreams_rate_limited() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    // Default 300s cooldown is above MAX_HOLD_WAIT_SECS, so no hold sleep.
+    let router = two_rate_limited_router(&metrics);
+
+    let res = router
+        .dispatch(
+            serde_json::json!({"model": "claude-sonnet-4"}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    assert!(matches!(res, Err(ProviderError::RateLimited)));
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 429);
+    assert_eq!(traces[0].model, "claude-sonnet-4");
+    assert_eq!(
+        traces[0].request_id,
+        metrics.get_recent_requests(1)[0].request_id
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_one_trace_status_400_and_return_err_when_validation_error() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+        name: "only",
+        error: || ProviderError::Validation("bad".to_string(), 400),
+        call_count: Arc::new(AtomicU32::new(0)),
+    })];
+    let router = fallback_router_with_metrics(vec![upstream(0, "only")], providers, &metrics);
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(matches!(res, Err(ProviderError::Validation(_, 400))));
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 400);
+}
+
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_exactly_one_trace_status_200_when_upstream_ok() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let router = single_ok_provider_fallback_router("only", Arc::clone(&metrics));
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok());
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 200);
+    assert_eq!(traces[0].provider, "only");
+}
+
+struct HangingProvider;
+
+#[async_trait::async_trait]
+impl Provider for HangingProvider {
+    fn name(&self) -> &str {
+        "hang"
+    }
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        std::future::pending().await
+    }
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_one_499_trace_when_upstream_hangs_and_future_dropped() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(HangingProvider)];
+    let router = fallback_router_with_metrics(vec![upstream(0, "hang")], providers, &metrics);
+
+    let dispatch = router.dispatch(serde_json::json!({}), HeaderMap::new(), false, 0);
+    let timed_out = tokio::time::timeout(Duration::from_secs(5), dispatch).await;
+
+    assert!(timed_out.is_err(), "upstream never responds");
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 499);
+    assert_eq!(metrics.get_recent_requests(10).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_emit_499_with_single_cancelled_attempt_latency_ge_5s_when_upstream_hangs_and_future_dropped(
+) {
+    use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome};
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(HangingProvider)];
+    let router = fallback_router_with_metrics(vec![upstream(0, "hang")], providers, &metrics);
+
+    let dispatch = router.dispatch(serde_json::json!({}), HeaderMap::new(), false, 0);
+    let timed_out = tokio::time::timeout(Duration::from_secs(5), dispatch).await;
+
+    assert!(timed_out.is_err());
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, 499);
+    let attempts = &traces[0].attempts;
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Cancelled);
+    assert_eq!(attempts[0].error_class, Some(AttemptErrorClass::Cancelled));
+    assert_eq!(attempts[0].status, None);
+    assert!(attempts[0].latency_ms >= 5000, "{}", attempts[0].latency_ms);
+}
+
+/// Line count of `router/mod.rs` on `main` (git `49ec827`), the plan's net-growth <= 0 baseline.
+const ROUTER_MOD_RS_LINES_BEFORE_ATTEMPT_CAPTURE: usize = 1097;
+
+#[test]
+fn router_mod_rs_should_not_grow_net_lines_after_attempt_capture() {
+    let lines = include_str!("../mod.rs").lines().count();
+    assert!(
+        lines <= ROUTER_MOD_RS_LINES_BEFORE_ATTEMPT_CAPTURE,
+        "router/mod.rs grew to {lines} lines; keep reason/outcome logic in metrics/trace.rs"
+    );
+}
+
+fn local_catalog_at(base_url: String) -> Arc<crate::providers::local_discovery::LocalCatalog> {
+    use crate::providers::local_discovery::{Endpoint, LocalBackend};
+    let catalog = crate::providers::local_discovery::LocalCatalog::new();
+    catalog.set(
+        LocalBackend::Ollama,
+        Some(Endpoint {
+            base_url,
+            models: vec!["llama3.2".to_string()],
+        }),
+    );
+    catalog
+}
+
+fn local_request_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "local/ollama/llama3.2",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn local_dispatch_should_emit_one_trace_kind_local_with_provider_local() {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            axum::Json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "model": "llama3.2",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let router = fallback_router_with_metrics(
+        vec![upstream(0, "a")],
+        vec![Arc::new(AlwaysOkProvider {
+            name: "a",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })],
+        &metrics,
+    )
+    .with_local_catalog(local_catalog_at(format!("http://{addr}")));
+
+    let res = router
+        .dispatch(local_request_body(), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok());
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    let t = &traces[0];
+    assert_eq!(t.trace_kind, crate::entrypoint::events::TraceKind::Local);
+    assert_eq!(t.routed_provider.as_deref(), Some("local"));
+    assert_eq!(t.route_reason.as_deref(), Some("local"));
+    assert_eq!(t.status_code, 200);
+    assert_eq!(t.attempts.len(), 1, "{:?}", t.attempts);
+    assert_eq!(t.attempts[0].outcome, AttemptOutcome::Ok);
+    assert_eq!(metrics.get_recent_requests(10).len(), 1);
+}
+
+#[tokio::test]
+async fn local_dispatch_failure_should_emit_mapped_status() {
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let router = fallback_router_with_metrics(
+        vec![upstream(0, "a")],
+        vec![Arc::new(AlwaysOkProvider {
+            name: "a",
+            call_count: Arc::new(AtomicU32::new(0)),
+        })],
+        &metrics,
+    )
+    // Port 1 refuses connections: the local call fails without a network.
+    .with_local_catalog(local_catalog_at("http://127.0.0.1:1".to_string()));
+
+    let res = router
+        .dispatch(local_request_body(), HeaderMap::new(), false, 0)
+        .await;
+
+    let expected = res.err().map(|e| e.trace_status());
+    assert!(expected.is_some());
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0].status_code, expected.unwrap_or_default());
+    assert_eq!(traces[0].attempts.len(), 1);
+    assert_ne!(traces[0].attempts[0].outcome, AttemptOutcome::Ok);
+}
+
+#[tokio::test]
+async fn requests_total_should_rise_by_3_and_errors_total_by_2_while_one_trace_when_three_attempt_chain(
+) {
+    let providers: Vec<Arc<dyn Provider>> = vec![
+        Arc::new(AlwaysErrProvider {
+            name: "anthropic",
+            error: || ProviderError::Upstream {
+                status: 529,
+                body: String::new(),
+            },
+            call_count: Arc::new(AtomicU32::new(0)),
+        }),
+        Arc::new(AlwaysErrProvider {
+            name: "bedrock",
+            error: || ProviderError::RateLimited,
+            call_count: Arc::new(AtomicU32::new(0)),
+        }),
+        Arc::new(AlwaysOkProvider {
+            name: "openrouter",
+            call_count: Arc::new(AtomicU32::new(0)),
+        }),
+    ];
+    let metrics = MetricsCollector::new();
+    let candidates = vec![
+        upstream(0, "anthropic"),
+        upstream(1, "bedrock"),
+        upstream(2, "openrouter"),
+    ];
+    let router = fallback_router_with_metrics(candidates, providers, &metrics);
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(
+        metrics.get_recent_requests(10).len(),
+        1,
+        "one client request"
+    );
+    assert_eq!(metrics.counters.requests_total.load(Ordering::Relaxed), 3);
+    assert_eq!(metrics.counters.errors_total.load(Ordering::Relaxed), 2);
+}

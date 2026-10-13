@@ -4,6 +4,8 @@
 pub mod counters;
 pub mod error_tracker;
 pub mod histogram;
+pub mod ids;
+pub mod trace;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -55,7 +57,7 @@ pub struct RequestDetail {
     pub session_id: Option<String>,
     /// The specific per-model candidate dispatch actually selected (e.g.
     /// `"deepseek/deepseek-chat-v3.1:free"`), populated post-selection via
-    /// [`MetricsCollector::set_selected_model`] (Story 5.1.3). `None` at
+    /// [`trace::TraceScope::record_selection`] (Story 5.1.3). `None` at
     /// construction and for every non-model-pinned route
     /// (`FallbackStrategy`/`WeightedStrategy` candidates always carry
     /// `model: None`).
@@ -63,18 +65,57 @@ pub struct RequestDetail {
     /// Whether `selected_model`'s pick was an epsilon-greedy exploration
     /// choice rather than the greedy argmax one (Pre-mortem P2 #2),
     /// populated post-selection via
-    /// [`MetricsCollector::set_selected_model_was_exploration`]. `None` at
+    /// [`trace::TraceScope::record_selection`]. `None` at
     /// construction, for every non-model-pinned route, and for a strategy
     /// that doesn't track the distinction — same nullability convention as
     /// `selected_model`.
     pub selected_model_was_exploration: Option<bool>,
+    /// HTTP status of the request's terminal trace; 0 until the owning
+    /// `TraceScope` finishes (or drops).
+    #[serde(default)]
+    pub status_code: u16,
+    /// The client's `body["model"]` verbatim; `None` when the request named none.
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub routed_model: Option<String>,
+    #[serde(default)]
+    pub routed_model_source: Option<trace::RoutedModelSource>,
+    #[serde(default)]
+    pub routed_provider: Option<String>,
+    /// `RouteReason` wire string, set when the request's terminal trace is written.
+    #[serde(default)]
+    pub route_reason: Option<String>,
+    #[serde(default)]
+    pub route_strategy: Option<String>,
+    #[serde(default)]
+    pub attempts: Vec<trace::AttemptRecord>,
+    #[serde(default)]
+    pub attempts_truncated: bool,
+    #[serde(default)]
+    pub iterations: u8,
+    #[serde(default)]
+    pub hold_retries: u8,
+    #[serde(default)]
+    pub trace_kind: crate::entrypoint::events::TraceKind,
+    #[serde(default)]
+    pub compression_status: crate::entrypoint::events::CompressionStatus,
+    #[serde(default)]
+    pub trace_revision: u8,
+    #[serde(default)]
+    pub first_byte_state: Option<crate::entrypoint::events::FirstByteState>,
+    #[serde(default)]
+    pub total_ms: Option<u64>,
 }
+
+/// Client-supplied `model` is untrusted; cap what the ring buffer and SSE keep.
+const MAX_REQUESTED_MODEL_CHARS: usize = 256;
 
 impl RequestDetail {
     /// Builds the initial ring-buffer entry for an incoming request, before
     /// dispatch has picked an upstream: `provider` starts empty and timing
     /// fields start at zero, filled in later via
-    /// [`MetricsCollector::update_request_timing`] once dispatch resolves.
+    /// [`MetricsCollector::finish_detail`] once the request's `TraceScope` finishes.
     /// `message_count`/`msg_types`/`has_context_management` are derived from
     /// the Anthropic-shaped request `body` (already true for both
     /// `/v1/messages` and `/v1/chat/completions`, since the latter is
@@ -109,6 +150,25 @@ impl RequestDetail {
             session_id,
             selected_model: None,
             selected_model_was_exploration: None,
+            status_code: 0,
+            requested_model: body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(|m| m.chars().take(MAX_REQUESTED_MODEL_CHARS).collect()),
+            routed_model: None,
+            routed_model_source: None,
+            routed_provider: None,
+            route_reason: None,
+            route_strategy: None,
+            attempts: Vec::new(),
+            attempts_truncated: false,
+            iterations: 0,
+            hold_retries: 0,
+            trace_kind: crate::entrypoint::events::TraceKind::default(),
+            compression_status: crate::entrypoint::events::CompressionStatus::default(),
+            trace_revision: 0,
+            first_byte_state: None,
+            total_ms: None,
         }
     }
 }
@@ -197,18 +257,10 @@ pub struct MetricsCollector {
     current_lag_ms: Mutex<f64>,
     pub event_tx:
         Mutex<Option<tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>>>,
-}
-
-/// Timing fields recorded once a dispatch attempt completes (Fowler's
-/// introduce-parameter-object — same pattern as `routing::router::
-/// RouterDeps`), passed to [`MetricsCollector::update_request_timing`].
-#[derive(Clone, Copy)]
-pub struct RequestTimingUpdate<'a> {
-    pub provider: &'a str,
-    pub duration_ms: f64,
-    pub first_byte_ms: f64,
-    pub bedrock_invocation_ms: u64,
-    pub bedrock_first_byte_ms: u64,
+    #[cfg(test)]
+    push_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    replace_calls: std::sync::atomic::AtomicU64,
 }
 
 impl MetricsCollector {
@@ -224,6 +276,10 @@ impl MetricsCollector {
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
             event_tx: Mutex::new(None),
+            #[cfg(test)]
+            push_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            replace_calls: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -241,6 +297,9 @@ impl MetricsCollector {
 
     /// Push a new request detail to the ring buffer (capped at 100 entries).
     pub fn push_request(&self, detail: RequestDetail) {
+        #[cfg(test)]
+        self.push_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut buf = self
             .recent_requests
             .lock()
@@ -251,78 +310,56 @@ impl MetricsCollector {
         buf.push_front(detail);
     }
 
-    /// Shared in-place-mutate-by-id pattern behind `update_request_timing`,
-    /// `set_selected_model`, and `set_selected_model_was_exploration`: a
-    /// no-op once the request has aged out of the 100-entry ring buffer.
-    fn mutate_request(&self, request_id: &str, f: impl FnOnce(&mut RequestDetail)) {
+    /// Overwrites the ring-buffer entry with the scope's final copy; `false` when
+    /// the entry has already aged out.
+    fn replace_request(&self, detail: &RequestDetail) -> bool {
+        #[cfg(test)]
+        self.replace_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut buf = self
             .recent_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(r) = buf.iter_mut().find(|r| r.request_id == request_id) {
-            f(r);
+        buf.iter_mut()
+            .find(|r| r.request_id == detail.request_id)
+            .map(|r| *r = detail.clone())
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_request_count(&self) -> u64 {
+        self.push_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_request_count(&self) -> u64 {
+        self.replace_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Writes a request's terminal state (one ring-buffer replace) and emits exactly one
+    /// `RequestTrace` built from `detail`, even if the ring-buffer entry was evicted.
+    /// Called only from `TraceScope::finish` and its `Drop`, so it must stay poison-safe
+    /// and non-panicking.
+    pub(crate) fn finish_detail(&self, detail: &RequestDetail) {
+        self.counters
+            .trace_finish_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.replace_request(detail) {
+            self.counters
+                .trace_finish_evicted_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(request_id = %detail.request_id, "trace finished after ring-buffer eviction");
         }
-    }
-
-    /// Update timing fields on an existing request by ID.
-    pub fn update_request_timing(&self, request_id: &str, update: RequestTimingUpdate<'_>) {
-        let mut trace_event = None;
-        self.mutate_request(request_id, |r| {
-            r.provider = update.provider.to_string();
-            r.duration_ms = (update.duration_ms * 10.0).round() / 10.0;
-            r.first_byte_ms = (update.first_byte_ms * 10.0).round() / 10.0;
-            r.bedrock_invocation_ms = update.bedrock_invocation_ms;
-            r.bedrock_first_byte_ms = update.bedrock_first_byte_ms;
-
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let duration_u64 = update.duration_ms.max(0.0) as u64;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let first_byte_u64 = update.first_byte_ms.max(0.0) as u64;
-
-            trace_event = Some(crate::entrypoint::events::RequestTraceData {
-                request_id: r.request_id.clone(),
-                timestamp: r.timestamp.clone(),
-                provider: r.provider.clone(),
-                model: r.model.clone(),
-                duration_ms: duration_u64,
-                first_byte_ms: first_byte_u64,
-                tokens_before: r.tokens_before,
-                tokens_after: r.tokens_after,
-                compressed: r.compressed,
-                status_code: 200,
-            });
-        });
-
-        if let Some(trace) = trace_event {
-            if let Ok(guard) = self.event_tx.lock() {
-                if let Some(ref tx) = *guard {
-                    let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
-                        trace,
-                    ));
-                }
-            }
+        let guard = self
+            .event_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref tx) = *guard {
+            let _ = tx.send(crate::entrypoint::events::DashboardEvent::RequestTrace(
+                crate::entrypoint::events::RequestTraceData::from_detail(detail),
+            ));
         }
-    }
-
-    /// Sets `selected_model` on an existing request by ID (Story 5.1.3).
-    /// Called once per dispatch attempt with the currently-chosen
-    /// candidate's model, so the last attempt wins across retries, matching
-    /// how `provider` is already overwritten on each retry in
-    /// `update_request_timing`.
-    pub fn set_selected_model(&self, request_id: &str, model: Option<String>) {
-        self.mutate_request(request_id, |r| r.selected_model = model);
-    }
-
-    /// Sets `selected_model_was_exploration` on an existing request by ID
-    /// (Pre-mortem P2 #2), called alongside `set_selected_model`.
-    pub fn set_selected_model_was_exploration(
-        &self,
-        request_id: &str,
-        was_exploration: Option<bool>,
-    ) {
-        self.mutate_request(request_id, |r| {
-            r.selected_model_was_exploration = was_exploration;
-        });
     }
 
     /// Caches a request's original (pre-dispatch) body, capped at 100
@@ -534,6 +571,10 @@ impl Default for MetricsCollector {
             lag_samples: Mutex::new(VecDeque::new()),
             current_lag_ms: Mutex::new(0.0),
             event_tx: Mutex::new(None),
+            #[cfg(test)]
+            push_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            replace_calls: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -564,5 +605,118 @@ pub async fn run_lag_monitor(metrics: Arc<MetricsCollector>) {
         }
         // Sleep for the remainder of a 1s interval (already consumed ~10ms).
         sleep(Duration::from_millis(990)).await;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Error rate per client request
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Error rate over finished traces, per client request (not per upstream attempt).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TraceErrorRate {
+    /// Routed and local traces that were not cancelled by the client.
+    pub requests: u64,
+    /// Of those, the ones with `status_code >= 400`.
+    pub errors: u64,
+    /// Client-closed (499) traces, reported apart from the rate.
+    pub cancelled: u64,
+    /// `errors / requests`, `0.0` for an empty window.
+    pub rate: f64,
+}
+
+/// Counts `status_code >= 400 && != 499` over routed and local traces. Cache hits are left
+/// out of the denominator (no upstream was tried) and cancelled requests are neither error
+/// nor success; unfinished entries (status 0) are skipped.
+#[must_use]
+pub fn trace_error_rate(traces: &[RequestDetail]) -> TraceErrorRate {
+    use crate::entrypoint::events::TraceKind;
+    const CANCELLED: u16 = 499;
+    let (mut requests, mut errors, mut cancelled) = (0_u64, 0_u64, 0_u64);
+    for trace in traces {
+        if trace.trace_kind == TraceKind::CacheHit || trace.status_code == 0 {
+            continue;
+        }
+        if trace.status_code == CANCELLED {
+            cancelled += 1;
+            continue;
+        }
+        requests += 1;
+        if trace.status_code >= 400 {
+            errors += 1;
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let rate = if requests == 0 {
+        0.0
+    } else {
+        errors as f64 / requests as f64
+    };
+    TraceErrorRate {
+        requests,
+        errors,
+        cancelled,
+        rate,
+    }
+}
+
+#[cfg(test)]
+mod requested_model_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn from_body_should_truncate_requested_model_to_256_chars_on_a_char_boundary() {
+        let long = "é".repeat(300);
+        let body = serde_json::json!({ "model": long });
+        let detail = RequestDetail::from_body("id".to_string(), false, 0, &body, None);
+        let kept = detail.requested_model.unwrap();
+        assert_eq!(kept.chars().count(), 256);
+        assert!(long.starts_with(&kept));
+        let short = RequestDetail::from_body(
+            "id".to_string(),
+            false,
+            0,
+            &serde_json::json!({ "model": "gpt-4o" }),
+            None,
+        );
+        assert_eq!(short.requested_model.as_deref(), Some("gpt-4o"));
+    }
+}
+
+#[cfg(test)]
+mod error_rate_tests {
+    use super::*;
+    use crate::entrypoint::events::TraceKind;
+
+    fn trace(kind: TraceKind, status_code: u16) -> RequestDetail {
+        let mut detail =
+            RequestDetail::from_body("id".to_string(), false, 0, &serde_json::json!({}), None);
+        detail.trace_kind = kind;
+        detail.status_code = status_code;
+        detail
+    }
+
+    #[test]
+    fn error_rate_should_exclude_cache_hits_and_cancelled_from_numerator_and_denominator() {
+        let mut window: Vec<RequestDetail> =
+            (0..10).map(|_| trace(TraceKind::Routed, 200)).collect();
+        window.extend((0..2).map(|_| trace(TraceKind::CacheHit, 200)));
+        window.push(trace(TraceKind::Routed, 499));
+        window.push(trace(TraceKind::Routed, 503));
+
+        let rate = trace_error_rate(&window);
+
+        assert_eq!(rate.requests, 11);
+        assert_eq!(rate.errors, 1);
+        assert_eq!(rate.cancelled, 1);
+        assert!((rate.rate - 1.0 / 11.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn error_rate_should_count_local_traces_and_be_zero_for_an_empty_window() {
+        let rate = trace_error_rate(&[trace(TraceKind::Local, 502), trace(TraceKind::Local, 200)]);
+        assert_eq!((rate.requests, rate.errors), (2, 1));
+        assert!(trace_error_rate(&[]).rate.abs() < f64::EPSILON);
     }
 }

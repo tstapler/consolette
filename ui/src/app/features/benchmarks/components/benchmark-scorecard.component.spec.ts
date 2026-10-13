@@ -65,4 +65,13 @@ describe('BenchmarkScorecardComponent', () => {
     component.sort('model');
     expect(component.sortDirectionSignal()).not.toBe(initialDirection);
   });
+
+  it('shows an en dash with a not-measured reason for TTFT instead of duration-equal numbers', () => {
+    const el = fixture.nativeElement as HTMLElement;
+    const cells = el.querySelectorAll('[data-ttft-na]');
+    expect(cells.length).toBeGreaterThan(0);
+    expect(cells[0].textContent).toContain('\u2013');
+    expect(el.textContent).toContain('n/a (not measured)');
+    expect(cells[0].closest('td')?.textContent).not.toMatch(/\d+ms/);
+  });
 });

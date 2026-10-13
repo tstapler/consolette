@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use super::*;
 
 mod basic_dispatch;
+mod characterization;
 mod from_config;
 mod model_pinning;
 mod observability;
 mod per_model_retry;
+mod provider_names;
 mod rate_limit_hold;
 mod selected_model;
 mod selection;
@@ -109,6 +111,28 @@ fn upstream(index: usize, name: &str) -> UpstreamRef {
         model: None,
         model_family: None,
     }
+}
+
+/// Subscribes to the collector's dashboard event stream (as the SSE handler does).
+fn subscribe_events(
+    metrics: &Arc<MetricsCollector>,
+) -> tokio::sync::broadcast::Receiver<crate::entrypoint::events::DashboardEvent> {
+    let (tx, rx) = tokio::sync::broadcast::channel(64);
+    metrics.set_event_tx(tx);
+    rx
+}
+
+/// Every `RequestTrace` currently queued on `rx`, in emit order.
+fn drain_traces(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::entrypoint::events::DashboardEvent>,
+) -> Vec<crate::entrypoint::events::RequestTraceData> {
+    let mut traces = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let crate::entrypoint::events::DashboardEvent::RequestTrace(t) = event {
+            traces.push(t);
+        }
+    }
+    traces
 }
 
 struct AlwaysAllow;

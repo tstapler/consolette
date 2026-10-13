@@ -172,7 +172,7 @@ pub async fn post_route(
         .with_session_overrides(std::sync::Arc::clone(&state.session_overrides))
         .with_capability(std::sync::Arc::clone(&state.capability))
         .with_local_catalog(state.dispatch_router.load().local_catalog());
-    state.dispatch_router.store(std::sync::Arc::new(new_router));
+    state.swap_router(new_router);
 
     // Re-evaluate admission against the new pins without blocking the
     // response: a newly pinned model that cannot emit tool calls is
@@ -586,6 +586,40 @@ name = "anthropic"
     async fn state_for(config_dir: &std::path::Path) -> EntrypointState {
         let config = crate::config::load(config_dir).unwrap();
         EntrypointState::build(&config, config_dir).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn post_route_should_prune_catalog_to_current_upstreams_without_refreshing() {
+        let dir = sample_config_dir();
+        let state = state_for(dir.path()).await;
+        let before: Vec<String> = state.catalog.snapshot().upstreams.keys().cloned().collect();
+        assert_eq!(before, ["anthropic", "bedrock"]);
+        write_conf_d(
+            dir.path(),
+            "[[upstreams]]\nname = \"anthropic\"\nkind = \"anthropic\"\n",
+            "[[routes]]\nname = \"default\"\nstrategy = \"fallback\"\n\n[[routes.upstreams]]\nname = \"anthropic\"\n",
+        );
+        let route = Route {
+            name: "default".to_string(),
+            strategy: Strategy::Fallback,
+            upstreams: vec![RouteUpstreamRef {
+                name: "anthropic".to_string(),
+                weight: None,
+                model: None,
+                model_family: None,
+            }],
+        };
+
+        let _applied = post_route(State(state.clone()), Json(route)).await.unwrap();
+
+        let snapshot = state.catalog.snapshot();
+        let after: Vec<&String> = snapshot.upstreams.keys().collect();
+        assert_eq!(after, ["anthropic"]);
+        assert_eq!(
+            snapshot.upstreams["anthropic"].state,
+            crate::routing::model_catalog::CatalogState::Loading
+        );
     }
 
     #[tokio::test]

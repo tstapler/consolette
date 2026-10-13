@@ -642,7 +642,10 @@ where
                             resolved_at: Instant::now(),
                         });
                     }
-                    Err(retry_err) if classify_probe_failure(&retry_err) == OpenaiErrorClass::WrongEndpoint => {
+                    Err(retry_err)
+                        if classify_probe_failure(&retry_err)
+                            == OpenaiErrorClass::WrongEndpoint =>
+                    {
                         // A candidate can need both corrections at once
                         // (gpt-5.6-terra, 2026-09-25 incident): the
                         // max_completion_tokens retry above got far enough
@@ -1261,7 +1264,9 @@ mod tests {
         let body = build_probe_body("family-v3-preview");
 
         assert_eq!(body["model"], serde_json::json!("family-v3-preview"));
-        let tools = body["tools"].as_array().expect("probe body must carry a tools array");
+        let tools = body["tools"]
+            .as_array()
+            .expect("probe body must carry a tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], serde_json::json!("function"));
         assert_eq!(
@@ -1281,7 +1286,9 @@ mod tests {
     fn build_probe_body_responses_should_carry_the_flat_shaped_synthetic_tool() {
         let body = build_probe_body_responses("family-v3-preview");
 
-        let tools = body["tools"].as_array().expect("probe body must carry a tools array");
+        let tools = body["tools"]
+            .as_array()
+            .expect("probe body must carry a tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], serde_json::json!("function"));
         assert_eq!(

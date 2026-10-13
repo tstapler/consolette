@@ -49,6 +49,9 @@ pub struct UpstreamCounters {
 #[derive(Default)]
 pub struct ProxyMetrics {
     // ---- Request counters ----
+    // Upstream attempts plus cache hits, not client requests: a 529 -> 429 -> 200 failover is
+    // one trace but raises `requests_total` by 3 and `errors_total` by 2. Per-client-request
+    // numbers come from traces (see `metrics::trace_error_rate`).
     pub requests_total: AtomicU64,
     pub requests_success: AtomicU64,
     pub errors_total: AtomicU64,
@@ -95,6 +98,19 @@ pub struct ProxyMetrics {
     pub server_tool_searches_ok: AtomicU64,
     pub server_tool_search_failures: AtomicU64,
     pub server_tool_iterations_total: AtomicU64,
+
+    // ---- Terminal-trace safety nets (ADR-002) ----
+    /// Requests whose `TraceScope` dropped before `finish` because the
+    /// handler future was cancelled (client abort): traced as 499.
+    pub trace_cancelled_total: AtomicU64,
+    /// Terminal traces written by `TraceScope::finish` or its `Drop`.
+    pub trace_finish_total: AtomicU64,
+    /// Terminal traces whose ring-buffer entry had already been evicted; the
+    /// event is still emitted from the scope's own copy.
+    pub trace_finish_evicted_total: AtomicU64,
+    /// Requests whose `TraceScope` dropped unfinished although the handler
+    /// returned or panicked: a bug, traced as 500.
+    pub trace_unfinished_total: AtomicU64,
     /// Per-backend hits, keyed `"brave"` / `"browser"` (D4 dashboard label).
     pub server_tool_backend_hits: DashMap<String, AtomicU64>,
 
@@ -331,6 +347,10 @@ impl ProxyMetrics {
         };
 
         json!({
+            "trace_cancelled_total": self.trace_cancelled_total.load(Ordering::Relaxed),
+            "trace_unfinished_total": self.trace_unfinished_total.load(Ordering::Relaxed),
+            "trace_finish_total": self.trace_finish_total.load(Ordering::Relaxed),
+            "trace_finish_evicted_total": self.trace_finish_evicted_total.load(Ordering::Relaxed),
             "summary": {
                 "total_requests": total,
                 "total_success": success,
@@ -518,5 +538,19 @@ mod tests {
 
         let latency = json["provider_latency"].as_object().unwrap();
         assert_eq!(latency["anthropic"]["avg_duration_ms"], json!(100));
+    }
+
+    #[test]
+    fn counters_should_expose_trace_finish_evicted_cancelled_unfinished_totals() {
+        let m = ProxyMetrics::new();
+        m.trace_finish_total.store(5, Ordering::Relaxed);
+        m.trace_finish_evicted_total.store(2, Ordering::Relaxed);
+        m.trace_cancelled_total.store(3, Ordering::Relaxed);
+        m.trace_unfinished_total.store(1, Ordering::Relaxed);
+        let json = m.to_json();
+        assert_eq!(json["trace_finish_total"], 5);
+        assert_eq!(json["trace_finish_evicted_total"], 2);
+        assert_eq!(json["trace_cancelled_total"], 3);
+        assert_eq!(json["trace_unfinished_total"], 1);
     }
 }

@@ -19,6 +19,7 @@ export interface ProviderHealthItem {
         <span class="text-xs text-neutral-400">{{ providers.length }} Upstream Providers</span>
       </div>
 
+      <p *ngIf="providers.length === 0" class="text-sm text-neutral-400">No upstreams reported</p>
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         <div
           *ngFor="let provider of providers; trackBy: trackByName"
@@ -31,16 +32,17 @@ export interface ProviderHealthItem {
               class="px-2.5 py-0.5 text-xs font-semibold rounded-full flex items-center gap-1.5"
               [ngClass]="getBadgeClass(provider.status)"
             >
-              <span class="w-1.5 h-1.5 rounded-full" [ngClass]="getDotClass(provider.status)"></span>
+              <span data-status-dot class="w-1.5 h-1.5 rounded-full border" [ngClass]="getDotClass(provider.status)"></span>
               {{ getStatusLabel(provider.status) }}
             </span>
           </div>
 
           <div *ngIf="isCooldown(provider.status)" class="mt-2 text-xs font-mono text-amber-400 flex items-center gap-1">
-            <svg class="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg class="w-3.5 h-3.5 motion-safe:animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            <span>Cooldown: {{ getCooldownRemaining(provider) }}s remaining</span>
+            <span *ngIf="getCooldownRemaining(provider) > 0">Cooldown: {{ getCooldownRemaining(provider) }}s remaining</span>
+            <span *ngIf="getCooldownRemaining(provider) <= 0">Cooldown</span>
           </div>
 
           <div *ngIf="provider.lastError" class="mt-2 text-xs text-rose-400 font-mono truncate" [title]="provider.lastError">
@@ -72,7 +74,7 @@ export class ProviderHealthGridComponent implements OnChanges, OnDestroy {
       this.providers = this.providersList.map(p => ({ ...p }));
     } else if (this.providerHealth) {
       this.providers = Object.entries(this.providerHealth).map(([name, status]) => {
-        const existingCooldown = this.cooldownTimers.get(name) ?? (this.isCooldown(status) ? 30 : 0);
+        const existingCooldown = this.cooldownTimers.get(name) ?? 0;
         return {
           name,
           status,
@@ -80,11 +82,7 @@ export class ProviderHealthGridComponent implements OnChanges, OnDestroy {
         };
       });
     } else {
-      this.providers = [
-        { name: 'Anthropic', status: 'Healthy' },
-        { name: 'AWS Bedrock', status: 'Healthy' },
-        { name: 'OpenAI', status: 'Healthy' }
-      ];
+      this.providers = [];
     }
 
     let hasCooldown = false;
@@ -92,7 +90,7 @@ export class ProviderHealthGridComponent implements OnChanges, OnDestroy {
       if (this.isCooldown(p.status)) {
         hasCooldown = true;
         if (!this.cooldownTimers.has(p.name)) {
-          this.cooldownTimers.set(p.name, p.cooldownSeconds ?? 30);
+          this.cooldownTimers.set(p.name, p.cooldownSeconds ?? 0);
         }
       } else {
         this.cooldownTimers.delete(p.name);
@@ -111,7 +109,7 @@ export class ProviderHealthGridComponent implements OnChanges, OnDestroy {
       let activeCooldowns = false;
       this.providers.forEach(p => {
         if (this.isCooldown(p.status)) {
-          const current = this.cooldownTimers.get(p.name) ?? (p.cooldownSeconds ?? 30);
+          const current = this.cooldownTimers.get(p.name) ?? (p.cooldownSeconds ?? 0);
           if (current > 0) {
             const next = current - 1;
             this.cooldownTimers.set(p.name, next);
@@ -146,6 +144,7 @@ export class ProviderHealthGridComponent implements OnChanges, OnDestroy {
     const s = status.toLowerCase();
     if (s === 'healthy' || s === 'active') return 'Active';
     if (s === 'degraded') return 'Degraded';
+    if (s === 'unhealthy') return 'Unhealthy';
     if (this.isCooldown(status)) return 'In Cooldown';
     if (s === 'autherror' || s === 'auth error' || s === 'auth_error') return 'Auth Error';
     return status;
@@ -170,11 +169,11 @@ export class ProviderHealthGridComponent implements OnChanges, OnDestroy {
 
   public getDotClass(status: string): string {
     const s = status.toLowerCase();
-    if (s === 'healthy' || s === 'active') return 'bg-emerald-400 animate-pulse';
-    if (s === 'degraded') return 'bg-yellow-400';
-    if (this.isCooldown(status)) return 'bg-amber-400 animate-ping';
-    if (s === 'autherror' || s === 'auth error' || s === 'auth_error') return 'bg-rose-400';
-    return 'bg-neutral-400';
+    if (s === 'healthy' || s === 'active') return 'bg-emerald-400 border-emerald-200 motion-safe:animate-pulse';
+    if (s === 'degraded') return 'bg-yellow-400 border-yellow-200';
+    if (this.isCooldown(status)) return 'bg-amber-400 border-amber-200 motion-safe:animate-ping';
+    if (s === 'autherror' || s === 'auth error' || s === 'auth_error') return 'bg-rose-400 border-rose-200';
+    return 'bg-neutral-400 border-neutral-200';
   }
 
   public getCardBorderClass(status: string): string {

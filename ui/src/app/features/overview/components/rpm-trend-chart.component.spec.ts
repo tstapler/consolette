@@ -36,7 +36,7 @@ describe('RpmTrendChartComponent (TC-UNIT-15 & TC-UNIT-16)', () => {
       const mockTick: MetricsTickData = {
         rpm: 10 + i,
         totalRequests: i,
-        tokensSaved: i * 100,
+        totalTokensSaved: i * 100,
         currentLagMs: 5 + (i % 3)
       };
       component.pushDataPoint(mockTick);
@@ -71,7 +71,7 @@ describe('RpmTrendChartComponent (TC-UNIT-15 & TC-UNIT-16)', () => {
     const history: MetricsTickData[] = Array.from({ length: 30 }, (_, i) => ({
       rpm: i * 2,
       totalRequests: i,
-      tokensSaved: i * 50,
+      totalTokensSaved: i * 50,
       currentLagMs: 2
     }));
 

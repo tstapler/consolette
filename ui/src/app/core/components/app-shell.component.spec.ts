@@ -35,9 +35,18 @@ describe('AppShellComponent (TC-UNIT-12)', () => {
     expect(compiled.textContent).toContain('Session Replay');
     expect(compiled.textContent).toContain('Model Benchmarks');
     expect(compiled.textContent).toContain('Config Editor');
+    expect(compiled.textContent).toContain('Models');
 
     const badgeText = compiled.querySelector('[data-testid="connection-badge-text"]');
     expect(badgeText?.textContent?.toLowerCase()).toContain('connected');
+  });
+
+  it('should link the Models nav entry to /models', () => {
+    const fixture = TestBed.createComponent(AppShellComponent);
+    fixture.detectChanges();
+    const link = Array.from((fixture.nativeElement as HTMLElement).querySelectorAll('a'))
+      .find((a) => a.textContent?.trim() === 'Models');
+    expect(link?.getAttribute('href')).toBe('/models');
   });
 
   it('TC-UNIT-12: should update connection badge when reconnecting', () => {

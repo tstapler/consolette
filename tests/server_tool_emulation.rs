@@ -350,7 +350,13 @@ async fn state_with_response(
         },
         event_tx: tokio::sync::broadcast::channel(1024).0,
         web_ui: consolette::config::schema::WebUiMode::Angular,
+        compat_snake_case: false,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        catalog: consolette::routing::model_catalog::ModelCatalog::new(
+            consolette::config::schema::ModelCatalogConfig::default(),
+            None,
+        ),
     };
     (state, calls)
 }
@@ -392,6 +398,43 @@ async fn entrypoint_should_dispatch_once_unchanged_when_no_server_def() {
     let json: Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(json, expected, "no-server-def path must be byte-identical");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one dispatch");
+}
+
+/// An emulated request that goes through the real handler leaves exactly one ring-buffer
+/// entry, however many dispatches the loop made (here the backend is down, so one).
+#[tokio::test]
+async fn emulation_through_http_should_produce_one_ring_buffer_entry() {
+    use consolette::entrypoint::entrypoint_router;
+    use consolette::providers::ProviderResponse;
+
+    let (mut state, calls) =
+        state_with_response(Ok(ProviderResponse::Full(grounded_answer_response()))).await;
+    state.search_pool = Arc::new(McpSearchPool::new(PoolConfig {
+        binary_path: "/nonexistent/consolette-test-no-binary".to_string(),
+        pool_size: 1,
+        per_search_timeout_ms: 1_000,
+        browser_timeout_ms: 1_000,
+    }));
+    let metrics = Arc::clone(&state.metrics);
+
+    let resp = tower::ServiceExt::oneshot(
+        entrypoint_router(state),
+        axum::http::Request::post("/v1/messages")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                search_request("claude-sonnet-4-5").to_string(),
+            ))
+            .expect("request build"),
+    )
+    .await
+    .expect("router responds");
+
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let traces = metrics.get_recent_requests(10);
+    assert_eq!(traces.len(), 1, "one ring-buffer entry per client request");
+    assert_eq!(traces[0].status_code, 200);
+    assert_eq!(traces[0].attempts.len(), 1);
 }
 
 /// Backend down at loop start (binary missing) ⇒ drop-degrade: defs

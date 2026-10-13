@@ -15,10 +15,12 @@ pub mod errors;
 pub mod events;
 pub mod landing;
 pub mod messages;
+pub mod models;
 pub mod observability;
 pub mod openai_stream;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod traces;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,6 +38,7 @@ use crate::cost_metrics::tracker::CostTracker;
 use crate::memory::cache::ResponseCache;
 use crate::metrics::MetricsCollector;
 use crate::routing::capability::{CapabilityCache, EVAL_TTL_SECS};
+use crate::routing::model_catalog::{run_refresh_loop, ModelCatalog};
 use crate::routing::router::Router as DispatchRouter;
 use crate::routing::session_overrides::SessionOverrideStore;
 use crate::server_tools::{McpSearchPool, ServerToolsRuntime};
@@ -106,11 +109,26 @@ pub struct EntrypointState {
     pub event_tx: tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
     /// Web UI mode: Angular (embedded SPA) or Legacy.
     pub web_ui: WebUiMode,
+    /// Also emit legacy snake_case keys on `RequestTrace` SSE frames (ADR-001 item 4 rollback).
+    pub compat_snake_case: bool,
     /// Thread-safe lock for atomic configuration updates and disk persistence.
     pub config_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Cached per-upstream model lists (`GET /api/model-catalog`); refreshed only on request
+    /// unless `[model_catalog]` opts into a timer.
+    pub catalog: Arc<ModelCatalog>,
+    /// Cancelled when shutdown starts; endless streams (the dashboard SSE feed) end on it.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl EntrypointState {
+    /// Installs a rebuilt router and prunes the model catalog to its upstreams
+    /// (ADR-003: every hot-swap must prune, or removed upstreams linger).
+    pub fn swap_router(&self, new_router: DispatchRouter) {
+        let providers = new_router.providers_named();
+        self.dispatch_router.store(Arc::new(new_router));
+        self.catalog.prune_providers(&providers);
+    }
+
     /// Builds the dispatch router (Task 1.1.1/1.1.2), cost tracker, metrics
     /// collector (Story 6.2 Task 6.2.5), and landing-page server info from a
     /// loaded `Config`. Spawns the background event-loop-lag monitor that
@@ -122,6 +140,21 @@ impl EntrypointState {
     /// dispatch router from `config` (for example, no candidates configured
     /// or a provider fails to initialize).
     pub async fn build(config: &Config, config_dir: &std::path::Path) -> anyhow::Result<Self> {
+        Self::build_with_cache_dir(config, config_dir, None).await
+    }
+
+    /// [`Self::build`] with the SQLite caches (`response-cache`, `omission`)
+    /// rooted in `cache_dir` instead of `~/.claude/consolette`, so tests never
+    /// touch real user state. `None` keeps the default location.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::build`], plus a failure to open either cache.
+    pub async fn build_with_cache_dir(
+        config: &Config,
+        config_dir: &std::path::Path,
+        cache_dir: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
         let metrics = MetricsCollector::new();
         tokio::spawn(crate::metrics::run_lag_monitor(Arc::clone(&metrics)));
         let session_overrides = Arc::new(SessionOverrideStore::new());
@@ -156,13 +189,20 @@ impl EntrypointState {
         });
         let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
         let pruning_policy_store = Arc::new(PruningPolicyStore::default());
-        let omission_cache = Arc::new(OmissionCache::open(&OmissionCache::default_cache_path())?);
+        let omission_path = cache_dir.map_or_else(OmissionCache::default_cache_path, |d| {
+            d.join("omission-cache.sqlite")
+        });
+        let response_path = cache_dir.map_or_else(ResponseCache::default_cache_path, |d| {
+            d.join("response-cache.sqlite")
+        });
+        let omission_cache = Arc::new(OmissionCache::open(&omission_path)?);
         let response_cache = Arc::new(ResponseCache::open(
-            &ResponseCache::default_cache_path(),
+            &response_path,
             config.response_cache.clone(),
         )?);
         let (event_tx, _) = tokio::sync::broadcast::channel(1024);
         metrics.set_event_tx(event_tx.clone());
+        let catalog = build_model_catalog(config, &dispatch_router, &event_tx);
 
         let ticker_tx = event_tx.clone();
         let ticker_metrics = Arc::clone(&metrics);
@@ -180,7 +220,12 @@ impl EntrypointState {
                 })
                 .collect(),
         });
-        let ticker_server_info = Arc::clone(&server_info);
+        let upstream_names: Vec<String> = server_info
+            .upstreams
+            .iter()
+            .map(|u| u.name.clone())
+            .collect();
+        let ticker_router = Arc::clone(&dispatch_router);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -204,10 +249,10 @@ impl EntrypointState {
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let total_tokens_saved = tokens_before.saturating_sub(tokens_after);
                 let current_lag_ms = ticker_metrics.current_lag_ms();
-                let mut provider_health = std::collections::HashMap::new();
-                for upstream in &ticker_server_info.upstreams {
-                    provider_health.insert(upstream.name.clone(), "healthy".to_string());
-                }
+                let provider_health = crate::entrypoint::events::provider_health_from_snapshot(
+                    &ticker_router.load().cooldown_snapshot(),
+                    &upstream_names,
+                );
 
                 let tick_data = crate::entrypoint::events::MetricsTickData {
                     rpm,
@@ -215,6 +260,12 @@ impl EntrypointState {
                     total_tokens_saved,
                     current_lag_ms,
                     provider_health,
+                    median_latency_ms: crate::entrypoint::events::median_latency_ms(
+                        &ticker_metrics.histogram,
+                    ),
+                    median_first_byte_ms: None,
+                    tps: None,
+                    token_savings_percent: None,
                 };
                 let _ = ticker_tx.send(crate::entrypoint::events::DashboardEvent::MetricsTick(
                     tick_data,
@@ -249,9 +300,52 @@ impl EntrypointState {
             response_cache,
             event_tx,
             web_ui: config.web_ui,
+            compat_snake_case: config.compat_snake_case,
             config_lock: Arc::new(tokio::sync::Mutex::new(())),
+            catalog,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         })
     }
+}
+
+/// Seeds the catalog with the router's upstreams (all `Loading`, no call made) and, only if
+/// `[model_catalog]` opts into `interval`, starts the timer.
+fn build_model_catalog(
+    config: &Config,
+    dispatch_router: &Arc<ArcSwap<DispatchRouter>>,
+    event_tx: &tokio::sync::broadcast::Sender<crate::entrypoint::events::DashboardEvent>,
+) -> Arc<ModelCatalog> {
+    let notify_tx = event_tx.clone();
+    let catalog = ModelCatalog::new(
+        config.model_catalog.clone(),
+        Some(Arc::new(move |upstream| {
+            let _ = notify_tx.send(
+                crate::entrypoint::events::DashboardEvent::ModelCatalogChanged(
+                    crate::entrypoint::events::ModelCatalogChangedData {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        upstream: upstream.to_string(),
+                    },
+                ),
+            );
+        })),
+    );
+    catalog.prune_providers(&dispatch_router.load().providers_named());
+    if let crate::config::schema::CatalogRefreshMode::Interval { secs } =
+        config.model_catalog.refresh_mode()
+    {
+        let router = Arc::downgrade(dispatch_router);
+        tokio::spawn(run_refresh_loop(
+            Arc::downgrade(&catalog),
+            secs,
+            move || {
+                router
+                    .upgrade()
+                    .map(|r| r.load().providers_named())
+                    .unwrap_or_default()
+            },
+        ));
+    }
+    catalog
 }
 
 /// Builds the axum `Router` exposing the landing page and the entrypoint
@@ -279,6 +373,10 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
         .route(
             "/v1/dashboard/events",
             axum::routing::get(events::handle_sse_events),
+        )
+        .route(
+            "/v1/dashboard/traces",
+            axum::routing::get(traces::get_dashboard_traces),
         )
         .route(
             "/v1/dashboard/sessions",
@@ -327,6 +425,14 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
         )
         .route("/api/models", axum::routing::get(api::get_models))
         .route(
+            "/api/model-catalog",
+            axum::routing::get(models::get_model_catalog),
+        )
+        .route(
+            "/api/model-catalog/refresh",
+            axum::routing::post(models::post_model_catalog_refresh),
+        )
+        .route(
             "/api/route",
             axum::routing::get(api::get_route).post(api::post_route),
         )
@@ -366,7 +472,9 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Returns an error if binding `127.0.0.1:{port}` fails (for example, the
 /// port is already in use) or if `axum::serve` itself returns an I/O error.
 pub async fn serve_entrypoint(port: u16, state: EntrypointState) -> anyhow::Result<()> {
-    serve_entrypoint_with_shutdown(port, state, shutdown_signal()).await
+    // A second Ctrl-C/SIGTERM while draining exits at once (the future is lazy: it only
+    // subscribes once `drain` polls it after shutdown has begun).
+    serve_inner(port, state, os_signal(), os_signal()).await
 }
 
 /// Same as `serve_entrypoint`, but with a caller-supplied shutdown future
@@ -382,15 +490,77 @@ pub async fn serve_entrypoint_with_shutdown(
     state: EntrypointState,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_inner(port, state, shutdown, std::future::pending()).await
+}
+
+async fn serve_inner(
+    port: u16,
+    state: EntrypointState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    second_signal: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "consolette http-entrypoint listening");
+    let shutdown_token = state.shutdown.clone();
     let router = entrypoint_router(state);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    let shutdown_started = Arc::new(tokio::sync::Notify::new());
+    let notify_started = Arc::clone(&shutdown_started);
+    let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown.await;
+        shutdown_token.cancel();
+        notify_started.notify_one();
+    });
+    // Graceful shutdown waits on every open connection. SSE streams end on the cancelled token;
+    // the grace only bounds requests that never finish, and a second signal skips it.
+    match drain(
+        std::future::IntoFuture::into_future(serve),
+        &shutdown_started,
+        SHUTDOWN_GRACE,
+        second_signal,
+    )
+    .await?
+    {
+        DrainEnd::Drained => {}
+        DrainEnd::GraceElapsed => tracing::warn!(
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "shutdown grace elapsed with connections still open; exiting"
+        ),
+        DrainEnd::Forced => tracing::warn!("second shutdown signal; exiting immediately"),
+    }
     Ok(())
 }
+
+/// How a shutdown ended once it had begun.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainEnd {
+    Drained,
+    GraceElapsed,
+    /// A second signal arrived while draining.
+    Forced,
+}
+
+async fn drain<E>(
+    serve: impl std::future::Future<Output = Result<(), E>>,
+    shutdown_started: &tokio::sync::Notify,
+    grace: std::time::Duration,
+    second_signal: impl std::future::Future<Output = ()>,
+) -> Result<DrainEnd, E> {
+    tokio::pin!(serve);
+    tokio::select! {
+        result = &mut serve => result.map(|()| DrainEnd::Drained),
+        end = async {
+            shutdown_started.notified().await;
+            tokio::select! {
+                () = tokio::time::sleep(grace) => DrainEnd::GraceElapsed,
+                () = second_signal => DrainEnd::Forced,
+            }
+        } => Ok(end),
+    }
+}
+
+/// How long in-flight (non-SSE) requests may drain after a shutdown signal.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// # Panics
 ///
@@ -399,7 +569,7 @@ pub async fn serve_entrypoint_with_shutdown(
 /// itself a sign the process environment is broken beyond recovery, so
 /// there's no meaningful fallback besides surfacing it immediately).
 #[allow(clippy::expect_used)]
-async fn shutdown_signal() {
+async fn os_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -636,6 +806,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_should_return_forced_when_second_signal_arrives_mid_drain() {
+        let started = tokio::sync::Notify::new();
+        started.notify_one();
+        let end = tokio::time::timeout(
+            Duration::from_secs(2),
+            drain::<()>(
+                std::future::pending(),
+                &started,
+                Duration::from_secs(60),
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("second signal must cut the grace short");
+        assert_eq!(end, Ok(DrainEnd::Forced));
+    }
+
+    #[tokio::test]
+    async fn drain_should_ignore_second_signal_before_shutdown_starts() {
+        let started = tokio::sync::Notify::new();
+        let end = drain::<()>(
+            async { Ok(()) },
+            &started,
+            Duration::from_secs(60),
+            std::future::ready(()),
+        )
+        .await;
+        assert_eq!(end, Ok(DrainEnd::Drained));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_should_report_grace_elapsed_without_second_signal() {
+        let started = tokio::sync::Notify::new();
+        started.notify_one();
+        let end = drain::<()>(
+            std::future::pending(),
+            &started,
+            Duration::from_secs(30),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(end, Ok(DrainEnd::GraceElapsed));
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_completes_promptly() {
         let state = EntrypointState::build(
             &Config::default(),
@@ -654,6 +869,129 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "server did not shut down within timeout");
         assert!(result.unwrap().unwrap().is_ok());
+    }
+
+    /// E-02: an open dashboard SSE stream used to hold graceful shutdown open
+    /// forever, so a restarted proxy left the old process serving a dead feed
+    /// to the browser, which never saw a disconnect.
+    #[tokio::test]
+    async fn shutdown_should_complete_even_while_a_dashboard_sse_client_is_connected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let reservation = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = rx.await;
+        };
+        let handle = tokio::spawn(serve_entrypoint_with_shutdown(addr.port(), state, shutdown));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /v1/dashboard/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut head = [0_u8; 64];
+        let n = client.read(&mut head).await.unwrap();
+        assert!(String::from_utf8_lossy(&head[..n]).contains("200"));
+
+        tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "server stayed up after shutdown because an SSE stream was still open"
+        );
+    }
+
+    /// A request already in flight when shutdown starts must be allowed to finish (not cut at a
+    /// short cap), while a dashboard SSE stream is closed promptly because it would never end.
+    #[tokio::test]
+    async fn shutdown_should_let_a_slow_request_finish_while_closing_sse_streams_promptly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let reservation = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = rx.await;
+        };
+        let handle = tokio::spawn(serve_entrypoint_with_shutdown(addr.port(), state, shutdown));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut sse = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sse.write_all(
+            b"GET /v1/dashboard/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut head = [0_u8; 64];
+        let n = sse.read(&mut head).await.unwrap();
+        assert!(String::from_utf8_lossy(&head[..n]).contains("200"));
+
+        // Headers sent, body withheld: the handler is mid-request when shutdown begins.
+        let body = br#"{"model":"m","max_tokens":1,"messages":[]}"#;
+        let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+        slow.write_all(
+            format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tx.send(()).unwrap();
+
+        // The SSE stream ends promptly (EOF), well inside the non-SSE grace.
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(2), sse.read_to_end(&mut rest)).await;
+        assert!(
+            closed.is_ok(),
+            "SSE stream was not closed promptly on shutdown"
+        );
+
+        // Past the old 2 s cap the slow request is still being served.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !handle.is_finished(),
+            "in-flight request was cut off by a short grace cap"
+        );
+        slow.write_all(body).await.unwrap();
+        let mut resp = vec![0_u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut resp))
+            .await
+            .expect("slow request got a response")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&resp[..n]).starts_with("HTTP/1.1 "));
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "server did not exit after the last request finished"
+        );
     }
 
     #[tokio::test]
@@ -703,6 +1041,7 @@ mod tests {
     async fn entrypoint_legacy_fallback_serves_legacy_dashboard_html() {
         let config = Config {
             web_ui: WebUiMode::Legacy,
+            compat_snake_case: false,
             ..Default::default()
         };
         let state = EntrypointState::build(&config, std::path::Path::new("/tmp/consolette-test"))

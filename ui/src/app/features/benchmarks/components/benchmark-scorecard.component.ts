@@ -55,26 +55,26 @@ export type SortDirection = 'asc' | 'desc';
                   </span>
                 </td>
                 <td class="py-3 px-4 text-right font-mono text-xs text-neutral-200">
-                  {{ row.ttftP50 || 0 }}ms <span class="text-neutral-500">/ {{ row.ttftP99 || 0 }}ms</span>
+                  <span data-ttft-na title="not measured">&#8211;</span><span class="sr-only">n/a (not measured)</span>
                 </td>
                 <td class="py-3 px-4 text-right font-mono text-xs text-neutral-200">
                   {{ row.durationP50 || row.ttftP50 || 0 }}ms
                 </td>
                 <td class="py-3 px-4 text-right font-mono text-xs text-emerald-400">
-                  {{ row.speedTokSec || 0 }}
+                  {{ row.speedTokSec ?? '\u2013' }}
                 </td>
                 <td class="py-3 px-4 text-right font-mono text-xs">
-                  <span [class]="(row.errorRate || (100 - (row.successRatePercent || 100))) > 5 ? 'text-red-400 font-bold' : 'text-neutral-300'">
-                    {{ (row.errorRate ?? (100 - (row.successRatePercent || 100))).toFixed(1) }}%
+                  <span [class]="(row.errorRate ?? 0) > 5 ? 'text-red-400 font-bold' : 'text-neutral-300'">
+                    {{ row.errorRate == null ? '\u2013' : row.errorRate.toFixed(1) + '%' }}
                   </span>
                 </td>
                 <td class="py-3 px-4 text-right font-mono text-xs font-semibold text-cyan-300">
-                  {{ row.aiderScore !== undefined ? row.aiderScore.toFixed(1) + '%' : 'N/A' }}
+                  {{ row.aiderScore == null ? '\u2013' : row.aiderScore.toFixed(1) + '%' }}
                 </td>
               </tr>
             } @empty {
               <tr>
-                <td colspan="7" class="py-8 text-center text-neutral-500 italic">No benchmark metrics available</td>
+                <td colspan="7" class="py-8 text-center text-neutral-400 italic">No traffic yet - benchmarks appear after requests flow</td>
               </tr>
             }
           </tbody>
@@ -101,10 +101,7 @@ export class BenchmarkScorecardComponent {
       let valA: any = a[field as keyof BenchmarkData];
       let valB: any = b[field as keyof BenchmarkData];
 
-      if (field === 'errorRate') {
-        valA = a.errorRate ?? (100 - (a.successRatePercent || 100));
-        valB = b.errorRate ?? (100 - (b.successRatePercent || 100));
-      } else if (field === 'durationP50') {
+      if (field === 'durationP50') {
         valA = a.durationP50 ?? a.ttftP50 ?? 0;
         valB = b.durationP50 ?? b.ttftP50 ?? 0;
       }

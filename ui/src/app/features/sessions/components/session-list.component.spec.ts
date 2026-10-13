@@ -56,9 +56,30 @@ describe('SessionListComponent', () => {
     expect(component.filteredSessions()[0].id).toBe('sess-2');
   });
 
+  it('should render sessions that arrive after the first render (E-03)', () => {
+    const late = TestBed.createComponent(SessionListComponent);
+    late.detectChanges();
+    expect(late.nativeElement.querySelectorAll('tbody tr td.font-mono').length).toBe(0);
+
+    late.componentRef.setInput('sessions', mockSessions);
+    late.detectChanges();
+
+    expect(late.nativeElement.textContent).toContain('sess-1');
+    expect(late.nativeElement.textContent).toContain('sess-2');
+  });
+
   it('should emit sessionSelected on click', () => {
     spyOn(component.sessionSelected, 'emit');
     component.selectSession(mockSessions[0]);
     expect(component.sessionSelected.emit).toHaveBeenCalledWith(mockSessions[0]);
+  });
+
+  it('shows an en dash, not 100.0%, when savings were never recorded', () => {
+    component.sessions = [{ ...mockSessions[0], id: 'sess-none', tokenSavingsPercent: null }];
+    fixture.detectChanges();
+    const row = Array.from((fixture.nativeElement as HTMLElement).querySelectorAll('tr')).find((r) =>
+      r.textContent?.includes('sess-none'));
+    expect(row?.textContent).toContain('\u2013');
+    expect(row?.textContent).not.toContain('%');
   });
 });

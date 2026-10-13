@@ -142,3 +142,140 @@ async fn dispatch_should_leave_selected_model_was_exploration_none_for_fallback_
         "FallbackStrategy has no explore/greedy distinction to report"
     );
 }
+
+// The setters are gone: `finish` alone populates the selection, including on
+// a failed request (the previous setters only ran for completed attempts).
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn selected_model_and_exploration_should_be_populated_by_finish_after_setters_removed() {
+    let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(AlwaysErrProvider {
+        name: "openrouter",
+        error: || ProviderError::Validation("bad".to_string(), 400),
+        call_count: Arc::new(AtomicU32::new(0)),
+    })];
+    let metrics = MetricsCollector::new();
+    let router = fallback_router_with_metrics(
+        vec![UpstreamRef {
+            model: Some("a/b:free".to_string()),
+            ..upstream(0, "openrouter")
+        }],
+        providers,
+        &metrics,
+    );
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_err());
+    let recent = metrics.get_recent_requests(1);
+    assert_eq!(recent[0].selected_model, Some("a/b:free".to_string()));
+    assert_eq!(recent[0].status_code, 400);
+}
+
+fn upstream_529() -> ProviderError {
+    ProviderError::Upstream {
+        status: 529,
+        body: String::new(),
+    }
+}
+
+// Story 2.1.2: the attempt chain reaches the terminal trace in order.
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_record_fallback_chain_in_order_and_reason_fallback() {
+    use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome};
+    let providers: Vec<Arc<dyn Provider>> = vec![
+        Arc::new(AlwaysErrProvider {
+            name: "anthropic",
+            error: upstream_529,
+            call_count: Arc::new(AtomicU32::new(0)),
+        }),
+        Arc::new(AlwaysOkProvider {
+            name: "bedrock",
+            call_count: Arc::new(AtomicU32::new(0)),
+        }),
+    ];
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let router = fallback_router_with_metrics(
+        vec![upstream(0, "anthropic"), upstream(1, "bedrock")],
+        providers,
+        &metrics,
+    );
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok());
+    let traces = drain_traces(&mut rx);
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    let attempts = &traces[0].attempts;
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0].upstream, "anthropic");
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Upstream);
+    assert_eq!(attempts[0].status, Some(529));
+    assert_eq!(attempts[0].error_class, Some(AttemptErrorClass::Overloaded));
+    assert_eq!(attempts[1].upstream, "bedrock");
+    assert_eq!(attempts[1].outcome, AttemptOutcome::Ok);
+    assert_eq!(attempts[1].status, Some(200));
+    assert_eq!(attempts[1].error_class, None);
+    assert_eq!(traces[0].route_reason.as_deref(), Some("fallback"));
+    assert_eq!(traces[0].routed_provider.as_deref(), Some("bedrock"));
+}
+
+struct ShedFirst;
+#[async_trait::async_trait]
+impl AdmissionControl for ShedFirst {
+    async fn admit(&self, upstream: &str, _est_tokens: u32) -> Admit {
+        if upstream == "anthropic" {
+            Admit::Shed
+        } else {
+            Admit::Allowed
+        }
+    }
+}
+
+// ADR-004: a shed is local admission control, so it must not trip cooldown.
+#[tokio::test]
+#[allow(clippy::indexing_slicing)]
+async fn dispatch_should_record_shed_attempt_zero_latency_without_changing_health() {
+    use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome};
+    let providers: Vec<Arc<dyn Provider>> = vec![
+        Arc::new(AlwaysOkProvider {
+            name: "anthropic",
+            call_count: Arc::new(AtomicU32::new(0)),
+        }),
+        Arc::new(AlwaysOkProvider {
+            name: "bedrock",
+            call_count: Arc::new(AtomicU32::new(0)),
+        }),
+    ];
+    let metrics = MetricsCollector::new();
+    let mut rx = subscribe_events(&metrics);
+    let health = Arc::new(HealthRegistry::new(300));
+    let router = Router::new(RouterDeps {
+        candidates: vec![upstream(0, "anthropic"), upstream(1, "bedrock")],
+        providers,
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::clone(&health),
+        admission: Arc::new(ShedFirst),
+        metrics: Arc::clone(&metrics),
+    });
+
+    let res = router
+        .dispatch(serde_json::json!({}), HeaderMap::new(), false, 0)
+        .await;
+
+    assert!(res.is_ok());
+    let traces = drain_traces(&mut rx);
+    let attempts = &traces[0].attempts;
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0].upstream, "anthropic");
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Shed);
+    assert_eq!(attempts[0].error_class, Some(AttemptErrorClass::Shed));
+    assert_eq!(attempts[0].latency_ms, 0);
+    assert_eq!(health.remaining_secs(0), 0);
+    assert!(health.is_available(0), "shed must not trip a cooldown");
+}

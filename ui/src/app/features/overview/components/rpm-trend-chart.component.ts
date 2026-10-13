@@ -21,7 +21,7 @@ import { MetricsTickData } from '../../../core/models/telemetry.models';
       <div class="flex items-center justify-between mb-4">
         <div>
           <h3 class="text-sm font-semibold text-white tracking-wide uppercase">RPM & Telemetry Trend</h3>
-          <p class="text-xs text-neutral-400 mt-0.5">Real-time requests per minute & event loop lag (60s window)</p>
+          <p class="text-xs text-neutral-400 mt-0.5">Real-time upstream attempts per minute & event loop lag (60s window)</p>
         </div>
         <div class="flex items-center gap-4 text-xs">
           <div class="flex items-center gap-1.5">

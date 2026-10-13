@@ -39,7 +39,7 @@ export interface TimelineStep {
               [class.text-red-400]="step.status === 'error'"
               [class.bg-neutral-950]="step.status === 'skipped'"
               [class.border-neutral-700]="step.status === 'skipped'"
-              [class.text-slate-500]="step.status === 'skipped'"
+              [class.text-slate-400]="step.status === 'skipped'"
             >
               @if (step.status === 'ok') { ✓ }
               @else if (step.status === 'warning') { ! }
@@ -59,14 +59,7 @@ export interface TimelineStep {
   `
 })
 export class TraceTimelineComponent {
-  @Input() steps: TimelineStep[] = [
-    { name: 'Ingress', durationMs: 1, status: 'ok' },
-    { name: 'RateLimit', durationMs: 2, status: 'ok' },
-    { name: 'Compression', durationMs: 12, status: 'ok' },
-    { name: 'Router', durationMs: 3, status: 'ok' },
-    { name: 'Provider Dispatch', durationMs: 145, status: 'ok' },
-    { name: 'Egress', durationMs: 2, status: 'ok' }
-  ];
+  @Input() steps: TimelineStep[] = [];
 
   public get totalDurationMs(): number {
     return this.steps.reduce((acc, step) => acc + step.durationMs, 0);

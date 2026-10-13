@@ -13,8 +13,10 @@ use axum::Json;
 
 use crate::entrypoint::cost_tee::{begin_cost_tracking, CostTrackingStream};
 use crate::entrypoint::errors::map_provider_error_openai;
+use crate::entrypoint::messages::HandlerResult;
 use crate::entrypoint::openai_stream::OpenAiStreamTranslator;
 use crate::entrypoint::EntrypointState;
+use crate::metrics::trace::TraceScope;
 use crate::providers::{translate_and_record, translate_openai_to_anthropic, ProviderResponse};
 
 /// Rough char-count heuristic for estimating input tokens ahead of dispatch,
@@ -36,10 +38,36 @@ pub async fn post_v1_chat_completions(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let stream = body
-        .get("stream")
+    let est_tokens = estimate_tokens(&body);
+    let anthropic_body = translate_openai_to_anthropic(&body);
+    let mut scope = TraceScope::begin(
+        &state.metrics,
+        &anthropic_body,
+        request_stream_flag(&body),
+        u64::from(est_tokens),
+    );
+    let result = chat_completions_inner(&mut scope, state, headers, body, anthropic_body).await;
+    scope.finish(result.outcome);
+    scope.mark_handler_returned();
+    result.response
+}
+
+fn request_stream_flag(body: &serde_json::Value) -> bool {
+    body.get("stream")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+// Does not panic in practice — see `post_v1_chat_completions`' panic documentation.
+#[allow(clippy::unwrap_used)]
+async fn chat_completions_inner(
+    scope: &mut TraceScope,
+    state: EntrypointState,
+    headers: HeaderMap,
+    body: serde_json::Value,
+    anthropic_body: serde_json::Value,
+) -> HandlerResult {
+    let stream = request_stream_flag(&body);
     let model = body
         .get("model")
         .and_then(serde_json::Value::as_str)
@@ -47,14 +75,12 @@ pub async fn post_v1_chat_completions(
         .to_string();
     let est_tokens = estimate_tokens(&body);
 
-    let anthropic_body = translate_openai_to_anthropic(&body);
-
     let (session_key, request_id) = begin_cost_tracking(&state.cost_tracker).await;
 
     match state
         .dispatch_router
         .load()
-        .dispatch(anthropic_body, headers, stream, est_tokens)
+        .dispatch_traced(scope, anthropic_body, headers, stream, est_tokens)
         .await
     {
         Ok(ProviderResponse::Full(json)) => {
@@ -67,7 +93,7 @@ pub async fn post_v1_chat_completions(
             }
             let openai_json =
                 translate_and_record(&state.cost_tracker, &session_key, request_id, &json).await;
-            (StatusCode::OK, Json(openai_json)).into_response()
+            HandlerResult::ok((StatusCode::OK, Json(openai_json)).into_response())
         }
         Ok(ProviderResponse::Stream(s)) => {
             let tee = CostTrackingStream::new(
@@ -78,13 +104,15 @@ pub async fn post_v1_chat_completions(
                 model.clone(),
             );
             let translated = OpenAiStreamTranslator::new(tee, model);
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
-                .header(CACHE_CONTROL, "no-cache")
-                .header(CONNECTION, "keep-alive")
-                .body(Body::from_stream(translated))
-                .unwrap()
+            HandlerResult::ok(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .header(CACHE_CONTROL, "no-cache")
+                    .header(CONNECTION, "keep-alive")
+                    .body(Body::from_stream(translated))
+                    .unwrap(),
+            )
         }
         Err(e) => {
             state
@@ -98,7 +126,7 @@ pub async fn post_v1_chat_completions(
                     .headers_mut()
                     .insert(RETRY_AFTER, retry_after.to_string().parse().unwrap());
             }
-            response
+            HandlerResult::failed(response, &e)
         }
     }
 }
@@ -252,6 +280,31 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn post_v1_chat_completions_should_emit_trace_status_when_translation_error() {
+        let (state, _calls) =
+            test_state_with_provider(Err(ProviderError::Validation("bad".to_string(), 400))).await;
+        let metrics = Arc::clone(&state.metrics);
+
+        let resp = entrypoint_router(state)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model": "claude-sonnet-4-5", "stream": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let traces = metrics.get_recent_requests(10);
+        assert_eq!(traces.len(), 1, "one trace per client request");
+        assert_eq!(traces[0].status_code, 400);
     }
 
     #[tokio::test]

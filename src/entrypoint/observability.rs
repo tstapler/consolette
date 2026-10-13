@@ -26,6 +26,7 @@ pub async fn get_metrics(State(state): State<EntrypointState>) -> impl IntoRespo
     result["cooldowns"] = state.dispatch_router.load().cooldown_snapshot();
     result["capability"] = state.dispatch_router.load().capability_snapshot();
     result["response_cache"] = state.response_cache.stats_json();
+    result["model_catalog"] = state.catalog.stats_json();
     // Story 5.1.2: present only for a route whose strategy overrides
     // `observability_snapshot()` (currently just `OpenrouterScoringStrategy`)
     // — omitted entirely (not `null`) otherwise.
@@ -57,7 +58,8 @@ pub struct SessionSummary {
     #[serde(rename = "sessionId", alias = "session_id")]
     pub session_id: String,
     pub turn_count: u32,
-    pub token_savings_percent: f64,
+    /// `None` when `tokens_after` was never recorded (compression is off), not 100.
+    pub token_savings_percent: Option<f64>,
     pub last_active_timestamp: String,
     #[serde(rename = "lastActive", alias = "last_active")]
     pub last_active: String,
@@ -65,6 +67,8 @@ pub struct SessionSummary {
     pub pin_status: Option<crate::routing::session_overrides::SessionOverride>,
     pub model: String,
     pub provider: String,
+    /// Newest ring-buffer request of the session: the id `GET /requests/{id}` accepts.
+    pub latest_request_id: String,
 }
 
 /// `GET /v1/dashboard/sessions` — list sessions with pagination and search parameters.
@@ -98,12 +102,13 @@ pub async fn get_dashboard_sessions(
         let tokens_before_sum: u64 = reqs.iter().map(|r| r.tokens_before).sum();
         let tokens_after_sum: u64 = reqs.iter().map(|r| r.tokens_after).sum();
 
-        let token_savings_percent = if tokens_before_sum > 0 {
+        // tokens_after stays 0 while compression is off; that is "not recorded", not a 100% saving.
+        let token_savings_percent = if tokens_before_sum > 0 && tokens_after_sum > 0 {
             let saved = tokens_before_sum.saturating_sub(tokens_after_sum);
             let pct = (saved as f64 / tokens_before_sum as f64) * 100.0;
-            (pct * 10.0).round() / 10.0
+            Some((pct * 10.0).round() / 10.0)
         } else {
-            0.0
+            None
         };
 
         let pin = state.session_overrides.get(&sess_id);
@@ -123,6 +128,7 @@ pub async fn get_dashboard_sessions(
             pin_status: pin,
             model,
             provider,
+            latest_request_id: latest_req.request_id.clone(),
         });
     }
 
@@ -168,12 +174,16 @@ pub struct BenchmarkItem {
     pub duration_p90: f64,
     pub duration_p95: f64,
     pub duration_p99: f64,
-    pub speed_tok_sec: f64,
-    pub success_rate_percent: f64,
-    pub error_rate: f64,
-    pub cost_per_1k: f64,
+    /// `None` when no output tokens were recorded (nothing to divide).
+    pub speed_tok_sec: Option<f64>,
+    /// `None` until finished traces exist; follows `metrics::trace_error_rate`.
+    pub success_rate_percent: Option<f64>,
+    pub error_rate: Option<f64>,
+    /// Always `None`: no price data is recorded.
+    pub cost_per_1k: Option<f64>,
     pub tokens_saved_percent: f64,
-    pub aider_score: f64,
+    /// `None` for a model absent from the bench table.
+    pub aider_score: Option<f64>,
 }
 
 /// `GET /v1/dashboard/benchmark` — comparative performance metrics across models and upstreams.
@@ -232,15 +242,23 @@ pub async fn get_dashboard_benchmark(
         };
 
         let total_duration_sec: f64 = reqs.iter().map(|r| r.duration_ms / 1000.0).sum();
-        let speed_tok_sec = if total_duration_sec > 0.0 {
-            total_after as f64 / total_duration_sec
-        } else {
-            35.0
-        };
+        let speed_tok_sec = (total_duration_sec > 0.0 && total_after > 0)
+            .then(|| total_after as f64 / total_duration_sec);
 
-        let aider_score = crate::routing::bench_table::bench_score(&model)
-            .map(|s| s * 100.0)
-            .unwrap_or(55.0);
+        let aider_score = crate::routing::bench_table::bench_score(&model).map(|s| s * 100.0);
+
+        let finished: Vec<crate::metrics::RequestDetail> =
+            reqs.iter().map(|r| (*r).clone()).collect();
+        let rate = crate::metrics::trace_error_rate(&finished);
+        let round1 = |v: f64| (v * 10.0).round() / 10.0;
+        let (error_rate, success_rate_percent) = if rate.requests == 0 {
+            (None, None)
+        } else {
+            (
+                Some(round1(rate.rate * 100.0)),
+                Some(round1((1.0 - rate.rate) * 100.0)),
+            )
+        };
 
         items.push(BenchmarkItem {
             model,
@@ -254,45 +272,12 @@ pub async fn get_dashboard_benchmark(
             duration_p95,
             duration_p99,
             speed_tok_sec,
-            success_rate_percent: 100.0,
-            error_rate: 0.0,
-            cost_per_1k: 0.015,
+            success_rate_percent,
+            error_rate,
+            cost_per_1k: None,
             tokens_saved_percent,
             aider_score,
         });
-    }
-
-    if items.is_empty() {
-        let default_models = vec![
-            ("claude-3-5-sonnet", "anthropic", 120.0, 450.0, 88.0),
-            ("gpt-4o", "openai", 140.0, 510.0, 85.0),
-            ("gemini-1.5-pro", "gemini", 180.0, 620.0, 81.0),
-            ("deepseek-chat-v3.1:free", "openrouter", 220.0, 750.0, 55.1),
-        ];
-
-        for (m, p, ttft, dur, score) in default_models {
-            let aider_score = crate::routing::bench_table::bench_score(m)
-                .map(|s| s * 100.0)
-                .unwrap_or(score);
-            items.push(BenchmarkItem {
-                model: m.to_string(),
-                provider: p.to_string(),
-                ttft_p50: ttft,
-                ttft_p90: ttft * 1.3,
-                ttft_p95: ttft * 1.5,
-                ttft_p99: ttft * 1.8,
-                duration_p50: dur,
-                duration_p90: dur * 1.3,
-                duration_p95: dur * 1.5,
-                duration_p99: dur * 1.8,
-                speed_tok_sec: 42.0,
-                success_rate_percent: 99.5,
-                error_rate: 0.5,
-                cost_per_1k: 0.015,
-                tokens_saved_percent: 24.5,
-                aider_score,
-            });
-        }
     }
 
     Json(items)
@@ -413,6 +398,47 @@ pub fn validate_base_url(url_str: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The `base_url` of upstream kinds that have one.
+fn upstream_base_url(kind: &crate::config::schema::UpstreamKind) -> Option<&str> {
+    use crate::config::schema::UpstreamKind;
+    match kind {
+        UpstreamKind::Anthropic { base_url } | UpstreamKind::Openai { base_url } => {
+            Some(base_url.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn upstream_base_url_mut(kind: &mut crate::config::schema::UpstreamKind) -> Option<&mut String> {
+    use crate::config::schema::UpstreamKind;
+    match kind {
+        UpstreamKind::Anthropic { base_url } | UpstreamKind::Openai { base_url } => Some(base_url),
+        _ => None,
+    }
+}
+
+/// Auth after the operator typed a new key: keeps the existing variant (and `Apikey`
+/// header) so a Bearer upstream stays Bearer; an upstream with no inline-key auth
+/// gets `Apikey` + `x-api-key`.
+fn auth_with_new_key(
+    existing: Option<&crate::config::schema::AuthMethod>,
+    new_key: String,
+) -> crate::config::schema::AuthMethod {
+    use crate::config::schema::{AuthMethod, SecretRef};
+    let secret = SecretRef::Inline { value: new_key };
+    match existing {
+        Some(AuthMethod::Bearer { .. }) => AuthMethod::Bearer { token: secret },
+        Some(AuthMethod::Apikey { header, .. }) => AuthMethod::Apikey {
+            key: secret,
+            header: header.clone(),
+        },
+        _ => AuthMethod::Apikey {
+            key: secret,
+            header: "x-api-key".to_string(),
+        },
+    }
+}
+
 /// `GET /v1/dashboard/config` — active runtime configuration with API keys masked.
 pub async fn get_dashboard_config(
     State(state): State<EntrypointState>,
@@ -443,7 +469,7 @@ pub async fn get_dashboard_config(
                 _ => {}
             }
         }
-        if let crate::config::schema::UpstreamKind::Openai { base_url } = &upstream.kind {
+        if let Some(base_url) = upstream_base_url(&upstream.kind) {
             p_obj.insert("baseUrl".to_string(), serde_json::json!(base_url));
             p_obj.insert("base_url".to_string(), serde_json::json!(base_url));
         }
@@ -463,8 +489,9 @@ pub async fn get_dashboard_config(
         .map(|r| r.upstreams.iter().map(|u| u.name.clone()).collect())
         .unwrap_or_default();
 
+    // Read-only: limits live in the route file and PUT does not persist them (E-14).
     let rate_limits = serde_json::json!({
-        "rpm": config.ratelimit.defaults.on_breach,
+        "onBreach": config.ratelimit.defaults.on_breach,
         "maxDelayMs": config.ratelimit.defaults.max_delay_ms,
     });
 
@@ -523,22 +550,30 @@ pub async fn put_dashboard_config(
             let base_url_opt = p_val
                 .get("baseUrl")
                 .or_else(|| p_val.get("base_url"))
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|u| !u.is_empty());
 
             if let Some(b_url) = base_url_opt {
-                validate_base_url(b_url).map_err(|err| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": err })),
-                    )
-                })?;
-                if let Some(upstream) = current_config
+                let upstream = current_config
                     .upstreams
                     .iter_mut()
-                    .find(|u| u.name == *p_name)
-                {
-                    if let crate::config::schema::UpstreamKind::Openai { base_url } =
-                        &mut upstream.kind
+                    .find(|u| u.name == *p_name);
+                // An unchanged URL is not re-validated, so one legacy `http://` upstream
+                // cannot reject the whole save (E-15).
+                let unchanged = upstream
+                    .as_ref()
+                    .and_then(|u| upstream_base_url(&u.kind))
+                    .is_some_and(|current| current == b_url);
+                if !unchanged {
+                    validate_base_url(b_url).map_err(|err| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": format!("{p_name}: {err}") })),
+                        )
+                    })?;
+                    if let Some(base_url) =
+                        upstream.and_then(|u| upstream_base_url_mut(&mut u.kind))
                     {
                         *base_url = b_url.to_string();
                     }
@@ -548,42 +583,20 @@ pub async fn put_dashboard_config(
             let api_key_opt = p_val
                 .get("apiKey")
                 .or_else(|| p_val.get("api_key"))
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .filter(|k| !k.is_empty() && !is_masked_key(k));
 
+            // A masked key is the GET echo, not a new secret: leave auth untouched.
             if let Some(api_key) = api_key_opt {
-                let effective_key = if is_masked_key(api_key) {
-                    current_config
-                        .upstreams
-                        .iter()
-                        .find(|u| u.name == *p_name)
-                        .and_then(|u| match &u.auth {
-                            Some(crate::config::schema::AuthMethod::Apikey { key, .. })
-                            | Some(crate::config::schema::AuthMethod::Bearer { token: key }) => {
-                                match key {
-                                    crate::config::schema::SecretRef::Inline { value } => {
-                                        Some(value.clone())
-                                    }
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| api_key.to_string())
-                } else {
-                    api_key.to_string()
-                };
-
                 if let Some(upstream) = current_config
                     .upstreams
                     .iter_mut()
                     .find(|u| u.name == *p_name)
                 {
-                    upstream.auth = Some(crate::config::schema::AuthMethod::Apikey {
-                        key: crate::config::schema::SecretRef::Inline {
-                            value: effective_key,
-                        },
-                        header: "x-api-key".to_string(),
-                    });
+                    upstream.auth = Some(auth_with_new_key(
+                        upstream.auth.as_ref(),
+                        api_key.to_string(),
+                    ));
                 }
             }
 
@@ -669,7 +682,7 @@ pub async fn put_dashboard_config(
             .with_capability(Arc::clone(&state.capability))
             .with_local_catalog(state.dispatch_router.load().local_catalog());
 
-    state.dispatch_router.store(Arc::new(new_router));
+    state.swap_router(new_router);
 
     let _ = state
         .event_tx
@@ -702,6 +715,36 @@ mod tests {
             .metrics
             .push_original_body(request_id.to_string(), body);
         state
+    }
+
+    #[tokio::test]
+    async fn put_dashboard_config_should_prune_catalog_to_the_swapped_routers_upstreams() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            EntrypointState::build_with_cache_dir(&Config::default(), dir.path(), Some(dir.path()))
+                .await
+                .unwrap();
+        let stale = crate::metrics::ids::UpstreamName::from("removed-upstream");
+        state.catalog.prune(&[stale]);
+        assert!(state
+            .catalog
+            .snapshot()
+            .upstreams
+            .contains_key("removed-upstream"));
+
+        let _ = put_dashboard_config(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+
+        assert!(!state
+            .catalog
+            .snapshot()
+            .upstreams
+            .contains_key("removed-upstream"));
     }
 
     #[tokio::test]
@@ -777,6 +820,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_dashboard_sessions_should_report_no_savings_when_tokens_after_was_never_recorded()
+    {
+        let state = state_with_cached_body("req-1", serde_json::json!({})).await;
+        let body = serde_json::json!({"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "hi"}]});
+        let detail = crate::metrics::RequestDetail::from_body(
+            "req-1".to_string(),
+            false,
+            100,
+            &body,
+            Some("sess-none".to_string()),
+        );
+        assert_eq!(
+            detail.tokens_after, 0,
+            "precondition: tokens_after unrecorded"
+        );
+        state.metrics.push_request(detail);
+
+        let Json(sessions) = get_dashboard_sessions(
+            State(state),
+            Query(SessionsQueryParams {
+                limit: Some(10),
+                cursor: None,
+                search: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(sessions[0].token_savings_percent, None);
+        let wire = serde_json::to_value(&sessions[0]).unwrap();
+        assert!(wire["tokenSavingsPercent"].is_null(), "{wire}");
+    }
+
+    #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn get_dashboard_sessions_returns_active_sessions() {
         let state = state_with_cached_body("req-1", serde_json::json!({})).await;
@@ -805,7 +881,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-abc");
         assert_eq!(sessions[0].turn_count, 1);
-        assert!((sessions[0].token_savings_percent - 40.0).abs() < f64::EPSILON);
+        assert_eq!(sessions[0].token_savings_percent, Some(40.0));
         assert_eq!(sessions[0].provider, "anthropic");
     }
 
@@ -1163,7 +1239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_dashboard_benchmark_returns_valid_items() {
+    async fn get_dashboard_benchmark_is_empty_without_traffic() {
         use crate::config::schema::Config;
 
         let state = EntrypointState::build(
@@ -1174,9 +1250,6 @@ mod tests {
         .unwrap();
 
         let Json(benchmarks) = get_dashboard_benchmark(State(state)).await;
-        assert!(!benchmarks.is_empty(), "benchmark list should not be empty");
-        assert!(benchmarks.iter().any(|b| b.model.contains("claude")
-            || b.model.contains("gpt")
-            || b.model.contains("deepseek")));
+        assert!(benchmarks.is_empty(), "no seed rows: {benchmarks:?}");
     }
 }

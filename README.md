@@ -227,6 +227,62 @@ Operational notes:
   Cache" panel) and `GET /metrics`'s `response_cache` field; both reset on
   restart (in-memory counters, not persisted).
 
+### Model catalog
+
+`GET /api/model-catalog` returns each upstream's cached model list (ids and
+`ownedBy`), the time it was last refreshed, a sanitized error if the last
+refresh failed (a kind, an HTTP status and a fixed phrase, never an upstream
+body), and `configWarnings` for models pinned on the first route that the
+upstream does not list. The dashboard's Models view renders it.
+
+Nothing refreshes by default. A refresh runs each upstream's credential flow
+(an SSO prompt, an `exec` helper, an AWS profile chain) and calls its model
+listing, which can cost money, so it happens only when asked:
+`POST /api/model-catalog/refresh` (all upstreams) or
+`POST /api/model-catalog/refresh?upstream=<name>`. `?ifStale=true` refreshes
+only upstreams that were never loaded or are older than `stale_after_secs`.
+Startup, a route hot-swap and `GET` never refresh. Shown with defaults:
+
+```toml
+# ~/.config/consolette/conf.d/40-model-catalog.toml
+[model_catalog]
+refresh = "on_demand"   # "on_demand" | "interval" | "off"
+interval_secs = 600     # only for refresh = "interval"; values below 300 become 300
+min_retry_secs = 300    # floor between automatic attempts at one upstream
+stale_after_secs = 1800 # ?ifStale=true skips entries refreshed more recently
+```
+
+- `on_demand`: manual and `?ifStale=true` requests refresh.
+- `interval`: additionally refreshes every `interval_secs`, starting at
+  startup (opt-in; this is the only mode with background credential-flow runs).
+- `off`: only a manual `POST` without `ifStale` refreshes.
+- Per upstream, one refresh runs at a time (a concurrent request coalesces
+  onto it), a manual refresh is throttled to one per 10 s (the response
+  carries `retryAfterSecs`), each call times out after 10 s, and an upstream
+  whose last refresh failed with an auth error is skipped by `ifStale` and
+  `interval` until someone refreshes it manually.
+
+**Security note**: the dashboard has no authentication, listens on
+`127.0.0.1` only, and its CORS policy allows any origin, so any local process
+or any web page open in your browser can send the refresh `POST`. The limits
+above bound how often it runs, not who can trigger it; this release adds no
+auth. Only warnings for the first route are produced: pins on other routes,
+`model_family` routes and fallback targets outside that route are not
+checked, so no warning is not proof that every target exists.
+
+### Dashboard event keys (`compat_snake_case`)
+
+Dashboard SSE events (`GET /v1/dashboard/events`) use camelCase keys. For external consumers
+still reading the old names, set `compat_snake_case = true` (default `false`) in a `conf.d`
+file: only the `request_trace` event then also carries the legacy snake_case keys
+(`request_id`, `duration_ms`, `first_byte_ms`, `tokens_before`, `tokens_after`, `status_code`)
+next to the camelCase ones. The `metrics_tick`, `error_logged` and `config_changed` events are
+camelCase now and are not affected by the flag.
+
+`duration_ms` is now `timeToHeadersMs`: the time until response headers, including earlier
+failed attempts and rate-limit holds, not the full response time. The legacy `duration_ms` key
+carries that same value.
+
 ## CLI reference
 
 | Command | Purpose |

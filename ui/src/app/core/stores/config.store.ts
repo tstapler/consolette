@@ -25,7 +25,7 @@ export class ConfigStore {
     this.http.get<ConfigData>('/v1/dashboard/config')
       .pipe(
         catchError((err) => {
-          this.errorSignal.set(err.message || 'Failed to load configuration');
+          this.errorSignal.set(err?.error?.error || err.message || 'Failed to load configuration');
           return of(null);
         })
       )
@@ -43,7 +43,7 @@ export class ConfigStore {
     this.http.put<ConfigData>('/v1/dashboard/config', newConfig)
       .pipe(
         catchError((err) => {
-          this.errorSignal.set(err.message || 'Failed to apply configuration');
+          this.errorSignal.set(err?.error?.error || err.message || 'Failed to apply configuration');
           this.isSavingSignal.set(false);
           return of(null);
         })

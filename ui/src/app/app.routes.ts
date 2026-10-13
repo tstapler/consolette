@@ -23,6 +23,10 @@ export const routes: Routes = [
     loadComponent: () => import('./features/config/config.component').then((m) => m.ConfigComponent)
   },
   {
+    path: 'models',
+    loadComponent: () => import('./features/models/upstream-models-view.component').then((m) => m.UpstreamModelsViewComponent)
+  },
+  {
     path: '**',
     redirectTo: 'overview'
   }

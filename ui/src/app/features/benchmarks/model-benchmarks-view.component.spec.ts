@@ -67,4 +67,36 @@ describe('ModelBenchmarksViewComponent', () => {
     expect(req.request.method).toBe('GET');
     req.flush(mockData);
   });
+
+  it('benchmarks_should_render_empty_state_and_en_dash_for_null_rates', () => {
+    fixture.detectChanges();
+    httpMock.expectOne('/v1/dashboard/benchmark').flush([]);
+    fixture.detectChanges();
+    const empty = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(empty).toContain('No traffic yet - benchmarks appear after requests flow');
+
+    store.setBenchmarks([
+      {
+        model: 'claude-sonnet-4',
+        provider: 'anthropic',
+        ttftP50: 120,
+        ttftP90: 150,
+        ttftP95: 180,
+        ttftP99: 210,
+        speedTokSec: null,
+        successRatePercent: null,
+        errorRate: null,
+        costPer1k: null,
+        tokensSavedPercent: 0,
+        aiderScore: null
+      }
+    ]);
+    fixture.detectChanges();
+    const cells = Array.from(
+      (fixture.nativeElement as HTMLElement).querySelectorAll('tbody tr:first-child td')
+    ).map((c) => (c.textContent ?? '').trim());
+    // speed, error rate, aider score
+    expect(cells.slice(4)).toEqual(['\u2013', '\u2013', '\u2013']);
+    expect(cells.join(' ')).not.toContain('0.0%');
+  });
 });

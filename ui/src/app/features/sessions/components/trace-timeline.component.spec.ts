@@ -20,6 +20,14 @@ describe('TraceTimelineComponent', () => {
   });
 
   it('should calculate total duration', () => {
-    expect(component.totalDurationMs).toBe(165);
+    component.steps = [
+      { name: 'Router', durationMs: 4, status: 'ok' },
+      { name: 'Provider Dispatch', durationMs: 160, status: 'ok' }
+    ];
+    expect(component.totalDurationMs).toBe(164);
+  });
+
+  it('should have no built-in steps (no fabricated defaults)', () => {
+    expect(component.steps).toEqual([]);
   });
 });

@@ -14,6 +14,7 @@
 pub mod bench_table;
 pub mod capability;
 pub mod health;
+pub mod model_catalog;
 pub mod model_stats;
 pub mod openrouter_scoring;
 pub mod router;

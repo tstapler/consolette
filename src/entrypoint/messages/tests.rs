@@ -432,3 +432,206 @@ fn merge_local_models_should_append_new_ids_skip_duplicates_and_update_cursors()
     assert_eq!(body["first_id"], "a");
     assert_eq!(body["last_id"], "local/ollama/llama3.2");
 }
+
+// ── Story 2.1.6: one trace per client request ───────────────────────────────
+
+fn plain_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false
+    })
+}
+
+#[tokio::test]
+async fn cache_hit_should_emit_one_trace_kind_cache_hit_with_no_attempts_and_null_provider() {
+    let response = serde_json::json!({
+        "id": "msg_1",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let (state, _calls) =
+        test_state_with_repeating_provider(response, enabled_cache_config()).await;
+    let metrics = Arc::clone(&state.metrics);
+
+    let _ = post_messages(state.clone(), plain_body()).await;
+    let _ = post_messages(state, plain_body()).await;
+
+    let traces = metrics.get_recent_requests(10);
+    assert_eq!(traces.len(), 2, "one trace per client request");
+    let hit = &traces[0];
+    assert_eq!(
+        hit.trace_kind,
+        crate::entrypoint::events::TraceKind::CacheHit
+    );
+    assert_eq!(hit.status_code, 200);
+    assert_eq!(hit.route_reason.as_deref(), Some("cache"));
+    assert!(hit.attempts.is_empty());
+    assert_eq!(hit.routed_provider, None);
+    assert_eq!(
+        metrics
+            .counters
+            .requests_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "one upstream attempt plus one cache hit, no double count"
+    );
+}
+
+#[tokio::test]
+async fn post_v1_messages_should_emit_trace_400_when_validation_fails_before_dispatch() {
+    let (state, _calls) =
+        test_state_with_provider(Err(ProviderError::Validation("bad".to_string(), 400))).await;
+    let metrics = Arc::clone(&state.metrics);
+    let unfinished_before = crate::metrics::trace::unfinished_path_hits();
+
+    let resp = post_messages(state, plain_body()).await;
+
+    assert_eq!(resp.status().as_u16(), 400);
+    let traces = metrics.get_recent_requests(10);
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].status_code, 400);
+    assert_eq!(
+        crate::metrics::trace::unfinished_path_hits(),
+        unfinished_before
+    );
+}
+
+/// Upstream that answers from a fixed script, one entry per `send`.
+struct SequenceProvider {
+    script: std::sync::Mutex<std::collections::VecDeque<Result<ProviderResponse, ProviderError>>>,
+}
+
+#[async_trait]
+impl Provider for SequenceProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("script exhausted")
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+fn search_call() -> Result<ProviderResponse, ProviderError> {
+    Ok(ProviderResponse::Full(serde_json::json!({
+        "id": "msg_s", "type": "message", "role": "assistant", "model": "m",
+        "content": [{"type": "tool_use", "id": "toolu_1", "name": "web_search",
+                     "input": {"query": "rust"}}],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })))
+}
+
+fn final_answer() -> Result<ProviderResponse, ProviderError> {
+    Ok(ProviderResponse::Full(serde_json::json!({
+        "id": "msg_f", "type": "message", "role": "assistant", "model": "m",
+        "content": [{"type": "text", "text": "done"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })))
+}
+
+/// Drives the real `ScopedDispatch` + `run_loop` over a router whose upstream follows `script`.
+async fn run_scripted_emulation(
+    script: Vec<Result<ProviderResponse, ProviderError>>,
+) -> (
+    Result<LoopOutcome, ProviderError>,
+    Arc<crate::metrics::MetricsCollector>,
+) {
+    use crate::routing::health::HealthRegistry;
+    use crate::routing::router::{Router as DispatchRouter, RouterDeps};
+    use crate::routing::strategy::{FallbackStrategy, UpstreamRef};
+    use crate::server_tools::executor::fake::{fake_pool, sample_results, FakeBehavior};
+
+    let provider: Arc<dyn Provider> = Arc::new(SequenceProvider {
+        script: std::sync::Mutex::new(script.into()),
+    });
+    let metrics = crate::metrics::MetricsCollector::new();
+    let router = Arc::new(DispatchRouter::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "test".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: None,
+        }],
+        providers: vec![provider],
+        strategy: Arc::new(FallbackStrategy) as Arc<dyn crate::routing::strategy::RoutingStrategy>,
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(crate::ratelimit::RateLimiters::new(
+            &crate::config::schema::RateLimitConfig::default(),
+        )) as Arc<dyn crate::ratelimit::AdmissionControl>,
+        metrics: Arc::clone(&metrics),
+    }));
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "q"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+    });
+    let (pool, _) = fake_pool(FakeBehavior::BraveOk(sample_results()), 5_000, 5_000, 2);
+    let limits = crate::server_tools::LoopLimits {
+        max_iterations: 5,
+        max_results: 5,
+        total_timeout: std::time::Duration::from_secs(30),
+    };
+
+    let mut scope = crate::metrics::trace::TraceScope::begin(&metrics, &body, false, 1);
+    let result = {
+        let dispatch = ScopedDispatch::new(router, HeaderMap::new(), 1, &mut scope);
+        run_loop(&body, &dispatch, &pool, &limits).await
+    };
+    scope.finish(match &result {
+        Ok(_) => crate::metrics::trace::RequestOutcome::ok(),
+        Err(e) => crate::metrics::trace::RequestOutcome::status(e.trace_status()),
+    });
+    scope.mark_handler_returned();
+    (result, metrics)
+}
+
+#[tokio::test]
+async fn emulation_loop_should_emit_one_trace_with_iterations_3_and_attempts_tagged_0_to_2() {
+    let (result, metrics) =
+        run_scripted_emulation(vec![search_call(), search_call(), final_answer()]).await;
+
+    assert!(result.is_ok());
+    let traces = metrics.get_recent_requests(10);
+    assert_eq!(traces.len(), 1, "one trace for three dispatches");
+    let t = &traces[0];
+    assert_eq!(t.iterations, 3);
+    let tags: Vec<u8> = t.attempts.iter().map(|a| a.iteration).collect();
+    assert_eq!(tags, vec![0, 1, 2]);
+    assert_eq!(t.status_code, 200);
+    let rounds_ms: u64 = t.attempts.iter().map(|a| a.latency_ms).sum();
+    assert!(t.total_ms.unwrap_or(0) >= rounds_ms);
+}
+
+#[tokio::test]
+async fn emulation_round_two_failure_should_emit_one_trace_with_error_status() {
+    let (result, metrics) = run_scripted_emulation(vec![
+        search_call(),
+        Err(ProviderError::Validation("bad".to_string(), 400)),
+    ])
+    .await;
+
+    assert!(result.is_err());
+    let traces = metrics.get_recent_requests(10);
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].status_code, 400);
+    assert_eq!(traces[0].attempts.len(), 2);
+    assert_eq!(traces[0].iterations, 2);
+}

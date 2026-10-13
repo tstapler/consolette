@@ -55,4 +55,13 @@ describe('ConfigStore (TC-UNIT-11)', () => {
     expect(store.config()).toEqual(updatedConfig);
     expect(store.lastApplied()).not.toBeNull();
   });
+
+  it('should surface the server error reason on a failed apply', () => {
+    store.applyConfig({ webUi: 'angular' });
+    httpMock
+      .expectOne('/v1/dashboard/config')
+      .flush({ error: 'Scheme must be HTTPS' }, { status: 400, statusText: 'Bad Request' });
+    expect(store.error()).toBe('Scheme must be HTTPS');
+    expect(store.lastApplied()).toBeNull();
+  });
 });

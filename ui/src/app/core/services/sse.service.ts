@@ -2,13 +2,15 @@ import { Injectable, DestroyRef, inject, signal, computed } from '@angular/core'
 import { Observable, Subject } from 'rxjs';
 import { DashboardEvent } from '../models/telemetry.models';
 
-export type SseConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
+export type SseConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 
 export interface SseServiceOptions {
   url?: string;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
   maxRetryAttempts?: number;
+  /** Reconnect when no frame (the backend ticks every second) arrives for this long. */
+  staleAfterMs?: number;
 }
 
 @Injectable({
@@ -28,11 +30,17 @@ export class SseService {
   public readonly isConnected = computed(() => this.statusSignal() === 'connected');
 
   public readonly events$: Observable<DashboardEvent> = this.eventsSubject.asObservable();
+  private readonly reconnectedSubject = new Subject<void>();
+  /** Fires when a stream opens after a drop, so consumers can backfill what they missed. */
+  public readonly reconnected$: Observable<void> = this.reconnectedSubject.asObservable();
+  private recovering = false;
 
   private url = '/v1/dashboard/events';
   private initialBackoffMs = 1000;
   private maxBackoffMs = 30000;
   private maxRetryAttempts = 20;
+  private staleAfterMs = 10000;
+  private staleTimer: any = null;
 
   constructor() {
     if (this.destroyRef) {
@@ -47,8 +55,37 @@ export class SseService {
     if (options?.initialBackoffMs) this.initialBackoffMs = options.initialBackoffMs;
     if (options?.maxBackoffMs) this.maxBackoffMs = options.maxBackoffMs;
     if (options?.maxRetryAttempts) this.maxRetryAttempts = options.maxRetryAttempts;
+    if (options?.staleAfterMs) this.staleAfterMs = options.staleAfterMs;
 
+    if (this.statusSignal() === 'disconnected') this.statusSignal.set('connecting');
     this.initEventSource();
+  }
+
+  /** Manual recovery after retries are exhausted: fresh counter, immediate attempt. */
+  public reconnect(): void {
+    this.recovering = true;
+    this.clearReconnectTimer();
+    this.retryCountSignal.set(0);
+    this.statusSignal.set('connecting');
+    this.initEventSource();
+  }
+
+  // A stream can die without onerror (e.g. a stopped proxy still holding the socket),
+  // so silence past `staleAfterMs` is treated as a drop.
+  private armStaleWatchdog(): void {
+    this.clearStaleTimer();
+    this.staleTimer = setTimeout(() => {
+      if (this.statusSignal() === 'connected') {
+        this.handleErrorAndReconnect();
+      }
+    }, this.staleAfterMs);
+  }
+
+  private clearStaleTimer(): void {
+    if (this.staleTimer) {
+      clearTimeout(this.staleTimer);
+      this.staleTimer = null;
+    }
   }
 
   private initEventSource(): void {
@@ -60,9 +97,15 @@ export class SseService {
       this.eventSource.onopen = () => {
         this.statusSignal.set('connected');
         this.retryCountSignal.set(0);
+        this.armStaleWatchdog();
+        if (this.recovering) {
+          this.recovering = false;
+          this.reconnectedSubject.next();
+        }
       };
 
       this.eventSource.onmessage = (event: MessageEvent) => {
+        this.armStaleWatchdog();
         try {
           const parsed = JSON.parse(event.data) as DashboardEvent;
           this.eventsSubject.next(parsed);
@@ -72,8 +115,9 @@ export class SseService {
       };
 
       // Listen to named custom events if emitted by SSE server
-      ['MetricsTick', 'RequestTrace', 'ErrorLogged', 'ConfigChanged', 'system_lag'].forEach((eventType) => {
+      ['MetricsTick', 'RequestTrace', 'ErrorLogged', 'ConfigChanged', 'ModelCatalogChanged', 'system_lag'].forEach((eventType) => {
         this.eventSource?.addEventListener(eventType, (event: MessageEvent) => {
+          this.armStaleWatchdog();
           try {
             const data = JSON.parse(event.data);
             this.eventsSubject.next({ type: eventType as any, data });
@@ -93,6 +137,7 @@ export class SseService {
 
   public handleErrorAndReconnect(): void {
     this.closeExistingSource();
+    this.recovering = true;
 
     const currentRetry = this.retryCountSignal();
     if (currentRetry >= this.maxRetryAttempts) {
@@ -124,6 +169,7 @@ export class SseService {
   }
 
   private closeExistingSource(): void {
+    this.clearStaleTimer();
     if (this.eventSource) {
       this.eventSource.close();
       this.eventSource = null;

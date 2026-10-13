@@ -816,8 +816,11 @@ impl Provider for OpenaiProvider {
                     if !Self::classify_wrong_endpoint_failure(&err) {
                         return Err(err);
                     }
-                    let responses_body = responses::translate_anthropic_request_to_responses(body).await;
-                    let response = self.send_responses_streaming_request(responses_body).await?;
+                    let responses_body =
+                        responses::translate_anthropic_request_to_responses(body).await;
+                    let response = self
+                        .send_responses_streaming_request(responses_body)
+                        .await?;
                     self.promote_cache_to_responses(family.as_deref(), &model, token_param);
                     let byte_stream = response
                         .bytes_stream()
@@ -847,10 +850,12 @@ impl Provider for OpenaiProvider {
                     if !Self::classify_wrong_endpoint_failure(&err) {
                         return Err(err);
                     }
-                    let responses_body = responses::translate_anthropic_request_to_responses(body).await;
+                    let responses_body =
+                        responses::translate_anthropic_request_to_responses(body).await;
                     let value = self.send_responses_request(responses_body).await?;
                     self.promote_cache_to_responses(family.as_deref(), &model, token_param);
-                    let anthropic_value = responses::translate_responses_response_to_anthropic(value);
+                    let anthropic_value =
+                        responses::translate_responses_response_to_anthropic(value);
                     return Ok(ProviderResponse::Full(anthropic_value));
                 }
             };
@@ -1735,7 +1740,9 @@ mod tests {
             let app = axum::Router::new()
                 .route(
                     "/v1/chat/completions",
-                    axum::routing::post(handle_chat_completions_rejects_tools_with_reasoning_effort),
+                    axum::routing::post(
+                        handle_chat_completions_rejects_tools_with_reasoning_effort,
+                    ),
                 )
                 .route("/v1/responses", axum::routing::post(handle_responses))
                 .with_state(captured.clone());
@@ -1829,8 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_openai_error_should_return_wrong_endpoint_for_400_tools_reasoning_effort_message()
-    {
+    fn classify_openai_error_should_return_wrong_endpoint_for_400_tools_reasoning_effort_message() {
         let body = r#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-5.6-terra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.","type":"invalid_request_error","param":"reasoning_effort","code":null}}"#;
         assert_eq!(
             classify_openai_error(400, body),

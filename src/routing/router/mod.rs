@@ -18,11 +18,12 @@ use http::HeaderMap;
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
 use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
-use crate::metrics::{MetricsCollector, ProxyMetrics, RequestTimingUpdate};
+use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, RequestOutcome, TraceScope};
+use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::bedrock::BedrockProvider;
 use crate::providers::gemini::GeminiProvider;
-use crate::providers::local_discovery::{LocalCatalog, LocalTarget};
+use crate::providers::local_discovery::LocalCatalog;
 use crate::providers::openai::{OpenaiProvider, MODEL_FAMILY_BODY_KEY};
 use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
@@ -73,6 +74,10 @@ pub struct Router {
     local_catalog: Arc<LocalCatalog>,
     /// Lazily-built providers for discovered local endpoints, keyed by base URL.
     local_providers: dashmap::DashMap<String, Arc<dyn Provider>>,
+    /// Config-order names of `providers` (see `provider_names.rs`).
+    provider_names: Vec<crate::metrics::ids::UpstreamName>,
+    /// Config fingerprints parallel to `provider_names` (see `provider_names.rs`).
+    fingerprints: Vec<crate::routing::model_catalog::UpstreamFingerprint>,
 }
 
 /// The four non-`openrouter`-kind upstreams: a plain `Arc<dyn Provider>`,
@@ -438,6 +443,8 @@ impl Router {
             )),
             local_catalog: LocalCatalog::new(),
             local_providers: dashmap::DashMap::new(),
+            provider_names: Vec::new(),
+            fingerprints: Vec::new(),
         }
     }
 
@@ -452,49 +459,6 @@ impl Router {
     #[must_use]
     pub fn local_catalog(&self) -> Arc<LocalCatalog> {
         Arc::clone(&self.local_catalog)
-    }
-
-    /// Sends a request for a discovered `local/<backend>/<model>` straight to
-    /// that backend's OpenAI-compatible endpoint, bypassing route candidates:
-    /// the client named the model explicitly, so there is nothing to select.
-    async fn dispatch_local(
-        &self,
-        target: LocalTarget,
-        mut body: serde_json::Value,
-        headers: HeaderMap,
-        stream: bool,
-    ) -> Result<ProviderResponse, ProviderError> {
-        let provider = match self.local_providers.get(&target.base_url) {
-            Some(p) => Arc::clone(&p),
-            None => {
-                let upstream = Arc::new(crate::config::schema::Upstream {
-                    name: format!("local/{}", target.backend.slug()),
-                    kind: UpstreamKind::Openai {
-                        base_url: target.base_url.clone(),
-                    },
-                    // OpenaiProvider requires an auth method; local servers
-                    // ignore the header, so a placeholder bearer suffices.
-                    auth: Some(crate::config::schema::AuthMethod::Bearer {
-                        token: crate::config::schema::SecretRef::Inline {
-                            value: "local".to_string(),
-                        },
-                    }),
-                });
-                let p: Arc<dyn Provider> = Arc::new(OpenaiProvider::new(
-                    upstream,
-                    target.base_url.clone(),
-                    Arc::new(SystemSecretResolver),
-                    Arc::new(ExecCredentialCache::new()),
-                    LOCAL_REQUEST_TIMEOUT_SECS,
-                    Arc::clone(&self.metrics.counters),
-                )?);
-                self.local_providers
-                    .insert(target.base_url.clone(), Arc::clone(&p));
-                p
-            }
-        };
-        body["model"] = serde_json::Value::String(target.model);
-        provider.send(body, headers, stream).await
     }
 
     /// Swaps in a shared capability-verdict cache, replacing the empty one
@@ -554,6 +518,7 @@ impl Router {
 
         let (providers, openrouter_providers) =
             build_providers(config, Arc::clone(&metrics.counters)).await?;
+        let provider_names = provider_names::names_of(&providers);
         let providers: Vec<Arc<dyn Provider>> = providers
             .into_iter()
             .map(|(_, provider)| provider)
@@ -585,7 +550,9 @@ impl Router {
             health,
             admission,
             metrics,
-        }))
+        })
+        .with_provider_names(provider_names)
+        .with_fingerprints(provider_names::fingerprints_of(config)))
     }
 
     /// This dispatch's candidate list: the route's normal `self.candidates`,
@@ -597,9 +564,9 @@ impl Router {
     /// silently falling over to a different one. Falls back to the normal
     /// candidates if the pinned upstream isn't in this route at all (e.g. a
     /// route change removed it).
-    fn effective_candidates(&self, session_id: Option<&str>) -> Vec<UpstreamRef> {
+    fn effective_candidates(&self, session_id: Option<&str>) -> (Vec<UpstreamRef>, bool) {
         let Some(over) = session_id.and_then(|sid| self.session_overrides.get(sid)) else {
-            return self.candidates.clone();
+            return (self.candidates.clone(), false);
         };
         let Some(pinned) = self.candidates.iter().find(|c| c.name == over.upstream) else {
             tracing::warn!(
@@ -607,15 +574,16 @@ impl Router {
                 upstream = %over.upstream,
                 "session-pinned upstream not in current route; falling back to normal routing"
             );
-            return self.candidates.clone();
+            return (self.candidates.clone(), false);
         };
-        vec![UpstreamRef {
+        let pin = UpstreamRef {
             index: pinned.index,
             name: pinned.name.clone(),
             weight: pinned.weight,
             model: over.model.clone().or_else(|| pinned.model.clone()),
             model_family: pinned.model_family.clone(),
-        }]
+        };
+        (vec![pin], true)
     }
 
     /// Healthy candidates not yet tried for this request, minus
@@ -660,12 +628,65 @@ impl Router {
     /// (`SessionOverrideStore`/`effective_candidates`) takes precedence over
     /// this route's normal candidate list.
     ///
+    /// This is the compat wrapper over [`Self::dispatch_traced`]: it owns a
+    /// [`TraceScope`] for the request, so every terminal path (success,
+    /// error, or the future being dropped) emits exactly one `RequestTrace`.
+    ///
     /// # Errors
     ///
     /// Returns the last [`ProviderError`] encountered once every candidate
     /// upstream has been tried (or none were available/admitted).
     pub async fn dispatch(
         &self,
+        body: serde_json::Value,
+        headers: HeaderMap,
+        stream: bool,
+        est_tokens: u32,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let mut scope = TraceScope::begin(&self.metrics, &body, stream, u64::from(est_tokens));
+        let result = self
+            .dispatch_traced(&mut scope, body, headers, stream, est_tokens)
+            .await;
+        scope.finish(match &result {
+            Ok(_) => RequestOutcome::ok(),
+            Err(e) => RequestOutcome::status(e.trace_status()),
+        });
+        scope.mark_handler_returned();
+        result
+    }
+
+    /// Dispatch against a caller-owned `scope`, which the caller must finish.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::dispatch`].
+    pub async fn dispatch_traced(
+        &self,
+        scope: &mut TraceScope,
+        body: serde_json::Value,
+        headers: HeaderMap,
+        stream: bool,
+        est_tokens: u32,
+    ) -> Result<ProviderResponse, ProviderError> {
+        scope.begin_dispatch();
+        if let Some(target) = self.local_target(&body) {
+            return self
+                .dispatch_local(scope, target, body, headers, stream)
+                .await;
+        }
+        let session_id = extract_session_id(&body);
+        let (candidates, pinned) = self.effective_candidates(session_id.as_deref());
+        scope.record_route(pinned, self.strategy.name());
+        let candidates = self.strategy.expand_candidates(candidates);
+        self.dispatch_attempts(scope, &candidates, body, headers, stream, est_tokens)
+            .await
+    }
+
+    /// The candidate-selection / retry / hold loop.
+    async fn dispatch_attempts(
+        &self,
+        scope: &mut TraceScope,
+        candidates: &[UpstreamRef],
         body: serde_json::Value,
         headers: HeaderMap,
         stream: bool,
@@ -679,45 +700,20 @@ impl Router {
             .unwrap_or("unknown")
             .to_string();
 
-        if let Some(target) = self.local_catalog.resolve(&model) {
-            return self.dispatch_local(target, body, headers, stream).await;
-        }
-
-        let session_id = extract_session_id(&body);
-        let candidates = self.effective_candidates(session_id.as_deref());
-        let candidates = self.strategy.expand_candidates(candidates);
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.metrics
-            .push_request(crate::metrics::RequestDetail::from_body(
-                request_id.clone(),
-                stream,
-                u64::from(est_tokens),
-                &body,
-                session_id.clone(),
-            ));
-        self.metrics
-            .push_original_body(request_id.clone(), body.clone());
-
-        let mut hold_retries: u32 = 0;
-
         loop {
-            let healthy = self.admitted_candidates(&candidates, &already_tried);
+            let healthy = self.admitted_candidates(candidates, &already_tried);
 
             let Some(chosen) = self.strategy.select(&healthy) else {
                 // Insulate agents from temporary rate-limit cooldowns: if
                 // all candidates are in short cooldown, hold and retry.
-                if self
-                    .hold_for_rate_limit_cooldown(&candidates, &mut hold_retries)
-                    .await
-                {
+                if self.hold_for_rate_limit_cooldown(candidates, scope).await {
                     already_tried.clear();
                     continue;
                 }
                 break;
             };
             already_tried.insert((chosen.index, chosen.model.clone()));
-            self.record_selection(&request_id, &chosen);
+            self.record_selection(scope, &chosen);
 
             // ADR-004: post-selection admission check, before the provider
             // call — a Shed re-selects from the remaining pool via the same
@@ -727,6 +723,12 @@ impl Router {
             match self.admission.admit(&chosen.name, est_tokens).await {
                 Admit::Allowed | Admit::Delayed(_) => {}
                 Admit::Shed => {
+                    scope.begin_attempt(&chosen.name, chosen.model.as_deref(), scope.iteration());
+                    scope.complete_attempt(
+                        AttemptOutcome::Shed,
+                        Some(AttemptErrorClass::Shed),
+                        None,
+                    );
                     last_error = Some(ProviderError::RateLimited);
                     continue;
                 }
@@ -745,23 +747,25 @@ impl Router {
                 request_body[MODEL_FAMILY_BODY_KEY] = serde_json::Value::String(family.clone());
             }
             let attempt_started = std::time::Instant::now();
+            scope.begin_attempt(&chosen.name, chosen.model.as_deref(), scope.iteration());
             let outcome = provider.send(request_body, headers.clone(), stream).await;
 
             match outcome {
                 Ok(response) => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
-                    #[allow(clippy::cast_precision_loss)]
-                    let duration_ms = attempt_started.elapsed().as_secs_f64() * 1000.0;
-                    self.record_first_attempt_timing(&request_id, &chosen.name, duration_ms);
+                    scope.complete_attempt_result(None);
+                    scope.record_provider(&chosen.name);
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    scope.complete_attempt_result(Some(&e));
                     return Err(e);
                 }
                 Err(e) if e.is_rate_limited() => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
-                    self.maybe_trip_rate_limit(&candidates, &already_tried, &chosen, &e);
+                    scope.complete_attempt_result(Some(&e));
+                    self.maybe_trip_rate_limit(candidates, &already_tried, &chosen, &e);
                     last_error = Some(e);
                 }
                 Err(e) if e.is_response_shape_mismatch() => {
@@ -772,6 +776,7 @@ impl Router {
                     // permanently-broken Gemini endpoint isn't retried on
                     // every request forever.
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    scope.complete_attempt_result(Some(&e));
                     self.health.trip(
                         chosen.index,
                         Some(Duration::from_secs(
@@ -782,13 +787,14 @@ impl Router {
                 }
                 Err(e) => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    scope.complete_attempt_result(Some(&e));
                     last_error = Some(e);
                 }
             }
         }
 
         if last_error.is_none() {
-            self.attribute_exhausted_kind(&candidates);
+            self.attribute_exhausted_kind(candidates);
         }
 
         Err(last_error.unwrap_or(ProviderError::Exhausted))
@@ -810,9 +816,9 @@ impl Router {
     async fn hold_for_rate_limit_cooldown(
         &self,
         candidates: &[UpstreamRef],
-        hold_retries: &mut u32,
+        scope: &mut TraceScope,
     ) -> bool {
-        if *hold_retries >= MAX_HOLD_RETRIES {
+        if scope.dispatch_hold_retries() >= MAX_HOLD_RETRIES {
             return false;
         }
         let Some(wait_secs) = candidates
@@ -829,12 +835,12 @@ impl Router {
         tracing::info!(
             "All upstream candidates rate-limited / cooling down. Holding request for {}s to insulate agent (attempt {}/{})...",
             wait_secs,
-            *hold_retries + 1,
+            scope.dispatch_hold_retries() + 1,
             MAX_HOLD_RETRIES
         );
         tokio::time::sleep(Duration::from_secs(wait_secs) + Duration::from_millis(HOLD_JITTER_MS))
             .await;
-        *hold_retries += 1;
+        scope.note_hold_retry();
         true
     }
 
@@ -845,15 +851,12 @@ impl Router {
     /// rather than the greedy argmax choice — both `None` for every
     /// non-model-pinned route and, for the latter, for any strategy that
     /// doesn't track the explore/greedy distinction.
-    fn record_selection(&self, request_id: &str, chosen: &UpstreamRef) {
-        self.metrics
-            .set_selected_model(request_id, chosen.model.clone());
+    fn record_selection(&self, scope: &mut TraceScope, chosen: &UpstreamRef) {
         let was_exploration = chosen
             .model
             .as_deref()
             .and_then(|m| self.strategy.last_selection_was_exploration(m));
-        self.metrics
-            .set_selected_model_was_exploration(request_id, was_exploration);
+        scope.record_selection(chosen.model.clone(), was_exploration);
     }
 
     /// Trips the whole-upstream cooldown for a rate-limited attempt, unless
@@ -1073,25 +1076,9 @@ impl Router {
             _ => {}
         }
     }
-
-    /// Records a successful first-attempt's timing on `/metrics`. First-byte
-    /// time isn't separately measured here (see `record_attempt`'s doc
-    /// comment) — `provider.send` returning is the closest proxy we have for
-    /// either a full response or a stream's headers, so both fields get the
-    /// same `duration_ms`.
-    fn record_first_attempt_timing(&self, request_id: &str, provider_name: &str, duration_ms: f64) {
-        self.metrics.update_request_timing(
-            request_id,
-            RequestTimingUpdate {
-                provider: provider_name,
-                duration_ms,
-                first_byte_ms: duration_ms,
-                bedrock_invocation_ms: 0,
-                bedrock_first_byte_ms: 0,
-            },
-        );
-    }
 }
 
+mod local_dispatch;
+mod provider_names;
 #[cfg(test)]
 mod tests;

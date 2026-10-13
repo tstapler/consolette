@@ -1,0 +1,1 @@
+{"type":"MetricsTick","data":{"rpm":12.5,"totalRequests":120,"totalTokensSaved":0,"currentLagMs":3.5,"providerHealth":{"anthropic":"healthy"},"medianLatencyMs":812.5,"medianFirstByteMs":null,"tps":null,"tokenSavingsPercent":null}}

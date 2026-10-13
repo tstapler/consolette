@@ -174,7 +174,17 @@ pub const PER_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 /// Minimum gap between manual refreshes of one upstream.
 pub const MANUAL_THROTTLE: Duration = Duration::from_secs(10);
 
-pub type NamedProvider = (UpstreamName, Arc<dyn Provider>);
+/// Hash of the upstream config that determines what it serves and how it authenticates; the
+/// secret itself is never stored. Equal fingerprints mean "same upstream" across a hot-swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UpstreamFingerprint(pub u64);
+
+#[derive(Clone)]
+pub struct NamedProvider {
+    pub name: UpstreamName,
+    pub provider: Arc<dyn Provider>,
+    pub fingerprint: UpstreamFingerprint,
+}
 /// Called once per finished refresh, after the in-flight guard is released.
 pub type Notifier = Arc<dyn Fn(&UpstreamName) + Send + Sync>;
 
@@ -223,8 +233,8 @@ struct State {
     /// Bumped whenever a name's provider instance changes; a refresh started under an older
     /// epoch must not write its result (it listed the previous provider's models).
     epochs: HashMap<UpstreamName, u64>,
-    /// Address of the provider instance each entry was last pruned against.
-    identities: HashMap<UpstreamName, usize>,
+    /// Config fingerprint each entry was last pruned against.
+    identities: HashMap<UpstreamName, UpstreamFingerprint>,
     next_epoch: u64,
 }
 
@@ -233,10 +243,6 @@ impl State {
         self.next_epoch += 1;
         self.epochs.insert(name.clone(), self.next_epoch);
     }
-}
-
-fn provider_identity(provider: &Arc<dyn Provider>) -> usize {
-    Arc::as_ptr(provider).cast::<()>() as usize
 }
 
 /// Marks one upstream as refreshing for exactly as long as it lives, so a
@@ -339,23 +345,28 @@ impl ModelCatalog {
         Self::prune_locked(&mut state, names);
     }
 
-    /// Like [`prune`](Self::prune), but a name whose provider instance changed gets a fresh
+    /// Like [`prune`](Self::prune), but a name whose config fingerprint changed (a rebuilt but identical provider keeps its entry) gets a fresh
     /// `Loading` entry and a new epoch: the old entry's models, error state and `last_attempt`
     /// belong to the previous upstream, and a refresh still running for it must not write.
     pub fn prune_providers(&self, providers: &[NamedProvider]) {
-        let names: Vec<_> = providers.iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<_> = providers.iter().map(|p| p.name.clone()).collect();
         let mut state = lock(&self.state);
         Self::prune_locked(&mut state, &names);
-        for (name, provider) in providers {
-            let identity = provider_identity(provider);
-            if let Some(previous) = state.identities.insert(name.clone(), identity) {
-                if previous != identity {
+        let mut changed = Vec::new();
+        for p in providers {
+            if let Some(previous) = state.identities.insert(p.name.clone(), p.fingerprint) {
+                if previous != p.fingerprint {
                     state
                         .entries
-                        .insert(name.clone(), UpstreamModels::loading());
-                    state.bump_epoch(name);
+                        .insert(p.name.clone(), UpstreamModels::loading());
+                    state.bump_epoch(&p.name);
+                    changed.push(p.name.clone());
                 }
             }
+        }
+        drop(state);
+        for name in &changed {
+            self.notify(name);
         }
     }
 
@@ -467,7 +478,7 @@ impl ModelCatalog {
     ) -> Result<RefreshStarted, UnknownUpstream> {
         let targets: Vec<&NamedProvider> = match target {
             Target::All => providers.iter().collect(),
-            Target::One(wanted) => providers.iter().filter(|(n, _)| n == wanted).collect(),
+            Target::One(wanted) => providers.iter().filter(|p| &p.name == wanted).collect(),
         };
         if targets.is_empty() && matches!(target, Target::One(_)) {
             return Err(UnknownUpstream);
@@ -477,7 +488,7 @@ impl ModelCatalog {
         let mut started = Vec::new();
         let mut already_running = 0usize;
         let mut retry_after: Option<u64> = None;
-        for (name, provider) in targets {
+        for NamedProvider { name, provider, .. } in targets {
             let (epoch, decision) = {
                 let state = lock(&self.state);
                 let epoch = state.epochs.get(name).copied().unwrap_or(0);
@@ -551,8 +562,12 @@ impl ModelCatalog {
         log_refresh(&name, &result, duration_ms);
         self.apply_result(&name, guard.epoch, result, Stamp::now());
         drop(guard);
+        self.notify(&name);
+    }
+
+    fn notify(&self, name: &UpstreamName) {
         if let Some(notify) = &self.notifier {
-            notify(&name);
+            notify(name);
         }
     }
 
@@ -1017,6 +1032,21 @@ mod refresh_tests {
         UpstreamName::from(n)
     }
 
+    /// Fingerprint derived from the instance address, so distinct fakes count as changed.
+    fn np(name: UpstreamName, provider: Arc<dyn Provider>) -> NamedProvider {
+        let fingerprint = UpstreamFingerprint(Arc::as_ptr(&provider).cast::<()>() as u64);
+        NamedProvider {
+            name,
+            provider,
+            fingerprint,
+        }
+    }
+
+    fn with_fp(mut p: NamedProvider, fp: u64) -> NamedProvider {
+        p.fingerprint = UpstreamFingerprint(fp);
+        p
+    }
+
     fn catalog_with(settings: ModelCatalogConfig, upstreams: &[&str]) -> Arc<ModelCatalog> {
         let catalog = ModelCatalog::new(settings, None);
         let names: Vec<UpstreamName> = upstreams.iter().map(|n| name(n)).collect();
@@ -1051,7 +1081,7 @@ mod refresh_tests {
     #[tokio::test(start_paused = true)]
     async fn on_demand_mode_should_make_no_list_models_call_at_startup_or_hot_swap_or_get() {
         let (calls, provider) = fake(Behavior::Models(vec!["m"]));
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
 
         catalog.prune(&[name("a")]);
@@ -1069,7 +1099,7 @@ mod refresh_tests {
     async fn ten_concurrent_ifStale_posts_should_call_list_models_once_and_count_9_coalesced() {
         let gate = Arc::new(Notify::new());
         let (calls, provider) = fake(Behavior::Gated(Arc::clone(&gate), vec!["m"]));
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
 
         let mut starts = Vec::new();
@@ -1100,7 +1130,7 @@ mod refresh_tests {
     async fn refreshing_flag_should_reset_after_list_models_panics_or_task_aborted() {
         let (_, panicking) = fake(Behavior::Panic);
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
-        let providers = vec![(name("a"), panicking)];
+        let providers = vec![np(name("a"), panicking)];
 
         let started = catalog
             .request_refresh(&providers, Target::All, Trigger::Manual)
@@ -1111,7 +1141,7 @@ mod refresh_tests {
 
         tokio::time::advance(Duration::from_secs(11)).await;
         let (calls, hanging) = fake(Behavior::Hang);
-        let providers = vec![(name("a"), hanging)];
+        let providers = vec![np(name("a"), hanging)];
         let started = catalog
             .request_refresh(&providers, Target::All, Trigger::Manual)
             .unwrap();
@@ -1136,7 +1166,7 @@ mod refresh_tests {
         let gate = Arc::new(Notify::new());
         let (a_calls, a) = fake(Behavior::Models(vec!["x"]));
         let (b_calls, b) = fake(Behavior::Gated(Arc::clone(&gate), vec!["y"]));
-        let providers = vec![(name("a"), a), (name("b"), b)];
+        let providers = vec![np(name("a"), a), np(name("b"), b)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b"]);
 
         let first = catalog
@@ -1161,7 +1191,7 @@ mod refresh_tests {
     #[tokio::test(start_paused = true)]
     async fn retry_floor_should_skip_at_60s_and_run_at_301s_measured_from_lastAttemptAt() {
         let (calls, provider) = fake(Behavior::Fail(|| ProviderError::Timeout));
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
         finish(
             catalog
@@ -1191,7 +1221,7 @@ mod refresh_tests {
     #[tokio::test(start_paused = true)]
     async fn auth_failure_should_skip_automatic_refresh_until_manual() {
         let (calls, provider) = fake(Behavior::Fail(auth_error));
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
         finish(
             catalog
@@ -1221,7 +1251,7 @@ mod refresh_tests {
     #[tokio::test(start_paused = true)]
     async fn off_mode_should_refresh_only_on_manual_post_without_ifStale() {
         let (calls, provider) = fake(Behavior::Models(vec!["m"]));
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let settings = ModelCatalogConfig {
             refresh: CatalogRefreshSetting::Off,
             ..ModelCatalogConfig::default()
@@ -1256,7 +1286,7 @@ mod refresh_tests {
         };
         assert_eq!(secs, 300);
         let catalog = catalog_with(settings, &["a"]);
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let loop_task = tokio::spawn(run_refresh_loop(
             Arc::downgrade(&catalog),
             secs,
@@ -1283,7 +1313,7 @@ mod refresh_tests {
         let (_, a) = fake(Behavior::Delay(Duration::from_secs(1), vec!["a1"]));
         let (_, b) = fake(Behavior::Delay(Duration::from_secs(1), vec!["b1"]));
         let (_, c) = fake(Behavior::Hang);
-        let providers = vec![(name("a"), a), (name("b"), b), (name("c"), c)];
+        let providers = vec![np(name("a"), a), np(name("b"), b), np(name("c"), c)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b", "c"]);
         let start = Instant::now();
 
@@ -1314,7 +1344,7 @@ mod refresh_tests {
     async fn manual_refresh_should_return_retryAfterSecs_7_when_last_attempt_3s_ago() {
         let (a_calls, a) = fake(Behavior::Models(vec!["x"]));
         let (b_calls, b) = fake(Behavior::Models(vec!["y"]));
-        let providers = vec![(name("a"), a), (name("b"), b)];
+        let providers = vec![np(name("a"), a), np(name("b"), b)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b"]);
         finish(
             catalog
@@ -1343,7 +1373,7 @@ mod refresh_tests {
     async fn prune_should_prevent_in_flight_refresh_resurrecting_removed_upstream() {
         let gate = Arc::new(Notify::new());
         let (_, c) = fake(Behavior::Gated(Arc::clone(&gate), vec!["m"]));
-        let providers = vec![(name("c"), c)];
+        let providers = vec![np(name("c"), c)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a", "b", "c"]);
         let started = catalog
             .request_refresh(&providers, Target::One(&name("c")), Trigger::Manual)
@@ -1362,8 +1392,8 @@ mod refresh_tests {
         let gate = Arc::new(Notify::new());
         let (_, old) = fake(Behavior::Gated(Arc::clone(&gate), vec!["old-model"]));
         let (_, new) = fake(Behavior::Models(vec!["new-model"]));
-        let old_providers = vec![(name("u"), old)];
-        let new_providers = vec![(name("u"), new)];
+        let old_providers = vec![np(name("u"), old)];
+        let new_providers = vec![np(name("u"), new)];
         let catalog = ModelCatalog::new(ModelCatalogConfig::default(), None);
         catalog.prune_providers(&old_providers);
         let old_started = catalog
@@ -1396,8 +1426,8 @@ mod refresh_tests {
     async fn hot_swap_with_new_provider_should_reset_auth_error_so_automatic_refresh_runs() {
         let (_, old) = fake(Behavior::Fail(auth_error));
         let (new_calls, new) = fake(Behavior::Models(vec!["m"]));
-        let old_providers = vec![(name("u"), old)];
-        let new_providers = vec![(name("u"), new)];
+        let old_providers = vec![np(name("u"), old)];
+        let new_providers = vec![np(name("u"), new)];
         let catalog = ModelCatalog::new(ModelCatalogConfig::default(), None);
         catalog.prune_providers(&old_providers);
         finish(
@@ -1422,7 +1452,7 @@ mod refresh_tests {
     #[tokio::test(start_paused = true)]
     async fn prune_providers_should_keep_entry_when_same_provider_instance_is_kept() {
         let (_, p) = fake(Behavior::Models(vec!["m"]));
-        let providers = vec![(name("u"), p)];
+        let providers = vec![np(name("u"), p)];
         let catalog = ModelCatalog::new(ModelCatalogConfig::default(), None);
         catalog.prune_providers(&providers);
         finish(
@@ -1433,6 +1463,53 @@ mod refresh_tests {
         .await;
         catalog.prune_providers(&providers);
         assert_eq!(state_of(&catalog, "u"), CatalogState::Ok);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_providers_should_keep_models_when_fingerprint_is_unchanged_on_new_instance() {
+        let (_, old) = fake(Behavior::Models(vec!["cached"]));
+        let (_, rebuilt) = fake(Behavior::Models(vec!["other"]));
+        let old_providers = vec![with_fp(np(name("u"), old), 7)];
+        let catalog = ModelCatalog::new(ModelCatalogConfig::default(), None);
+        catalog.prune_providers(&old_providers);
+        finish(
+            catalog
+                .request_refresh(&old_providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+
+        catalog.prune_providers(&[with_fp(np(name("u"), rebuilt), 7)]);
+
+        let snapshot = catalog.snapshot();
+        assert_eq!(snapshot.upstreams["u"].state, CatalogState::Ok);
+        assert_eq!(snapshot.upstreams["u"].models[0].id, "cached");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_providers_should_reset_and_notify_when_fingerprint_changes() {
+        let notified = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&notified);
+        let notifier: Notifier = Arc::new(move |n: &UpstreamName| {
+            sink.lock().unwrap().push(n.to_string());
+        });
+        let (_, old) = fake(Behavior::Models(vec!["cached"]));
+        let (_, new) = fake(Behavior::Models(vec!["x"]));
+        let old_providers = vec![with_fp(np(name("u"), old), 1)];
+        let catalog = ModelCatalog::new(ModelCatalogConfig::default(), Some(notifier));
+        catalog.prune_providers(&old_providers);
+        finish(
+            catalog
+                .request_refresh(&old_providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+        notified.lock().unwrap().clear();
+
+        catalog.prune_providers(&[with_fp(np(name("u"), new), 2)]);
+
+        assert_eq!(state_of(&catalog, "u"), CatalogState::Loading);
+        assert_eq!(*notified.lock().unwrap(), ["u"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1493,7 +1570,7 @@ mod refresh_tests {
     ) {
         let (buf, _guard) = capture_logs();
         let (_, provider) = fake(Behavior::Models(vec!["secret-model-id-1", "m2"]));
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
 
         catalog.refresh_all(&providers).await;
@@ -1520,7 +1597,7 @@ mod refresh_tests {
             status: 401,
             body: "SENTINEL-body".into(),
         }));
-        let providers = vec![(name("a"), provider)];
+        let providers = vec![np(name("a"), provider)];
         let catalog = catalog_with(ModelCatalogConfig::default(), &["a"]);
 
         catalog.refresh_all(&providers).await;

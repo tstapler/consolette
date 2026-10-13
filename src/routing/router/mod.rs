@@ -76,6 +76,8 @@ pub struct Router {
     local_providers: dashmap::DashMap<String, Arc<dyn Provider>>,
     /// Config-order names of `providers` (see `provider_names.rs`).
     provider_names: Vec<crate::metrics::ids::UpstreamName>,
+    /// Config fingerprints parallel to `provider_names` (see `provider_names.rs`).
+    fingerprints: Vec<crate::routing::model_catalog::UpstreamFingerprint>,
 }
 
 /// The four non-`openrouter`-kind upstreams: a plain `Arc<dyn Provider>`,
@@ -442,6 +444,7 @@ impl Router {
             local_catalog: LocalCatalog::new(),
             local_providers: dashmap::DashMap::new(),
             provider_names: Vec::new(),
+            fingerprints: Vec::new(),
         }
     }
 
@@ -548,7 +551,8 @@ impl Router {
             admission,
             metrics,
         })
-        .with_provider_names(provider_names))
+        .with_provider_names(provider_names)
+        .with_fingerprints(provider_names::fingerprints_of(config)))
     }
 
     /// This dispatch's candidate list: the route's normal `self.candidates`,

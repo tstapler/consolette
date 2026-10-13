@@ -6,7 +6,7 @@
 //! reaches the browser is a kind, a status and a fixed phrase; upstream bodies
 //! (which can echo keys or account ARNs) are logged at `debug` only.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -220,19 +220,49 @@ pub struct CatalogSnapshot {
 struct State {
     current: Vec<UpstreamName>,
     entries: HashMap<UpstreamName, UpstreamModels>,
+    /// Bumped whenever a name's provider instance changes; a refresh started under an older
+    /// epoch must not write its result (it listed the previous provider's models).
+    epochs: HashMap<UpstreamName, u64>,
+    /// Address of the provider instance each entry was last pruned against.
+    identities: HashMap<UpstreamName, usize>,
+    next_epoch: u64,
+}
+
+impl State {
+    fn bump_epoch(&mut self, name: &UpstreamName) {
+        self.next_epoch += 1;
+        self.epochs.insert(name.clone(), self.next_epoch);
+    }
+}
+
+fn provider_identity(provider: &Arc<dyn Provider>) -> usize {
+    Arc::as_ptr(provider).cast::<()>() as usize
 }
 
 /// Marks one upstream as refreshing for exactly as long as it lives, so a
 /// panic or an aborted task can never leave the flag stuck.
 struct InFlight {
     name: UpstreamName,
-    set: Arc<Mutex<HashSet<UpstreamName>>>,
+    epoch: u64,
+    set: Arc<Mutex<HashMap<UpstreamName, u64>>>,
 }
 
 impl InFlight {
-    fn claim(set: &Arc<Mutex<HashSet<UpstreamName>>>, name: &UpstreamName) -> Option<Self> {
-        lock(set).insert(name.clone()).then(|| Self {
+    /// `None` when a refresh for the same epoch is already running; one from an older epoch is
+    /// stale and gets replaced.
+    fn claim(
+        set: &Arc<Mutex<HashMap<UpstreamName, u64>>>,
+        name: &UpstreamName,
+        epoch: u64,
+    ) -> Option<Self> {
+        let mut running = lock(set);
+        if running.get(name) == Some(&epoch) {
+            return None;
+        }
+        running.insert(name.clone(), epoch);
+        Some(Self {
             name: name.clone(),
+            epoch,
             set: Arc::clone(set),
         })
     }
@@ -240,7 +270,10 @@ impl InFlight {
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        lock(&self.set).remove(&self.name);
+        let mut running = lock(&self.set);
+        if running.get(&self.name) == Some(&self.epoch) {
+            running.remove(&self.name);
+        }
     }
 }
 
@@ -264,7 +297,7 @@ pub struct ModelCatalog {
     settings: ModelCatalogConfig,
     mode: CatalogRefreshMode,
     state: Mutex<State>,
-    in_flight: Arc<Mutex<HashSet<UpstreamName>>>,
+    in_flight: Arc<Mutex<HashMap<UpstreamName, u64>>>,
     coalesced_total: AtomicU64,
     notifier: Option<Notifier>,
 }
@@ -288,8 +321,11 @@ impl ModelCatalog {
             state: Mutex::new(State {
                 current: Vec::new(),
                 entries: HashMap::new(),
+                epochs: HashMap::new(),
+                identities: HashMap::new(),
+                next_epoch: 0,
             }),
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             coalesced_total: AtomicU64::new(0),
             notifier,
         })
@@ -300,12 +336,40 @@ impl ModelCatalog {
     /// name cannot resurrect it (`apply_result` checks `current`).
     pub fn prune(&self, names: &[UpstreamName]) {
         let mut state = lock(&self.state);
+        Self::prune_locked(&mut state, names);
+    }
+
+    /// Like [`prune`](Self::prune), but a name whose provider instance changed gets a fresh
+    /// `Loading` entry and a new epoch: the old entry's models, error state and `last_attempt`
+    /// belong to the previous upstream, and a refresh still running for it must not write.
+    pub fn prune_providers(&self, providers: &[NamedProvider]) {
+        let names: Vec<_> = providers.iter().map(|(n, _)| n.clone()).collect();
+        let mut state = lock(&self.state);
+        Self::prune_locked(&mut state, &names);
+        for (name, provider) in providers {
+            let identity = provider_identity(provider);
+            if let Some(previous) = state.identities.insert(name.clone(), identity) {
+                if previous != identity {
+                    state
+                        .entries
+                        .insert(name.clone(), UpstreamModels::loading());
+                    state.bump_epoch(name);
+                }
+            }
+        }
+    }
+
+    fn prune_locked(state: &mut State, names: &[UpstreamName]) {
         state.entries.retain(|name, _| names.contains(name));
+        state.epochs.retain(|name, _| names.contains(name));
+        state.identities.retain(|name, _| names.contains(name));
         for name in names {
-            state
-                .entries
-                .entry(name.clone())
-                .or_insert_with(UpstreamModels::loading);
+            if !state.entries.contains_key(name) {
+                state
+                    .entries
+                    .insert(name.clone(), UpstreamModels::loading());
+                state.bump_epoch(name);
+            }
         }
         state.current = names.to_vec();
     }
@@ -319,7 +383,7 @@ impl ModelCatalog {
             .iter()
             .filter_map(|name| {
                 let mut entry = state.entries.get(name)?.clone();
-                entry.refreshing = in_flight.contains(name);
+                entry.refreshing = in_flight.contains_key(name);
                 Some((name.to_string(), entry))
             })
             .collect();
@@ -414,23 +478,27 @@ impl ModelCatalog {
         let mut already_running = 0usize;
         let mut retry_after: Option<u64> = None;
         for (name, provider) in targets {
-            if lock(&self.in_flight).contains(name) {
-                already_running += 1;
-                continue;
-            }
-            if automatic_ignored {
-                continue;
-            }
-            let decision = match lock(&self.state).entries.get(name) {
-                Some(entry) => self.decide(entry, trigger, now),
-                None => continue,
+            let (epoch, decision) = {
+                let state = lock(&self.state);
+                let epoch = state.epochs.get(name).copied().unwrap_or(0);
+                if lock(&self.in_flight).get(name) == Some(&epoch) {
+                    already_running += 1;
+                    continue;
+                }
+                if automatic_ignored {
+                    continue;
+                }
+                match state.entries.get(name) {
+                    Some(entry) => (epoch, self.decide(entry, trigger, now)),
+                    None => continue,
+                }
             };
             match decision {
                 Decision::Skip => {}
                 Decision::Throttled(secs) => {
                     retry_after = Some(retry_after.map_or(secs, |prev| prev.min(secs)));
                 }
-                Decision::Start => match InFlight::claim(&self.in_flight, name) {
+                Decision::Start => match InFlight::claim(&self.in_flight, name, epoch) {
                     Some(guard) => started.push((name.clone(), Arc::clone(provider), guard)),
                     None => already_running += 1,
                 },
@@ -481,18 +549,24 @@ impl ModelCatalog {
         };
         let duration_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
         log_refresh(&name, &result, duration_ms);
-        self.apply_result(&name, result, Stamp::now());
+        self.apply_result(&name, guard.epoch, result, Stamp::now());
         drop(guard);
         if let Some(notify) = &self.notifier {
             notify(&name);
         }
     }
 
-    /// Writes `result` only while `name` is still a current upstream (the
-    /// check and the write share one lock, so a prune cannot interleave).
-    fn apply_result(&self, name: &UpstreamName, result: RefreshResult, at: Stamp) -> bool {
+    /// Writes `result` only while `name` is still a current upstream under the epoch the
+    /// refresh started in (the check and the write share one lock, so a prune cannot interleave).
+    fn apply_result(
+        &self,
+        name: &UpstreamName,
+        epoch: u64,
+        result: RefreshResult,
+        at: Stamp,
+    ) -> bool {
         let mut state = lock(&self.state);
-        if !state.current.contains(name) {
+        if !state.current.contains(name) || state.epochs.get(name) != Some(&epoch) {
             return false;
         }
         state.entries.get_mut(name).is_some_and(|entry| {
@@ -1281,6 +1355,84 @@ mod refresh_tests {
         finish(started).await;
 
         assert!(!catalog.snapshot().upstreams.contains_key("c"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hot_swap_with_same_name_and_new_provider_should_reject_old_refresh_result() {
+        let gate = Arc::new(Notify::new());
+        let (_, old) = fake(Behavior::Gated(Arc::clone(&gate), vec!["old-model"]));
+        let (_, new) = fake(Behavior::Models(vec!["new-model"]));
+        let old_providers = vec![(name("u"), old)];
+        let new_providers = vec![(name("u"), new)];
+        let catalog = ModelCatalog::new(ModelCatalogConfig::default(), None);
+        catalog.prune_providers(&old_providers);
+        let old_started = catalog
+            .request_refresh(&old_providers, Target::One(&name("u")), Trigger::Manual)
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        catalog.prune_providers(&new_providers);
+        let new_started = catalog
+            .request_refresh(&new_providers, Target::One(&name("u")), Trigger::Manual)
+            .unwrap();
+        assert!(
+            !new_started.ack.coalesced,
+            "stale refresh must not coalesce the new one"
+        );
+        finish(new_started).await;
+        gate.notify_one();
+        finish(old_started).await;
+
+        let ids: Vec<String> = catalog.snapshot().upstreams["u"]
+            .models
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(ids, ["new-model"]);
+        assert!(!catalog.snapshot().upstreams["u"].refreshing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hot_swap_with_new_provider_should_reset_auth_error_so_automatic_refresh_runs() {
+        let (_, old) = fake(Behavior::Fail(auth_error));
+        let (new_calls, new) = fake(Behavior::Models(vec!["m"]));
+        let old_providers = vec![(name("u"), old)];
+        let new_providers = vec![(name("u"), new)];
+        let catalog = ModelCatalog::new(ModelCatalogConfig::default(), None);
+        catalog.prune_providers(&old_providers);
+        finish(
+            catalog
+                .request_refresh(&old_providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(state_of(&catalog, "u"), CatalogState::Error);
+
+        catalog.prune_providers(&new_providers);
+        finish(
+            catalog
+                .request_refresh(&new_providers, Target::All, Trigger::IfStale)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(new_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state_of(&catalog, "u"), CatalogState::Ok);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_providers_should_keep_entry_when_same_provider_instance_is_kept() {
+        let (_, p) = fake(Behavior::Models(vec!["m"]));
+        let providers = vec![(name("u"), p)];
+        let catalog = ModelCatalog::new(ModelCatalogConfig::default(), None);
+        catalog.prune_providers(&providers);
+        finish(
+            catalog
+                .request_refresh(&providers, Target::All, Trigger::Manual)
+                .unwrap(),
+        )
+        .await;
+        catalog.prune_providers(&providers);
+        assert_eq!(state_of(&catalog, "u"), CatalogState::Ok);
     }
 
     #[tokio::test(start_paused = true)]

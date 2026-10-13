@@ -122,13 +122,9 @@ impl EntrypointState {
     /// Installs a rebuilt router and prunes the model catalog to its upstreams
     /// (ADR-003: every hot-swap must prune, or removed upstreams linger).
     pub fn swap_router(&self, new_router: DispatchRouter) {
-        let names: Vec<_> = new_router
-            .providers_named()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
+        let providers = new_router.providers_named();
         self.dispatch_router.store(Arc::new(new_router));
-        self.catalog.prune(&names);
+        self.catalog.prune_providers(&providers);
     }
 
     /// Builds the dispatch router (Task 1.1.1/1.1.2), cost tracker, metrics
@@ -330,13 +326,7 @@ fn build_model_catalog(
             );
         })),
     );
-    let names: Vec<_> = dispatch_router
-        .load()
-        .providers_named()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    catalog.prune(&names);
+    catalog.prune_providers(&dispatch_router.load().providers_named());
     if let crate::config::schema::CatalogRefreshMode::Interval { secs } =
         config.model_catalog.refresh_mode()
     {

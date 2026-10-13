@@ -185,7 +185,7 @@ pub struct RequestTraceData {
     pub stream: bool,
     pub trace_kind: TraceKind,
     pub status_code: u16,
-    /// 0 = terminal trace; the UI never lets a lower revision overwrite a higher one.
+    /// 0 = in-flight placeholder, 1 = terminal trace; the UI never lets a lower revision overwrite a higher one.
     pub trace_revision: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_byte_state: Option<FirstByteState>,
@@ -442,6 +442,7 @@ mod tests {
             selected_model: None,
             selected_model_was_exploration: None,
             status_code: 200,
+            trace_revision: 1,
             routed_model: Some("claude-haiku-4-5".to_string()),
             routed_model_source: Some(crate::metrics::trace::RoutedModelSource::Passthrough),
             routed_provider: Some("anthropic".to_string()),

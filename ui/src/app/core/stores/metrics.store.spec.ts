@@ -202,6 +202,25 @@ describe('MetricsStore (TC-UNIT-10)', () => {
     expect(store.recentTraces()[2].firstByteMs).toBe(450);
   });
 
+  it('mergeBackfill_should_retain_terminal_row_when_stale_backfill_carries_in_flight_placeholder', () => {
+    const http = TestBed.inject(HttpTestingController);
+    const base = traceSuccess.data as unknown as RequestTraceData;
+    http.expectOne('/v1/dashboard/traces?limit=50').flush([]);
+    const terminal: RequestTraceData = { ...base, traceRevision: 1, statusCode: 200 };
+    deliver({ type: 'RequestTrace', data: terminal });
+    deliver({ type: 'system_lag', data: { skipped: 1 } });
+    const inFlight: RequestTraceData = { ...base, traceRevision: 0, statusCode: 0, attempts: [], provider: '' };
+    // Same revision (legacy server) must not let a status-0 placeholder win either.
+    const inFlightSameRevision: RequestTraceData = { ...inFlight, traceRevision: 1 };
+    http.expectOne('/v1/dashboard/traces?limit=50').flush([inFlight]);
+    expect(store.recentTraces()[0]).toEqual(terminal);
+    deliver({ type: 'system_lag', data: { skipped: 1 } });
+    http.expectOne('/v1/dashboard/traces?limit=50').flush([inFlightSameRevision]);
+    expect(store.recentTraces()[0]).toEqual(terminal);
+    store.pushTrace(inFlightSameRevision);
+    expect(store.recentTraces()[0]).toEqual(terminal);
+  });
+
   it('should backfill again after the SSE service reports a reconnect', () => {
     const http = TestBed.inject(HttpTestingController);
     http.expectOne('/v1/dashboard/traces?limit=50').flush([]);

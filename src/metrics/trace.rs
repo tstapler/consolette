@@ -245,6 +245,8 @@ const OK_STATUS: u16 = 200;
 const LOCAL_UPSTREAM: &str = "local";
 const CANCELLED_STATUS: u16 = 499;
 const UNFINISHED_STATUS: u16 = 500;
+/// In-flight placeholders are revision 0; the terminal emit outranks them.
+const TERMINAL_TRACE_REVISION: u8 = 1;
 
 /// Owns one request's terminal trace. Call [`finish`](Self::finish) then
 /// [`mark_handler_returned`](Self::mark_handler_returned) on every normal exit;
@@ -466,6 +468,7 @@ impl TraceScope {
         d.selected_model = self.selected_model.take();
         d.selected_model_was_exploration = self.selected_model_was_exploration;
         d.status_code = status_code;
+        d.trace_revision = TERMINAL_TRACE_REVISION;
         d.routed_provider = last_attempt.map(|a| a.upstream.to_string());
         (d.routed_model, d.routed_model_source) = match routed_model {
             Some((model, source)) => (Some(model), Some(source)),
@@ -754,6 +757,19 @@ mod tests {
         assert_eq!(metrics.get_recent_requests(1)[0].status_code, 200);
         assert_eq!(counter(&metrics, |m| &m.counters.trace_cancelled_total), 0);
         assert_eq!(counter(&metrics, |m| &m.counters.trace_unfinished_total), 0);
+    }
+
+    #[test]
+    fn finish_should_stamp_terminal_trace_revision_above_in_flight_placeholder() {
+        let (metrics, mut rx, mut scope) = scope_with_events();
+        let in_flight = metrics.get_recent_requests(1)[0].trace_revision;
+        scope.finish(RequestOutcome::ok());
+        let t = traces(&mut rx);
+        assert!(t[0].trace_revision > in_flight, "{t:?}");
+        assert_eq!(
+            metrics.get_recent_requests(1)[0].trace_revision,
+            t[0].trace_revision
+        );
     }
 
     #[test]

@@ -13,6 +13,17 @@ export interface MetricsStoreOptions {
   maxTimeSeriesPoints?: number;
 }
 
+/**
+ * Higher revision wins; at equal revision an in-flight placeholder (status 0) never replaces a
+ * row that already has a status, so a slow backfill cannot undo a finished trace.
+ */
+function supersedes(incoming: RequestTraceData, existing: RequestTraceData): boolean {
+  if (incoming.traceRevision !== existing.traceRevision) {
+    return incoming.traceRevision > existing.traceRevision;
+  }
+  return !(incoming.statusCode === 0 && existing.statusCode !== 0);
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -105,8 +116,8 @@ export class MetricsStore {
       });
   }
 
-  // Equal-or-higher traceRevision wins per requestId (so an older snapshot never overwrites a
-  // newer live row); unseen rows are added and the result is ordered newest first by timestamp.
+  // A row replaces the existing one only if `supersedes` allows it (so an older snapshot never
+  // overwrites a newer live row); unseen rows are added and the result is ordered newest first.
   private mergeBackfill(rows: RequestTraceData[]): void {
     this.recentTracesSignal.update((existing) => {
       const merged = existing.slice();
@@ -114,7 +125,7 @@ export class MetricsStore {
         const idx = merged.findIndex((t) => t.requestId === row.requestId);
         if (idx === -1) {
           merged.push(row);
-        } else if (row.traceRevision >= merged[idx].traceRevision) {
+        } else if (supersedes(row, merged[idx])) {
           merged[idx] = row;
         }
       }
@@ -137,7 +148,7 @@ export class MetricsStore {
       if (idx === -1) {
         return [trace, ...existing].slice(0, this.maxTracesLimit);
       }
-      if (trace.traceRevision < existing[idx].traceRevision) {
+      if (!supersedes(trace, existing[idx])) {
         return existing;
       }
       const updated = existing.slice();

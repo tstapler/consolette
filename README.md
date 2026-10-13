@@ -270,6 +270,19 @@ auth. Only warnings for the first route are produced: pins on other routes,
 `model_family` routes and fallback targets outside that route are not
 checked, so no warning is not proof that every target exists.
 
+### Dashboard event keys (`compat_snake_case`)
+
+Dashboard SSE events (`GET /v1/dashboard/events`) use camelCase keys. For external consumers
+still reading the old names, set `compat_snake_case = true` (default `false`) in a `conf.d`
+file: only the `request_trace` event then also carries the legacy snake_case keys
+(`request_id`, `duration_ms`, `first_byte_ms`, `tokens_before`, `tokens_after`, `status_code`)
+next to the camelCase ones. The `metrics_tick`, `error_logged` and `config_changed` events are
+camelCase now and are not affected by the flag.
+
+`duration_ms` is now `timeToHeadersMs`: the time until response headers, including earlier
+failed attempts and rate-limit holds, not the full response time. The legacy `duration_ms` key
+carries that same value.
+
 ## CLI reference
 
 | Command | Purpose |

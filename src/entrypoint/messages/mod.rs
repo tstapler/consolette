@@ -465,12 +465,10 @@ impl Dispatch for ScopedDispatch<'_> {
     > {
         Box::pin(async move {
             let mut scope = self.scope.lock().await;
-            let iteration = self
-                .next_iteration
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    Some(n.saturating_add(1))
-                })
-                .unwrap_or_else(|previous| previous);
+            // Rounds are serialized by the scope lock held above, so load+store cannot race.
+            let iteration = self.next_iteration.load(Ordering::Relaxed);
+            self.next_iteration
+                .store(iteration.saturating_add(1), Ordering::Relaxed);
             scope.set_iteration(iteration);
             let result = self
                 .router

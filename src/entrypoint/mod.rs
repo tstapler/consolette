@@ -472,7 +472,9 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Returns an error if binding `127.0.0.1:{port}` fails (for example, the
 /// port is already in use) or if `axum::serve` itself returns an I/O error.
 pub async fn serve_entrypoint(port: u16, state: EntrypointState) -> anyhow::Result<()> {
-    serve_entrypoint_with_shutdown(port, state, shutdown_signal()).await
+    // A second Ctrl-C/SIGTERM while draining exits at once (the future is lazy: it only
+    // subscribes once `drain` polls it after shutdown has begun).
+    serve_inner(port, state, os_signal(), os_signal()).await
 }
 
 /// Same as `serve_entrypoint`, but with a caller-supplied shutdown future
@@ -488,6 +490,15 @@ pub async fn serve_entrypoint_with_shutdown(
     state: EntrypointState,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_inner(port, state, shutdown, std::future::pending()).await
+}
+
+async fn serve_inner(
+    port: u16,
+    state: EntrypointState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    second_signal: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "consolette http-entrypoint listening");
@@ -501,18 +512,51 @@ pub async fn serve_entrypoint_with_shutdown(
         notify_started.notify_one();
     });
     // Graceful shutdown waits on every open connection. SSE streams end on the cancelled token;
-    // the cap only bounds requests that never finish.
-    tokio::select! {
-        result = serve => result?,
-        () = async {
-            shutdown_started.notified().await;
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-        } => tracing::warn!(
+    // the grace only bounds requests that never finish, and a second signal skips it.
+    match drain(
+        std::future::IntoFuture::into_future(serve),
+        &shutdown_started,
+        SHUTDOWN_GRACE,
+        second_signal,
+    )
+    .await?
+    {
+        DrainEnd::Drained => {}
+        DrainEnd::GraceElapsed => tracing::warn!(
             grace_secs = SHUTDOWN_GRACE.as_secs(),
             "shutdown grace elapsed with connections still open; exiting"
         ),
+        DrainEnd::Forced => tracing::warn!("second shutdown signal; exiting immediately"),
     }
     Ok(())
+}
+
+/// How a shutdown ended once it had begun.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainEnd {
+    Drained,
+    GraceElapsed,
+    /// A second signal arrived while draining.
+    Forced,
+}
+
+async fn drain<E>(
+    serve: impl std::future::Future<Output = Result<(), E>>,
+    shutdown_started: &tokio::sync::Notify,
+    grace: std::time::Duration,
+    second_signal: impl std::future::Future<Output = ()>,
+) -> Result<DrainEnd, E> {
+    tokio::pin!(serve);
+    tokio::select! {
+        result = &mut serve => result.map(|()| DrainEnd::Drained),
+        end = async {
+            shutdown_started.notified().await;
+            tokio::select! {
+                () = tokio::time::sleep(grace) => DrainEnd::GraceElapsed,
+                () = second_signal => DrainEnd::Forced,
+            }
+        } => Ok(end),
+    }
 }
 
 /// How long in-flight (non-SSE) requests may drain after a shutdown signal.
@@ -525,7 +569,7 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// itself a sign the process environment is broken beyond recovery, so
 /// there's no meaningful fallback besides surfacing it immediately).
 #[allow(clippy::expect_used)]
-async fn shutdown_signal() {
+async fn os_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -759,6 +803,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn drain_should_return_forced_when_second_signal_arrives_mid_drain() {
+        let started = tokio::sync::Notify::new();
+        started.notify_one();
+        let end = tokio::time::timeout(
+            Duration::from_secs(2),
+            drain::<()>(
+                std::future::pending(),
+                &started,
+                Duration::from_secs(60),
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("second signal must cut the grace short");
+        assert_eq!(end, Ok(DrainEnd::Forced));
+    }
+
+    #[tokio::test]
+    async fn drain_should_ignore_second_signal_before_shutdown_starts() {
+        let started = tokio::sync::Notify::new();
+        let end = drain::<()>(
+            async { Ok(()) },
+            &started,
+            Duration::from_secs(60),
+            std::future::ready(()),
+        )
+        .await;
+        assert_eq!(end, Ok(DrainEnd::Drained));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_should_report_grace_elapsed_without_second_signal() {
+        let started = tokio::sync::Notify::new();
+        started.notify_one();
+        let end = drain::<()>(
+            std::future::pending(),
+            &started,
+            Duration::from_secs(30),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(end, Ok(DrainEnd::GraceElapsed));
     }
 
     #[tokio::test]

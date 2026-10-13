@@ -6,8 +6,8 @@ use std::sync::Arc;
 use super::Router;
 use crate::config::schema::Config;
 use crate::metrics::ids::UpstreamName;
-use crate::routing::model_catalog::{NamedProvider, UpstreamFingerprint};
 use crate::providers::Provider;
+use crate::routing::model_catalog::{NamedProvider, UpstreamFingerprint};
 
 /// Names of `build_providers`' `(name, provider)` pairs, in order.
 pub(super) fn names_of(providers: &[(String, Arc<dyn Provider>)]) -> Vec<UpstreamName> {

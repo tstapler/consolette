@@ -268,6 +268,8 @@ pub struct TraceScope {
     /// Emulation-loop round that the next attempt belongs to (0 for a plain request).
     iteration: u8,
     hold_retries: u8,
+    /// Holds spent by the current `dispatch_traced` call only (the budget); reset per call.
+    dispatch_hold_retries: u8,
     session_pinned: bool,
     strategy_name: &'static str,
 }
@@ -305,6 +307,7 @@ impl TraceScope {
             pending: None,
             iteration: 0,
             hold_retries: 0,
+            dispatch_hold_retries: 0,
             session_pinned: false,
             strategy_name: "",
         }
@@ -340,13 +343,26 @@ impl TraceScope {
         self.strategy_name = strategy_name;
     }
 
+    /// Total holds across every dispatch round on this scope (shown on the trace).
     #[must_use]
     pub fn hold_retries(&self) -> u32 {
         u32::from(self.hold_retries)
     }
 
+    /// Holds spent by the current dispatch round; this is what the hold budget limits.
+    #[must_use]
+    pub fn dispatch_hold_retries(&self) -> u32 {
+        u32::from(self.dispatch_hold_retries)
+    }
+
+    /// Starts a dispatch round with a fresh hold budget; the total keeps accumulating.
+    pub fn begin_dispatch(&mut self) {
+        self.dispatch_hold_retries = 0;
+    }
+
     pub fn note_hold_retry(&mut self) {
         self.hold_retries = self.hold_retries.saturating_add(1);
+        self.dispatch_hold_retries = self.dispatch_hold_retries.saturating_add(1);
     }
 
     /// Opens an attempt before its upstream call, so a dropped request still records it.

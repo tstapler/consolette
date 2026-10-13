@@ -664,6 +664,7 @@ impl Router {
         stream: bool,
         est_tokens: u32,
     ) -> Result<ProviderResponse, ProviderError> {
+        scope.begin_dispatch();
         if let Some(target) = self.local_target(&body) {
             return self
                 .dispatch_local(scope, target, body, headers, stream)
@@ -813,7 +814,7 @@ impl Router {
         candidates: &[UpstreamRef],
         scope: &mut TraceScope,
     ) -> bool {
-        if scope.hold_retries() >= MAX_HOLD_RETRIES {
+        if scope.dispatch_hold_retries() >= MAX_HOLD_RETRIES {
             return false;
         }
         let Some(wait_secs) = candidates
@@ -830,7 +831,7 @@ impl Router {
         tracing::info!(
             "All upstream candidates rate-limited / cooling down. Holding request for {}s to insulate agent (attempt {}/{})...",
             wait_secs,
-            scope.hold_retries() + 1,
+            scope.dispatch_hold_retries() + 1,
             MAX_HOLD_RETRIES
         );
         tokio::time::sleep(Duration::from_secs(wait_secs) + Duration::from_millis(HOLD_JITTER_MS))

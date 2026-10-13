@@ -183,6 +183,40 @@ async fn gives_up_after_three_holds_when_cooldown_never_clears() {
     );
 }
 
+/// The hold budget is per `dispatch_traced` call: `ScopedDispatch` runs several rounds on one
+/// scope, and each round must get its own `MAX_HOLD_RETRIES`, while the scope keeps the total.
+#[tokio::test(start_paused = true)]
+async fn each_dispatch_traced_call_on_one_scope_should_get_the_full_hold_budget() {
+    let provider: Arc<dyn Provider> = Arc::new(AlwaysOkProvider {
+        name: "only",
+        call_count: Arc::new(AtomicU32::new(0)),
+    });
+    let health = Arc::new(HealthRegistry::new(300));
+    health.trip(
+        0,
+        Some(Duration::from_secs(15) + Duration::from_millis(500)),
+    );
+    let router = single_candidate_router(provider, health);
+    let mut scope = TraceScope::begin(&router.metrics, &serde_json::json!({}), false, 0);
+
+    for round in 1..=2u32 {
+        let res = router
+            .dispatch_traced(
+                &mut scope,
+                serde_json::json!({}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+        assert!(
+            matches!(res, Err(ProviderError::Exhausted)),
+            "round {round}"
+        );
+        assert_eq!(scope.hold_retries(), 3 * round, "round {round} total");
+    }
+}
+
 /// The mirror boundary case: a cooldown just outside the hold window (>15s)
 /// must skip holding entirely and fail fast rather than sleep at all.
 #[tokio::test]

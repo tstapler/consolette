@@ -1073,7 +1073,10 @@ mod tests {
         if !html.contains("<app-root") {
             return; // build.rs placeholder: UI not built (`make ui`), nothing to check
         }
-        assert!(html.contains(r#"<base href="/dashboard/">"#), "base href: {html:.300}");
+        assert!(
+            html.contains(r#"<base href="/dashboard/">"#),
+            "base href: {html:.300}"
+        );
 
         let assets = html
             .split(['"', '\''])

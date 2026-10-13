@@ -116,6 +116,8 @@ pub struct EntrypointState {
     /// Cached per-upstream model lists (`GET /api/model-catalog`); refreshed only on request
     /// unless `[model_catalog]` opts into a timer.
     pub catalog: Arc<ModelCatalog>,
+    /// Cancelled when shutdown starts; endless streams (the dashboard SSE feed) end on it.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl EntrypointState {
@@ -301,6 +303,7 @@ impl EntrypointState {
             compat_snake_case: config.compat_snake_case,
             config_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         })
     }
 }
@@ -488,15 +491,17 @@ pub async fn serve_entrypoint_with_shutdown(
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "consolette http-entrypoint listening");
+    let shutdown_token = state.shutdown.clone();
     let router = entrypoint_router(state);
     let shutdown_started = Arc::new(tokio::sync::Notify::new());
     let notify_started = Arc::clone(&shutdown_started);
     let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
         shutdown.await;
+        shutdown_token.cancel();
         notify_started.notify_one();
     });
-    // Graceful shutdown waits on every open connection, and a dashboard SSE
-    // stream never ends on its own, so cap the drain.
+    // Graceful shutdown waits on every open connection. SSE streams end on the cancelled token;
+    // the cap only bounds requests that never finish.
     tokio::select! {
         result = serve => result?,
         () = async {
@@ -510,8 +515,8 @@ pub async fn serve_entrypoint_with_shutdown(
     Ok(())
 }
 
-/// How long in-flight requests may drain after a shutdown signal.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long in-flight (non-SSE) requests may drain after a shutdown signal.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// # Panics
 ///
@@ -819,6 +824,84 @@ mod tests {
         assert!(
             result.is_ok(),
             "server stayed up after shutdown because an SSE stream was still open"
+        );
+    }
+
+    /// A request already in flight when shutdown starts must be allowed to finish (not cut at a
+    /// short cap), while a dashboard SSE stream is closed promptly because it would never end.
+    #[tokio::test]
+    async fn shutdown_should_let_a_slow_request_finish_while_closing_sse_streams_promptly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let reservation = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = rx.await;
+        };
+        let handle = tokio::spawn(serve_entrypoint_with_shutdown(addr.port(), state, shutdown));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut sse = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sse.write_all(
+            b"GET /v1/dashboard/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut head = [0_u8; 64];
+        let n = sse.read(&mut head).await.unwrap();
+        assert!(String::from_utf8_lossy(&head[..n]).contains("200"));
+
+        // Headers sent, body withheld: the handler is mid-request when shutdown begins.
+        let body = br#"{"model":"m","max_tokens":1,"messages":[]}"#;
+        let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+        slow.write_all(
+            format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tx.send(()).unwrap();
+
+        // The SSE stream ends promptly (EOF), well inside the non-SSE grace.
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(2), sse.read_to_end(&mut rest)).await;
+        assert!(
+            closed.is_ok(),
+            "SSE stream was not closed promptly on shutdown"
+        );
+
+        // Past the old 2 s cap the slow request is still being served.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !handle.is_finished(),
+            "in-flight request was cut off by a short grace cap"
+        );
+        slow.write_all(body).await.unwrap();
+        let mut resp = vec![0_u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut resp))
+            .await
+            .expect("slow request got a response")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&resp[..n]).starts_with("HTTP/1.1 "));
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "server did not exit after the last request finished"
         );
     }
 

@@ -300,6 +300,7 @@ mod tests {
             web_ui: crate::config::schema::WebUiMode::Angular,
             compat_snake_case: false,
             config_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             catalog: crate::routing::model_catalog::ModelCatalog::new(
                 crate::config::schema::ModelCatalogConfig::default(),
                 None,

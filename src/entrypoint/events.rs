@@ -326,6 +326,7 @@ pub async fn handle_sse_events(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.event_tx.subscribe();
     let compat_snake_case = state.compat_snake_case;
+    let shutdown = state.shutdown.clone().cancelled_owned();
     let stream = BroadcastStream::new(rx).map(move |msg| match msg {
         Ok(event) => {
             let json = event_json(&event, compat_snake_case);
@@ -341,7 +342,7 @@ pub async fn handle_sse_events(
         }
     });
 
-    Sse::new(stream).keep_alive(
+    Sse::new(futures_util::StreamExt::take_until(stream, shutdown)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("ping"),

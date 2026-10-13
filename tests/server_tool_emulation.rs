@@ -352,6 +352,7 @@ async fn state_with_response(
         web_ui: consolette::config::schema::WebUiMode::Angular,
         compat_snake_case: false,
         config_lock: Arc::new(tokio::sync::Mutex::new(())),
+        shutdown: tokio_util::sync::CancellationToken::new(),
         catalog: consolette::routing::model_catalog::ModelCatalog::new(
             consolette::config::schema::ModelCatalogConfig::default(),
             None,

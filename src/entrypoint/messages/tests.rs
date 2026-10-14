@@ -635,3 +635,105 @@ async fn emulation_round_two_failure_should_emit_one_trace_with_error_status() {
     assert_eq!(traces[0].attempts.len(), 2);
     assert_eq!(traces[0].iterations, 2);
 }
+
+/// Upstream that reports a family-resolved model, then answers with a final text turn.
+struct ResolvingFinalProvider;
+
+#[async_trait]
+impl Provider for ResolvingFinalProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        crate::providers::note_resolved_model("gpt-6.1-sol");
+        final_answer()
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Runs the real `handle_emulated_search` over a resolving upstream and
+/// returns the session's actual cost, with the requested model absent from the pricing table.
+async fn emulated_search_cost(stream: bool) -> Option<f64> {
+    use crate::routing::health::HealthRegistry;
+    use crate::routing::router::{Router as DispatchRouter, RouterDeps};
+    use crate::routing::strategy::{FallbackStrategy, UpstreamRef};
+
+    let metrics = crate::metrics::MetricsCollector::new();
+    let router = DispatchRouter::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "test".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: Some("gpt-6".to_string()),
+        }],
+        providers: vec![Arc::new(ResolvingFinalProvider)],
+        strategy: Arc::new(FallbackStrategy) as Arc<dyn crate::routing::strategy::RoutingStrategy>,
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(crate::ratelimit::RateLimiters::new(
+            &crate::config::schema::RateLimitConfig::default(),
+        )) as Arc<dyn crate::ratelimit::AdmissionControl>,
+        metrics: Arc::clone(&metrics),
+    });
+    let state =
+        crate::entrypoint::test_support::state_with_router(router, Arc::clone(&metrics)).await;
+    let (session_key, request_id) =
+        crate::entrypoint::cost_tee::begin_cost_tracking(&state.cost_tracker).await;
+    let body = serde_json::json!({
+        "model": "unpriced-requested-model",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "q"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+    });
+    let mut scope = crate::metrics::trace::TraceScope::begin(&metrics, &body, stream, 1);
+    let result = handle_emulated_search(
+        &mut scope,
+        EmulatedSearchParams {
+            state: state.clone(),
+            body,
+            headers: HeaderMap::new(),
+            model: "unpriced-requested-model".to_string(),
+            session_key: session_key.clone(),
+            request_id,
+            est_tokens: 1,
+            stream,
+        },
+    )
+    .await;
+    let response = result.response;
+    // Drain so the stream tee reaches message_stop and re-records.
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    scope.mark_handler_returned();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let report = state
+        .cost_tracker
+        .report_for_session(&session_key)
+        .await
+        .unwrap();
+    report.by_tier.iter().find_map(|t| t.cost_actual_usd)
+}
+
+#[tokio::test]
+async fn emulated_search_full_prices_by_resolved_model() {
+    assert_resolved_price(emulated_search_cost(false).await);
+}
+
+/// 1 input + 1 output token at gpt-6.1-sol rates (2e-6 in, 1e-5 out).
+fn assert_resolved_price(cost: Option<f64>) {
+    let cost = cost.expect("cost must be priced");
+    assert!((cost - 1.2e-5).abs() < 1e-12, "got {cost}");
+}
+
+#[tokio::test]
+async fn emulated_search_stream_prices_by_resolved_model() {
+    assert_resolved_price(emulated_search_cost(true).await);
+}

@@ -94,8 +94,14 @@ async fn chat_completions_inner(
                     usage.output_tokens,
                 );
             }
-            let openai_json =
-                translate_and_record(&state.cost_tracker, &session_key, request_id, &json).await;
+            let openai_json = translate_and_record(
+                &state.cost_tracker,
+                &session_key,
+                request_id,
+                &cost_model,
+                &json,
+            )
+            .await;
             HandlerResult::ok((StatusCode::OK, Json(openai_json)).into_response())
         }
         Ok(ProviderResponse::Stream(s)) => {

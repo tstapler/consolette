@@ -1630,15 +1630,9 @@ pub async fn translate_and_record(
     tracker: &crate::cost_metrics::tracker::CostTracker,
     session_key: &crate::session_compaction::SessionKey,
     request_id: crate::cost_metrics::types::RequestId,
+    model: &str,
     anthropic: &serde_json::Value,
 ) -> serde_json::Value {
-    use serde_json::Value;
-
-    let model = anthropic
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-
     // TODO(cost-metrics): this is the real call site for
     // `record_actual_usage_from_anthropic_response` once a live
     // provider-dispatch loop exists — see plan.md Epic 2.2, Story 2.2.1's
@@ -3056,10 +3050,33 @@ mod tests {
             .unwrap();
 
         let anthropic = anthropic_response_with_usage(12400, 300);
-        let openai = translate_and_record(&tracker, &key, request_id, &anthropic).await;
+        let openai =
+            translate_and_record(&tracker, &key, request_id, "claude-sonnet-5", &anthropic).await;
 
         assert_eq!(openai["usage"]["total_tokens"], json!(12700));
         let report = tracker.report_for_session(&key).await.unwrap();
         assert_eq!(report.actual_tokens, Some(12_700));
+    }
+
+    #[tokio::test]
+    async fn translate_and_record_prices_by_the_given_model_not_the_body_model() {
+        let tracker = CostTracker::new(PricingTable::load_default()).await;
+        let key = SessionKey::new("s1");
+        let request_id = RequestId::new();
+        tracker
+            .record_pending(&key, request_id, CompactionTier::Off)
+            .await;
+
+        let mut anthropic = anthropic_response_with_usage(1000, 200);
+        anthropic["model"] = json!("unknown");
+        translate_and_record(&tracker, &key, request_id, "gpt-6.1-sol", &anthropic).await;
+
+        let report = tracker.report_for_session(&key).await.unwrap();
+        let cost = report
+            .by_tier
+            .iter()
+            .find_map(|t| t.cost_actual_usd)
+            .unwrap();
+        assert!((cost - 0.004).abs() < 1e-9, "got {cost}");
     }
 }

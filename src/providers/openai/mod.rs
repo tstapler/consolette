@@ -1463,6 +1463,73 @@ mod tests {
             }
         }
 
+        async fn record_and_stream_ok(
+            axum::extract::State(seen): axum::extract::State<Arc<Mutex<Vec<Value>>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            seen.lock().unwrap().push(body);
+            (
+                [("content-type", "text/event-stream")],
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )
+                .into_response()
+        }
+
+        /// Real `OpenaiProvider::send` on a seeded `model_family` route against a recording
+        /// upstream; returns the bodies the upstream saw and the model `send` reported resolving.
+        async fn send_family_stream() -> (Vec<Value>, Option<String>) {
+            let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let app = axum::Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    axum::routing::post(record_and_stream_ok),
+                )
+                .with_state(seen.clone());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let provider = provider_for(format!("http://{addr}"));
+            provider.resolution.cache.insert(
+                "gpt-5".to_string(),
+                crate::providers::openai::resolution::ResolvedModel {
+                    model_id: "gpt-5.1-codex-max".to_string(),
+                    endpoint: crate::providers::openai::resolution::Endpoint::ChatCompletions,
+                    token_param: crate::providers::openai::resolution::TokenParamStyle::MaxTokens,
+                    resolved_at: tokio::time::Instant::now(),
+                },
+            );
+            let body = json!({
+                "model": "claude-sonnet-5-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                MODEL_FAMILY_BODY_KEY: "gpt-5",
+            });
+            let (result, resolved) = crate::providers::capture_resolved_model(provider.send(
+                body,
+                HeaderMap::new(),
+                true,
+            ))
+            .await;
+            assert!(result.is_ok());
+            let bodies = seen.lock().unwrap().clone();
+            (bodies, resolved)
+        }
+
+        #[tokio::test]
+        async fn send_reports_the_family_resolved_model() {
+            let (_, resolved) = send_family_stream().await;
+            assert_eq!(resolved.as_deref(), Some("gpt-5.1-codex-max"));
+        }
+
+        #[tokio::test]
+        async fn streaming_send_puts_include_usage_on_the_wire() {
+            let (bodies, _) = send_family_stream().await;
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(bodies[0]["stream_options"]["include_usage"], true);
+        }
+
         #[tokio::test]
         #[allow(clippy::unwrap_used)]
         async fn chat_stream_retries_once_without_stream_options_when_upstream_rejects_it() {

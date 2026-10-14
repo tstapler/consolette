@@ -737,3 +737,47 @@ fn assert_resolved_price(cost: Option<f64>) {
 async fn emulated_search_stream_prices_by_resolved_model() {
     assert_resolved_price(emulated_search_cost(true).await);
 }
+
+async fn post_unpriced(
+    state: &EntrypointState,
+    uri: &str,
+    body: serde_json::Value,
+) -> bytes::Bytes {
+    let resp = entrypoint_router(state.clone())
+        .oneshot(
+            Request::post(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    to_bytes(resp.into_body(), usize::MAX).await.unwrap()
+}
+
+#[tokio::test]
+async fn direct_full_response_prices_cost_by_resolved_family_model() {
+    let state = crate::entrypoint::test_support::cost_probe_state(false).await;
+    post_unpriced(
+        &state,
+        "/v1/messages",
+        serde_json::json!({"model": "unpriced-requested-model", "max_tokens": 10, "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    crate::entrypoint::test_support::assert_cost_priced_by_routed_model(&state).await;
+}
+
+#[tokio::test]
+async fn direct_stream_response_prices_cost_by_pinned_model() {
+    let state = crate::entrypoint::test_support::cost_probe_state(true).await;
+    post_unpriced(
+        &state,
+        "/v1/messages",
+        serde_json::json!({"model": "unpriced-requested-model", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    crate::entrypoint::test_support::assert_cost_priced_by_routed_model(&state).await;
+}

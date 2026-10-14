@@ -184,6 +184,18 @@ impl SessionCostStore {
         self.cache.run_pending_tasks().await;
         self.cache.entry_count()
     }
+
+    /// Every cost row across all sessions; lets handler tests read a row
+    /// whose session key is generated inside the handler.
+    #[cfg(test)]
+    pub(crate) async fn snapshot_records(&self) -> Vec<CostRecord> {
+        let states: Vec<_> = self.cache.iter().map(|(_, state)| state).collect();
+        let mut out = Vec::new();
+        for state in states {
+            out.extend(state.read().await.records.iter().cloned());
+        }
+        out
+    }
 }
 
 #[cfg(test)]

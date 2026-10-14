@@ -347,3 +347,68 @@ async fn dispatch_should_record_resolved_model_as_routed_model_for_family_routes
         Some(crate::metrics::trace::RoutedModelSource::Pinned)
     );
 }
+
+/// Resolves a model on its first call only, like a cache-warm family on round one.
+struct ResolveOnceProvider(std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl Provider for ResolveOnceProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            crate::providers::note_resolved_model("gpt-6.1-sol");
+        }
+        Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+// A later round that reports no resolved model must not erase an earlier one.
+#[tokio::test]
+async fn later_dispatch_without_resolved_model_keeps_the_earlier_one() {
+    let metrics = MetricsCollector::new();
+    let router = Router::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "openai".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: Some("gpt-6".to_string()),
+        }],
+        providers: vec![Arc::new(ResolveOnceProvider(
+            std::sync::atomic::AtomicBool::new(false),
+        ))],
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(AlwaysAllow),
+        metrics: Arc::clone(&metrics),
+    });
+    let mut scope =
+        crate::metrics::trace::TraceScope::begin(&metrics, &serde_json::json!({}), false, 0);
+
+    for _ in 0..2 {
+        let res = router
+            .dispatch_traced(
+                &mut scope,
+                serde_json::json!({}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+        assert!(res.is_ok());
+    }
+
+    assert_eq!(scope.priced_model(), Some("gpt-6.1-sol"));
+}

@@ -354,4 +354,39 @@ mod tests {
         assert!(text.contains("\"finish_reason\":\"stop\""));
         assert!(text.ends_with("data: [DONE]\n\n"));
     }
+
+    async fn post_unpriced_chat(state: &EntrypointState, stream: bool) {
+        let resp = entrypoint_router(state.clone())
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "unpriced-requested-model",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": stream
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_response_prices_cost_by_resolved_family_model() {
+        let state = crate::entrypoint::test_support::cost_probe_state(false).await;
+        post_unpriced_chat(&state, false).await;
+        crate::entrypoint::test_support::assert_cost_priced_by_routed_model(&state).await;
+    }
+
+    #[tokio::test]
+    async fn stream_response_prices_cost_by_resolved_family_model() {
+        let state = crate::entrypoint::test_support::cost_probe_state(false).await;
+        post_unpriced_chat(&state, true).await;
+        crate::entrypoint::test_support::assert_cost_priced_by_routed_model(&state).await;
+    }
 }

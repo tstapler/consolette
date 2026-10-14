@@ -301,6 +301,12 @@ impl CostTracker {
         Ok(())
     }
 
+    /// Test seam: every cost row, across sessions.
+    #[cfg(test)]
+    pub(crate) async fn snapshot_records(&self) -> Vec<CostRecord> {
+        self.store.snapshot_records().await
+    }
+
     /// Set the model a row is priced against. Non-creating: an unknown
     /// session or row is ignored. Call before usage is folded.
     pub async fn record_model(&self, session_key: &SessionKey, request_id: RequestId, model: &str) {

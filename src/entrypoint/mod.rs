@@ -187,6 +187,7 @@ impl EntrypointState {
         let server_tools = Arc::new(ServerToolsRuntime {
             config: config.server_tools.clone(),
             route_eligible: ServerToolsRuntime::route_eligible_from_config(config),
+            anthropic_upstreams: ServerToolsRuntime::anthropic_upstream_names(config),
         });
         let search_pool = Arc::new(McpSearchPool::new(server_tools.config.pool_config()));
         let pruning_policy_store = Arc::new(PruningPolicyStore::default());

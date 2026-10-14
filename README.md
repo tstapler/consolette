@@ -292,7 +292,7 @@ curl http://127.0.0.1:47000/v1/messages \
   unknown-name error lists the configured upstream names (names only).
 - The proxy removes the header before dispatch, so no upstream ever sees it.
   A forced request neither reads nor writes the response cache.
-- The dashboard shows these requests with the route reason `forced`.
+- The dashboard shows these requests with the route reason chip `forced`.
 
 **Security note**: the proxy has no authentication, listens on `127.0.0.1`
 only, and its CORS policy allows any origin, so any local process can set the

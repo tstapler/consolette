@@ -195,7 +195,10 @@ async fn messages_inner(
     // on an eligible route run the proxy-internal loop instead of the
     // single-shot path. Requests without server defs fall through to
     // today's path byte-identically (S-3).
-    if state.server_tools.should_emulate(&body) {
+    if state
+        .server_tools
+        .should_emulate(&body, scope.forced_upstream())
+    {
         return handle_emulated_search(
             scope,
             EmulatedSearchParams {

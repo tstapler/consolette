@@ -237,6 +237,8 @@ fn openai_completion() -> Value {
     })
 }
 
+// Provider header allowlists already drop it, so this guards the wire only; the strip itself
+// is covered by the `upstream_override` unit tests.
 #[tokio::test]
 async fn consolette_headers_should_never_reach_an_anthropic_or_openai_upstream() {
     let a = FakeUpstream::start(ok_upstream()).await;

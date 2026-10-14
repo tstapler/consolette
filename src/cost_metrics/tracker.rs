@@ -27,13 +27,13 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::watch;
 
-use crate::cost_metrics::pricing::PricingTable;
+use crate::cost_metrics::pricing::{ModelPrice, PricingTable};
 use crate::cost_metrics::report::{CostReport, CostReportError, TierBreakdown};
 use crate::cost_metrics::store::{
     tier_index, CostRecord, SessionCostState, SessionCostStore, TierTotals, ALL_TIERS,
 };
 use crate::cost_metrics::types::{
-    cost_for_tokens, CostAmountUsd, ReconciliationStatus, RequestId, TokenCount,
+    cost_for_tokens, CostAmountUsd, ReconciliationStatus, RequestId, TokenCount, TokenSource,
 };
 use crate::session_compaction::session_state::SessionKey;
 use crate::session_compaction::tiered::CompactionTier;
@@ -144,6 +144,7 @@ impl CostTracker {
             counterfactual_est: None,
             compacted_est: None,
             actual_tokens: None,
+            actual_usage: None,
             model: None,
             status: ReconciliationStatus::Pending,
             recorded_at: Utc::now(),
@@ -214,6 +215,39 @@ impl CostTracker {
         request_id: RequestId,
         actual: TokenCount,
     ) -> Result<(), CostTrackerError> {
+        self.record_actual(session_key, request_id, actual, None)
+            .await
+    }
+
+    /// Like [`Self::record_actual_usage`], but from a per-class usage
+    /// breakdown: the token total counts input, output and cache tokens, and
+    /// the cost prices each class at its own rate (see [`actual_cost`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SessionNotFound)` if `session_key` is unknown/evicted.
+    pub async fn record_actual_usage_detailed(
+        &self,
+        session_key: &SessionKey,
+        request_id: RequestId,
+        usage: crate::providers::AnthropicUsage,
+        source: TokenSource,
+    ) -> Result<(), CostTrackerError> {
+        let actual = TokenCount {
+            value: usage.total_tokens(),
+            source,
+        };
+        self.record_actual(session_key, request_id, actual, Some(usage))
+            .await
+    }
+
+    async fn record_actual(
+        &self,
+        session_key: &SessionKey,
+        request_id: RequestId,
+        actual: TokenCount,
+        usage: Option<crate::providers::AnthropicUsage>,
+    ) -> Result<(), CostTrackerError> {
         // Non-creating get first: a session that was never seen (or was
         // evicted) must not be silently resurrected.
         let Some(state) = self.store.get(session_key).await else {
@@ -237,6 +271,7 @@ impl CostTracker {
                 counterfactual_est: None,
                 compacted_est: None,
                 actual_tokens: Some(actual),
+                actual_usage: usage,
                 model: None,
                 status: ReconciliationStatus::Pending,
                 recorded_at: Utc::now(),
@@ -251,12 +286,14 @@ impl CostTracker {
             unfold(&mut state_guard, tier, request_id, &pricing);
             if let Some(record) = state_guard.find_mut(request_id) {
                 record.actual_tokens = Some(actual);
+                record.actual_usage = usage;
                 record.status = ReconciliationStatus::Pending;
             }
             try_fold_if_ready(&mut state_guard, request_id, &pricing);
         } else {
             if let Some(record) = state_guard.find_mut(request_id) {
                 record.actual_tokens = Some(actual);
+                record.actual_usage = usage;
             }
             try_fold_if_ready(&mut state_guard, request_id, &pricing);
         }
@@ -426,7 +463,7 @@ fn try_fold_if_ready(state: &mut SessionCostState, request_id: RequestId, pricin
     let price = record.model.as_deref().and_then(|m| pricing.price_for(m));
     let cost_counterfactual =
         price.map(|p| cost_for_tokens(&counterfactual, p.input_usd_per_token));
-    let cost_actual = price.map(|p| cost_for_tokens(&actual, p.input_usd_per_token));
+    let cost_actual = price.map(|p| actual_cost(&actual, record.actual_usage.as_ref(), p));
 
     record.status = ReconciliationStatus::Reconciled;
     record.cost = cost_actual;
@@ -438,6 +475,33 @@ fn try_fold_if_ready(state: &mut SessionCostState, request_id: RequestId, pricin
     totals.reconciled_count += 1;
     totals.cost_counterfactual = sum_opt(totals.cost_counterfactual, cost_counterfactual);
     totals.cost_actual = sum_opt(totals.cost_actual, cost_actual);
+}
+
+/// Cost of a request's actual usage. With a per-class breakdown each class
+/// is priced at its own rate; a cache rate the pricing table omits (0.0)
+/// falls back to the input rate, a conservative upper bound rather than free.
+/// Without a breakdown the combined count is priced at the input rate, as before.
+fn actual_cost(
+    actual: &TokenCount,
+    usage: Option<&crate::providers::AnthropicUsage>,
+    price: ModelPrice,
+) -> CostAmountUsd {
+    let Some(u) = usage else {
+        return cost_for_tokens(actual, price.input_usd_per_token);
+    };
+    let rate_or_input = |rate: f64| {
+        if rate > 0.0 {
+            rate
+        } else {
+            price.input_usd_per_token
+        }
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let usd = u.input_tokens as f64 * price.input_usd_per_token
+        + u.output_tokens as f64 * price.output_usd_per_token
+        + u.cache_read_input_tokens as f64 * rate_or_input(price.cache_read_usd_per_token)
+        + u.cache_creation_input_tokens as f64 * rate_or_input(price.cache_creation_usd_per_token);
+    CostAmountUsd(usd)
 }
 
 /// Reverse a previous fold's contribution for `request_id` from `tier`'s
@@ -816,6 +880,56 @@ mod tests {
             .unwrap();
         assert_eq!(full.tokens_saved, Some(8000));
         assert_eq!(report.tokens_saved, Some(10000));
+    }
+
+    #[tokio::test]
+    async fn detailed_usage_prices_output_and_cache_tokens_at_their_own_rates() {
+        let mut pricing = PricingTable::new();
+        pricing.insert(
+            "m",
+            ModelPrice {
+                input_usd_per_token: 0.000_003,
+                output_usd_per_token: 0.000_015,
+                cache_read_usd_per_token: 0.000_000_3,
+                cache_creation_usd_per_token: 0.000_003_75,
+            },
+        );
+        let tracker = CostTracker::new(pricing).await;
+        let key = SessionKey::new("s1");
+        let request = RequestId::new();
+        tracker
+            .record_pending(&key, request, CompactionTier::Off)
+            .await;
+        {
+            let state = tracker.store.get(&key).await.unwrap();
+            state.write().await.find_mut(request).unwrap().model = Some("m".to_string());
+        }
+
+        tracker
+            .record_actual_usage_detailed(
+                &key,
+                request,
+                crate::providers::AnthropicUsage {
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    cache_creation_input_tokens: 400,
+                    cache_read_input_tokens: 8000,
+                },
+                TokenSource::Exact,
+            )
+            .await
+            .unwrap();
+
+        let report = tracker.report_for_session(&key).await.unwrap();
+        let off = report
+            .by_tier
+            .iter()
+            .find(|t| t.tier == CompactionTier::Off)
+            .unwrap();
+        assert_eq!(off.actual_tokens, Some(9600));
+        // 1000*3e-6 + 200*15e-6 + 400*3.75e-6 + 8000*0.3e-6 = 0.0099
+        let cost = off.cost_actual_usd.unwrap();
+        assert!((cost - 0.0099).abs() < 1e-9, "got {cost}");
     }
 
     #[tokio::test]

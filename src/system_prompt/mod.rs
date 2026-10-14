@@ -84,6 +84,31 @@ pub fn patch_open_model_tool_prompt(text: &str, tool_names: &[&str]) -> String {
     patched
 }
 
+/// Flatten an Anthropic `system` value (a string, or an array of content
+/// blocks) to plain text for upstreams that only accept a string. Non-text
+/// blocks are skipped; text blocks are joined with a blank line.
+#[must_use]
+pub fn flatten_system_text(system: &serde_json::Value) -> Option<String> {
+    match system {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<&str> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    serde_json::Value::String(s) => Some(s.as_str()),
+                    _ => b.get("text").and_then(serde_json::Value::as_str),
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Neutralize misleading vision instructions in system prompt and inject a
 /// system note for non-vision upstreams.
 #[must_use]

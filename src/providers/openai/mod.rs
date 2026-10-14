@@ -731,6 +731,7 @@ impl Provider for OpenaiProvider {
             .await?;
             endpoint = resolved.endpoint;
             token_param = resolved.token_param;
+            crate::providers::note_resolved_model(&resolved.model_id);
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("model".to_string(), Value::String(resolved.model_id));
             }
@@ -800,6 +801,7 @@ impl Provider for OpenaiProvider {
         }
 
         if stream {
+            request_stream_usage(&mut openai_body);
             let est_tokens =
                 u64::from(u32::try_from(openai_body.to_string().len() / 4).unwrap_or(u32::MAX));
             let response = match self.send_streaming_request(openai_body).await {
@@ -910,12 +912,28 @@ pub(crate) struct OpenaiToAnthropicStream<S> {
     id: String,
     model: String,
     input_tokens: u64,
+    /// Stop reason seen on a `finish_reason` chunk; closing waits for the
+    /// trailing usage chunk (`stream_options.include_usage`) or `[DONE]`.
+    pending_stop: Option<&'static str>,
+    /// Real upstream usage, already in Anthropic shape.
+    usage: Option<Value>,
     started: bool,
     finished: bool,
     done: bool,
     pending: VecDeque<Bytes>,
     text_started: bool,
     tools: Vec<ToolSlot>,
+}
+
+/// Ask the upstream for a trailing usage chunk so streamed token counts are
+/// real rather than estimated; a client-set `stream_options` is kept.
+fn request_stream_usage(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        let opts = obj.entry("stream_options").or_insert_with(|| json!({}));
+        if let Some(o) = opts.as_object_mut() {
+            o.entry("include_usage").or_insert(Value::Bool(true));
+        }
+    }
 }
 
 /// One in-progress tool call block: arguments accumulate here until the
@@ -942,6 +960,8 @@ where
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             model,
             input_tokens: 0,
+            pending_stop: None,
+            usage: None,
             started: false,
             finished: false,
             done: false,
@@ -1133,13 +1153,19 @@ where
             &json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason},
-                "usage": {"output_tokens": 0}
+                "usage": self.usage.clone().unwrap_or_else(|| json!({"output_tokens": 0}))
             }),
         ));
         self.pending.push_back(Self::frame(
             "message_stop",
             &json!({"type": "message_stop"}),
         ));
+    }
+
+    /// Close with the stop reason a `finish_reason` chunk already announced.
+    fn close_pending(&mut self) {
+        let reason = self.pending_stop.unwrap_or("end_turn");
+        self.close(reason);
     }
 }
 
@@ -1167,15 +1193,15 @@ where
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
-                    this.close("end_turn");
+                    this.close_pending();
                 }
                 Poll::Ready(Some(Err(e))) => {
                     warn!(error = %e, "openai->anthropic stream translator: eventsource parse error");
-                    this.close("end_turn");
+                    this.close_pending();
                 }
                 Poll::Ready(Some(Ok(event))) => {
                     if event.data == "[DONE]" {
-                        this.close("end_turn");
+                        this.close_pending();
                         continue;
                     }
                     if crate::providers::bodies_logged() {
@@ -1238,11 +1264,19 @@ where
                         }
                     }
 
+                    if let Some(u) = parsed.get("usage").filter(|u| u.is_object()) {
+                        this.usage = Some(crate::providers::anthropic_usage_from_openai(Some(u)));
+                    }
                     if let Some(reason) = choice
                         .and_then(|c| c.get("finish_reason"))
                         .and_then(Value::as_str)
                     {
-                        this.close(map_openai_finish_reason(Some(reason)));
+                        this.pending_stop = Some(map_openai_finish_reason(Some(reason)));
+                    }
+                    // With `include_usage` the usage chunk trails the
+                    // finish chunk, so wait for it; [DONE]/EOF still close.
+                    if this.pending_stop.is_some() && this.usage.is_some() {
+                        this.close_pending();
                     }
                 }
             }
@@ -1975,6 +2009,61 @@ mod tests {
 
             let (_, message_delta_data) = parse_event(&out[4]);
             assert_eq!(message_delta_data["delta"]["stop_reason"], "max_tokens");
+        }
+
+        #[tokio::test]
+        async fn trailing_usage_chunk_populates_message_delta_usage() {
+            let inner = stream::iter(vec![
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+                )),
+                Ok(sse(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)),
+                Ok(sse(
+                    r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":60,"cache_write_tokens":10}}}"#,
+                )),
+                Ok(sse("[DONE]")),
+            ]);
+            let out = drain(OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string())).await;
+
+            let events: Vec<(String, Value)> = out.iter().map(parse_event).collect();
+            let (_, md) = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+            assert_eq!(md["delta"]["stop_reason"], "end_turn");
+            assert_eq!(md["usage"]["output_tokens"], 7);
+            assert_eq!(md["usage"]["input_tokens"], 30);
+            assert_eq!(md["usage"]["cache_read_input_tokens"], 60);
+            assert_eq!(md["usage"]["cache_creation_input_tokens"], 10);
+            assert_eq!(events.last().unwrap().0, "message_stop");
+        }
+
+        #[tokio::test]
+        async fn length_stop_reason_survives_trailing_usage_chunk() {
+            let inner = stream::iter(vec![
+                Ok(sse(
+                    r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}"#,
+                )),
+                Ok(sse(
+                    r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":9}}"#,
+                )),
+            ]);
+            let out = drain(OpenaiToAnthropicStream::new(inner, "gpt-4o".to_string())).await;
+            let (_, md) = out
+                .iter()
+                .map(parse_event)
+                .find(|(e, _)| e == "message_delta")
+                .unwrap();
+            assert_eq!(md["delta"]["stop_reason"], "max_tokens");
+            assert_eq!(md["usage"]["output_tokens"], 9);
+        }
+
+        #[test]
+        fn request_stream_usage_sets_include_usage_and_keeps_client_choice() {
+            let mut body = json!({"model": "m"});
+            request_stream_usage(&mut body);
+            assert_eq!(body["stream_options"]["include_usage"], true);
+
+            let mut body = json!({"stream_options": {"include_usage": false}});
+            request_stream_usage(&mut body);
+            assert_eq!(body["stream_options"]["include_usage"], false);
         }
 
         #[tokio::test]

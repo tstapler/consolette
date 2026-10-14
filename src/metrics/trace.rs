@@ -262,6 +262,8 @@ pub struct TraceScope {
     provider: String,
     selected_model: Option<String>,
     selected_model_was_exploration: Option<bool>,
+    /// Concrete model a `model_family` route resolved to, reported by the provider.
+    resolved_model: Option<String>,
     /// The scope's own copy of the ring-buffer entry; `finish` completes it and writes it back once.
     detail: RequestDetail,
     pending: Option<PendingAttempt>,
@@ -303,6 +305,7 @@ impl TraceScope {
             provider: String::new(),
             selected_model: None,
             selected_model_was_exploration: None,
+            resolved_model: None,
             detail,
             pending: None,
             iteration: 0,
@@ -331,6 +334,11 @@ impl TraceScope {
     ) {
         self.selected_model = selected_model;
         self.selected_model_was_exploration = was_exploration;
+    }
+
+    /// Records the concrete model a family route resolved to (last call wins).
+    pub fn record_resolved_model(&mut self, resolved_model: Option<String>) {
+        self.resolved_model = resolved_model;
     }
 
     pub fn record_attempt(&mut self, attempt: AttemptRecord) {
@@ -468,6 +476,10 @@ impl TraceScope {
         let last_attempt = self.attempts.records().last();
         let routed_model = match (&self.selected_model, &self.detail.requested_model) {
             (Some(pinned), _) => Some((pinned.clone(), RoutedModelSource::Pinned)),
+            (None, _) if self.resolved_model.is_some() => self
+                .resolved_model
+                .clone()
+                .map(|m| (m, RoutedModelSource::Pinned)),
             (None, Some(asked)) if last_attempt.is_some() => {
                 Some((asked.clone(), RoutedModelSource::Passthrough))
             }

@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 
 use crate::cost_metrics::tracker::CostTracker;
-use crate::cost_metrics::types::{EstimatorKind, RequestId, TokenCount, TokenSource};
+use crate::cost_metrics::types::{EstimatorKind, RequestId, TokenSource};
 use crate::session_compaction::{CompactionTier, SessionKey};
 
 /// Records a `Pending` cost row *before* dispatch is called, per ADR-016.
@@ -126,12 +126,13 @@ impl<S> CostTrackingStream<S> {
         let last_usage = self.last_usage;
         tokio::spawn(async move {
             if let Some(usage) = last_usage {
-                let actual = TokenCount {
-                    value: usage.input_tokens + usage.output_tokens,
-                    source: TokenSource::Exact,
-                };
                 let _ = tracker
-                    .record_actual_usage(&session_key, request_id, actual)
+                    .record_actual_usage_detailed(
+                        &session_key,
+                        request_id,
+                        usage,
+                        TokenSource::Exact,
+                    )
                     .await;
             } else {
                 tracker
@@ -158,14 +159,15 @@ impl<S> CostTrackingStream<S> {
         let last_usage = self.last_usage;
         tokio::spawn(async move {
             if let Some(usage) = last_usage {
-                let actual = TokenCount {
-                    value: usage.input_tokens + usage.output_tokens,
-                    source: TokenSource::Estimated {
-                        via: EstimatorKind::AnthropicCountTokensApi,
-                    },
-                };
                 let _ = tracker
-                    .record_actual_usage(&session_key, request_id, actual)
+                    .record_actual_usage_detailed(
+                        &session_key,
+                        request_id,
+                        usage,
+                        TokenSource::Estimated {
+                            via: EstimatorKind::AnthropicCountTokensApi,
+                        },
+                    )
                     .await;
             } else {
                 tracker

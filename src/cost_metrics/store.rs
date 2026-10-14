@@ -60,6 +60,9 @@ pub struct CostRecord {
     pub counterfactual_est: Option<TokenCount>,
     pub compacted_est: Option<TokenCount>,
     pub actual_tokens: Option<TokenCount>,
+    /// Per-class token breakdown of the actual usage, when the caller had one
+    /// (live proxy path); lets cost price output and cache tokens at their own rates.
+    pub actual_usage: Option<crate::providers::AnthropicUsage>,
     pub model: Option<String>,
     pub status: ReconciliationStatus,
     pub recorded_at: DateTime<Utc>,
@@ -197,6 +200,7 @@ mod tests {
             counterfactual_est: None,
             compacted_est: None,
             actual_tokens: None,
+            actual_usage: None,
             model: None,
             status: ReconciliationStatus::Pending,
             recorded_at: Utc::now(),

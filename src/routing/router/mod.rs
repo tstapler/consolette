@@ -760,9 +760,7 @@ impl Router {
                     self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
                     scope.complete_attempt_result(None);
                     scope.record_provider(&chosen.name);
-                    if resolved.is_some() {
-                        scope.record_resolved_model(resolved);
-                    }
+                    scope.record_resolved_model(&chosen.name, resolved);
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {

@@ -817,7 +817,12 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
         .to_string();
 
     let usage = extract_usage(anthropic).unwrap_or_default();
-    let (prompt_tokens, completion_tokens) = (usage.input_tokens, usage.output_tokens);
+    // OpenAI's prompt_tokens includes cached tokens; Anthropic's input_tokens does not.
+    let prompt_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
+    let completion_tokens = usage.output_tokens;
 
     // OpenAI convention: `content` is null when the turn is tool-calls-only.
     let content = if content_text.is_empty() && !tool_calls.is_empty() {
@@ -845,7 +850,8 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
+            "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": usage.cache_read_input_tokens}
         }
     })
 }
@@ -2242,6 +2248,20 @@ mod tests {
             openai["messages"][0],
             json!({"role": "system", "content": "be terse\n\nuse tools"})
         );
+    }
+
+    #[test]
+    fn translate_anthropic_to_openai_adds_cache_tokens_back_into_prompt_tokens() {
+        let anthropic = json!({
+            "id": "m", "model": "x", "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 20,
+                      "cache_read_input_tokens": 60, "cache_creation_input_tokens": 10}
+        });
+        let usage = &translate_anthropic_to_openai(&anthropic)["usage"];
+        assert_eq!(usage["prompt_tokens"], json!(100));
+        assert_eq!(usage["total_tokens"], json!(120));
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(60));
     }
 
     #[test]

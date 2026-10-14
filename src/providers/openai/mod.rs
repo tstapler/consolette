@@ -452,8 +452,29 @@ impl OpenaiProvider {
         &self,
         body: Value,
     ) -> Result<reqwest::Response, ProviderError> {
-        self.send_streaming_request_to(body, "/v1/chat/completions")
+        // Some gateways reject `stream_options`; retry once without it
+        // (nothing has been streamed to the client yet).
+        let fallback = body.get("stream_options").map(|_| {
+            let mut b = body.clone();
+            if let Some(o) = b.as_object_mut() {
+                o.remove("stream_options");
+            }
+            b
+        });
+        match self
+            .send_streaming_request_to(body, "/v1/chat/completions")
             .await
+        {
+            Err(ProviderError::Validation(msg, 400)) if msg.contains("stream_options") => {
+                let Some(retry_body) = fallback else {
+                    return Err(ProviderError::Validation(msg, 400));
+                };
+                warn!("upstream rejected stream_options; retrying without it");
+                self.send_streaming_request_to(retry_body, "/v1/chat/completions")
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// Streaming counterpart to [`Self::send_responses_request`] — same
@@ -1418,6 +1439,58 @@ mod tests {
                 Arc::new(ProxyMetrics::new()),
             )
             .unwrap()
+        }
+
+        async fn reject_stream_options(
+            axum::extract::State(seen): axum::extract::State<Arc<Mutex<Vec<Value>>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let rejected = body.get("stream_options").is_some();
+            seen.lock().unwrap().push(body);
+            if rejected {
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"Unknown parameter: stream_options"}}"#,
+                )
+                    .into_response()
+            } else {
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+                    .into_response()
+            }
+        }
+
+        #[tokio::test]
+        #[allow(clippy::unwrap_used)]
+        async fn chat_stream_retries_once_without_stream_options_when_upstream_rejects_it() {
+            let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let app = axum::Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    axum::routing::post(reject_stream_options),
+                )
+                .with_state(seen.clone());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let provider = provider_for(format!("http://{addr}"));
+
+            let body = json!({
+                "model": "gpt-5.1",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let result = provider.send(body, HeaderMap::new(), true).await;
+
+            assert!(result.is_ok(), "stream_options rejection must fall back");
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "exactly one retry");
+            assert!(seen[0].get("stream_options").is_some());
+            assert!(seen[1].get("stream_options").is_none());
         }
 
         #[tokio::test]

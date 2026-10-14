@@ -181,8 +181,8 @@ impl AnthropicProvider {
     ///   present, otherwise falls back to the default version.
     /// - Sets auth per the upstream's configured `AuthMethod` (see
     ///   `apply_auth`).
-    /// - Forwarded verbatim to whatever `base_url` is configured; no
-    ///   per-upstream header allow/deny-list yet.
+    /// - Nothing else from the client is forwarded: the outgoing headers are
+    ///   built from this allowlist, not copied from `incoming`.
     async fn build_headers(
         &self,
         incoming: &HeaderMap,

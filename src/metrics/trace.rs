@@ -111,6 +111,8 @@ impl AttemptLog {
 /// Why the request went where it did; one row chip per request (ADR-004 item 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteReason {
+    /// The client named the upstream with `X-Consolette-Upstream`.
+    Override,
     SessionPin,
     /// Carries the `RoutingStrategy::name()` that chose the upstream.
     Strategy(&'static str),
@@ -126,6 +128,7 @@ pub enum RouteReason {
 #[derive(Debug, Clone, Copy)]
 pub struct RouteInputs<'a> {
     pub kind: TraceKind,
+    pub forced_override: bool,
     pub session_pinned: bool,
     pub strategy_name: &'static str,
     pub exploration: bool,
@@ -137,7 +140,7 @@ pub struct RouteInputs<'a> {
 const DEFAULT_ROUTE_STRATEGY: &str = "fallback";
 
 impl RouteReason {
-    /// Precedence: Cache/Local > SessionPin > Exploration > Fallback > RateLimitHold > Strategy > Default.
+    /// Precedence: Cache/Local > Override > SessionPin > Exploration > Fallback > RateLimitHold > Strategy > Default.
     #[must_use]
     pub fn for_request(inputs: &RouteInputs<'_>) -> Self {
         match inputs.kind {
@@ -147,7 +150,9 @@ impl RouteReason {
         }
         // Earlier attempts always failed or were shed, since the loop stops at the first success.
         let followed_a_failure = inputs.attempts.len() > 1;
-        if inputs.session_pinned {
+        if inputs.forced_override {
+            Self::Override
+        } else if inputs.session_pinned {
             Self::SessionPin
         } else if inputs.exploration {
             Self::Exploration
@@ -166,6 +171,7 @@ impl RouteReason {
     #[must_use]
     pub fn wire(self) -> &'static str {
         match self {
+            Self::Override => "override",
             Self::SessionPin => "session_pin",
             Self::Strategy(_) => "strategy",
             Self::Exploration => "exploration",
@@ -271,6 +277,7 @@ pub struct TraceScope {
     /// Holds spent by the current `dispatch_traced` call only (the budget); reset per call.
     dispatch_hold_retries: u8,
     session_pinned: bool,
+    forced_upstream: Option<String>,
     strategy_name: &'static str,
 }
 
@@ -309,6 +316,7 @@ impl TraceScope {
             hold_retries: 0,
             dispatch_hold_retries: 0,
             session_pinned: false,
+            forced_upstream: None,
             strategy_name: "",
         }
     }
@@ -341,6 +349,16 @@ impl TraceScope {
     pub fn record_route(&mut self, session_pinned: bool, strategy_name: &'static str) {
         self.session_pinned = session_pinned;
         self.strategy_name = strategy_name;
+    }
+
+    /// Marks this request as forced onto `upstream` by `X-Consolette-Upstream`.
+    pub fn force_upstream(&mut self, upstream: String) {
+        self.forced_upstream = Some(upstream);
+    }
+
+    #[must_use]
+    pub fn forced_upstream(&self) -> Option<&str> {
+        self.forced_upstream.as_deref()
     }
 
     /// Total holds across every dispatch round on this scope (shown on the trace).
@@ -459,6 +477,7 @@ impl TraceScope {
         let duration_ms = self.started.elapsed().as_secs_f64() * 1000.0;
         let reason = RouteReason::for_request(&RouteInputs {
             kind: self.detail.trace_kind,
+            forced_override: self.forced_upstream.is_some(),
             session_pinned: self.session_pinned,
             strategy_name: self.strategy_name,
             exploration: self.selected_model_was_exploration == Some(true),
@@ -591,6 +610,7 @@ mod tests {
     fn inputs(attempts: &[AttemptRecord]) -> RouteInputs<'_> {
         RouteInputs {
             kind: TraceKind::Routed,
+            forced_override: false,
             session_pinned: false,
             strategy_name: "weighted",
             exploration: false,
@@ -618,6 +638,7 @@ mod tests {
         ] {
             let all_flags = RouteInputs {
                 kind,
+                forced_override: true,
                 session_pinned: true,
                 exploration: true,
                 hold_retries: 2,
@@ -625,6 +646,13 @@ mod tests {
             };
             assert_eq!(RouteReason::for_request(&all_flags), want);
         }
+        let forced = RouteInputs {
+            forced_override: true,
+            session_pinned: true,
+            exploration: true,
+            ..inputs(&failed_then_ok)
+        };
+        assert_eq!(RouteReason::for_request(&forced), RouteReason::Override);
         let pinned = RouteInputs {
             session_pinned: true,
             exploration: true,
@@ -684,6 +712,7 @@ mod tests {
     /// Exhaustive on purpose: a new `RouteReason` variant fails to compile here.
     fn expected_wire(reason: RouteReason) -> (&'static str, Option<&'static str>) {
         match reason {
+            RouteReason::Override => ("override", None),
             RouteReason::SessionPin => ("session_pin", None),
             RouteReason::Strategy(name) => ("strategy", Some(name)),
             RouteReason::Exploration => ("exploration", None),
@@ -699,6 +728,7 @@ mod tests {
     fn route_reason_should_serialize_to_exact_wire_strings_session_pin_strategy_exploration_fallback_rate_limit_hold_default_cache_local_via_exhaustive_helper(
     ) {
         let all = [
+            RouteReason::Override,
             RouteReason::SessionPin,
             RouteReason::Strategy("weighted"),
             RouteReason::Exploration,

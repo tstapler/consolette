@@ -318,7 +318,7 @@ describe('RecentTraceTableComponent (TC-UNIT-17)', () => {
 
     it('route_chip_text_should_map_each_wire_reason_exactly_and_status_cell_should_derive_fell_back_vs_retried', () => {
       const expected: Record<string, string> = {
-        session_pin: 'pinned', strategy: 'strategy', exploration: 'explore', fallback: 'fallback',
+        override: 'forced', session_pin: 'pinned', strategy: 'strategy', exploration: 'explore', fallback: 'fallback',
         rate_limit_hold: 'held', default: 'default', cache: 'cache', local: 'local',
       };
       render([...Object.keys(expected), 'brand_new_reason'].map(r => routed({ requestId: r, id: r, routeReason: r })));
@@ -371,7 +371,7 @@ describe('RecentTraceTableComponent (TC-UNIT-17)', () => {
 
     it('every_wire_route_reason_should_have_chip_title_and_legend_row_with_plain_language_text', () => {
       const keys = Object.keys(ROUTE_REASONS);
-      expect(keys.length).toBe(8);
+      expect(keys.length).toBe(9);
       render(keys.map(r => routed({ requestId: r, id: r, routeReason: r })));
       keys.forEach((k, i) => {
         const chipEl = rows()[i].querySelector('[data-chip]') as HTMLElement;

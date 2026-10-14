@@ -18,6 +18,7 @@ use crate::cost_metrics::record_actual_usage_from_anthropic_response;
 use crate::cost_metrics::types::RequestId;
 use crate::entrypoint::cost_tee::{begin_cost_tracking, CostTrackingStream};
 use crate::entrypoint::errors::map_provider_error_anthropic;
+use crate::entrypoint::upstream_override::take_upstream_override;
 use crate::entrypoint::EntrypointState;
 use crate::metrics::trace::{RequestOutcome, TraceScope};
 use crate::providers::{ProviderError, ProviderResponse};
@@ -141,9 +142,17 @@ impl HandlerResult {
 async fn messages_inner(
     scope: &mut TraceScope,
     state: EntrypointState,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: serde_json::Value,
 ) -> HandlerResult {
+    match take_upstream_override(&mut headers) {
+        Ok(Some(upstream)) => scope.force_upstream(upstream),
+        Ok(None) => {}
+        Err(e) => {
+            let (status, _, error_body) = map_provider_error_anthropic(&e);
+            return HandlerResult::failed((status, Json(error_body)).into_response(), &e);
+        }
+    }
     // Syntax variance telemetry (ADR-001): flag unmapped headers or body keys
     let mut variances = crate::syntax_variance::inspect_headers(&headers);
     variances.extend(crate::syntax_variance::inspect_request_body(&body));
@@ -163,7 +172,8 @@ async fn messages_inner(
     // Semantic response cache (issue #24): only non-streaming requests are
     // considered — replaying a cached response as a synthetic SSE stream
     // is out of scope for this feature.
-    let cache_key = if stream {
+    // A forced upstream has its own answers, so it neither reads nor fills the shared cache.
+    let cache_key = if stream || scope.forced_upstream().is_some() {
         None
     } else {
         state.response_cache.cacheable_key(&body, &headers)

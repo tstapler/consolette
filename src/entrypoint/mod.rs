@@ -21,6 +21,7 @@ pub mod openai_stream;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod traces;
+pub mod upstream_override;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -15,6 +15,7 @@ use crate::entrypoint::cost_tee::{begin_cost_tracking, CostTrackingStream};
 use crate::entrypoint::errors::map_provider_error_openai;
 use crate::entrypoint::messages::HandlerResult;
 use crate::entrypoint::openai_stream::OpenAiStreamTranslator;
+use crate::entrypoint::upstream_override::take_upstream_override;
 use crate::entrypoint::EntrypointState;
 use crate::metrics::trace::TraceScope;
 use crate::providers::{translate_and_record, translate_openai_to_anthropic, ProviderResponse};
@@ -63,10 +64,18 @@ fn request_stream_flag(body: &serde_json::Value) -> bool {
 async fn chat_completions_inner(
     scope: &mut TraceScope,
     state: EntrypointState,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: serde_json::Value,
     anthropic_body: serde_json::Value,
 ) -> HandlerResult {
+    match take_upstream_override(&mut headers) {
+        Ok(Some(upstream)) => scope.force_upstream(upstream),
+        Ok(None) => {}
+        Err(e) => {
+            let (status, _, error_body) = map_provider_error_openai(&e);
+            return HandlerResult::failed((status, Json(error_body)).into_response(), &e);
+        }
+    }
     let stream = request_stream_flag(&body);
     let model = body
         .get("model")

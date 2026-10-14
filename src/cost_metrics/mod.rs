@@ -47,10 +47,11 @@ pub async fn record_actual_usage_from_anthropic_response(
     tracker: &CostTracker,
     session_key: &SessionKey,
     request_id: RequestId,
-    _model: &str,
+    model: &str,
     anthropic_response: &serde_json::Value,
 ) -> Option<Result<(), CostTrackerError>> {
     let usage = crate::providers::extract_usage(anthropic_response)?;
+    tracker.record_model(session_key, request_id, model).await;
     Some(
         tracker
             .record_actual_usage_detailed(session_key, request_id, usage, TokenSource::Exact)

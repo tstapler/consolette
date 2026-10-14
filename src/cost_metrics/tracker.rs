@@ -301,6 +301,18 @@ impl CostTracker {
         Ok(())
     }
 
+    /// Set the model a row is priced against. Non-creating: an unknown
+    /// session or row is ignored. Call before usage is folded.
+    pub async fn record_model(&self, session_key: &SessionKey, request_id: RequestId, model: &str) {
+        let Some(state) = self.store.get(session_key).await else {
+            return;
+        };
+        let mut state = state.write().await;
+        if let Some(record) = state.find_mut(request_id) {
+            record.model = Some(model.to_string());
+        }
+    }
+
     /// Mark a `Pending` row `Abandoned`. Contributes nothing to
     /// `totals_by_tier`, and never un-folds anything already folded
     /// (`Abandoned` rows by construction never reached `Reconciled`).

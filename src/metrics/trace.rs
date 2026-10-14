@@ -336,6 +336,15 @@ impl TraceScope {
         self.selected_model_was_exploration = was_exploration;
     }
 
+    /// The model this request is billed against: the route's pin or the
+    /// family-resolved model, `None` for passthrough (client's own name).
+    #[must_use]
+    pub fn priced_model(&self) -> Option<&str> {
+        self.selected_model
+            .as_deref()
+            .or(self.resolved_model.as_deref())
+    }
+
     /// Records the concrete model a family route resolved to (last call wins).
     pub fn record_resolved_model(&mut self, resolved_model: Option<String>) {
         self.resolved_model = resolved_model;

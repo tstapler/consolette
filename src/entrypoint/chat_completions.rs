@@ -77,12 +77,15 @@ async fn chat_completions_inner(
 
     let (session_key, request_id) = begin_cost_tracking(&state.cost_tracker).await;
 
-    match state
+    let result = state
         .dispatch_router
         .load()
         .dispatch_traced(scope, anthropic_body, headers, stream, est_tokens)
-        .await
-    {
+        .await;
+    let cost_model = scope
+        .priced_model()
+        .map_or_else(|| model.clone(), str::to_string);
+    match result {
         Ok(ProviderResponse::Full(json)) => {
             if let Some(usage) = crate::providers::extract_usage(&json) {
                 state.metrics.counters.record_model_tokens(
@@ -101,7 +104,7 @@ async fn chat_completions_inner(
                 std::sync::Arc::clone(&state.cost_tracker),
                 session_key,
                 request_id,
-                model.clone(),
+                cost_model,
             );
             let translated = OpenAiStreamTranslator::new(tee, model);
             HandlerResult::ok(

@@ -47,7 +47,7 @@ pub struct CostTrackingStream<S> {
     tracker: Arc<CostTracker>,
     session_key: SessionKey,
     request_id: RequestId,
-    #[allow(dead_code)] // reserved for future model-aware cost recording
+    /// Model the request is priced against.
     model: String,
     buf: Vec<u8>,
     last_usage: Option<crate::providers::AnthropicUsage>,
@@ -124,8 +124,10 @@ impl<S> CostTrackingStream<S> {
         let session_key = self.session_key.clone();
         let request_id = self.request_id;
         let last_usage = self.last_usage;
+        let model = self.model.clone();
         tokio::spawn(async move {
             if let Some(usage) = last_usage {
+                tracker.record_model(&session_key, request_id, &model).await;
                 let _ = tracker
                     .record_actual_usage_detailed(
                         &session_key,
@@ -157,8 +159,10 @@ impl<S> CostTrackingStream<S> {
         let session_key = self.session_key.clone();
         let request_id = self.request_id;
         let last_usage = self.last_usage;
+        let model = self.model.clone();
         tokio::spawn(async move {
             if let Some(usage) = last_usage {
+                tracker.record_model(&session_key, request_id, &model).await;
                 let _ = tracker
                     .record_actual_usage_detailed(
                         &session_key,
@@ -275,6 +279,59 @@ mod tests {
 
         let report = tracker.report_for_session(&session_key).await.unwrap();
         assert_eq!(report.actual_tokens, Some(42));
+    }
+
+    #[tokio::test]
+    async fn tee_prices_usage_per_class_without_the_model_being_set_by_hand() {
+        let (tracker, session_key, request_id) = build_tracker_and_session().await;
+        let inner = stream::iter(vec![
+            Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n")),
+            Ok(Bytes::from_static(
+                b"event: message_delta\ndata: {\"usage\":{\"input_tokens\":1000,\"output_tokens\":200,\"cache_read_input_tokens\":8000,\"cache_creation_input_tokens\":400}}\n\n",
+            )),
+            Ok(Bytes::from_static(b"event: message_stop\ndata: {}\n\n")),
+        ]);
+        let tee = CostTrackingStream::new(
+            inner,
+            Arc::clone(&tracker),
+            session_key.clone(),
+            request_id,
+            "claude-sonnet-5-5".to_string(),
+        );
+        drain(tee).await;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let report = tracker.report_for_session(&session_key).await.unwrap();
+        // claude-sonnet-5-5 (default table): in 2e-6, out 1e-5, cache read 1e-7,
+        // cache write 2.5e-6 -> 0.002 + 0.002 + 0.0008 + 0.001 = 0.0058
+        let cost = report
+            .by_tier
+            .iter()
+            .find_map(|t| t.cost_actual_usd)
+            .unwrap(); // None means the tee never recorded a model
+        assert!((cost - 0.0058).abs() < 1e-9, "got {cost}");
+    }
+
+    #[tokio::test]
+    async fn full_response_recorder_sets_model_so_cost_is_priced() {
+        let (tracker, session_key, request_id) = build_tracker_and_session().await;
+        let response = serde_json::json!({"usage": {"input_tokens": 1000, "output_tokens": 200}});
+        crate::cost_metrics::record_actual_usage_from_anthropic_response(
+            &tracker,
+            &session_key,
+            request_id,
+            "gpt-6.1-sol",
+            &response,
+        )
+        .await;
+        let report = tracker.report_for_session(&session_key).await.unwrap();
+        let cost = report
+            .by_tier
+            .iter()
+            .find_map(|t| t.cost_actual_usd)
+            .unwrap();
+        assert!((cost - 0.004).abs() < 1e-9, "got {cost}");
     }
 
     #[tokio::test]

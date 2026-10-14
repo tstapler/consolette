@@ -210,6 +210,9 @@ async fn messages_inner(
     handle_direct_dispatch(
         &state,
         DirectDispatchContext {
+            cost_model: scope
+                .priced_model()
+                .map_or_else(|| model.clone(), str::to_string),
             model,
             session_key,
             request_id,
@@ -227,6 +230,8 @@ async fn messages_inner(
 /// `EmulatedSearchParams`.
 struct DirectDispatchContext {
     model: String,
+    /// Model the request is priced against (resolved/pinned, else requested).
+    cost_model: String,
     session_key: SessionKey,
     request_id: RequestId,
     cache_key: Option<String>,
@@ -245,7 +250,7 @@ async fn handle_direct_dispatch(
         }
         Ok(ProviderResponse::Stream(s)) => HandlerResult::ok(direct_stream_response(
             state,
-            ctx.model,
+            ctx.cost_model,
             ctx.session_key,
             ctx.request_id,
             s,
@@ -270,7 +275,7 @@ async fn direct_full_response(
         &state.cost_tracker,
         &ctx.session_key,
         ctx.request_id,
-        &ctx.model,
+        &ctx.cost_model,
         &json,
     )
     .await;

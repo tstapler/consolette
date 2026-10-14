@@ -278,6 +278,20 @@ mod tests {
     }
 
     #[test]
+    fn default_snapshot_prices_current_claude_and_gpt_models_with_cache_rates() {
+        let table = PricingTable::load_default();
+        for model in ["claude-sonnet-5-5", "gpt-6.1-sol"] {
+            let price = table
+                .price_for(model)
+                .unwrap_or_else(|| panic!("{model} missing"));
+            assert_eq!(price.input_usd_per_token, 0.000_002);
+            assert_eq!(price.output_usd_per_token, 0.000_01);
+            assert_eq!(price.cache_read_usd_per_token, 0.000_000_1);
+            assert_eq!(price.cache_creation_usd_per_token, 0.000_002_5);
+        }
+    }
+
+    #[test]
     fn model_price_should_populate_cache_rate_fields_when_snapshot_sets_them() {
         let snapshot: PricingSnapshot = serde_json::from_str(
             r#"{"models": {"cache-heavy-model": {

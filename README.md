@@ -270,6 +270,36 @@ auth. Only warnings for the first route are produced: pins on other routes,
 `model_family` routes and fallback targets outside that route are not
 checked, so no warning is not proof that every target exists.
 
+### Forcing one upstream (`X-Consolette-Upstream`)
+
+To test one backend of a multi-upstream route on a live proxy, name it in a
+request header:
+
+```sh
+curl http://127.0.0.1:47000/v1/messages \
+  -H 'X-Consolette-Upstream: anthropic' \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+- Works on `POST /v1/messages` and `POST /v1/chat/completions`. The value is a
+  configured upstream `name`; it need not be in the active route. If it is, that
+  route entry's pinned `model` / `model_family` still apply.
+- The request goes to that upstream only. If it fails, you get its error: there
+  is no fallback. Rate limits and cooldowns still apply, and a session pin does
+  not override the header.
+- An unknown name, or an empty or repeated header, returns HTTP 400. The
+  unknown-name error lists the configured upstream names (names only).
+- The proxy removes the header before dispatch, so no upstream ever sees it.
+  A forced request neither reads nor writes the response cache.
+- The dashboard shows these requests with the route reason `forced`.
+
+**Security note**: the proxy has no authentication, listens on `127.0.0.1`
+only, and its CORS policy allows any origin, so any local process can set the
+header. A web page in your browser can too, though the browser must first
+preflight a custom header. The effect is limited to choosing among the upstreams
+you already configured.
+
 ### Dashboard event keys (`compat_snake_case`)
 
 Dashboard SSE events (`GET /v1/dashboard/events`) use camelCase keys. For external consumers

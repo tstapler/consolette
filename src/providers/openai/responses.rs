@@ -147,13 +147,15 @@ pub(crate) async fn translate_anthropic_request_to_responses(anthropic: Value) -
 
     let mut items: Vec<Value> = Vec::new();
 
-    let system_raw = anthropic.get("system").and_then(Value::as_str);
+    let system_raw = anthropic
+        .get("system")
+        .and_then(crate::system_prompt::flatten_system_text);
     let system_text = match system_raw {
         Some(sys) => {
             if !is_claude && !tool_names.is_empty() {
-                crate::system_prompt::patch_open_model_tool_prompt(sys, &tool_names)
+                crate::system_prompt::patch_open_model_tool_prompt(&sys, &tool_names)
             } else {
-                sys.to_string()
+                sys
             }
         }
         None => {
@@ -385,17 +387,6 @@ pub(crate) fn translate_responses_response_to_anthropic(responses_body: Value) -
         }
     };
 
-    let input_tokens = responses_body
-        .get("usage")
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output_tokens = responses_body
-        .get("usage")
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
     json!({
         "id": id,
         "type": "message",
@@ -403,10 +394,7 @@ pub(crate) fn translate_responses_response_to_anthropic(responses_body: Value) -
         "model": model,
         "content": Value::Array(blocks),
         "stop_reason": stop_reason,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": crate::providers::anthropic_usage_from_openai(responses_body.get("usage"))
     })
 }
 
@@ -468,6 +456,8 @@ pub(crate) struct ResponsesToAnthropicStream<S> {
     id: String,
     model: String,
     input_tokens: u64,
+    /// Real upstream usage from the terminal event, in Anthropic shape.
+    usage: Option<Value>,
     started: bool,
     finished: bool,
     done: bool,
@@ -489,6 +479,7 @@ where
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             model,
             input_tokens: 0,
+            usage: None,
             started: false,
             finished: false,
             done: false,
@@ -668,25 +659,8 @@ where
     }
 
     /// Close every still-open block (safety net for a terminal event
-    /// arriving before every item's own `output_item.done`) and emit the
-    /// terminal `message_delta`/`message_stop` pair. `stop_reason ==
-    /// "error"` is Story 3.3.2's mid-stream-application-error signal — the
-    /// choice documented there: a distinguishing `stop_reason` value on
-    /// `message_delta`, not a separate Anthropic `error` SSE event type,
-    /// since that's the minimum bar Anthropic-compatible clients are
-    /// guaranteed to branch on (they already inspect `stop_reason`).
-    fn close(&mut self, stop_reason: &str) {
-        if self.finished {
-            return;
-        }
-        self.ensure_message_started();
-        self.finished = true;
-
-        let saw_tool_use = self
-            .blocks
-            .iter()
-            .any(|b| b.kind == ResponsesBlockKind::ToolUse && b.started);
-
+    /// arriving before every item's own `output_item.done`).
+    fn close_open_blocks(&mut self) {
         for i in 0..self.blocks.len() {
             let block = &self.blocks[i];
             if block.started && !block.stopped {
@@ -715,6 +689,22 @@ where
                 ));
             }
         }
+    }
+
+    /// Close open blocks and emit the terminal `message_delta`/`message_stop`
+    /// pair with a valid Anthropic `stop_reason`.
+    fn close(&mut self, stop_reason: &str) {
+        if self.finished {
+            return;
+        }
+        self.ensure_message_started();
+        self.finished = true;
+
+        let saw_tool_use = self
+            .blocks
+            .iter()
+            .any(|b| b.kind == ResponsesBlockKind::ToolUse && b.started);
+        self.close_open_blocks();
 
         let stop_reason = if stop_reason == "end_turn" && saw_tool_use {
             "tool_use"
@@ -727,12 +717,32 @@ where
             &json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason},
-                "usage": {"output_tokens": 0}
+                "usage": self.usage.clone().unwrap_or_else(|| json!({"output_tokens": 0}))
             }),
         ));
         self.pending.push_back(Self::frame(
             "message_stop",
             &json!({"type": "message_stop"}),
+        ));
+    }
+
+    /// Mid-stream application failure: close open blocks, then emit an
+    /// Anthropic `error` event (the only wire-valid way to signal failure;
+    /// `message_delta.stop_reason` has no error value) and end the stream
+    /// without `message_stop`, so clients treat it as a failed request.
+    fn close_with_error(&mut self, message: &str) {
+        if self.finished {
+            return;
+        }
+        self.ensure_message_started();
+        self.finished = true;
+        self.close_open_blocks();
+        self.pending.push_back(Self::frame(
+            "error",
+            &json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": message}
+            }),
         ));
     }
 }
@@ -741,6 +751,16 @@ impl<S> ResponsesToAnthropicStream<S>
 where
     S: Stream<Item = Result<Bytes, anyhow::Error>>,
 {
+    fn record_terminal_usage(&mut self, parsed: &Value) {
+        if let Some(u) = parsed
+            .get("response")
+            .and_then(|r| r.get("usage"))
+            .filter(|u| u.is_object())
+        {
+            self.usage = Some(crate::providers::anthropic_usage_from_openai(Some(u)));
+        }
+    }
+
     /// Dispatch one parsed Responses SSE event JSON payload to the
     /// appropriate state-machine transition. Split out of `poll_next` to
     /// keep the poll loop itself flat.
@@ -779,14 +799,32 @@ where
                 }
             }
             "response.completed" => {
+                self.record_terminal_usage(parsed);
                 self.close("end_turn");
             }
+            "response.incomplete" => {
+                self.record_terminal_usage(parsed);
+                let reason = parsed
+                    .get("response")
+                    .and_then(|r| r.get("incomplete_details"))
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str);
+                self.close(match reason {
+                    Some("max_output_tokens") => "max_tokens",
+                    Some("content_filter") => "refusal",
+                    _ => "end_turn",
+                });
+            }
             "response.failed" | "response.error" => {
-                // Story 3.3.2: a mid-stream application-level failure —
-                // surfaced as `stop_reason: "error"` rather than a silent
-                // `end_turn`, so a coding-agent tool loop can tell a
-                // genuine completion from a truncated one (pitfalls.md §2).
-                self.close("error");
+                let message = parsed
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .or_else(|| parsed.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .or_else(|| parsed.get("message").and_then(Value::as_str))
+                    .unwrap_or("upstream response failed");
+                self.close_with_error(message);
             }
             // Unrecognized/uninteresting event (e.g. `response.created`,
             // `response.function_call_arguments.done`): no-op. The
@@ -875,6 +913,25 @@ mod tests {
         assert_eq!(result["model"], json!("gpt-5.3-codex"));
         assert_eq!(result["input"], json!("hi"));
         assert_eq!(result["max_output_tokens"], json!(100));
+    }
+
+    #[tokio::test]
+    async fn translate_anthropic_request_to_responses_flattens_system_block_array() {
+        let anthropic = json!({
+            "model": "gpt-5.3-codex",
+            "system": [
+                {"type": "text", "text": "be terse"},
+                {"type": "text", "text": "use tools"},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+
+        let result = translate_anthropic_request_to_responses(anthropic).await;
+
+        let text = result["input"][0]["content"][0]["text"]
+            .as_str()
+            .expect("system block array must reach the upstream as text");
+        assert!(text.contains("be terse\n\nuse tools"), "got {text}");
     }
 
     #[tokio::test]
@@ -1198,6 +1255,20 @@ mod tests {
         assert_eq!(result["content"], json!([{"type": "text", "text": ""}]));
     }
 
+    #[test]
+    fn translate_responses_response_maps_cached_tokens_to_cache_read() {
+        let body = json!({
+            "id": "resp_1", "model": "gpt-5", "output": [],
+            "usage": {"input_tokens": 200, "output_tokens": 5,
+                      "input_tokens_details": {"cached_tokens": 120}}
+        });
+        let result = translate_responses_response_to_anthropic(body);
+        assert_eq!(
+            result["usage"],
+            json!({"input_tokens": 80, "output_tokens": 5, "cache_read_input_tokens": 120})
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // ResponsesToAnthropicStream (Epic 3.3)
     // ────────────────────────────────────────────────────────────────────
@@ -1385,12 +1456,10 @@ mod tests {
             assert_eq!(stops, vec![0, 1, 2]);
         }
 
-        /// Story 3.3.2: a `response.failed` event mid-stream must produce a
-        /// terminal event distinguishable from normal `end_turn`
-        /// completion — chosen signal: `message_delta` with `stop_reason:
-        /// "error"` (documented on `ResponsesToAnthropicStream::close`).
+        /// A `response.failed` event mid-stream must surface as an Anthropic
+        /// `error` event (not a bogus `stop_reason`), after closing open blocks.
         #[tokio::test]
-        async fn responses_to_anthropic_stream_should_emit_distinguishable_error_state_when_response_failed_event_arrives(
+        async fn responses_to_anthropic_stream_should_emit_error_event_when_response_failed_event_arrives(
         ) {
             let inner = stream::iter(vec![
                 Ok(sse(
@@ -1407,20 +1476,66 @@ mod tests {
             let out = drain(translator).await;
             let events: Vec<(String, Value)> = out.iter().map(parse_event).collect();
 
-            let (_, message_delta) = events
-                .iter()
-                .find(|(e, _)| e == "message_delta")
-                .expect("message_delta must be emitted");
-            assert_eq!(message_delta["delta"]["stop_reason"], "error");
-            assert_ne!(message_delta["delta"]["stop_reason"], "end_turn");
-
-            assert_eq!(events.last().unwrap().0, "message_stop");
+            assert!(
+                !events.iter().any(|(e, _)| e == "message_delta"),
+                "no message_delta (and so no invalid stop_reason) on failure"
+            );
+            let (name, data) = events.last().unwrap();
+            assert_eq!(name, "error");
+            assert_eq!(data["type"], "error");
+            assert_eq!(data["error"]["type"], "api_error");
+            assert_eq!(data["error"]["message"], "content policy violation");
 
             // The in-progress text block must still be cleanly closed
-            // before the terminal events, not left dangling.
+            // before the error event, not left dangling.
             assert!(events
                 .iter()
                 .any(|(e, d)| e == "content_block_stop" && d["index"] == 0));
+        }
+
+        #[tokio::test]
+        async fn response_incomplete_max_output_tokens_maps_to_max_tokens() {
+            let inner = stream::iter(vec![
+                Ok(sse(
+                    r#"{"type":"response.output_item.added","item":{"id":"item_1","type":"message","role":"assistant","content":[]}}"#,
+                )),
+                Ok(sse(
+                    r#"{"type":"response.output_text.delta","item_id":"item_1","delta":"cut"}"#,
+                )),
+                Ok(sse(
+                    r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":50,"output_tokens":12}}}"#,
+                )),
+            ]);
+            let out = drain(ResponsesToAnthropicStream::new(inner, "gpt-5".to_string())).await;
+            let (_, md) = out
+                .iter()
+                .map(parse_event)
+                .find(|(e, _)| e == "message_delta")
+                .unwrap();
+            assert_eq!(md["delta"]["stop_reason"], "max_tokens");
+            assert_eq!(md["usage"]["output_tokens"], 12);
+        }
+
+        #[tokio::test]
+        async fn response_completed_usage_maps_cache_and_output_tokens() {
+            let inner = stream::iter(vec![
+                Ok(sse(
+                    r#"{"type":"response.output_item.added","item":{"id":"item_1","type":"message","role":"assistant","content":[]}}"#,
+                )),
+                Ok(sse(
+                    r#"{"type":"response.completed","response":{"usage":{"input_tokens":200,"output_tokens":33,"input_tokens_details":{"cached_tokens":150}}}}"#,
+                )),
+            ]);
+            let out = drain(ResponsesToAnthropicStream::new(inner, "gpt-5".to_string())).await;
+            let (_, md) = out
+                .iter()
+                .map(parse_event)
+                .find(|(e, _)| e == "message_delta")
+                .unwrap();
+            assert_eq!(md["delta"]["stop_reason"], "end_turn");
+            assert_eq!(md["usage"]["output_tokens"], 33);
+            assert_eq!(md["usage"]["input_tokens"], 50);
+            assert_eq!(md["usage"]["cache_read_input_tokens"], 150);
         }
 
         /// Task 3.4.2a: integration test chaining Story 3.3.1's streaming

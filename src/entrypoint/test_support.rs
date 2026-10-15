@@ -85,3 +85,98 @@ pub(crate) async fn state_with_router(
         ),
     }
 }
+
+/// Upstream double for cost-attribution tests: optionally reports a
+/// family-resolved model, then answers 1000 input / 200 output tokens
+/// (Full JSON or a complete Anthropic SSE stream).
+pub(crate) struct CostProbeProvider {
+    pub note_resolved: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for CostProbeProvider {
+    fn name(&self) -> &str {
+        "probe"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: http::HeaderMap,
+        stream: bool,
+    ) -> Result<crate::providers::ProviderResponse, crate::providers::ProviderError> {
+        use crate::providers::ProviderResponse;
+        if self.note_resolved {
+            crate::providers::note_resolved_model(COST_PROBE_ROUTED_MODEL);
+        }
+        let usage = serde_json::json!({"input_tokens": 1000, "output_tokens": 200});
+        if stream {
+            let frames = [
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n".to_string(),
+                format!("event: message_delta\ndata: {}\n\n", serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":usage})),
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+            ];
+            let s = futures_util::stream::iter(
+                frames
+                    .into_iter()
+                    .map(|f| Ok::<_, anyhow::Error>(bytes::Bytes::from(f))),
+            );
+            return Ok(ProviderResponse::Stream(Box::pin(s)));
+        }
+        Ok(ProviderResponse::Full(serde_json::json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "unknown",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": usage
+        })))
+    }
+
+    async fn list_models(
+        &self,
+    ) -> Result<Vec<crate::providers::ModelInfo>, crate::providers::ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+/// The routed model the probe reports/pins; present in the default pricing table.
+pub(crate) const COST_PROBE_ROUTED_MODEL: &str = "gpt-6.1-sol";
+
+/// A state whose single route is a pin (`pinned == true`: `model` set, provider reports
+/// nothing) or a `model_family` (provider reports the resolved model).
+pub(crate) async fn cost_probe_state(pinned: bool) -> EntrypointState {
+    use crate::routing::health::HealthRegistry;
+    use crate::routing::strategy::{FallbackStrategy, UpstreamRef};
+
+    let metrics = MetricsCollector::new();
+    let router = DispatchRouter::new(crate::routing::router::RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "probe".to_string(),
+            weight: 1.0,
+            model: pinned.then(|| COST_PROBE_ROUTED_MODEL.to_string()),
+            model_family: (!pinned).then(|| "gpt-6".to_string()),
+        }],
+        providers: vec![Arc::new(CostProbeProvider {
+            note_resolved: !pinned,
+        })],
+        strategy: Arc::new(FallbackStrategy) as Arc<dyn crate::routing::strategy::RoutingStrategy>,
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(crate::ratelimit::RateLimiters::new(
+            &crate::config::schema::RateLimitConfig::default(),
+        )) as Arc<dyn crate::ratelimit::AdmissionControl>,
+        metrics: Arc::clone(&metrics),
+    });
+    state_with_router(router, metrics).await
+}
+
+/// Asserts the one cost row was priced by [`COST_PROBE_ROUTED_MODEL`]
+/// (the requested model in these tests is absent from the pricing table).
+/// 1000 in + 200 out at 2e-6 / 1e-5.
+#[allow(clippy::unwrap_used)]
+pub(crate) async fn assert_cost_priced_by_routed_model(state: &EntrypointState) {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let rows = state.cost_tracker.snapshot_records().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let cost = rows[0].cost.unwrap().0; // None means the row was never priced
+    assert!((cost - 0.004).abs() < 1e-9, "got {cost}");
+}

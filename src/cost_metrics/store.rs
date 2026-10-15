@@ -60,6 +60,9 @@ pub struct CostRecord {
     pub counterfactual_est: Option<TokenCount>,
     pub compacted_est: Option<TokenCount>,
     pub actual_tokens: Option<TokenCount>,
+    /// Per-class token breakdown of the actual usage, when the caller had one
+    /// (live proxy path); lets cost price output and cache tokens at their own rates.
+    pub actual_usage: Option<crate::providers::AnthropicUsage>,
     pub model: Option<String>,
     pub status: ReconciliationStatus,
     pub recorded_at: DateTime<Utc>,
@@ -181,6 +184,18 @@ impl SessionCostStore {
         self.cache.run_pending_tasks().await;
         self.cache.entry_count()
     }
+
+    /// Every cost row across all sessions; lets handler tests read a row
+    /// whose session key is generated inside the handler.
+    #[cfg(test)]
+    pub(crate) async fn snapshot_records(&self) -> Vec<CostRecord> {
+        let states: Vec<_> = self.cache.iter().map(|(_, state)| state).collect();
+        let mut out = Vec::new();
+        for state in states {
+            out.extend(state.read().await.records.iter().cloned());
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +212,7 @@ mod tests {
             counterfactual_est: None,
             compacted_est: None,
             actual_tokens: None,
+            actual_usage: None,
             model: None,
             status: ReconciliationStatus::Pending,
             recorded_at: Utc::now(),

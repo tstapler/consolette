@@ -223,6 +223,9 @@ async fn messages_inner(
     handle_direct_dispatch(
         &state,
         DirectDispatchContext {
+            cost_model: scope
+                .priced_model()
+                .map_or_else(|| model.clone(), str::to_string),
             model,
             session_key,
             request_id,
@@ -240,6 +243,8 @@ async fn messages_inner(
 /// `EmulatedSearchParams`.
 struct DirectDispatchContext {
     model: String,
+    /// Model the request is priced against (resolved/pinned, else requested).
+    cost_model: String,
     session_key: SessionKey,
     request_id: RequestId,
     cache_key: Option<String>,
@@ -258,7 +263,7 @@ async fn handle_direct_dispatch(
         }
         Ok(ProviderResponse::Stream(s)) => HandlerResult::ok(direct_stream_response(
             state,
-            ctx.model,
+            ctx.cost_model,
             ctx.session_key,
             ctx.request_id,
             s,
@@ -283,7 +288,7 @@ async fn direct_full_response(
         &state.cost_tracker,
         &ctx.session_key,
         ctx.request_id,
-        &ctx.model,
+        &ctx.cost_model,
         &json,
     )
     .await;
@@ -395,13 +400,23 @@ async fn handle_emulated_search(
             Err(failed) => return *failed,
         };
 
-    record_emulation_outcome(&state, &session_key, request_id, &model, &outcome).await;
+    // The stream tee re-records the model, so both sites must use this one.
+    let cost_model = scope
+        .priced_model()
+        .map_or_else(|| model.clone(), str::to_string);
+    record_emulation_outcome(&state, &session_key, request_id, &cost_model, &outcome).await;
 
     HandlerResult::ok(if stream {
         // Buffered V1 (pre-mortem failure 3): time-to-first-byte degrades to
         // time-to-final-answer for search turns only. Non-search streams are
         // untouched (they never enter this branch).
-        stream_response(&state, model, session_key, request_id, &outcome.message)
+        stream_response(
+            &state,
+            cost_model,
+            session_key,
+            request_id,
+            &outcome.message,
+        )
     } else {
         full_response(outcome.message)
     })

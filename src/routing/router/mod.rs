@@ -753,13 +753,19 @@ impl Router {
             }
             let attempt_started = std::time::Instant::now();
             scope.begin_attempt(&chosen.name, chosen.model.as_deref(), scope.iteration());
-            let outcome = provider.send(request_body, headers.clone(), stream).await;
+            let (outcome, resolved) = crate::providers::capture_resolved_model(provider.send(
+                request_body,
+                headers.clone(),
+                stream,
+            ))
+            .await;
 
             match outcome {
                 Ok(response) => {
                     self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
                     scope.complete_attempt_result(None);
                     scope.record_provider(&chosen.name);
+                    scope.record_resolved_model(&chosen.name, resolved);
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {

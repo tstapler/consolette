@@ -268,6 +268,8 @@ pub struct TraceScope {
     provider: String,
     selected_model: Option<String>,
     selected_model_was_exploration: Option<bool>,
+    /// Concrete model a `model_family` route resolved to, reported by the provider.
+    resolved_model: Option<(String, String)>,
     /// The scope's own copy of the ring-buffer entry; `finish` completes it and writes it back once.
     detail: RequestDetail,
     pending: Option<PendingAttempt>,
@@ -310,6 +312,7 @@ impl TraceScope {
             provider: String::new(),
             selected_model: None,
             selected_model_was_exploration: None,
+            resolved_model: None,
             detail,
             pending: None,
             iteration: 0,
@@ -339,6 +342,31 @@ impl TraceScope {
     ) {
         self.selected_model = selected_model;
         self.selected_model_was_exploration = was_exploration;
+    }
+
+    /// The model this request is billed against: the route's pin or the
+    /// family-resolved model, `None` for passthrough (client's own name).
+    #[must_use]
+    pub fn priced_model(&self) -> Option<&str> {
+        self.selected_model
+            .as_deref()
+            .or(self.resolved_model.as_ref().map(|(_, m)| m.as_str()))
+    }
+
+    /// Records the concrete model a family route resolved to (last call wins).
+    pub fn record_resolved_model(&mut self, upstream: &str, resolved_model: Option<String>) {
+        match resolved_model {
+            Some(model) => self.resolved_model = Some((upstream.to_string(), model)),
+            // A success on another upstream that reports nothing invalidates it.
+            None if self
+                .resolved_model
+                .as_ref()
+                .is_some_and(|(u, _)| u != upstream) =>
+            {
+                self.resolved_model = None;
+            }
+            None => {}
+        }
     }
 
     pub fn record_attempt(&mut self, attempt: AttemptRecord) {
@@ -487,6 +515,10 @@ impl TraceScope {
         let last_attempt = self.attempts.records().last();
         let routed_model = match (&self.selected_model, &self.detail.requested_model) {
             (Some(pinned), _) => Some((pinned.clone(), RoutedModelSource::Pinned)),
+            (None, _) if self.resolved_model.is_some() => self
+                .resolved_model
+                .clone()
+                .map(|(_, m)| (m, RoutedModelSource::Pinned)),
             (None, Some(asked)) if last_attempt.is_some() => {
                 Some((asked.clone(), RoutedModelSource::Passthrough))
             }

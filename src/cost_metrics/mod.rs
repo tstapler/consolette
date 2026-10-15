@@ -18,13 +18,13 @@ pub mod tracker;
 pub mod types;
 
 use crate::cost_metrics::tracker::{CostTracker, CostTrackerError};
-use crate::cost_metrics::types::{RequestId, TokenCount, TokenSource};
+use crate::cost_metrics::types::{RequestId, TokenSource};
 use crate::session_compaction::SessionKey;
 
 /// Extract real `usage.*` token counts from an Anthropic Messages API
 /// response and record them against `(session_key, request_id)` via
 /// [`CostTracker::record_actual_usage`], combined into one billed-token
-/// figure (`input_tokens + output_tokens`) with [`TokenSource::Exact`]
+/// figure (input + output + cache tokens) with [`TokenSource::Exact`]
 /// (plan.md Epic 2.2, Story 2.2.1).
 ///
 /// `model` is accepted for signature parity with plan.md's Task 2.2.1b —
@@ -47,17 +47,14 @@ pub async fn record_actual_usage_from_anthropic_response(
     tracker: &CostTracker,
     session_key: &SessionKey,
     request_id: RequestId,
-    _model: &str,
+    model: &str,
     anthropic_response: &serde_json::Value,
 ) -> Option<Result<(), CostTrackerError>> {
     let usage = crate::providers::extract_usage(anthropic_response)?;
-    let actual = TokenCount {
-        value: usage.input_tokens + usage.output_tokens,
-        source: TokenSource::Exact,
-    };
+    tracker.record_model(session_key, request_id, model).await;
     Some(
         tracker
-            .record_actual_usage(session_key, request_id, actual)
+            .record_actual_usage_detailed(session_key, request_id, usage, TokenSource::Exact)
             .await,
     )
 }

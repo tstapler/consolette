@@ -279,3 +279,217 @@ async fn dispatch_should_record_shed_attempt_zero_latency_without_changing_healt
     assert_eq!(health.remaining_secs(0), 0);
     assert!(health.is_available(0), "shed must not trip a cooldown");
 }
+
+/// Provider that reports the concrete model a family resolved to, as
+/// `OpenaiProvider::send` does.
+struct ResolvingProvider;
+
+#[async_trait::async_trait]
+impl Provider for ResolvingProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        crate::providers::note_resolved_model("gpt-6.1-sol");
+        Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+// *Given* a `model_family` route whose provider resolves the family to a
+// concrete model, *then* the trace's routed model is the resolved model
+// (pinned by the route), not the model the client asked for.
+#[tokio::test]
+async fn dispatch_should_record_resolved_model_as_routed_model_for_family_routes() {
+    let metrics = MetricsCollector::new();
+    let router = Router::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "openai".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: Some("gpt-6".to_string()),
+        }],
+        providers: vec![Arc::new(ResolvingProvider)],
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(AlwaysAllow),
+        metrics: Arc::clone(&metrics),
+    });
+
+    let res = router
+        .dispatch(
+            serde_json::json!({"model": "claude-sonnet-5-5"}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    assert!(res.is_ok());
+    let recent = metrics.get_recent_requests(1);
+    assert_eq!(
+        recent[0].requested_model.as_deref(),
+        Some("claude-sonnet-5-5")
+    );
+    assert_eq!(recent[0].routed_model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(
+        recent[0].routed_model_source,
+        Some(crate::metrics::trace::RoutedModelSource::Pinned)
+    );
+}
+
+/// Resolves a model on its first call only, like a cache-warm family on round one.
+struct ResolveOnceProvider(std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl Provider for ResolveOnceProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            crate::providers::note_resolved_model("gpt-6.1-sol");
+        }
+        Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+// A later round that reports no resolved model must not erase an earlier one.
+#[tokio::test]
+async fn later_dispatch_without_resolved_model_keeps_the_earlier_one() {
+    let metrics = MetricsCollector::new();
+    let router = Router::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "openai".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: Some("gpt-6".to_string()),
+        }],
+        providers: vec![Arc::new(ResolveOnceProvider(
+            std::sync::atomic::AtomicBool::new(false),
+        ))],
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(AlwaysAllow),
+        metrics: Arc::clone(&metrics),
+    });
+    let mut scope =
+        crate::metrics::trace::TraceScope::begin(&metrics, &serde_json::json!({}), false, 0);
+
+    for _ in 0..2 {
+        let res = router
+            .dispatch_traced(
+                &mut scope,
+                serde_json::json!({}),
+                HeaderMap::new(),
+                false,
+                0,
+            )
+            .await;
+        assert!(res.is_ok());
+    }
+
+    assert_eq!(scope.priced_model(), Some("gpt-6.1-sol"));
+}
+
+/// Reports nothing, like a passthrough upstream.
+struct SilentProvider;
+
+#[async_trait::async_trait]
+impl Provider for SilentProvider {
+    fn name(&self) -> &str {
+        "plain"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        Ok(ProviderResponse::Full(serde_json::json!({"ok": true})))
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+// Round 1 succeeds on family upstream A (resolves a model); round 2 falls to
+// passthrough upstream B. B must not be priced at A's resolved model.
+#[tokio::test]
+async fn resolved_model_does_not_leak_to_a_different_upstream_in_a_later_round() {
+    let metrics = MetricsCollector::new();
+    let health = Arc::new(HealthRegistry::new(300));
+    let router = Router::new(RouterDeps {
+        candidates: vec![
+            UpstreamRef {
+                index: 0,
+                name: "openai".to_string(),
+                weight: 1.0,
+                model: None,
+                model_family: Some("gpt-6".to_string()),
+            },
+            UpstreamRef {
+                index: 1,
+                name: "plain".to_string(),
+                weight: 1.0,
+                model: None,
+                model_family: None,
+            },
+        ],
+        providers: vec![Arc::new(ResolvingProvider), Arc::new(SilentProvider)],
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::clone(&health),
+        admission: Arc::new(AlwaysAllow),
+        metrics: Arc::clone(&metrics),
+    });
+    let mut scope =
+        crate::metrics::trace::TraceScope::begin(&metrics, &serde_json::json!({}), false, 0);
+
+    let first = router
+        .dispatch_traced(
+            &mut scope,
+            serde_json::json!({}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+    assert!(first.is_ok());
+    assert_eq!(scope.priced_model(), Some("gpt-6.1-sol"));
+
+    health.trip(0, None);
+    let second = router
+        .dispatch_traced(
+            &mut scope,
+            serde_json::json!({}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+    assert!(second.is_ok());
+    assert_eq!(scope.priced_model(), None, "B reported nothing");
+}

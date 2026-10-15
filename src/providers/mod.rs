@@ -30,6 +30,34 @@ pub enum ProviderResponse {
     Stream(Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send>>),
 }
 
+tokio::task_local! {
+    static RESOLVED_MODEL: std::sync::Mutex<Option<String>>;
+}
+
+/// Run a provider call, returning the concrete model it reported via
+/// [`note_resolved_model`] (set when a `model_family` resolved to a model).
+pub(crate) async fn capture_resolved_model<F: std::future::Future>(
+    fut: F,
+) -> (F::Output, Option<String>) {
+    RESOLVED_MODEL
+        .scope(std::sync::Mutex::new(None), async {
+            let out = fut.await;
+            let resolved = RESOLVED_MODEL.with(|m| m.lock().ok().and_then(|mut g| g.take()));
+            (out, resolved)
+        })
+        .await
+}
+
+/// Report the concrete model this request was sent to; a no-op outside
+/// [`capture_resolved_model`].
+pub(crate) fn note_resolved_model(model: &str) {
+    let _ = RESOLVED_MODEL.try_with(|m| {
+        if let Ok(mut g) = m.lock() {
+            *g = Some(model.to_string());
+        }
+    });
+}
+
 /// Errors any provider implementation can return. Classification methods
 /// below are what the router's dispatch loop branches on.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -789,7 +817,12 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
         .to_string();
 
     let usage = extract_usage(anthropic).unwrap_or_default();
-    let (prompt_tokens, completion_tokens) = (usage.input_tokens, usage.output_tokens);
+    // OpenAI's prompt_tokens includes cached tokens; Anthropic's input_tokens does not.
+    let prompt_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
+    let completion_tokens = usage.output_tokens;
 
     // OpenAI convention: `content` is null when the turn is tool-calls-only.
     let content = if content_text.is_empty() && !tool_calls.is_empty() {
@@ -817,7 +850,8 @@ pub fn translate_anthropic_to_openai(anthropic: &serde_json::Value) -> serde_jso
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
+            "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": usage.cache_read_input_tokens}
         }
     })
 }
@@ -885,12 +919,14 @@ pub async fn translate_anthropic_request_to_openai(
         })
         .unwrap_or_default();
 
-    let system_raw = anthropic.get("system").and_then(Value::as_str);
+    let system_raw = anthropic
+        .get("system")
+        .and_then(crate::system_prompt::flatten_system_text);
     let mut system_text = if let Some(sys) = system_raw {
         if supports_vision {
-            sys.to_string()
+            sys
         } else {
-            crate::system_prompt::patch_non_vision_system_prompt(sys)
+            crate::system_prompt::patch_non_vision_system_prompt(&sys)
         }
     } else if !supports_vision {
         crate::system_prompt::NON_VISION_SYSTEM_NOTE
@@ -1399,17 +1435,6 @@ pub fn translate_openai_response_to_anthropic(
         map_openai_finish_reason(finish_reason)
     };
 
-    let prompt_tokens = openai
-        .get("usage")
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let completion_tokens = openai
-        .get("usage")
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
     json!({
         "id": id,
         "type": "message",
@@ -1417,11 +1442,49 @@ pub fn translate_openai_response_to_anthropic(
         "model": model,
         "content": Value::Array(blocks),
         "stop_reason": stop_reason,
-        "usage": {
-            "input_tokens": prompt_tokens,
-            "output_tokens": completion_tokens
-        }
+        "usage": anthropic_usage_from_openai(openai.get("usage"))
     })
+}
+
+/// Map an `OpenAI` usage object (Chat Completions `prompt_tokens`/
+/// `completion_tokens`, or Responses `input_tokens`/`output_tokens`) to
+/// Anthropic's shape. `OpenAI` counts cached/cache-write tokens inside the
+/// prompt total while Anthropic reports them separately, so they are
+/// subtracted from `input_tokens` and surfaced as `cache_read_input_tokens`
+/// / `cache_creation_input_tokens` (only when nonzero).
+#[must_use]
+pub(crate) fn anthropic_usage_from_openai(usage: Option<&serde_json::Value>) -> serde_json::Value {
+    use serde_json::Value;
+    let field = |keys: &[&str]| -> u64 {
+        usage
+            .and_then(|u| keys.iter().find_map(|k| u.get(*k)))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let detail = |key: &str| -> u64 {
+        usage
+            .and_then(|u| {
+                u.get("prompt_tokens_details")
+                    .or_else(|| u.get("input_tokens_details"))
+            })
+            .and_then(|d| d.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let prompt = field(&["prompt_tokens", "input_tokens"]);
+    let cache_read = detail("cached_tokens");
+    let cache_write = detail("cache_write_tokens");
+    let mut out = json!({
+        "input_tokens": prompt.saturating_sub(cache_read.saturating_add(cache_write)),
+        "output_tokens": field(&["completion_tokens", "output_tokens"]),
+    });
+    if cache_read > 0 {
+        out["cache_read_input_tokens"] = json!(cache_read);
+    }
+    if cache_write > 0 {
+        out["cache_creation_input_tokens"] = json!(cache_write);
+    }
+    out
 }
 
 /// Collect native `thinking` blocks from `reasoning_details` entries that
@@ -1519,11 +1582,22 @@ pub(crate) fn map_openai_finish_reason(finish_reason: Option<&str>) -> &'static 
 /// Story 1.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(clippy::struct_field_names)] // field names match the Anthropic API's own `usage.*` keys
-pub(crate) struct AnthropicUsage {
+pub struct AnthropicUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+}
+
+impl AnthropicUsage {
+    /// Every billed token class summed: input, output and both cache classes.
+    #[must_use]
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
 }
 
 /// Extract `usage.*` from an Anthropic Messages API response body (or any
@@ -1562,15 +1636,9 @@ pub async fn translate_and_record(
     tracker: &crate::cost_metrics::tracker::CostTracker,
     session_key: &crate::session_compaction::SessionKey,
     request_id: crate::cost_metrics::types::RequestId,
+    model: &str,
     anthropic: &serde_json::Value,
 ) -> serde_json::Value {
-    use serde_json::Value;
-
-    let model = anthropic
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-
     // TODO(cost-metrics): this is the real call site for
     // `record_actual_usage_from_anthropic_response` once a live
     // provider-dispatch loop exists — see plan.md Epic 2.2, Story 2.2.1's
@@ -2160,6 +2228,58 @@ mod tests {
                 {"role": "system", "content": "be terse"},
                 {"role": "user", "content": "hi"},
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn translate_anthropic_request_to_openai_flattens_system_block_array() {
+        let anthropic = json!({
+            "model": "claude-sonnet-5",
+            "system": [
+                {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "use tools"},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+
+        let openai = translate_anthropic_request_to_openai(&anthropic).await;
+
+        assert_eq!(
+            openai["messages"][0],
+            json!({"role": "system", "content": "be terse\n\nuse tools"})
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_to_openai_adds_cache_tokens_back_into_prompt_tokens() {
+        let anthropic = json!({
+            "id": "m", "model": "x", "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 20,
+                      "cache_read_input_tokens": 60, "cache_creation_input_tokens": 10}
+        });
+        let usage = &translate_anthropic_to_openai(&anthropic)["usage"];
+        assert_eq!(usage["prompt_tokens"], json!(100));
+        assert_eq!(usage["total_tokens"], json!(120));
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(60));
+    }
+
+    #[test]
+    fn openai_usage_maps_cache_tokens_to_anthropic_fields() {
+        let usage = json!({
+            "prompt_tokens": 100, "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10}
+        });
+        assert_eq!(
+            anthropic_usage_from_openai(Some(&usage)),
+            json!({
+                "input_tokens": 30, "output_tokens": 20,
+                "cache_read_input_tokens": 60, "cache_creation_input_tokens": 10
+            })
+        );
+        assert_eq!(
+            anthropic_usage_from_openai(None),
+            json!({"input_tokens": 0, "output_tokens": 0})
         );
     }
 
@@ -2950,10 +3070,33 @@ mod tests {
             .unwrap();
 
         let anthropic = anthropic_response_with_usage(12400, 300);
-        let openai = translate_and_record(&tracker, &key, request_id, &anthropic).await;
+        let openai =
+            translate_and_record(&tracker, &key, request_id, "claude-sonnet-5", &anthropic).await;
 
         assert_eq!(openai["usage"]["total_tokens"], json!(12700));
         let report = tracker.report_for_session(&key).await.unwrap();
         assert_eq!(report.actual_tokens, Some(12_700));
+    }
+
+    #[tokio::test]
+    async fn translate_and_record_prices_by_the_given_model_not_the_body_model() {
+        let tracker = CostTracker::new(PricingTable::load_default()).await;
+        let key = SessionKey::new("s1");
+        let request_id = RequestId::new();
+        tracker
+            .record_pending(&key, request_id, CompactionTier::Off)
+            .await;
+
+        let mut anthropic = anthropic_response_with_usage(1000, 200);
+        anthropic["model"] = json!("unknown");
+        translate_and_record(&tracker, &key, request_id, "gpt-6.1-sol", &anthropic).await;
+
+        let report = tracker.report_for_session(&key).await.unwrap();
+        let cost = report
+            .by_tier
+            .iter()
+            .find_map(|t| t.cost_actual_usd)
+            .unwrap();
+        assert!((cost - 0.004).abs() < 1e-9, "got {cost}");
     }
 }

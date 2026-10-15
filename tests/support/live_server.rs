@@ -147,6 +147,27 @@ value = "sk-test"
         sock
     }
 
+    /// Sends `POST path` with extra request headers and returns the open socket without reading.
+    pub async fn post_with_headers(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &serde_json::Value,
+    ) -> TcpStream {
+        let payload = body.to_string();
+        let extra: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
+        let mut sock = TcpStream::connect(self.addr).await.unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        sock
+    }
+
     /// `GET /metrics` as JSON over a fresh connection.
     pub async fn metrics(&self) -> serde_json::Value {
         self.request_json("GET", "/metrics").await

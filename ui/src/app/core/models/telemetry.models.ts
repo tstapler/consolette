@@ -19,7 +19,7 @@ export type FirstByteState = 'pending' | 'measured' | 'ended_empty' | 'client_cl
 
 export type RoutedModelSource = 'pinned' | 'passthrough';
 export type RouteReason =
-  | 'session_pin' | 'strategy' | 'exploration' | 'fallback' | 'rate_limit_hold' | 'default' | 'cache' | 'local';
+  | 'override' | 'session_pin' | 'strategy' | 'exploration' | 'fallback' | 'rate_limit_hold' | 'default' | 'cache' | 'local';
 export type AttemptOutcome =
   | 'ok' | 'rate_limited' | 'timeout' | 'auth' | 'validation' | 'shape_mismatch' | 'upstream' | 'shed' | 'cancelled';
 export type AttemptErrorClass =

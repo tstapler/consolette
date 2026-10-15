@@ -377,7 +377,11 @@ mod tests {
         assert_eq!(event, deserialized);
     }
 
-    const FIXTURES: [(&str, &str); 7] = [
+    const FIXTURES: [(&str, &str); 8] = [
+        (
+            "request-trace-override.json",
+            include_str!("../../ui/src/testing/fixtures/sse/request-trace-override.json"),
+        ),
         (
             "request-trace-success-compat.json",
             include_str!("../../ui/src/testing/fixtures/sse/request-trace-success-compat.json"),

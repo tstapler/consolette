@@ -5,6 +5,7 @@ import { AttemptTraceData, RequestTraceData } from '../../../core/models/telemet
 import { ROUTE_REASONS } from '../../../core/models/trace-labels';
 import traceFailure from '../../../../testing/fixtures/sse/request-trace-failure.json';
 import traceSuccess from '../../../../testing/fixtures/sse/request-trace-success.json';
+import traceOverride from '../../../../testing/fixtures/sse/request-trace-override.json';
 
 const base = traceSuccess.data as RequestTraceData;
 const failureFixture = traceFailure.data as RequestTraceData;
@@ -250,6 +251,11 @@ describe('InspectDrawerComponent', () => {
     expect(src).not.toContain('configured model');
   });
 
+  it('override_fixture_should_explain_the_forced_upstream_in_the_why_block', () => {
+    openOn(traceOverride.data as RequestTraceData);
+    expect(text(q('[data-why]'))).toContain('forced to this upstream by the X-Consolette-Upstream header');
+  });
+
   it('why_block_should_show_model_source_pinned_or_passthrough_with_routed_upstream_and_exact_why_text_for_all_eight_reasons_and_cancelled', () => {
     const t = trace();
     openOn(t);
@@ -263,6 +269,7 @@ describe('InspectDrawerComponent', () => {
 
     const rateHold = [att('a', { outcome: 'rate_limited', status: 429, errorClass: 'rate_limited' }), att('a')];
     const expected: Array<[string, Partial<RequestTraceData>, string]> = [
+      ['override', {}, 'forced to this upstream by the X-Consolette-Upstream header; no fallback'],
       ['session_pin', {}, 'pinned to this upstream by the session'],
       ['strategy', { routeStrategy: 'weighted' }, 'chosen by the weighted strategy'],
       ['exploration', {}, 'exploration pick'],

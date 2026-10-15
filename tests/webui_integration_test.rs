@@ -274,6 +274,7 @@ fn fixture_files_should_be_reachable_via_include_str_when_cargo_test_runs() {
     let fixtures = [
         include_str!("../ui/src/testing/fixtures/sse/request-trace-success.json"),
         include_str!("../ui/src/testing/fixtures/sse/request-trace-failure.json"),
+        include_str!("../ui/src/testing/fixtures/sse/request-trace-override.json"),
         include_str!("../ui/src/testing/fixtures/sse/metrics-tick.json"),
         include_str!("../ui/src/testing/fixtures/sse/error-logged.json"),
         include_str!("../ui/src/testing/fixtures/sse/config-changed.json"),

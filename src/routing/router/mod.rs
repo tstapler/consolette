@@ -759,10 +759,10 @@ impl Router {
                 stream,
             ))
             .await;
+            let counted = resolved.as_deref().unwrap_or(&model);
 
             match outcome {
                 Ok(response) => {
-                    let counted = resolved.as_deref().unwrap_or(&model);
                     self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), counted);
                     scope.complete_attempt_result(None);
                     scope.record_provider(&chosen.name);
@@ -770,12 +770,12 @@ impl Router {
                     return Ok(response);
                 }
                 Err(e) if e.is_validation() || e.is_auth() => {
-                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), counted);
                     scope.complete_attempt_result(Some(&e));
                     return Err(e);
                 }
                 Err(e) if e.is_rate_limited() => {
-                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), counted);
                     scope.complete_attempt_result(Some(&e));
                     self.maybe_trip_rate_limit(candidates, &already_tried, &chosen, &e);
                     last_error = Some(e);
@@ -787,7 +787,7 @@ impl Router {
                     // using a longer override than the default so a
                     // permanently-broken Gemini endpoint isn't retried on
                     // every request forever.
-                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), counted);
                     scope.complete_attempt_result(Some(&e));
                     self.health.trip(
                         chosen.index,
@@ -798,7 +798,7 @@ impl Router {
                     last_error = Some(e);
                 }
                 Err(e) => {
-                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), &model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Err(&e), counted);
                     scope.complete_attempt_result(Some(&e));
                     last_error = Some(e);
                 }

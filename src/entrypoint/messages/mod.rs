@@ -283,7 +283,7 @@ async fn direct_full_response(
     if let Some(key) = &ctx.cache_key {
         state.response_cache.put(key, &ctx.model, &json);
     }
-    record_model_token_usage(state, &ctx.model, &json);
+    record_model_token_usage(state, &ctx.cost_model, &json);
     record_actual_usage_from_anthropic_response(
         &state.cost_tracker,
         &ctx.session_key,

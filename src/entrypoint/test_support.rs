@@ -179,4 +179,13 @@ pub(crate) async fn assert_cost_priced_by_routed_model(state: &EntrypointState) 
     assert_eq!(rows.len(), 1, "{rows:?}");
     let cost = rows[0].cost.unwrap().0; // None means the row was never priced
     assert!((cost - 0.004).abs() < 1e-9, "got {cost}");
+    let models = state.metrics.counters.models_json();
+    assert!(
+        models.get("unpriced-requested-model").is_none(),
+        "per-model counters must not use the requested name: {models}"
+    );
+    assert!(
+        models.get(COST_PROBE_ROUTED_MODEL).is_some(),
+        "per-model counters must use the routed model: {models}"
+    );
 }

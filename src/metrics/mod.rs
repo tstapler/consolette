@@ -112,6 +112,13 @@ pub struct RequestDetail {
 const MAX_REQUESTED_MODEL_CHARS: usize = 256;
 
 impl RequestDetail {
+    /// The model that actually served the request: the routed model when the router recorded
+    /// one, else the (client-requested) `model`. Use for per-model aggregation.
+    #[must_use]
+    pub fn effective_model(&self) -> &str {
+        self.routed_model.as_deref().unwrap_or(&self.model)
+    }
+
     /// Builds the initial ring-buffer entry for an incoming request, before
     /// dispatch has picked an upstream: `provider` starts empty and timing
     /// fields start at zero, filled in later via

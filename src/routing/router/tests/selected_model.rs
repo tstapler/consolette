@@ -493,3 +493,65 @@ async fn resolved_model_does_not_leak_to_a_different_upstream_in_a_later_round()
     assert!(second.is_ok());
     assert_eq!(scope.priced_model(), None, "B reported nothing");
 }
+
+/// Resolves the family, then fails with a server error, as a 5xx after resolution does.
+struct ResolveThenFailProvider;
+
+#[async_trait::async_trait]
+impl Provider for ResolveThenFailProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    async fn send(
+        &self,
+        _body: serde_json::Value,
+        _headers: HeaderMap,
+        _stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
+        crate::providers::note_resolved_model("gpt-6.1-sol");
+        Err(ProviderError::Upstream {
+            status: 500,
+            body: "boom".to_string(),
+        })
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+// A failed attempt after the family resolved is counted under the resolved model, so one
+// model's attempts and errors never split across the requested and resolved names.
+#[tokio::test]
+async fn failed_family_attempt_is_counted_under_the_resolved_model() {
+    let metrics = MetricsCollector::new();
+    let router = Router::new(RouterDeps {
+        candidates: vec![UpstreamRef {
+            index: 0,
+            name: "openai".to_string(),
+            weight: 1.0,
+            model: None,
+            model_family: Some("gpt-6".to_string()),
+        }],
+        providers: vec![Arc::new(ResolveThenFailProvider)],
+        strategy: Arc::new(FallbackStrategy),
+        health: Arc::new(HealthRegistry::new(300)),
+        admission: Arc::new(AlwaysAllow),
+        metrics: Arc::clone(&metrics),
+    });
+
+    let res = router
+        .dispatch(
+            serde_json::json!({"model": "claude-sonnet-5-5"}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await;
+
+    assert!(res.is_err());
+    let models = metrics.counters.models_json();
+    assert!(models.get("claude-sonnet-5-5").is_none(), "{models}");
+    assert_eq!(models["gpt-6.1-sol"]["errors"], 1, "{models}");
+}

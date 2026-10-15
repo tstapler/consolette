@@ -113,7 +113,7 @@ pub async fn get_dashboard_sessions(
 
         let pin = state.session_overrides.get(&sess_id);
         let pinned = pin.is_some();
-        let model = latest_req.model.clone();
+        let model = latest_req.effective_model().to_string();
         let provider = latest_req.provider.clone();
         let last_active = latest_req.timestamp.clone();
 
@@ -201,7 +201,7 @@ pub async fn get_dashboard_benchmark(
             req.provider.clone()
         };
         groups
-            .entry((req.model.clone(), provider))
+            .entry((req.effective_model().to_string(), provider))
             .or_default()
             .push(req);
     }
@@ -1236,6 +1236,49 @@ mod tests {
         // Rejected localhost and internal hostnames
         assert!(validate_base_url("https://localhost/v1").is_err());
         assert!(validate_base_url("https://service.internal/v1").is_err());
+    }
+
+    #[tokio::test]
+    async fn get_dashboard_benchmark_groups_by_routed_model_not_requested_model() {
+        use crate::config::schema::Config;
+
+        let state = EntrypointState::build(
+            &Config::default(),
+            std::path::Path::new("/tmp/consolette-test"),
+        )
+        .await
+        .unwrap();
+        let body = serde_json::json!({"model": "claude-sonnet-5-5", "messages": []});
+        let mut routed =
+            crate::metrics::RequestDetail::from_body("a".into(), false, 0, &body, None);
+        routed.provider = "model-gateway-openai".into();
+        routed.routed_model = Some("gpt-6.1-sol".into());
+        let mut unrouted =
+            crate::metrics::RequestDetail::from_body("b".into(), false, 0, &body, None);
+        unrouted.provider = "model-gateway-anthropic".into();
+        state.metrics.push_request(routed);
+        state.metrics.push_request(unrouted);
+
+        let Json(benchmarks) = get_dashboard_benchmark(State(state)).await;
+        let mut rows: Vec<(String, String)> = benchmarks
+            .into_iter()
+            .map(|b| (b.model, b.provider))
+            .collect();
+        rows.sort();
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "claude-sonnet-5-5".to_string(),
+                    "model-gateway-anthropic".to_string()
+                ),
+                (
+                    "gpt-6.1-sol".to_string(),
+                    "model-gateway-openai".to_string()
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

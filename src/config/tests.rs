@@ -511,3 +511,41 @@ fn model_catalog_section_should_parse_modes_and_clamp_interval_below_300s() {
         CatalogRefreshMode::Interval { secs: 900 }
     );
 }
+
+#[test]
+fn load_should_parse_model_tiers_from_conf_d_and_replace_arrays_across_files() {
+    let dir = TempDir::new().unwrap();
+    let conf = conf_d(&dir);
+    let tier = |name: &str, model: &str| {
+        format!(
+            "[[model_tiers]]\nname = \"{name}\"\nmatch = [\"claude-haiku\"]\n\
+             [model_tiers.upstreams.anthropic]\nmodel = \"{model}\"\n"
+        )
+    };
+    write(&conf, "10-tiers.toml", &tier("haiku", "cheap-a"));
+    write(&conf, "20-tiers.toml", &tier("haiku2", "cheap-b"));
+
+    let config = load(dir.path()).unwrap();
+
+    assert_eq!(config.model_tiers.len(), 1, "arrays replace wholesale");
+    assert_eq!(config.model_tiers[0].name, "haiku2");
+    assert_eq!(config.model_tiers[0].match_prefixes, vec!["claude-haiku"]);
+}
+
+#[test]
+fn load_should_reject_model_tier_naming_an_undeclared_upstream() {
+    let dir = TempDir::new().unwrap();
+    let conf = conf_d(&dir);
+    write(
+        &conf,
+        "10-tiers.toml",
+        "[[model_tiers]]\nname = \"t\"\nmatch = [\"a\"]\n[model_tiers.upstreams.ghost]\nmodel = \"x\"\n",
+    );
+
+    let err = load(dir.path()).unwrap_err();
+
+    assert!(
+        matches!(err, ConfigError::InvalidModelTier { .. }),
+        "{err:?}"
+    );
+}

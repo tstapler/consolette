@@ -202,6 +202,31 @@ pub struct RouteUpstreamRef {
     pub model_family: Option<String>,
 }
 
+/// One `[[model_tiers]]` entry: when the client-requested model starts with any `match`
+/// prefix (case-insensitive), the named upstreams serve the override model instead of the
+/// route's default. Upstreams without an override, and tiers naming upstreams outside the
+/// route, leave the route unchanged.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelTier {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub match_prefixes: Vec<String>,
+    #[serde(default)]
+    pub upstreams: std::collections::BTreeMap<String, TierUpstreamOverride>,
+}
+
+/// A tier's model selector for one upstream; exactly one field must be set
+/// (`validate::validate_model_tiers`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TierUpstreamOverride {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_family: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -363,6 +388,10 @@ pub struct Config {
     pub upstreams: Vec<Upstream>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// Per-client-model-tier overrides of a route's pinned model (arrays replace wholesale
+    /// across conf.d layers, like `routes`). See [`ModelTier`].
+    #[serde(default)]
+    pub model_tiers: Vec<ModelTier>,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
     #[serde(default)]
@@ -560,6 +589,7 @@ impl Default for Config {
                     },
                 ],
             }],
+            model_tiers: Vec::new(),
             ratelimit: RateLimitConfig::default(),
             cost_metrics: CostMetricsConfig::default(),
             server_tools: crate::server_tools::ServerToolsConfig::default(),

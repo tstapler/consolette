@@ -8,7 +8,7 @@ mod validate;
 
 pub use load::{load, plugin_bin_dirs};
 pub use runtime_overrides::RuntimeOverrides;
-pub use validate::{validate_model_selectors, validate_references};
+pub use validate::{validate_model_selectors, validate_model_tiers, validate_references};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -29,6 +29,10 @@ pub enum ConfigError {
         upstream: String,
         kind: String,
     },
+    /// A `[[model_tiers]]` entry is malformed (duplicate name, empty `match`, unknown upstream,
+    /// or a bad `model` / `model_family` selector).
+    #[error("model tier {tier:?}: {reason}")]
+    InvalidModelTier { tier: String, reason: String },
     #[error("failed to load runtime overrides: {0}")]
     RuntimeOverrides(String),
 }

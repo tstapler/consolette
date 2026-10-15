@@ -657,6 +657,13 @@ pub async fn put_dashboard_config(
         )
     })?;
 
+    crate::config::validate_model_tiers(&current_config).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
     if let Some(route) = current_config.routes.first() {
         let overrides = crate::config::RuntimeOverrides {
             route: Some(route.clone()),

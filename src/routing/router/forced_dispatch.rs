@@ -76,7 +76,8 @@ impl Router {
             ));
         };
         scope.record_route(false, self.strategy.name());
-        self.dispatch_attempts(scope, &[candidate], body, headers, stream, est_tokens)
+        let candidates = self.apply_model_tiers(vec![candidate], &body);
+        self.dispatch_attempts(scope, &candidates, body, headers, stream, est_tokens)
             .await
     }
 }

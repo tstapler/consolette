@@ -434,6 +434,7 @@ impl TraceScope {
     /// Opens the single attempt of a local-model request and marks the trace local.
     pub fn begin_local_attempt(&mut self, model: &str) {
         self.detail.trace_kind = TraceKind::Local;
+        self.resolved_model = Some((LOCAL_UPSTREAM.to_string(), model.to_string()));
         self.record_provider(LOCAL_UPSTREAM);
         self.begin_attempt(LOCAL_UPSTREAM, Some(model), self.iteration);
     }

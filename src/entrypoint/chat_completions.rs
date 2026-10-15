@@ -98,7 +98,7 @@ async fn chat_completions_inner(
         Ok(ProviderResponse::Full(json)) => {
             if let Some(usage) = crate::providers::extract_usage(&json) {
                 state.metrics.counters.record_model_tokens(
-                    &model,
+                    &cost_model,
                     usage.input_tokens,
                     usage.output_tokens,
                 );

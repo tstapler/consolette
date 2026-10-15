@@ -581,6 +581,11 @@ async fn local_dispatch_should_emit_one_trace_kind_local_with_provider_local() {
     assert_eq!(t.trace_kind, crate::entrypoint::events::TraceKind::Local);
     assert_eq!(t.routed_provider.as_deref(), Some("local"));
     assert_eq!(t.route_reason.as_deref(), Some("local"));
+    assert_eq!(
+        t.routed_model.as_deref(),
+        Some("llama3.2"),
+        "a local request is routed to the local model, not the requested name"
+    );
     assert_eq!(t.status_code, 200);
     assert_eq!(t.attempts.len(), 1, "{:?}", t.attempts);
     assert_eq!(t.attempts[0].outcome, AttemptOutcome::Ok);

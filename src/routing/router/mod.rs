@@ -762,7 +762,8 @@ impl Router {
 
             match outcome {
                 Ok(response) => {
-                    self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), &model);
+                    let counted = resolved.as_deref().unwrap_or(&model);
+                    self.record_dispatch_outcome(&chosen, attempt_started, Ok(()), counted);
                     scope.complete_attempt_result(None);
                     scope.record_provider(&chosen.name);
                     scope.record_resolved_model(&chosen.name, resolved);

@@ -669,6 +669,11 @@ impl Router {
         est_tokens: u32,
     ) -> Result<ProviderResponse, ProviderError> {
         scope.begin_dispatch();
+        if let Some(forced) = scope.forced_upstream().map(str::to_owned) {
+            return self
+                .dispatch_forced(scope, &forced, body, headers, stream, est_tokens)
+                .await;
+        }
         if let Some(target) = self.local_target(&body) {
             return self
                 .dispatch_local(scope, target, body, headers, stream)
@@ -1084,6 +1089,7 @@ impl Router {
     }
 }
 
+mod forced_dispatch;
 mod local_dispatch;
 mod provider_names;
 #[cfg(test)]

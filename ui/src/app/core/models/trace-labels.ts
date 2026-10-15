@@ -6,6 +6,7 @@ export interface ReasonLabel { chip: string; legend: string; why: string; }
 
 /** Keyed by wire `routeReason`. `why` may contain `<...>` placeholders filled by `whyText`. */
 export const ROUTE_REASONS: Readonly<Record<string, ReasonLabel>> = {
+  override: { chip: 'forced', legend: 'the request named this upstream with the X-Consolette-Upstream header; no fallback', why: 'forced to this upstream by the X-Consolette-Upstream header; no fallback' },
   session_pin: { chip: 'pinned', legend: 'a session pinned this conversation to one upstream', why: 'pinned to this upstream by the session' },
   strategy: { chip: 'strategy', legend: 'the routing strategy picked this upstream (name shown in the drawer)', why: 'chosen by the <routeStrategy> strategy' },
   exploration: { chip: 'explore', legend: 'an occasional exploration pick to test another upstream', why: 'exploration pick' },

@@ -172,6 +172,8 @@ impl ServerToolsConfig {
 pub struct ServerToolsRuntime {
     pub config: ServerToolsConfig,
     pub route_eligible: bool,
+    /// Names of Anthropic-kind upstreams; a forced request emulates iff its target is not one.
+    pub anthropic_upstreams: std::collections::HashSet<String>,
 }
 
 impl Default for ServerToolsRuntime {
@@ -179,6 +181,7 @@ impl Default for ServerToolsRuntime {
         Self {
             config: ServerToolsConfig::default(),
             route_eligible: true,
+            anthropic_upstreams: std::collections::HashSet::new(),
         }
     }
 }
@@ -189,8 +192,29 @@ impl ServerToolsRuntime {
     /// no-server-tools case returns `false` so today's path stays
     /// byte-identical (S-3).
     #[must_use]
-    pub fn should_emulate(&self, body: &serde_json::Value) -> bool {
-        self.config.enabled && self.route_eligible && has_server_web_search_def(body)
+    pub fn should_emulate(&self, body: &serde_json::Value, forced: Option<&str>) -> bool {
+        let eligible = forced.map_or(self.route_eligible, |name| {
+            !self.anthropic_upstreams.contains(name)
+        });
+        self.config.enabled && eligible && has_server_web_search_def(body)
+    }
+
+    /// Names of the Anthropic-kind upstreams in `config`.
+    #[must_use]
+    pub fn anthropic_upstream_names(
+        config: &crate::config::schema::Config,
+    ) -> std::collections::HashSet<String> {
+        config
+            .upstreams
+            .iter()
+            .filter(|u| {
+                matches!(
+                    u.kind,
+                    crate::config::schema::UpstreamKind::Anthropic { .. }
+                )
+            })
+            .map(|u| u.name.clone())
+            .collect()
     }
 
     /// Pure route-eligibility check over a loaded config: `true` unless every
@@ -282,6 +306,28 @@ mod tests {
         let config = crate::config::schema::Config::default();
 
         assert!(ServerToolsRuntime::route_eligible_from_config(&config));
+    }
+
+    #[test]
+    fn should_emulate_should_follow_the_forced_upstream_kind() {
+        let body =
+            serde_json::json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]});
+        let runtime = |route_eligible| ServerToolsRuntime {
+            config: ServerToolsConfig {
+                enabled: true,
+                ..ServerToolsConfig::default()
+            },
+            route_eligible,
+            anthropic_upstreams: ["native".to_string()].into(),
+        };
+
+        // All-Anthropic route, request forced to a non-Anthropic upstream: emulate.
+        assert!(runtime(false).should_emulate(&body, Some("openai")));
+        // Mixed route, request forced to a native Anthropic upstream: pass through.
+        assert!(!runtime(true).should_emulate(&body, Some("native")));
+        // Not forced: the route decides.
+        assert!(runtime(true).should_emulate(&body, None));
+        assert!(!runtime(false).should_emulate(&body, None));
     }
 
     #[test]

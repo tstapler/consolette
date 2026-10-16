@@ -119,10 +119,15 @@ pub fn validate_model_tiers(config: &Config) -> Result<(), ConfigError> {
                     format!("upstream {name:?} has an empty model or model_family"),
                 ));
             }
-            if over.model.is_some() == over.model_family.is_some() {
+            let both = over.model.is_some() && over.model_family.is_some();
+            let nothing =
+                over.model.is_none() && over.model_family.is_none() && over.effort.is_none();
+            if both || nothing {
                 return Err(invalid(
                     &tier.name,
-                    format!("upstream {name:?} must set exactly one of model or model_family"),
+                    format!(
+                        "upstream {name:?}: set exactly one of model or model_family (effort may accompany either, or stand alone)"
+                    ),
                 ));
             }
             if over.model_family.is_some() && !matches!(upstream.kind, UpstreamKind::Openai { .. })
@@ -134,6 +139,33 @@ pub fn validate_model_tiers(config: &Config) -> Result<(), ConfigError> {
                         upstream.kind.label()
                     ),
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates `[effort.<upstream>]`: each key names a declared upstream and `min` <= `max`.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidEffort`] naming the offending upstream.
+pub fn validate_effort(config: &Config) -> Result<(), ConfigError> {
+    for (name, effort) in &config.effort {
+        let invalid = |reason: String| ConfigError::InvalidEffort {
+            upstream: name.clone(),
+            reason,
+        };
+        if !config.upstreams.iter().any(|u| &u.name == name) {
+            return Err(invalid("unknown upstream".to_string()));
+        }
+        if let (Some(min), Some(max)) = (effort.min, effort.max) {
+            if min > max {
+                return Err(invalid(format!(
+                    "min {} is above max {}",
+                    min.as_str(),
+                    max.as_str()
+                )));
             }
         }
     }
@@ -362,6 +394,45 @@ match = ["a"]
         }
 
         #[test]
+        fn validate_model_tiers_should_accept_effort_alone_and_reject_unknown_level() {
+            let ok = check(
+                r#"
+[[model_tiers]]
+name = "t"
+match = ["a"]
+[model_tiers.upstreams.gw-openai]
+effort = "low"
+"#,
+            );
+            assert!(ok.is_ok(), "{ok:?}");
+
+            let bad: Result<Config, _> = toml::from_str(&format!(
+                "{UPSTREAMS}[[model_tiers]]\nname = \"t\"\nmatch = [\"a\"]\n\
+                 [model_tiers.upstreams.gw-openai]\neffort = \"ludicrous\"\n"
+            ));
+            let err = bad
+                .expect_err("unknown level must fail at parse time")
+                .to_string();
+            assert!(err.contains("ludicrous"), "{err}");
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_model_and_effort_with_family() {
+            let r = reason(
+                r#"
+[[model_tiers]]
+name = "t"
+match = ["a"]
+[model_tiers.upstreams.gw-openai]
+model = "x"
+model_family = "y"
+effort = "low"
+"#,
+            );
+            assert!(r.contains("exactly one"), "{r}");
+        }
+
+        #[test]
         fn validate_model_tiers_should_reject_model_family_on_non_openai_upstream() {
             let r = reason(
                 r#"
@@ -411,6 +482,79 @@ match = ["b"]
             );
 
             assert!(r.contains("duplicate"), "{r}");
+        }
+    }
+
+    mod effort {
+        use super::super::validate_effort;
+        use super::{Config, ConfigError};
+        use crate::effort::{EffortMode, Level};
+
+        const UPSTREAMS: &str = r#"
+[[upstreams]]
+name = "gw-openai"
+kind = "openai"
+base_url = "https://example.invalid"
+"#;
+
+        fn parse(effort: &str) -> Config {
+            toml::from_str(&format!("{UPSTREAMS}{effort}")).expect("fragment should parse")
+        }
+
+        #[test]
+        fn validate_effort_should_accept_policy_and_default_to_off() {
+            let config =
+                parse("[effort.gw-openai]\nmode = \"map\"\nmin = \"low\"\nmax = \"high\"\n");
+            assert!(validate_effort(&config).is_ok());
+            assert_eq!(config.effort["gw-openai"].mode, EffortMode::Map);
+
+            let bare = parse("[effort.gw-openai]\n");
+            assert_eq!(bare.effort["gw-openai"].mode, EffortMode::Off);
+            assert_eq!(parse("").effort.len(), 0);
+        }
+
+        #[test]
+        fn validate_effort_should_accept_equal_bounds() {
+            let config = parse("[effort.gw-openai]\nmin = \"high\"\nmax = \"high\"\n");
+            assert!(validate_effort(&config).is_ok());
+        }
+
+        #[test]
+        fn validate_effort_should_reject_unknown_upstream_and_inverted_bounds() {
+            let ghost = parse("[effort.ghost]\nmode = \"map\"\n");
+            assert!(matches!(
+                validate_effort(&ghost),
+                Err(ConfigError::InvalidEffort { ref reason, .. }) if reason.contains("unknown")
+            ));
+            let inverted = parse("[effort.gw-openai]\nmin = \"high\"\nmax = \"low\"\n");
+            assert!(matches!(
+                validate_effort(&inverted),
+                Err(ConfigError::InvalidEffort { ref reason, .. }) if reason.contains("above")
+            ));
+        }
+
+        #[test]
+        fn effort_policy_should_combine_table_bounds_with_forced_level() {
+            let config = parse("[effort.gw-openai]\nmode = \"map\"\nmax = \"medium\"\n");
+            let policy = config
+                .effort_policy("gw-openai", Some(Level::Max))
+                .expect("map mode yields a policy");
+            assert_eq!(policy.resolve(None), Some(Level::Medium));
+        }
+
+        #[test]
+        fn effort_policy_should_be_none_when_mode_is_off_or_upstream_unlisted() {
+            let config = parse("[effort.gw-openai]\nmax = \"medium\"\n");
+            assert_eq!(config.effort_policy("gw-openai", Some(Level::Max)), None);
+            assert_eq!(config.effort_policy("other", Some(Level::Max)), None);
+        }
+
+        #[test]
+        fn effort_table_should_reject_unknown_keys() {
+            let bad: Result<Config, _> =
+                toml::from_str(&format!("{UPSTREAMS}[effort.gw-openai]\nmodee = \"map\"\n"));
+            let err = bad.expect_err("typo'd key must fail").to_string();
+            assert!(err.contains("modee"), "{err}");
         }
     }
 }

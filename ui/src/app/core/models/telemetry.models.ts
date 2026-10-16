@@ -60,6 +60,8 @@ export interface RequestTraceData {
   requestedModel?: string | null;
   routedModel?: string | null;
   routedModelSource?: RoutedModelSource | null;
+  /** The effort level the client asked for; absent when it sent none. */
+  clientEffort?: string | null;
   routedProvider?: string | null;
   routeReason?: RouteReason | string | null;
   routeStrategy?: string | null;

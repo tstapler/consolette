@@ -125,6 +125,23 @@ tempfile = "3"
 # past `MODEL_LIST_REFRESH_INTERVAL` (5 minutes) without a real sleep.
 tokio = { version = "1", features = ["test-util"] }
 
+# Building tiktoken's ~100k-entry BPE table takes seconds unoptimized, which blows the 5s
+# per-file timeout in `claude_code_session::session_bi` tests; optimize only that chain.
+[profile.dev.package.tiktoken-rs]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.bstr]
+opt-level = 3
+
 [profile.dist]
 inherits = "release"
 lto = "thin"

@@ -608,6 +608,10 @@ impl Provider for OpenrouterProvider {
         "openrouter"
     }
 
+    fn translates_request(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         body: Value,
@@ -666,6 +670,11 @@ impl Provider for OpenrouterProvider {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn translates_request_should_be_true_for_openrouter() {
+        assert!(OpenrouterProvider::test_provider().translates_request());
+    }
 
     /// `FreeModelEntry` constructor for tests that just need one
     /// zero-priced entry seeded into `model_cache`.

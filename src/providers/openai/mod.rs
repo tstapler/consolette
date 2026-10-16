@@ -677,6 +677,10 @@ impl Provider for OpenaiProvider {
         "openai"
     }
 
+    fn translates_request(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_lines)] // one cohesive dispatch path across chat-completions/responses translation
     async fn send(
         &self,
@@ -1320,6 +1324,11 @@ mod tests {
             },
             auth: None,
         })
+    }
+
+    #[test]
+    fn translates_request_should_be_true_for_openai() {
+        assert!(test_provider().translates_request());
     }
 
     fn test_provider() -> OpenaiProvider {

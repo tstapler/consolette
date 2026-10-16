@@ -114,6 +114,9 @@ const GENERATION_PARAM_FIELDS: &[&str] = &[
     "top_p",
     "top_k",
     "stop_sequences",
+    // Reasoning depth changes the answer: an effort-`max` reply must not serve an effort-`low` ask.
+    "output_config",
+    "thinking",
 ];
 
 /// Deterministic cache key: sha256 of the model name, system prompt, tool
@@ -321,7 +324,9 @@ impl ResponseCache {
         if !self.config.enabled {
             return None;
         }
+        // `safeguards` requests carry a per-request auto-mode review verdict in the response.
         if cache_bypass_requested(headers)
+            || crate::auto_mode::request_has_safeguards(body)
             || body_uses_mutating_tool(body, &self.config.mutating_tools)
         {
             self.bypassed.fetch_add(1, Ordering::Relaxed);
@@ -556,6 +561,17 @@ mod tests {
     }
 
     #[test]
+    fn cacheable_key_should_return_none_when_request_carries_safeguards() {
+        let dir = TempDir::new().unwrap();
+        let cache = temp_cache(&dir, enabled_config());
+        let plain = json!({"model": "claude-sonnet-5", "messages": []});
+        let guarded = json!({"model": "claude-sonnet-5", "messages": [], "safeguards": {}});
+
+        assert!(cache.cacheable_key(&plain, &HeaderMap::new()).is_some());
+        assert_eq!(cache.cacheable_key(&guarded, &HeaderMap::new()), None);
+    }
+
+    #[test]
     fn cacheable_key_should_return_none_when_newest_turn_is_a_bash_tool_result() {
         let dir = TempDir::new().unwrap();
         let cache = temp_cache(&dir, enabled_config());
@@ -688,6 +704,28 @@ mod tests {
             compute_cache_key(&base),
             compute_cache_key(&different_temperature)
         );
+    }
+
+    #[test]
+    fn compute_cache_key_should_differ_when_effort_or_thinking_differ() {
+        let request = |extra: Value| {
+            let mut body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "same question"}]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            compute_cache_key(&body)
+        };
+        let low = request(json!({"output_config": {"effort": "low"}}));
+        let max = request(json!({"output_config": {"effort": "max"}}));
+        let adaptive = request(json!({"thinking": {"type": "adaptive"}}));
+
+        assert_ne!(low, max);
+        assert_ne!(low, request(json!({})));
+        assert_ne!(adaptive, request(json!({})));
+        assert_eq!(low, request(json!({"output_config": {"effort": "low"}})));
     }
 
     #[test]

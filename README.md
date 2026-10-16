@@ -398,6 +398,18 @@ If a session dies around compaction, either declare the real window with
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, or restore the old wait-for-the-API
 behavior with `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`.
 
+**"This session isn't eligible for auto mode's no-charge classifier requests"** —
+in auto mode Claude Code asks the Anthropic server to review risky actions by
+sending a `safeguards` request field and reading `safeguard_results` from the
+reply ([details](https://code.claude.com/docs/en/auto-mode-classifier-billing)).
+consolette forwards both unchanged to `anthropic` upstreams, and never serves
+a `safeguards` request from the [response cache](#response-cache). Upstreams
+that translate the request (`openai`, `gemini`, `openrouter`) can't carry it:
+consolette logs a one-time warning per kind, and Claude Code falls back to its
+own classifier requests, which are billed as token usage on API accounts. To
+stop the notice on those routes, set `CLAUDE_CODE_AUTO_MODE_SERVER=0` in the
+client's environment or `env` settings key.
+
 **Seeing empty replies?** — enable redacted payload logging to capture the
 raw upstream shape:
 ```bash

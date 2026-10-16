@@ -77,6 +77,10 @@ pub struct RequestDetail {
     /// The client's `body["model"]` verbatim; `None` when the request named none.
     #[serde(default)]
     pub requested_model: Option<String>,
+    /// The client's effort level (`output_config.effort`, else derived from a legacy thinking
+    /// budget); `None` when the request carried neither.
+    #[serde(default)]
+    pub client_effort: Option<String>,
     #[serde(default)]
     pub routed_model: Option<String>,
     #[serde(default)]
@@ -162,6 +166,9 @@ impl RequestDetail {
                 .get("model")
                 .and_then(serde_json::Value::as_str)
                 .map(|m| m.chars().take(MAX_REQUESTED_MODEL_CHARS).collect()),
+            client_effort: crate::effort::ClientEffort::from_request(body)
+                .effective_level()
+                .map(|l| l.as_str().to_string()),
             routed_model: None,
             routed_model_source: None,
             routed_provider: None,
@@ -670,6 +677,18 @@ pub fn trace_error_rate(traces: &[RequestDetail]) -> TraceErrorRate {
 #[cfg(test)]
 mod requested_model_tests {
     use super::*;
+
+    #[test]
+    fn from_body_should_record_client_effort_from_level_or_legacy_budget() {
+        let build = |body: serde_json::Value| {
+            RequestDetail::from_body("r".into(), false, 0, &body, None).client_effort
+        };
+        let level = serde_json::json!({"output_config": {"effort": "xhigh"}});
+        assert_eq!(build(level).as_deref(), Some("xhigh"));
+        let budget = serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": 2048}});
+        assert_eq!(build(budget).as_deref(), Some("medium"));
+        assert_eq!(build(serde_json::json!({})), None);
+    }
 
     #[test]
     #[allow(clippy::unwrap_used)]

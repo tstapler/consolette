@@ -46,8 +46,11 @@ impl Router {
         };
         for candidate in &mut candidates {
             if let Some(over) = tier.upstreams.get(&candidate.name) {
-                candidate.model.clone_from(&over.model);
-                candidate.model_family.clone_from(&over.model_family);
+                // An effort-only override must keep the route's model.
+                if over.model.is_some() || over.model_family.is_some() {
+                    candidate.model.clone_from(&over.model);
+                    candidate.model_family.clone_from(&over.model_family);
+                }
             }
         }
         candidates

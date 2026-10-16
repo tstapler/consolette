@@ -13,6 +13,7 @@ pub mod config;
 pub mod context_forensics;
 pub mod cost_metrics;
 pub mod dashboard;
+pub mod effort;
 pub mod entrypoint;
 pub mod learn;
 pub mod mcp_gateway;

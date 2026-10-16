@@ -192,6 +192,8 @@ pub struct RequestTraceData {
     /// The raw model the client asked for; `None` when the request named none.
     #[serde(default)]
     pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_effort: Option<String>,
     #[serde(default)]
     pub routed_model: Option<String>,
     #[serde(default)]
@@ -237,6 +239,7 @@ impl RequestTraceData {
             trace_revision: detail.trace_revision,
             first_byte_state: detail.first_byte_state,
             requested_model: detail.requested_model.clone(),
+            client_effort: detail.client_effort.clone(),
             routed_model: detail.routed_model.clone(),
             routed_model_source: detail.routed_model_source,
             routed_provider: detail.routed_provider.clone(),

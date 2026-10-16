@@ -743,6 +743,25 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn send_streaming_request_should_forward_safeguards_unchanged() {
+            let (base_url, captured, _server) = start_capturing_messages_server().await;
+            let provider = provider_for(base_url, true);
+            let body = json!({
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [],
+                "safeguards": {"unrecognized": ["field", 1]}
+            });
+
+            provider
+                .send_streaming_request(body.clone(), &HeaderMap::new())
+                .await
+                .unwrap();
+
+            let (_path, sent) = captured.lock().unwrap().clone().expect("request captured");
+            assert_eq!(sent["safeguards"], body["safeguards"]);
+        }
+
+        #[tokio::test]
         async fn send_streaming_request_should_hit_the_configured_base_url() {
             let (base_url, captured, _server) = start_capturing_messages_server().await;
             let provider = provider_for(base_url, true);

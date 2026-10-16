@@ -1,6 +1,7 @@
 //! Reasoning-effort model: the client's requested level, operator policy, and a per-model
 //! capability table. Pure data and functions; no request rewriting yet (see
-//! `project_plans/effort-mapping/research-and-design.md`).
+//! `project_plans/effort-mapping/research-and-design.md`). A leaf module: it must not depend on
+//! `config`, which already depends on it.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,7 +38,8 @@ impl Level {
     }
 
     /// Case-insensitive; `None` for anything else, since clients may send levels newer than
-    /// this table and an unknown level must not fail the request.
+    /// this table and an unknown level must not fail the request. Config files use the serde
+    /// derive instead, which accepts only the lowercase names.
     #[must_use]
     pub fn parse(s: &str) -> Option<Level> {
         Level::ALL
@@ -45,19 +47,25 @@ impl Level {
             .find(|l| l.as_str().eq_ignore_ascii_case(s.trim()))
     }
 
-    /// Nearest level for a legacy `thinking.budget_tokens`; thresholds invert the LiteLLM
-    /// level-to-budget table (1024/2048/4096/8192/16384).
+    /// Nearest level for a legacy `thinking.budget_tokens`, by the ceilings in
+    /// [`BUDGET_CEILINGS`].
     #[must_use]
     pub fn from_budget_tokens(budget: u64) -> Level {
-        match budget {
-            0..=1024 => Level::Low,
-            1025..=2048 => Level::Medium,
-            2049..=4096 => Level::High,
-            4097..=8192 => Level::Xhigh,
-            _ => Level::Max,
-        }
+        BUDGET_CEILINGS
+            .iter()
+            .find(|(ceiling, _)| budget <= *ceiling)
+            .map_or(Level::Max, |(_, level)| *level)
     }
 }
+
+/// Inclusive upper bound of `budget_tokens` per level; inverts the LiteLLM level-to-budget table
+/// (1024/2048/4096/8192/16384). Anything above the last ceiling is `Max`.
+const BUDGET_CEILINGS: [(u64, Level); 4] = [
+    (1024, Level::Low),
+    (2048, Level::Medium),
+    (4096, Level::High),
+    (8192, Level::Xhigh),
+];
 
 /// The client's `thinking` request field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,20 +174,40 @@ impl ModelCaps {
     }
 }
 
-const ALL5: &[Level] = &Level::ALL;
 const NO_XHIGH: &[Level] = &[Level::Low, Level::Medium, Level::High, Level::Max];
 
 /// Anthropic models by normalized-id prefix; longest match wins. Sourced from the effort and
 /// thinking docs (2026-10-16, see the research doc). Opus 4.5 supports effort but the docs read
 /// don't list its levels, so it is left empty (effort omitted) until confirmed.
 const ANTHROPIC_MODELS: &[(&str, ModelCaps)] = &[
-    ("claude-fable-5", caps(ALL5, ThinkingSupport::AdaptiveOnly)),
-    ("claude-mythos-5", caps(ALL5, ThinkingSupport::AdaptiveOnly)),
-    ("claude-opus-5", caps(ALL5, ThinkingSupport::AdaptiveOnly)),
-    ("claude-opus-4-8", caps(ALL5, ThinkingSupport::AdaptiveOnly)),
-    ("claude-opus-4-7", caps(ALL5, ThinkingSupport::AdaptiveOnly)),
-    ("claude-sonnet-5", caps(ALL5, ThinkingSupport::AdaptiveOnly)),
-    ("claude-haiku-5", caps(ALL5, ThinkingSupport::AdaptiveOnly)),
+    (
+        "claude-fable-5",
+        caps(&Level::ALL, ThinkingSupport::AdaptiveOnly),
+    ),
+    (
+        "claude-mythos-5",
+        caps(&Level::ALL, ThinkingSupport::AdaptiveOnly),
+    ),
+    (
+        "claude-opus-5",
+        caps(&Level::ALL, ThinkingSupport::AdaptiveOnly),
+    ),
+    (
+        "claude-opus-4-8",
+        caps(&Level::ALL, ThinkingSupport::AdaptiveOnly),
+    ),
+    (
+        "claude-opus-4-7",
+        caps(&Level::ALL, ThinkingSupport::AdaptiveOnly),
+    ),
+    (
+        "claude-sonnet-5",
+        caps(&Level::ALL, ThinkingSupport::AdaptiveOnly),
+    ),
+    (
+        "claude-haiku-5",
+        caps(&Level::ALL, ThinkingSupport::AdaptiveOnly),
+    ),
     ("claude-opus-4-6", caps(NO_XHIGH, ThinkingSupport::Both)),
     ("claude-sonnet-4-6", caps(NO_XHIGH, ThinkingSupport::Both)),
     ("claude-opus-4-5", caps(&[], ThinkingSupport::EnabledOnly)),
@@ -207,7 +235,11 @@ pub fn anthropic_caps(model: &str) -> Option<ModelCaps> {
     let id = normalize_claude_id(model)?;
     ANTHROPIC_MODELS
         .iter()
-        .filter(|(prefix, _)| id.starts_with(prefix))
+        .filter(|(prefix, _)| {
+            // A digit after the prefix means a different version (`...4-8` vs `...4-80`).
+            id.strip_prefix(prefix)
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
         .max_by_key(|(prefix, _)| prefix.len())
         .map(|(_, caps)| *caps)
 }
@@ -307,6 +339,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_should_let_max_win_when_bounds_are_inverted() {
+        let inverted = EffortPolicy {
+            force: None,
+            min: Some(Level::High),
+            max: Some(Level::Low),
+        };
+        assert_eq!(inverted.resolve(Some(Level::Medium)), Some(Level::Low));
+    }
+
+    #[test]
     fn resolve_should_stay_silent_without_a_level() {
         let bounded = EffortPolicy {
             force: None,
@@ -331,7 +373,7 @@ mod tests {
             "anthropic/claude-opus-4.8",
         ] {
             let caps = anthropic_caps(id).unwrap_or_else(|| panic!("{id} should be known"));
-            assert_eq!(caps.levels, ALL5, "{id}");
+            assert_eq!(caps.levels, &Level::ALL, "{id}");
             assert_eq!(caps.thinking, ThinkingSupport::AdaptiveOnly, "{id}");
         }
     }
@@ -345,6 +387,30 @@ mod tests {
         assert_eq!(legacy.thinking, ThinkingSupport::EnabledOnly);
         assert!(legacy.levels.is_empty());
         assert!(anthropic_caps("claude-opus-4-1").is_none());
+    }
+
+    #[test]
+    fn anthropic_caps_should_cover_every_table_row_and_respect_version_boundaries() {
+        use ThinkingSupport::{AdaptiveOnly, Both, EnabledOnly};
+        let cases: [(&str, usize, ThinkingSupport); 11] = [
+            ("claude-fable-5-1", 5, AdaptiveOnly),
+            ("claude-mythos-5", 5, AdaptiveOnly),
+            ("claude-opus-5-5", 5, AdaptiveOnly),
+            ("claude-opus-4-7", 5, AdaptiveOnly),
+            ("claude-sonnet-5-5", 5, AdaptiveOnly),
+            ("claude-haiku-5-5", 5, AdaptiveOnly),
+            ("claude-opus-4-6", 4, Both),
+            ("claude-sonnet-4-6", 4, Both),
+            ("claude-opus-4-5", 0, EnabledOnly),
+            ("claude-sonnet-4-5", 0, EnabledOnly),
+            ("claude-opus-4-8[1m]", 5, AdaptiveOnly),
+        ];
+        for (id, levels, thinking) in cases {
+            let caps = anthropic_caps(id).unwrap_or_else(|| panic!("{id} should be known"));
+            assert_eq!(caps.levels.len(), levels, "{id}");
+            assert_eq!(caps.thinking, thinking, "{id}");
+        }
+        assert!(anthropic_caps("claude-opus-4-80").is_none());
     }
 
     #[test]

@@ -710,7 +710,7 @@ impl Router {
             if let Some(family) = &chosen.model_family {
                 request_body[MODEL_FAMILY_BODY_KEY] = serde_json::Value::String(family.clone());
             }
-            crate::auto_mode::warn_if_safeguards_dropped(provider.name(), &request_body);
+            crate::auto_mode::warn_if_safeguards_dropped(provider.as_ref(), &request_body);
             let attempt_started = std::time::Instant::now();
             scope.begin_attempt(&chosen.name, chosen.model.as_deref(), scope.iteration());
             let (outcome, resolved) = crate::providers::capture_resolved_model(provider.send(

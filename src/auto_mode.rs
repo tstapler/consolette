@@ -9,9 +9,11 @@
 //! request's verdict for another.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use serde_json::Value;
+
+use crate::providers::Provider;
 
 pub const SAFEGUARDS_FIELD: &str = "safeguards";
 
@@ -20,27 +22,30 @@ pub fn request_has_safeguards(body: &Value) -> bool {
     body.get(SAFEGUARDS_FIELD).is_some()
 }
 
-/// Provider kinds (`Provider::name()`) that translate the request into another API's schema, so
-/// `safeguards` cannot reach a server that understands it.
-#[must_use]
-pub fn drops_safeguards(provider_name: &str) -> bool {
-    matches!(provider_name, "openai" | "gemini" | "openrouter")
+/// True the first time a `safeguards` request reaches each provider kind that translates the
+/// request; records `provider_name` in `seen`. Checks before inserting so repeat calls don't
+/// allocate, and recovers a poisoned lock rather than silencing the warning.
+fn first_dropped_for(
+    seen: &Mutex<HashSet<String>>,
+    provider_name: &str,
+    translates_request: bool,
+    body: &Value,
+) -> bool {
+    if !translates_request || !request_has_safeguards(body) {
+        return false;
+    }
+    let mut seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    !seen.contains(provider_name) && seen.insert(provider_name.to_string())
 }
 
 /// Logs once per provider kind when a request carrying `safeguards` is sent to an upstream that
 /// cannot honor it, naming the client-side switch that silences the resulting billing notice.
-pub fn warn_if_safeguards_dropped(provider_name: &str, body: &Value) {
-    if !request_has_safeguards(body) || !drops_safeguards(provider_name) {
-        return;
-    }
+pub fn warn_if_safeguards_dropped(provider: &dyn Provider, body: &Value) {
     static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let first_time = WARNED
-        .get_or_init(Mutex::default)
-        .lock()
-        .is_ok_and(|mut warned| warned.insert(provider_name.to_string()));
-    if first_time {
+    let seen = WARNED.get_or_init(Mutex::default);
+    if first_dropped_for(seen, provider.name(), provider.translates_request(), body) {
         tracing::warn!(
-            upstream_kind = provider_name,
+            upstream_kind = provider.name(),
             "request carries `safeguards` but this upstream translates the request, so Claude \
              Code's server-side auto-mode review is unavailable; Claude Code will use its own \
              classifier requests (billed as token usage). Set CLAUDE_CODE_AUTO_MODE_SERVER=0 in \
@@ -54,6 +59,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn guarded() -> Value {
+        json!({"safeguards": {}})
+    }
+
     #[test]
     fn request_has_safeguards_should_detect_the_field_by_presence() {
         assert!(request_has_safeguards(&json!({"safeguards": {}})));
@@ -62,12 +71,28 @@ mod tests {
     }
 
     #[test]
-    fn drops_safeguards_should_flag_only_translating_provider_kinds() {
-        for kind in ["openai", "gemini", "openrouter"] {
-            assert!(drops_safeguards(kind), "{kind}");
-        }
-        for kind in ["anthropic", "bedrock"] {
-            assert!(!drops_safeguards(kind), "{kind}");
-        }
+    fn first_dropped_for_should_fire_once_per_provider_kind() {
+        let seen = Mutex::default();
+
+        assert!(first_dropped_for(&seen, "openai", true, &guarded()));
+        assert!(!first_dropped_for(&seen, "openai", true, &guarded()));
+        assert!(first_dropped_for(&seen, "gemini", true, &guarded()));
+    }
+
+    #[test]
+    fn first_dropped_for_should_stay_silent_for_verbatim_providers_and_plain_requests() {
+        let seen = Mutex::default();
+
+        assert!(!first_dropped_for(&seen, "anthropic", false, &guarded()));
+        assert!(!first_dropped_for(
+            &seen,
+            "openai",
+            true,
+            &json!({"model": "m"})
+        ));
+        assert!(
+            first_dropped_for(&seen, "openai", true, &guarded()),
+            "skipped calls must not consume the once-per-kind slot"
+        );
     }
 }

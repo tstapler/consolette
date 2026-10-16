@@ -688,6 +688,13 @@ mod requested_model_tests {
         let budget = serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": 2048}});
         assert_eq!(build(budget).as_deref(), Some("medium"));
         assert_eq!(build(serde_json::json!({})), None);
+        for body in [
+            serde_json::json!({"thinking": {"type": "adaptive"}}),
+            serde_json::json!({"thinking": {"type": "enabled"}}),
+            serde_json::json!({"output_config": {"effort": "ludicrous"}}),
+        ] {
+            assert_eq!(build(body.clone()), None, "{body}");
+        }
     }
 
     #[test]

@@ -608,6 +608,10 @@ impl Provider for OpenrouterProvider {
         "openrouter"
     }
 
+    fn translates_request(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         body: Value,

@@ -192,6 +192,7 @@ pub struct RequestTraceData {
     /// The raw model the client asked for; `None` when the request named none.
     #[serde(default)]
     pub requested_model: Option<String>,
+    /// The effort level the client asked for (`low`..`max`); omitted when it sent none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_effort: Option<String>,
     #[serde(default)]
@@ -482,6 +483,22 @@ mod tests {
             .map(|(_, raw)| *raw)
             .expect("fixture registered");
         serde_json::from_str(raw).expect("fixture json")
+    }
+
+    #[test]
+    fn request_trace_should_carry_client_effort_and_omit_it_when_absent() {
+        let mut detail = sample_detail();
+        let absent = serde_json::to_value(RequestTraceData::from_detail(&detail)).unwrap();
+        assert!(absent.get("clientEffort").is_none(), "{absent}");
+
+        detail.client_effort = Some("high".to_string());
+        let present = serde_json::to_value(RequestTraceData::from_detail(&detail)).unwrap();
+        assert_eq!(present["clientEffort"], "high");
+
+        let mut legacy = absent;
+        legacy.as_object_mut().unwrap().remove("clientEffort");
+        let parsed: RequestTraceData = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.client_effort, None);
     }
 
     #[test]

@@ -472,6 +472,10 @@ impl Provider for GeminiProvider {
         "gemini"
     }
 
+    fn translates_request(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         body: Value,

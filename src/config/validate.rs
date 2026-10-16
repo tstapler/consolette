@@ -126,7 +126,7 @@ pub fn validate_model_tiers(config: &Config) -> Result<(), ConfigError> {
                 return Err(invalid(
                     &tier.name,
                     format!(
-                        "upstream {name:?} must set exactly one of model or model_family (or effort alone)"
+                        "upstream {name:?}: set exactly one of model or model_family (effort may accompany either, or stand alone)"
                     ),
                 ));
             }
@@ -410,7 +410,10 @@ effort = "low"
                 "{UPSTREAMS}[[model_tiers]]\nname = \"t\"\nmatch = [\"a\"]\n\
                  [model_tiers.upstreams.gw-openai]\neffort = \"ludicrous\"\n"
             ));
-            assert!(bad.is_err(), "unknown level must fail at parse time");
+            let err = bad
+                .expect_err("unknown level must fail at parse time")
+                .to_string();
+            assert!(err.contains("ludicrous"), "{err}");
         }
 
         #[test]
@@ -526,18 +529,26 @@ base_url = "https://example.invalid"
 
         #[test]
         fn effort_policy_should_combine_table_bounds_with_forced_level() {
-            let config = parse("[effort.gw-openai]\nmax = \"medium\"\n");
-            let policy = config.effort_policy("gw-openai", Some(Level::Max));
+            let config = parse("[effort.gw-openai]\nmode = \"map\"\nmax = \"medium\"\n");
+            let policy = config
+                .effort_policy("gw-openai", Some(Level::Max))
+                .expect("map mode yields a policy");
             assert_eq!(policy.resolve(None), Some(Level::Medium));
-            let unlisted = config.effort_policy("other", None);
-            assert_eq!(unlisted.resolve(Some(Level::Max)), Some(Level::Max));
+        }
+
+        #[test]
+        fn effort_policy_should_be_none_when_mode_is_off_or_upstream_unlisted() {
+            let config = parse("[effort.gw-openai]\nmax = \"medium\"\n");
+            assert_eq!(config.effort_policy("gw-openai", Some(Level::Max)), None);
+            assert_eq!(config.effort_policy("other", Some(Level::Max)), None);
         }
 
         #[test]
         fn effort_table_should_reject_unknown_keys() {
             let bad: Result<Config, _> =
                 toml::from_str(&format!("{UPSTREAMS}[effort.gw-openai]\nmodee = \"map\"\n"));
-            assert!(bad.is_err());
+            let err = bad.expect_err("typo'd key must fail").to_string();
+            assert!(err.contains("modee"), "{err}");
         }
     }
 }

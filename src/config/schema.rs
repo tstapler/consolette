@@ -8,6 +8,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::effort::{EffortMode, EffortPolicy, Level};
+
 fn default_apikey_header() -> String {
     "x-api-key".to_string()
 }
@@ -204,32 +206,31 @@ pub struct RouteUpstreamRef {
 
 /// `[effort.<upstream>]`: whether and how the client's reasoning effort is translated for one
 /// upstream. `mode = "off"` (the default) forwards nothing new; `min` / `max` clamp whichever
-/// level results, client's or a tier's forced one.
+/// level results, client's or a tier's forced one. Reserved: parsed and validated, but dispatch
+/// does not act on it yet (load logs a warning if it is turned on).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamEffort {
     #[serde(default)]
-    pub mode: crate::effort::EffortMode,
+    pub mode: EffortMode,
     #[serde(default)]
-    pub min: Option<crate::effort::Level>,
+    pub min: Option<Level>,
     #[serde(default)]
-    pub max: Option<crate::effort::Level>,
+    pub max: Option<Level>,
 }
 
 impl Config {
-    /// Effort policy for `upstream`, with `forced` the matching tier's `effort` override.
+    /// Effort policy for `upstream`, with `forced` the matching tier's `effort` override;
+    /// `None` when the upstream's mode is `off`, which forwards no effort at all (a tier's forced
+    /// level included).
     #[must_use]
-    pub fn effort_policy(
-        &self,
-        upstream: &str,
-        forced: Option<crate::effort::Level>,
-    ) -> crate::effort::EffortPolicy {
+    pub fn effort_policy(&self, upstream: &str, forced: Option<Level>) -> Option<EffortPolicy> {
         let cfg = self.effort.get(upstream).copied().unwrap_or_default();
-        crate::effort::EffortPolicy {
+        (cfg.mode == EffortMode::Map).then_some(EffortPolicy {
             force: forced,
             min: cfg.min,
             max: cfg.max,
-        }
+        })
     }
 }
 
@@ -259,7 +260,7 @@ pub struct TierUpstreamOverride {
     pub model_family: Option<String>,
     /// Forces this reasoning level for the tier on this upstream, ignoring the client's.
     #[serde(default)]
-    pub effort: Option<crate::effort::Level>,
+    pub effort: Option<Level>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

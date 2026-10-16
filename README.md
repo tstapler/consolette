@@ -168,6 +168,8 @@ model = "claude-haiku-4-5"
 - **Validated at load and on config/route hot-swap**: tier names must be unique,
   `match` non-empty, upstreams declared, selectors exclusive (`model_family` on
   `kind = "openai"` only). Like `[[routes]]`, arrays replace wholesale across conf.d files.
+- The response cache is keyed on the client's model and is not invalidated when tiers
+  change on hot-swap, so cached answers persist until their TTL.
 - Traces record the tier-mapped model as the routed model. Example:
   `references/conf.d/10-model-tiers.toml`.
 

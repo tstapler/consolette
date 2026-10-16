@@ -319,3 +319,47 @@ async fn from_config_should_carry_model_tiers_into_the_router() {
     assert_eq!(model_of("bedrock"), Some(Some("cheap-model".to_string())));
     assert_eq!(model_of("anthropic"), Some(None));
 }
+
+#[tokio::test]
+async fn dispatch_should_match_tier_prefix_with_surrounding_whitespace() {
+    let (router, alpha, _, _) = tiered_router(vec![tier(
+        "haiku",
+        &["  Claude-Haiku "],
+        &[("alpha", pin_model("cheap-model"))],
+    )]);
+
+    dispatch_model(&router, "claude-haiku-4-5").await;
+
+    assert_eq!(sent_model(&alpha).as_deref(), Some("cheap-model"));
+}
+
+#[tokio::test]
+async fn dispatch_should_prefer_session_pin_over_matching_tier() {
+    let (router, alpha, beta, _) = tiered_router(vec![tier(
+        "haiku",
+        &["claude-haiku"],
+        &[("beta", pin_model("beta-cheap"))],
+    )]);
+    let overrides = Arc::new(crate::routing::session_overrides::SessionOverrideStore::new());
+    overrides.set(
+        "sess-1".to_string(),
+        crate::routing::session_overrides::SessionOverride {
+            upstream: "beta".to_string(),
+            model: Some("pinned-model".to_string()),
+        },
+    );
+    let router = router.with_session_overrides(overrides);
+
+    router
+        .dispatch(
+            serde_json::json!({"model": "claude-haiku-4-5", "metadata": {"user_id": "sess-1"}}),
+            HeaderMap::new(),
+            false,
+            0,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dispatch failed: {e:?}"));
+
+    assert_eq!(sent_model(&alpha), None, "pin routes only to beta");
+    assert_eq!(sent_model(&beta).as_deref(), Some("pinned-model"));
+}

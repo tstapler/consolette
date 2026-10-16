@@ -5,13 +5,14 @@ use super::Router;
 use crate::config::schema::ModelTier;
 use crate::routing::strategy::UpstreamRef;
 
-/// First tier whose `match` has a case-insensitive prefix of `requested`.
+/// First tier whose `match` has a prefix of `requested`; prefixes are pre-normalized
+/// (trimmed, lowercased) by [`Router::with_model_tiers`].
 pub(super) fn matching_tier<'a>(tiers: &'a [ModelTier], requested: &str) -> Option<&'a ModelTier> {
     let requested = requested.to_lowercase();
     tiers.iter().find(|tier| {
         tier.match_prefixes
             .iter()
-            .any(|prefix| requested.starts_with(&prefix.to_lowercase()))
+            .any(|prefix| requested.starts_with(prefix.as_str()))
     })
 }
 
@@ -19,7 +20,12 @@ impl Router {
     /// Carries `[[model_tiers]]` onto a router (hot-swaps rebuild via `from_config`, which
     /// calls this with the new config's tiers).
     #[must_use]
-    pub fn with_model_tiers(mut self, model_tiers: Vec<ModelTier>) -> Self {
+    pub fn with_model_tiers(mut self, mut model_tiers: Vec<ModelTier>) -> Self {
+        for tier in &mut model_tiers {
+            for prefix in &mut tier.match_prefixes {
+                *prefix = prefix.trim().to_lowercase();
+            }
+        }
         self.model_tiers = model_tiers;
         self
     }

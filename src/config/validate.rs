@@ -112,6 +112,13 @@ pub fn validate_model_tiers(config: &Config) -> Result<(), ConfigError> {
             let Some(upstream) = config.upstreams.iter().find(|u| &u.name == name) else {
                 return Err(invalid(&tier.name, format!("unknown upstream {name:?}")));
             };
+            let blank = |v: &Option<String>| v.as_deref().is_some_and(|v| v.trim().is_empty());
+            if blank(&over.model) || blank(&over.model_family) {
+                return Err(invalid(
+                    &tier.name,
+                    format!("upstream {name:?} has an empty model or model_family"),
+                ));
+            }
             if over.model.is_some() == over.model_family.is_some() {
                 return Err(invalid(
                     &tier.name,
@@ -376,6 +383,18 @@ model_family = "y"
 
             assert!(empty.contains("match"), "{empty}");
             assert!(blank.contains("match"), "{blank}");
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_blank_selectors() {
+            for field in ["model", "model_family"] {
+                let r = reason(&format!(
+                    "[[model_tiers]]\nname = \"t\"\nmatch = [\"a\"]\n\
+                     [model_tiers.upstreams.gw-openai]\n{field} = \" \"\n"
+                ));
+
+                assert!(r.contains("empty"), "{field}: {r}");
+            }
         }
 
         #[test]

@@ -84,6 +84,62 @@ pub fn validate_model_selectors(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validates `[[model_tiers]]`: unique names, non-empty `match` (no blank prefixes), every
+/// upstream name declared, and exactly one of `model` / `model_family` per override, with
+/// `model_family` only on `kind = "openai"` upstreams (same rules as route selectors).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidModelTier`] naming the offending tier.
+pub fn validate_model_tiers(config: &Config) -> Result<(), ConfigError> {
+    let invalid = |tier: &str, reason: String| ConfigError::InvalidModelTier {
+        tier: tier.to_string(),
+        reason,
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
+    for tier in &config.model_tiers {
+        if !seen.insert(tier.name.as_str()) {
+            return Err(invalid(&tier.name, "duplicate tier name".to_string()));
+        }
+        if tier.match_prefixes.is_empty() || tier.match_prefixes.iter().any(|m| m.trim().is_empty())
+        {
+            return Err(invalid(
+                &tier.name,
+                "`match` must list at least one non-empty prefix".to_string(),
+            ));
+        }
+        for (name, over) in &tier.upstreams {
+            let Some(upstream) = config.upstreams.iter().find(|u| &u.name == name) else {
+                return Err(invalid(&tier.name, format!("unknown upstream {name:?}")));
+            };
+            let blank = |v: &Option<String>| v.as_deref().is_some_and(|v| v.trim().is_empty());
+            if blank(&over.model) || blank(&over.model_family) {
+                return Err(invalid(
+                    &tier.name,
+                    format!("upstream {name:?} has an empty model or model_family"),
+                ));
+            }
+            if over.model.is_some() == over.model_family.is_some() {
+                return Err(invalid(
+                    &tier.name,
+                    format!("upstream {name:?} must set exactly one of model or model_family"),
+                ));
+            }
+            if over.model_family.is_some() && !matches!(upstream.kind, UpstreamKind::Openai { .. })
+            {
+                return Err(invalid(
+                    &tier.name,
+                    format!(
+                        "upstream {name:?} sets model_family but its kind is {:?}, not \"openai\"",
+                        upstream.kind.label()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -210,5 +266,151 @@ model = "gpt-5.1"
         let result = validate_model_selectors(&config);
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    mod tiers {
+        use super::super::validate_model_tiers;
+        use super::{Config, ConfigError};
+
+        const UPSTREAMS: &str = r#"
+[[upstreams]]
+name = "gw-openai"
+kind = "openai"
+base_url = "https://example.invalid"
+
+[[upstreams]]
+name = "gw-anthropic"
+kind = "anthropic"
+
+[[routes]]
+name = "default"
+strategy = "fallback"
+
+[[routes.upstreams]]
+name = "gw-openai"
+model = "gpt-5"
+"#;
+
+        fn check(tiers: &str) -> Result<(), ConfigError> {
+            let config: Config =
+                toml::from_str(&format!("{UPSTREAMS}{tiers}")).expect("fragment should parse");
+            validate_model_tiers(&config)
+        }
+
+        fn reason(tiers: &str) -> String {
+            match check(tiers) {
+                Err(ConfigError::InvalidModelTier { reason, .. }) => reason,
+                other => panic!("expected InvalidModelTier, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn validate_model_tiers_should_accept_valid_tier() {
+            let result = check(
+                r#"
+[[model_tiers]]
+name = "haiku"
+match = ["claude-haiku"]
+[model_tiers.upstreams.gw-openai]
+model_family = "gpt-6-luna"
+[model_tiers.upstreams.gw-anthropic]
+model = "claude-haiku-5-5"
+"#,
+            );
+
+            assert!(result.is_ok(), "{result:?}");
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_unknown_upstream() {
+            let r = reason(
+                r#"
+[[model_tiers]]
+name = "haiku"
+match = ["claude-haiku"]
+[model_tiers.upstreams.nope]
+model = "x"
+"#,
+            );
+
+            assert!(r.contains("unknown upstream"), "{r}");
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_both_or_neither_selector() {
+            let both = reason(
+                r#"
+[[model_tiers]]
+name = "t"
+match = ["a"]
+[model_tiers.upstreams.gw-openai]
+model = "x"
+model_family = "y"
+"#,
+            );
+            let neither = reason(
+                r#"
+[[model_tiers]]
+name = "t"
+match = ["a"]
+[model_tiers.upstreams.gw-openai]
+"#,
+            );
+
+            assert!(both.contains("exactly one"), "{both}");
+            assert!(neither.contains("exactly one"), "{neither}");
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_model_family_on_non_openai_upstream() {
+            let r = reason(
+                r#"
+[[model_tiers]]
+name = "t"
+match = ["a"]
+[model_tiers.upstreams.gw-anthropic]
+model_family = "y"
+"#,
+            );
+
+            assert!(r.contains("not \"openai\""), "{r}");
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_empty_match() {
+            let empty = reason("[[model_tiers]]\nname = \"t\"\nmatch = []\n");
+            let blank = reason("[[model_tiers]]\nname = \"t\"\nmatch = [\" \"]\n");
+
+            assert!(empty.contains("match"), "{empty}");
+            assert!(blank.contains("match"), "{blank}");
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_blank_selectors() {
+            for field in ["model", "model_family"] {
+                let r = reason(&format!(
+                    "[[model_tiers]]\nname = \"t\"\nmatch = [\"a\"]\n\
+                     [model_tiers.upstreams.gw-openai]\n{field} = \" \"\n"
+                ));
+
+                assert!(r.contains("empty"), "{field}: {r}");
+            }
+        }
+
+        #[test]
+        fn validate_model_tiers_should_reject_duplicate_tier_names() {
+            let r = reason(
+                r#"
+[[model_tiers]]
+name = "t"
+match = ["a"]
+[[model_tiers]]
+name = "t"
+match = ["b"]
+"#,
+            );
+
+            assert!(r.contains("duplicate"), "{r}");
+        }
     }
 }

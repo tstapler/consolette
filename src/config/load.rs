@@ -10,7 +10,7 @@ use figment::Figment;
 use super::plugins;
 use super::runtime_overrides::RuntimeOverrides;
 use super::schema::{Config, Upstream, UpstreamKind};
-use super::validate::{validate_model_selectors, validate_references};
+use super::validate::{validate_model_selectors, validate_model_tiers, validate_references};
 use super::ConfigError;
 
 /// Env overrides are restricted to a small allowlist of top-level scalars —
@@ -64,6 +64,7 @@ pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
 
     validate_references(&config)?;
     validate_model_selectors(&config)?;
+    validate_model_tiers(&config)?;
     Ok(config)
 }
 

@@ -142,6 +142,37 @@ Adopting `model_family` in an internal OpenAI-compatible gateway plugin's config
 `gpt-5.1-codex-max`) is tracked as a follow-up PR in the separate `ndotfiles`
 repo, not part of this repo.
 
+### Model tiers (`model_tiers`)
+
+One route can serve different concrete models depending on the tier of the model the
+client asked for (e.g. `claude-haiku-*` on a cheap OpenAI model, `claude-sonnet-*` on a
+mid one). A `[[model_tiers]]` entry overrides the route's `model` / `model_family` per
+upstream; the route still decides membership, order, and fallback.
+
+```toml
+[[model_tiers]]
+name  = "haiku"
+match = ["claude-haiku"]      # case-insensitive prefix of the request's "model"
+
+[model_tiers.upstreams.openai]
+model_family = "gpt-5-mini"   # exactly one of model | model_family
+
+[model_tiers.upstreams.anthropic]
+model = "claude-haiku-4-5"
+```
+
+- **First match wins**: tiers are checked in file order; an upstream with no override
+  in the matching tier (or a request that matches no tier) keeps the route's default.
+- **Applies everywhere the route does**, including `X-Consolette-Upstream` forced
+  requests. A session pin (`/api/sessions/{id}/route`) still takes precedence over tiers.
+- **Validated at load and on config/route hot-swap**: tier names must be unique,
+  `match` non-empty, upstreams declared, selectors exclusive (`model_family` on
+  `kind = "openai"` only). Like `[[routes]]`, arrays replace wholesale across conf.d files.
+- The response cache is keyed on the client's model and is not invalidated when tiers
+  change on hot-swap, so cached answers persist until their TTL.
+- Traces record the tier-mapped model as the routed model. Example:
+  `references/conf.d/10-model-tiers.toml`.
+
 ### Server-tool emulation (`web_search`)
 
 Claude Code's `web_search` server tool is emulated inside the proxy on

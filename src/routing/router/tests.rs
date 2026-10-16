@@ -12,6 +12,7 @@ mod basic_dispatch;
 mod characterization;
 mod from_config;
 mod model_pinning;
+mod model_tiers;
 mod observability;
 mod per_model_retry;
 mod provider_names;

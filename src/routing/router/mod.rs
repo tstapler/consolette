@@ -17,7 +17,7 @@ use http::HeaderMap;
 
 use crate::auth::exec::ExecCredentialCache;
 use crate::auth::{SecretResolver, SystemSecretResolver};
-use crate::config::schema::{Config, Route, Strategy, UpstreamKind};
+use crate::config::schema::{Config, ModelTier, Route, Strategy, UpstreamKind};
 use crate::metrics::trace::{AttemptErrorClass, AttemptOutcome, RequestOutcome, TraceScope};
 use crate::metrics::{MetricsCollector, ProxyMetrics};
 use crate::providers::anthropic::AnthropicProvider;
@@ -28,6 +28,8 @@ use crate::providers::openai::{OpenaiProvider, MODEL_FAMILY_BODY_KEY};
 use crate::providers::openrouter::OpenrouterProvider;
 use crate::providers::{Provider, ProviderError, ProviderResponse};
 use crate::ratelimit::{AdmissionControl, Admit, RateLimiters};
+
+use route_candidates::{build_route_candidates, select_primary_route};
 
 use super::capability::CapabilityCache;
 use super::health::{Availability, HealthRegistry};
@@ -78,6 +80,8 @@ pub struct Router {
     provider_names: Vec<crate::metrics::ids::UpstreamName>,
     /// Config fingerprints parallel to `provider_names` (see `provider_names.rs`).
     fingerprints: Vec<crate::routing::model_catalog::UpstreamFingerprint>,
+    /// `[[model_tiers]]` overrides (see `tiers.rs`); empty for hand-built routers.
+    model_tiers: Vec<ModelTier>,
 }
 
 /// The four non-`openrouter`-kind upstreams: a plain `Arc<dyn Provider>`,
@@ -324,58 +328,6 @@ fn disable_bedrock_cooldown(config: &Config, health: &HealthRegistry) {
     }
 }
 
-/// The one `Route` `from_config` builds a `Router` from — always the
-/// first configured route; any others are logged and ignored.
-///
-/// # Errors
-///
-/// Returns `Err` if `config.routes` is empty.
-fn select_primary_route(config: &Config) -> anyhow::Result<&Route> {
-    let route = config
-        .routes
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no routes configured"))?;
-    if config.routes.len() > 1 {
-        tracing::warn!(
-            ignored = ?config.routes[1..].iter().map(|r| &r.name).collect::<Vec<_>>(),
-            "multiple routes configured; using the first"
-        );
-    }
-    Ok(route)
-}
-
-/// Resolves `route`'s upstream-name references into `UpstreamRef`s indexed
-/// against `config.upstreams`.
-///
-/// # Errors
-///
-/// Returns `Err` naming `route` and the offending name if it references an
-/// upstream not present in `config.upstreams`.
-fn build_route_candidates(route: &Route, config: &Config) -> anyhow::Result<Vec<UpstreamRef>> {
-    let mut candidates = Vec::with_capacity(route.upstreams.len());
-    for route_upstream in &route.upstreams {
-        let index = config
-            .upstreams
-            .iter()
-            .position(|u| u.name == route_upstream.name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "route \"{}\" references unknown upstream \"{}\"",
-                    route.name,
-                    route_upstream.name
-                )
-            })?;
-        candidates.push(UpstreamRef {
-            index,
-            name: route_upstream.name.clone(),
-            weight: route_upstream.weight.unwrap_or(1.0),
-            model: route_upstream.model.clone(),
-            model_family: route_upstream.model_family.clone(),
-        });
-    }
-    Ok(candidates)
-}
-
 /// Resolves `route`'s configured `Strategy` into a live `RoutingStrategy`.
 ///
 /// # Errors
@@ -445,6 +397,7 @@ impl Router {
             local_providers: dashmap::DashMap::new(),
             provider_names: Vec::new(),
             fingerprints: Vec::new(),
+            model_tiers: Vec::new(),
         }
     }
 
@@ -552,7 +505,8 @@ impl Router {
             metrics,
         })
         .with_provider_names(provider_names)
-        .with_fingerprints(provider_names::fingerprints_of(config)))
+        .with_fingerprints(provider_names::fingerprints_of(config))
+        .with_model_tiers(config.model_tiers.clone()))
     }
 
     /// This dispatch's candidate list: the route's normal `self.candidates`,
@@ -682,6 +636,11 @@ impl Router {
         let session_id = extract_session_id(&body);
         let (candidates, pinned) = self.effective_candidates(session_id.as_deref());
         scope.record_route(pinned, self.strategy.name());
+        let candidates = if pinned {
+            candidates
+        } else {
+            self.apply_model_tiers(candidates, &body)
+        };
         let candidates = self.strategy.expand_candidates(candidates);
         self.dispatch_attempts(scope, &candidates, body, headers, stream, est_tokens)
             .await
@@ -1093,5 +1052,7 @@ impl Router {
 mod forced_dispatch;
 mod local_dispatch;
 mod provider_names;
+mod route_candidates;
 #[cfg(test)]
 mod tests;
+mod tiers;

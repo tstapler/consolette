@@ -154,6 +154,13 @@ pub async fn post_route(
         )
     })?;
 
+    crate::config::validate_model_tiers(&candidate).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+
     overrides.save(&state.config_dir).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

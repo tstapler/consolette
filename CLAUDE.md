@@ -15,7 +15,7 @@ This file guides Claude Code when working in this repository. It was generated b
 
 **Planning and implementing features**: use `/sdd:full` (or the individual phases) for anything non-trivial; `/sdd:quick` for small fixes.
 
-**Cutting a release**: see `RELEASE.md` — Claude Code may push the release tag itself (an interactive, user-credentialed push works fine; only a CI-bot/`GITHUB_TOKEN`-authored push fails to trigger `release.yml`), but only when the user has asked for a release and agreed on the version number, never on Claude Code's own initiative. Do not push a tag from a bot-authored commit (release-please-style), and do not hand-edit `.github/workflows/release.yml` (regenerate via `dist generate` instead).
+**Cutting a release**: see `RELEASE.md` — Claude Code may push the release tag itself (an interactive, user-credentialed push works fine; only a CI-bot/`GITHUB_TOKEN`-authored push fails to trigger `release.yml`), but only when the user has asked for a release, never on Claude Code's own initiative. The version is whatever `scripts/next-version.sh` prints (derived from Conventional Commits), so don't ask for it. Do not push a tag from a bot-authored commit (release-please-style), and do not hand-edit `.github/workflows/release.yml` (regenerate via `dist generate` instead).
 
 ## Architecture Notes
 

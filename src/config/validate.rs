@@ -514,6 +514,12 @@ base_url = "https://example.invalid"
         }
 
         #[test]
+        fn validate_effort_should_accept_equal_bounds() {
+            let config = parse("[effort.gw-openai]\nmin = \"high\"\nmax = \"high\"\n");
+            assert!(validate_effort(&config).is_ok());
+        }
+
+        #[test]
         fn validate_effort_should_reject_unknown_upstream_and_inverted_bounds() {
             let ghost = parse("[effort.ghost]\nmode = \"map\"\n");
             assert!(matches!(

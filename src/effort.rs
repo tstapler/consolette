@@ -59,7 +59,8 @@ impl Level {
 }
 
 /// Inclusive upper bound of `budget_tokens` per level; inverts the LiteLLM level-to-budget table
-/// (1024/2048/4096/8192/16384). Anything above the last ceiling is `Max`.
+/// (1024/2048/4096/8192/16384). A budget rounds up to the next level, so anything above the last
+/// ceiling is `Max`.
 const BUDGET_CEILINGS: [(u64, Level); 4] = [
     (1024, Level::Low),
     (2048, Level::Medium),

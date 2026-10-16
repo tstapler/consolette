@@ -720,6 +720,12 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn translates_request_should_be_false_for_anthropic() {
+            let provider = provider_for("http://127.0.0.1:1".to_string(), true);
+            assert!(!provider.translates_request());
+        }
+
+        #[tokio::test]
         async fn send_request_should_forward_safeguards_and_return_safeguard_results_unchanged() {
             let (base_url, captured, _server) = start_capturing_messages_server().await;
             let provider = provider_for(base_url, true);

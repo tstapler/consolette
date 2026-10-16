@@ -87,6 +87,22 @@ fn warn_if_effort_configured(config: &Config) {
              applied yet: requests are forwarded with their original effort"
         );
     }
+    for tier in &config.model_tiers {
+        for (upstream, over) in &tier.upstreams {
+            let map_mode = config
+                .effort
+                .get(upstream)
+                .is_some_and(|e| e.mode == EffortMode::Map);
+            if over.effort.is_some() && !map_mode {
+                tracing::warn!(
+                    tier = %tier.name,
+                    upstream = %upstream,
+                    "tier sets `effort` but [effort.{upstream}] mode is not \"map\": the forced \
+                     level will be ignored"
+                );
+            }
+        }
+    }
 }
 
 /// `bin/` directories of every plugin discovered under `<config_dir>/plugins.d/`

@@ -114,6 +114,9 @@ const GENERATION_PARAM_FIELDS: &[&str] = &[
     "top_p",
     "top_k",
     "stop_sequences",
+    // Reasoning depth changes the answer: an effort-`max` reply must not serve an effort-`low` ask.
+    "output_config",
+    "thinking",
 ];
 
 /// Deterministic cache key: sha256 of the model name, system prompt, tool
@@ -701,6 +704,28 @@ mod tests {
             compute_cache_key(&base),
             compute_cache_key(&different_temperature)
         );
+    }
+
+    #[test]
+    fn compute_cache_key_should_differ_when_effort_or_thinking_differ() {
+        let request = |extra: Value| {
+            let mut body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "same question"}]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            compute_cache_key(&body)
+        };
+        let low = request(json!({"output_config": {"effort": "low"}}));
+        let max = request(json!({"output_config": {"effort": "max"}}));
+        let adaptive = request(json!({"thinking": {"type": "adaptive"}}));
+
+        assert_ne!(low, max);
+        assert_ne!(low, request(json!({})));
+        assert_ne!(adaptive, request(json!({})));
+        assert_eq!(low, request(json!({"output_config": {"effort": "low"}})));
     }
 
     #[test]

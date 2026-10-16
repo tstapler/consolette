@@ -1326,6 +1326,11 @@ mod tests {
         })
     }
 
+    #[test]
+    fn translates_request_should_be_true_for_openai() {
+        assert!(test_provider().translates_request());
+    }
+
     fn test_provider() -> OpenaiProvider {
         OpenaiProvider::new(
             test_upstream(),

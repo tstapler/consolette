@@ -520,6 +520,11 @@ mod tests {
         })
     }
 
+    #[test]
+    fn translates_request_should_be_true_for_gemini() {
+        assert!(test_provider().translates_request());
+    }
+
     fn test_provider() -> GeminiProvider {
         GeminiProvider::new(
             test_upstream("my-gcp-project"),

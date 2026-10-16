@@ -528,7 +528,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(snapshot.rows.len(), 2);
+        assert_eq!(
+            snapshot.rows.len(),
+            2,
+            "parse_failures: {:?}",
+            snapshot.parse_failures
+        );
         assert!(snapshot.parse_failures.is_empty());
     }
 

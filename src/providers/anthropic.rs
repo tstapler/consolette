@@ -646,7 +646,8 @@ mod tests {
                 "role": "assistant",
                 "content": [{"type": "text", "text": "ok"}],
                 "model": "claude-3-5-sonnet-20241022",
-                "usage": {"input_tokens": 1, "output_tokens": 1}
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "safeguard_results": [{"tool_use_id": "toolu_1", "verdict": "allow"}]
             }))
         }
 
@@ -716,6 +717,29 @@ mod tests {
                 .expect("mock server must have received a request");
             assert_eq!(path, "/v1/messages");
             assert_eq!(captured_body, body);
+        }
+
+        #[tokio::test]
+        async fn send_request_should_forward_safeguards_and_return_safeguard_results_unchanged() {
+            let (base_url, captured, _server) = start_capturing_messages_server().await;
+            let provider = provider_for(base_url, true);
+            let body = json!({
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [],
+                "safeguards": {"unrecognized": ["field", 1]}
+            });
+
+            let (response, _status) = provider
+                .send_request(body.clone(), &HeaderMap::new())
+                .await
+                .unwrap();
+
+            let (_path, sent) = captured.lock().unwrap().clone().expect("request captured");
+            assert_eq!(sent["safeguards"], body["safeguards"]);
+            assert_eq!(
+                response["safeguard_results"],
+                json!([{"tool_use_id": "toolu_1", "verdict": "allow"}])
+            );
         }
 
         #[tokio::test]

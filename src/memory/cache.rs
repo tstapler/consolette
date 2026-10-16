@@ -321,7 +321,9 @@ impl ResponseCache {
         if !self.config.enabled {
             return None;
         }
+        // `safeguards` requests carry a per-request auto-mode review verdict in the response.
         if cache_bypass_requested(headers)
+            || crate::auto_mode::request_has_safeguards(body)
             || body_uses_mutating_tool(body, &self.config.mutating_tools)
         {
             self.bypassed.fetch_add(1, Ordering::Relaxed);
@@ -553,6 +555,17 @@ mod tests {
         headers.insert(BYPASS_HEADER, "true".parse().unwrap());
 
         assert_eq!(cache.cacheable_key(&body, &headers), None);
+    }
+
+    #[test]
+    fn cacheable_key_should_return_none_when_request_carries_safeguards() {
+        let dir = TempDir::new().unwrap();
+        let cache = temp_cache(&dir, enabled_config());
+        let plain = json!({"model": "claude-sonnet-5", "messages": []});
+        let guarded = json!({"model": "claude-sonnet-5", "messages": [], "safeguards": {}});
+
+        assert!(cache.cacheable_key(&plain, &HeaderMap::new()).is_some());
+        assert_eq!(cache.cacheable_key(&guarded, &HeaderMap::new()), None);
     }
 
     #[test]

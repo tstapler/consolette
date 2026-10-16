@@ -7,6 +7,7 @@
 //! ratelimit abstractions without duplicating code.
 
 pub mod auth;
+pub mod auto_mode;
 pub mod claude_code_session;
 pub mod compression;
 pub mod config;

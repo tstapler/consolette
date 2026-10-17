@@ -284,6 +284,12 @@ pub trait Provider: Send + Sync {
     /// Human-readable provider name for logging (e.g. `"anthropic"`, `"bedrock"`).
     fn name(&self) -> &str;
 
+    /// True when the request is rebuilt into another API's schema, so any Anthropic field the
+    /// translator doesn't map (such as `safeguards`) is lost.
+    fn translates_request(&self) -> bool {
+        false
+    }
+
     /// Send a single request to the provider and return either a full JSON
     /// body or a streaming byte response.
     ///

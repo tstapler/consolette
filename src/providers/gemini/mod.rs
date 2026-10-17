@@ -472,6 +472,10 @@ impl Provider for GeminiProvider {
         "gemini"
     }
 
+    fn translates_request(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         body: Value,
@@ -514,6 +518,11 @@ mod tests {
             },
             auth: None,
         })
+    }
+
+    #[test]
+    fn translates_request_should_be_true_for_gemini() {
+        assert!(test_provider().translates_request());
     }
 
     fn test_provider() -> GeminiProvider {

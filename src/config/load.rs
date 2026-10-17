@@ -10,8 +10,11 @@ use figment::Figment;
 use super::plugins;
 use super::runtime_overrides::RuntimeOverrides;
 use super::schema::{Config, Upstream, UpstreamKind};
-use super::validate::{validate_model_selectors, validate_model_tiers, validate_references};
+use super::validate::{
+    validate_effort, validate_model_selectors, validate_model_tiers, validate_references,
+};
 use super::ConfigError;
+use crate::effort::EffortMode;
 
 /// Env overrides are restricted to a small allowlist of top-level scalars —
 /// arrays-of-tables (`upstreams`/`routes`) are file-only (ADR-001).
@@ -65,7 +68,41 @@ pub fn load(config_dir: &Path) -> Result<Config, ConfigError> {
     validate_references(&config)?;
     validate_model_selectors(&config)?;
     validate_model_tiers(&config)?;
+    validate_effort(&config)?;
+    warn_if_effort_configured(&config);
     Ok(config)
+}
+
+/// Effort settings are parsed and validated but dispatch does not act on them yet; say so rather
+/// than let an operator believe `mode = "map"` or a tier `effort` is doing something.
+fn warn_if_effort_configured(config: &Config) {
+    let mapped = config.effort.values().any(|e| e.mode == EffortMode::Map);
+    let forced = config
+        .model_tiers
+        .iter()
+        .any(|t| t.upstreams.values().any(|o| o.effort.is_some()));
+    if mapped || forced {
+        tracing::warn!(
+            "effort settings ([effort.*] mode = \"map\" or a tier `effort`) are accepted but not \
+             applied yet: requests are forwarded with their original effort"
+        );
+    }
+    for tier in &config.model_tiers {
+        for (upstream, over) in &tier.upstreams {
+            let map_mode = config
+                .effort
+                .get(upstream)
+                .is_some_and(|e| e.mode == EffortMode::Map);
+            if over.effort.is_some() && !map_mode {
+                tracing::warn!(
+                    tier = %tier.name,
+                    upstream = %upstream,
+                    "tier sets `effort` but [effort.{upstream}] mode is not \"map\": the forced \
+                     level will be ignored"
+                );
+            }
+        }
+    }
 }
 
 /// `bin/` directories of every plugin discovered under `<config_dir>/plugins.d/`

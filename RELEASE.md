@@ -16,8 +16,8 @@ a bot-pushed tag would never kick off `release.yml`. The constraint is about
 cut a release the same way a human would — `git tag` + `git push` using the
 session's own authenticated git remote — since that's an interactive push,
 not a `GITHUB_TOKEN`-authored one. It still shouldn't push a tag on its own
-initiative; only when the user asks for a release, with a version number
-they've agreed to.
+initiative; only when the user asks for a release. The version number is not
+a per-release question: it is whatever `scripts/next-version.sh` prints.
 
 ## One-time setup
 
@@ -37,13 +37,25 @@ they've agreed to.
 
 ## Cutting a release
 
+The version comes from the Conventional Commits since the last tag, via
+`scripts/next-version.sh` (wraps `git cliff --bumped-version`; rules in the `[bump]`
+table of `cliff.toml`: `feat` bumps minor, `fix`/`perf`/`refactor` bump patch, and a breaking
+change bumps minor until 1.0). It exits 2 with "no releasable commits" when there is
+nothing to ship; `docs`/`test`/`chore`/`style` commits alone don't release.
+
 ```bash
-git cliff --tag vX.Y.Z -o CHANGELOG.md   # preview/update the changelog
-git add CHANGELOG.md
-git commit -m "chore: release vX.Y.Z"
-git tag vX.Y.Z
-git push origin main --tags
+VERSION=$(scripts/next-version.sh) || exit    # e.g. 0.4.0
+sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml   # first match = [package]; GNU sed: drop the ''
+cargo update --workspace --offline            # refresh Cargo.lock's package version
+git cliff --tag "v$VERSION" -o CHANGELOG.md   # update the changelog
+git add Cargo.toml Cargo.lock CHANGELOG.md
+git commit -m "chore: release v$VERSION"
+git tag "v$VERSION"
+git push origin main "v$VERSION"
 ```
+
+cargo-dist requires the tag to match the `Cargo.toml` version, which is why the release commit
+bumps both (see the `chore: release v0.3.0` commit for the shape).
 
 The tag push triggers `release.yml`: cross-compiles for the configured
 targets, creates the GitHub Release (using `CHANGELOG.md` for notes), and

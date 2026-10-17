@@ -8,6 +8,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::effort::{EffortMode, EffortPolicy, Level};
+
 fn default_apikey_header() -> String {
     "x-api-key".to_string()
 }
@@ -202,6 +204,36 @@ pub struct RouteUpstreamRef {
     pub model_family: Option<String>,
 }
 
+/// `[effort.<upstream>]`: whether and how the client's reasoning effort is translated for one
+/// upstream. `mode = "off"` (the default) forwards nothing new; `min` / `max` clamp whichever
+/// level results, client's or a tier's forced one. Reserved: parsed and validated, but dispatch
+/// does not act on it yet (load logs a warning if it is turned on).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamEffort {
+    #[serde(default)]
+    pub mode: EffortMode,
+    #[serde(default)]
+    pub min: Option<Level>,
+    #[serde(default)]
+    pub max: Option<Level>,
+}
+
+impl Config {
+    /// Effort policy for `upstream`, with `forced` the matching tier's `effort` override;
+    /// `None` when the upstream's mode is `off`, which forwards no effort at all (a tier's forced
+    /// level included).
+    #[must_use]
+    pub fn effort_policy(&self, upstream: &str, forced: Option<Level>) -> Option<EffortPolicy> {
+        let cfg = self.effort.get(upstream).copied().unwrap_or_default();
+        (cfg.mode == EffortMode::Map).then_some(EffortPolicy {
+            force: forced,
+            min: cfg.min,
+            max: cfg.max,
+        })
+    }
+}
+
 /// One `[[model_tiers]]` entry: when the client-requested model starts with any `match`
 /// prefix (case-insensitive), the named upstreams serve the override model instead of the
 /// route's default. Upstreams without an override, and tiers naming upstreams outside the
@@ -216,8 +248,9 @@ pub struct ModelTier {
     pub upstreams: std::collections::BTreeMap<String, TierUpstreamOverride>,
 }
 
-/// A tier's model selector for one upstream; exactly one field must be set
-/// (`validate::validate_model_tiers`).
+/// A tier's override for one upstream: at most one of `model` / `model_family`, and at least
+/// one of those or `effort` (`validate::validate_model_tiers`). `effort` alone forces the
+/// reasoning level without changing the model.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TierUpstreamOverride {
@@ -225,6 +258,9 @@ pub struct TierUpstreamOverride {
     pub model: Option<String>,
     #[serde(default)]
     pub model_family: Option<String>,
+    /// Forces this reasoning level for the tier on this upstream, ignoring the client's.
+    #[serde(default)]
+    pub effort: Option<Level>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -392,6 +428,10 @@ pub struct Config {
     /// across conf.d layers, like `routes`). See [`ModelTier`].
     #[serde(default)]
     pub model_tiers: Vec<ModelTier>,
+    /// Per-upstream reasoning-effort policy, keyed by upstream name (`[effort.<upstream>]`).
+    /// Absent upstreams behave as `mode = "off"`. See [`UpstreamEffort`].
+    #[serde(default)]
+    pub effort: std::collections::BTreeMap<String, UpstreamEffort>,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
     #[serde(default)]
@@ -590,6 +630,7 @@ impl Default for Config {
                 ],
             }],
             model_tiers: Vec::new(),
+            effort: std::collections::BTreeMap::new(),
             ratelimit: RateLimitConfig::default(),
             cost_metrics: CostMetricsConfig::default(),
             server_tools: crate::server_tools::ServerToolsConfig::default(),

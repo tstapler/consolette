@@ -14,6 +14,12 @@ body = """
 """
 trim = true
 
+[bump]
+# Pre-1.0: feat bumps minor, fix/perf/refactor bump patch, and a breaking change bumps minor
+# (not 1.0.0) until the project deliberately declares 1.0.
+features_always_bump_minor = true
+breaking_always_bump_major = false
+
 [git]
 conventional_commits = true
 filter_unconventional = true

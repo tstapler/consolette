@@ -22,6 +22,7 @@ fn pin_model(model: &str) -> TierUpstreamOverride {
     TierUpstreamOverride {
         model: Some(model.to_string()),
         model_family: None,
+        effort: None,
     }
 }
 
@@ -29,6 +30,7 @@ fn pin_family(family: &str) -> TierUpstreamOverride {
     TierUpstreamOverride {
         model: None,
         model_family: Some(family.to_string()),
+        effort: None,
     }
 }
 
@@ -102,6 +104,24 @@ async fn dispatch_should_apply_tier_override_when_requested_model_prefix_matches
     dispatch_model(&router, "claude-haiku-4-5").await;
 
     assert_eq!(sent_model(&alpha).as_deref(), Some("cheap-model"));
+}
+
+#[tokio::test]
+async fn dispatch_should_keep_route_model_when_tier_override_sets_only_effort() {
+    let effort_only = TierUpstreamOverride {
+        model: None,
+        model_family: None,
+        effort: Some(crate::effort::Level::Low),
+    };
+    let (router, alpha, _, _) = tiered_router(vec![tier(
+        "haiku",
+        &["claude-haiku"],
+        &[("alpha", effort_only)],
+    )]);
+
+    dispatch_model(&router, "claude-haiku-4-5").await;
+
+    assert_eq!(sent_model(&alpha).as_deref(), Some("alpha-default"));
 }
 
 #[tokio::test]

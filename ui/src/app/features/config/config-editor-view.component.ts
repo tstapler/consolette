@@ -6,6 +6,7 @@ import { RoutingConfigComponent, ProviderConfigItem } from './components/routing
 import { FallbackCascadeBuilderComponent } from './components/fallback-cascade-builder.component';
 import { RateLimitConfigComponent, RateLimitValues } from './components/rate-limit-config.component';
 import { ConfigDiffModalComponent } from './components/config-diff-modal.component';
+import { FamilyMatchConfigComponent } from './components/family-match-config.component';
 
 @Component({
   selector: 'app-config-editor-view',
@@ -15,7 +16,8 @@ import { ConfigDiffModalComponent } from './components/config-diff-modal.compone
     RoutingConfigComponent,
     FallbackCascadeBuilderComponent,
     RateLimitConfigComponent,
-    ConfigDiffModalComponent
+    ConfigDiffModalComponent,
+    FamilyMatchConfigComponent
   ],
   template: `
     <div class="space-y-6">
@@ -78,6 +80,9 @@ import { ConfigDiffModalComponent } from './components/config-diff-modal.compone
         [cascade]="cascadeItems()"
         (cascadeChange)="onCascadeChange($event)"
       />
+
+      <!-- Model family matching -->
+      <app-family-match-config />
 
       <!-- Rate Limits -->
       <app-rate-limit-config

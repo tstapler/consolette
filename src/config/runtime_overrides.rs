@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::schema::{Config, Route};
+use super::schema::{Config, FamilyMatch, Route};
 
 pub const FILE_NAME: &str = "runtime-overrides.toml";
 
@@ -24,6 +24,8 @@ pub const FILE_NAME: &str = "runtime-overrides.toml";
 pub struct RuntimeOverrides {
     #[serde(default)]
     pub route: Option<Route>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_match: Option<FamilyMatch>,
 }
 
 impl RuntimeOverrides {
@@ -71,6 +73,9 @@ impl RuntimeOverrides {
         if let Some(route) = &self.route {
             config.routes = vec![route.clone()];
         }
+        if let Some(family_match) = self.family_match {
+            config.family_match = family_match;
+        }
     }
 }
 
@@ -106,6 +111,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overrides = RuntimeOverrides {
             route: Some(sample_route()),
+            ..Default::default()
         };
         overrides.save(dir.path()).unwrap();
 
@@ -114,9 +120,25 @@ mod tests {
     }
 
     #[test]
+    fn apply_sets_family_match_without_touching_routes() {
+        let overrides = RuntimeOverrides {
+            family_match: Some(FamilyMatch::Newest),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        let routes_before = config.routes.clone();
+        assert_eq!(config.family_match, FamilyMatch::Shortest);
+
+        overrides.apply(&mut config);
+        assert_eq!(config.family_match, FamilyMatch::Newest);
+        assert_eq!(config.routes, routes_before);
+    }
+
+    #[test]
     fn apply_replaces_routes_wholesale() {
         let overrides = RuntimeOverrides {
             route: Some(sample_route()),
+            ..Default::default()
         };
         let mut config = Config::default();
         assert_ne!(config.routes, vec![sample_route()]);

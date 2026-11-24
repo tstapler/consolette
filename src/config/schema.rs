@@ -204,6 +204,18 @@ pub struct RouteUpstreamRef {
     pub model_family: Option<String>,
 }
 
+/// How a `model_family` prefix picks among the upstream's matching catalog ids.
+/// `shortest` tries the id equal to the family first, so family `gpt-6.1-sol` prefers
+/// `gpt-6.1-sol` over `gpt-6.1-sol-healthcare`, then the rest newest-first; `newest` is newest-first
+/// throughout.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FamilyMatch {
+    #[default]
+    Shortest,
+    Newest,
+}
+
 /// `[effort.<upstream>]`: whether and how the client's reasoning effort is translated for one
 /// upstream. `mode = "off"` (the default) forwards nothing new; `min` / `max` clamp whichever
 /// level results, client's or a tier's forced one. Reserved: parsed and validated, but dispatch
@@ -428,6 +440,9 @@ pub struct Config {
     /// across conf.d layers, like `routes`). See [`ModelTier`].
     #[serde(default)]
     pub model_tiers: Vec<ModelTier>,
+    /// Candidate order for `model_family` resolution; tunable at runtime via `/api/family-match`.
+    #[serde(default)]
+    pub family_match: FamilyMatch,
     /// Per-upstream reasoning-effort policy, keyed by upstream name (`[effort.<upstream>]`).
     /// Absent upstreams behave as `mode = "off"`. See [`UpstreamEffort`].
     #[serde(default)]
@@ -589,6 +604,7 @@ impl Default for Config {
             memory_max_entries: default_memory_max_entries(),
             web_ui: WebUiMode::Angular,
             compat_snake_case: false,
+            family_match: FamilyMatch::default(),
             upstreams: vec![
                 Upstream {
                     name: "anthropic".to_string(),

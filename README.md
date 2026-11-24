@@ -107,7 +107,8 @@ model_family = "gpt-5"
 `model_family` is a **prefix match** against the upstream's live `/v1/models`
 catalog: `"gpt-5"` matches `gpt-5.1-codex-max`, `gpt-5.2-codex`,
 `gpt-5.3-codex`, etc., but not `gpt-4-turbo`. Consolette orders matching
-candidates newest-first and tries them via real requests until one succeeds;
+candidates newest-first (an id equal to the family itself goes first; see
+`family_match` below) and tries them via real requests until one succeeds;
 the working choice is cached per upstream and re-resolved when a real request
 against it fails with a `Deprecated` classification. As a secondary safety
 net, a cache entry also expires after an internal `RESOLUTION_TTL` (currently
@@ -115,6 +116,13 @@ net, a cache entry also expires after an internal `RESOLUTION_TTL` (currently
 this catches cases like a `WrongEndpoint` misclassification surviving into
 steady state, or a model silently un-deprecated or newly available.
 
+- **Match order** (`family_match`, default `shortest`): `shortest` tries the id equal to the family
+  first (family `gpt-6.1-sol` prefers `gpt-6.1-sol` over a catalog-listed `gpt-6.1-sol-healthcare`),
+  then the rest newest-first; with no exact id it is identical to `newest`. Note a bare `gpt-5` id
+  would outrank newer `gpt-5.x` ids under family `gpt-5`; set `newest` to avoid that. Set it
+  top-level in conf.d, or change it live from the dashboard's Config Editor (`GET`/`POST
+  /api/family-match`, persisted to `runtime-overrides.toml`). A candidate the gateway rejects as
+  "does not exist or you do not have access" is skipped like a deprecated one.
 - **Opt-in, additive**: `model_family` is unset by default, and existing
   `model`-pinned upstreams are unaffected.
 - **Mutually exclusive with `model`**: exactly one of `model`/`model_family`

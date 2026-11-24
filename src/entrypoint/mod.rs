@@ -438,6 +438,10 @@ pub fn entrypoint_router(state: EntrypointState) -> axum::Router {
             "/api/route",
             axum::routing::get(api::get_route).post(api::post_route),
         )
+        .route(
+            "/api/family-match",
+            axum::routing::get(api::get_family_match).post(api::post_family_match),
+        )
         .route("/api/sessions", axum::routing::get(api::get_sessions))
         .route(
             "/api/sessions/{id}/route",

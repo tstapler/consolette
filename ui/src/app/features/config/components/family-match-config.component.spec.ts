@@ -27,6 +27,17 @@ describe('FamilyMatchConfigComponent', () => {
     expect(fixture.componentInstance.mode()).toBe('newest');
   });
 
+  it('should keep the user choice when the initial GET resolves after a change', () => {
+    const fixture = create();
+    const get = httpMock.expectOne('/api/family-match');
+
+    fixture.componentInstance.onChange('newest');
+    get.flush({ family_match: 'shortest' });
+    httpMock.expectOne('/api/family-match').flush({ family_match: 'newest' });
+
+    expect(fixture.componentInstance.mode()).toBe('newest');
+  });
+
   it('should POST the new mode when the select changes', () => {
     const fixture = create();
     httpMock.expectOne('/api/family-match').flush({ family_match: 'shortest' });

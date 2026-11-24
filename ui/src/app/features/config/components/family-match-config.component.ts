@@ -59,6 +59,7 @@ export const FAMILY_MATCH_OPTIONS: ReadonlyArray<{ value: FamilyMatch; label: st
 })
 export class FamilyMatchConfigComponent implements OnInit {
   private readonly http = inject(HttpClient);
+  private touched = false;
 
   public readonly options = FAMILY_MATCH_OPTIONS;
   public readonly mode = signal<FamilyMatch>('shortest');
@@ -71,12 +72,17 @@ export class FamilyMatchConfigComponent implements OnInit {
 
   public ngOnInit(): void {
     this.http.get<{ family_match: FamilyMatch }>(FAMILY_MATCH_URL).subscribe({
-      next: (res) => this.mode.set(res.family_match),
+      next: (res) => {
+        if (!this.touched) {
+          this.mode.set(res.family_match);
+        }
+      },
       error: () => this.error.set('Could not load the current match order')
     });
   }
 
   public onChange(value: FamilyMatch): void {
+    this.touched = true;
     const previous = this.mode();
     this.mode.set(value);
     this.saving.set(true);

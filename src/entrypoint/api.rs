@@ -135,6 +135,7 @@ pub async fn post_route(
     State(state): State<EntrypointState>,
     Json(route): Json<Route>,
 ) -> Result<Json<Route>, (StatusCode, Json<Value>)> {
+    let _guard = state.config_lock.lock().await;
     let mut candidate =
         crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
     let mut overrides = RuntimeOverrides::load(&state.config_dir).map_err(|e| {
@@ -224,6 +225,7 @@ pub async fn post_family_match(
             Json(json!({ "error": format!("failed to persist runtime overrides: {e}") })),
         )
     };
+    let _guard = state.config_lock.lock().await;
     let mut overrides = RuntimeOverrides::load(&state.config_dir).map_err(internal)?;
     overrides.family_match = Some(body.family_match);
     overrides.save(&state.config_dir).map_err(internal)?;

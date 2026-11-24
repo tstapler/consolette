@@ -666,7 +666,12 @@ pub async fn put_dashboard_config(
 
     if let Some(route) = current_config.routes.first() {
         let mut overrides =
-            crate::config::RuntimeOverrides::load(&state.config_dir).unwrap_or_default();
+            crate::config::RuntimeOverrides::load(&state.config_dir).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("failed to read overrides: {e}") })),
+                )
+            })?;
         overrides.route = Some(route.clone());
         overrides.save(&state.config_dir).map_err(|e| {
             (

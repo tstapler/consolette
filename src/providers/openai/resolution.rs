@@ -87,11 +87,14 @@ fn resolved_before_mode_change(resolved_at: Instant) -> bool {
         .is_some_and(|changed_at| resolved_at < changed_at)
 }
 
-/// For `Shortest`, stable-sort by id length so equal-length ids keep their newest-first order.
-/// Every candidate shares the family prefix, so length order is suffix-length order.
-fn apply_family_match(mut candidates: Vec<String>, mode: FamilyMatch) -> Vec<String> {
+/// For `Shortest`, move the id equal to the family itself to the front; everything else keeps its
+/// newest-first order (a raw length sort would rank `gpt-5.9-codex` above `gpt-5.10-codex`).
+fn apply_family_match(mut candidates: Vec<String>, family: &str, mode: FamilyMatch) -> Vec<String> {
     if mode == FamilyMatch::Shortest {
-        candidates.sort_by_key(String::len);
+        if let Some(exact) = candidates.iter().position(|id| id == family) {
+            let id = candidates.remove(exact);
+            candidates.insert(0, id);
+        }
     }
     candidates
 }
@@ -600,6 +603,7 @@ where
 {
     let candidates = apply_family_match(
         resolve_candidates(fetch_models().await, family)?,
+        family,
         family_match(),
     );
     let timeout = probe_timeout(request_timeout_secs, candidates.len());
@@ -834,7 +838,11 @@ async fn await_concurrent_walk(
         () = notified.notified() => {}
         () = tokio::time::sleep(wait) => {}
     }
-    match state.cache.get(family) {
+    match state
+        .cache
+        .get(family)
+        .filter(|entry| !resolved_before_mode_change(entry.resolved_at))
+    {
         Some(entry) => Ok(entry.clone()),
         None => Err(ProviderError::Upstream {
             status: 0,
@@ -898,6 +906,7 @@ where
         return await_concurrent_walk(state, family, wait_budget).await;
     };
 
+    let mode_at_start = family_match();
     // `_permit` is held for the duration of the walk and released via its
     // `Drop` impl no matter how this scope exits below.
     let result = walk_candidates(
@@ -910,6 +919,8 @@ where
     )
     .await;
     match &result {
+        // A walk ordered under a mode that has since changed must not seed the cache.
+        Ok(_) if family_match() != mode_at_start => {}
         Ok(resolved) => {
             state.cache.insert(family.to_string(), resolved.clone());
             state.backoff.remove(family);
@@ -953,8 +964,12 @@ mod tests {
             &ids(&["gpt-6.1-sol-healthcare", "gpt-6.1-sol", "gpt-6.1-sol-mini"]),
         );
         assert_eq!(
-            apply_family_match(ranked, FamilyMatch::Shortest),
-            ids(&["gpt-6.1-sol", "gpt-6.1-sol-mini", "gpt-6.1-sol-healthcare"])
+            apply_family_match(ranked.clone(), "gpt-6.1-sol", FamilyMatch::Shortest)[0],
+            "gpt-6.1-sol"
+        );
+        assert_eq!(
+            apply_family_match(ranked, "gpt-6.1-sol", FamilyMatch::Shortest).len(),
+            3
         );
     }
 
@@ -962,18 +977,76 @@ mod tests {
     fn apply_family_match_should_keep_newest_first_order_when_newest() {
         let ranked = ids(&["gpt-6.1-sol-healthcare", "gpt-6.1-sol"]);
         assert_eq!(
-            apply_family_match(ranked.clone(), FamilyMatch::Newest),
+            apply_family_match(ranked.clone(), "gpt-6.1-sol", FamilyMatch::Newest),
             ranked
         );
     }
 
     #[test]
-    fn apply_family_match_should_break_length_ties_by_newest_first() {
-        let ranked = rank_candidates("gpt-", &ids(&["gpt-5", "gpt-7", "gpt-6"]));
-        assert_eq!(
-            apply_family_match(ranked, FamilyMatch::Shortest),
-            ids(&["gpt-7", "gpt-6", "gpt-5"])
+    fn apply_family_match_should_not_demote_newer_versions_when_no_exact_id_exists() {
+        let ranked = rank_candidates(
+            "gpt-",
+            &ids(&["gpt-5.9-codex", "gpt-5.10-codex", "gpt-5.3-codex-max"]),
         );
+        assert_eq!(
+            apply_family_match(ranked.clone(), "gpt-", FamilyMatch::Shortest),
+            ranked
+        );
+        assert_eq!(ranked[0], "gpt-5.10-codex");
+    }
+
+    #[test]
+    fn apply_family_match_should_put_only_the_exact_id_first_and_keep_the_rest_newest_first() {
+        let ranked = rank_candidates("gpt-5", &ids(&["gpt-5.3-codex", "gpt-5", "gpt-5.2-codex"]));
+        assert_eq!(
+            apply_family_match(ranked, "gpt-5", FamilyMatch::Shortest),
+            ids(&["gpt-5", "gpt-5.3-codex", "gpt-5.2-codex"])
+        );
+    }
+
+    /// Serializes tests that flip the process-wide mode; restores `Shortest` on exit.
+    static MODE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn set_family_match_should_make_older_cache_entries_stale_and_nothing_newer() {
+        let _guard = MODE_TEST_LOCK.lock().await;
+        set_family_match(FamilyMatch::Shortest);
+        let before = Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        set_family_match(FamilyMatch::Newest);
+        let after = Instant::now();
+        set_family_match(FamilyMatch::Shortest);
+
+        assert!(resolved_before_mode_change(before));
+        assert!(!resolved_before_mode_change(
+            after + Duration::from_millis(50)
+        ));
+    }
+
+    #[tokio::test]
+    async fn walk_candidates_should_probe_the_exact_family_id_first_under_shortest() {
+        let _guard = MODE_TEST_LOCK.lock().await;
+        set_family_match(FamilyMatch::Shortest);
+        let metrics = ProxyMetrics::new();
+        let probed = std::sync::Mutex::new(Vec::new());
+
+        let resolved = walk_candidates(
+            || async { Ok(vec![model("gpt-6.1-sol-healthcare"), model("gpt-6.1-sol")]) },
+            "gpt-6.1-sol",
+            60,
+            |candidate: String, _t, _e, _p| {
+                probed.lock().unwrap().push(candidate);
+                async { Ok(serde_json::json!({})) }
+            },
+            &metrics,
+            "up",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.model_id, "gpt-6.1-sol");
+        assert_eq!(probed.lock().unwrap().as_slice(), ["gpt-6.1-sol"]);
     }
 
     #[test]

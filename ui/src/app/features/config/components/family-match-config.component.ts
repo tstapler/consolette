@@ -10,7 +10,7 @@ export const FAMILY_MATCH_OPTIONS: ReadonlyArray<{ value: FamilyMatch; label: st
   {
     value: 'shortest',
     label: 'Shortest match',
-    hint: 'Prefer the id closest to the family prefix (gpt-6.1-sol before gpt-6.1-sol-healthcare).'
+    hint: 'Try the id equal to the family first (gpt-6.1-sol before gpt-6.1-sol-healthcare), then newest.'
   },
   {
     value: 'newest',

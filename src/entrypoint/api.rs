@@ -137,7 +137,12 @@ pub async fn post_route(
 ) -> Result<Json<Route>, (StatusCode, Json<Value>)> {
     let mut candidate =
         crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
-    let mut overrides = RuntimeOverrides::load(&state.config_dir).unwrap_or_default();
+    let mut overrides = RuntimeOverrides::load(&state.config_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to read runtime overrides: {e}") })),
+        )
+    })?;
     overrides.route = Some(route.clone());
     overrides.apply(&mut candidate);
     crate::config::validate_references(&candidate).map_err(|e| {

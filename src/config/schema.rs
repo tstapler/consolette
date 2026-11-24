@@ -205,9 +205,9 @@ pub struct RouteUpstreamRef {
 }
 
 /// How a `model_family` prefix picks among the upstream's matching catalog ids.
-/// `shortest` tries the id with the fewest characters beyond the prefix first, so family
-/// `gpt-6.1-sol` prefers `gpt-6.1-sol` over `gpt-6.1-sol-healthcare`; `newest` tries the highest
-/// version first. Ties in `shortest` fall back to newest-first.
+/// `shortest` tries the id equal to the family first, so family `gpt-6.1-sol` prefers
+/// `gpt-6.1-sol` over `gpt-6.1-sol-healthcare`, then the rest newest-first; `newest` is newest-first
+/// throughout.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FamilyMatch {

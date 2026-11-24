@@ -3,6 +3,24 @@
 
 ### Bug Fixes
 
+- Exact-id-first shortest match, guard cache against mid-walk mode change (74e9062)
+
+- Serialize override writes, keep UI choice over late initial GET (b1be797)
+
+
+### CI
+
+- Prefer the tstapler-homebrew-tap-writer app, fall back to the legacy app secrets (0704082)
+
+
+### Features
+
+- Default model_family to the shortest match, tunable from the UI (9bf47a4)
+
+
+
+### Bug Fixes
+
 - Force ad-hoc re-sign to avoid macOS taskgated SIGKILL (ff6bd8a)
 
 - Resolve clippy warnings and formatting for GitHub Actions test gate (dc6b2d0)

@@ -47,11 +47,54 @@ use tokio::sync::Notify;
 // make those tests slow/flaky — research/pitfalls.md §5).
 use tokio::time::Instant;
 
+use crate::config::schema::FamilyMatch;
 use crate::metrics::counters::{ResolutionOutcome, ResolutionState as ResolutionMetricState};
 use crate::metrics::ProxyMetrics;
 use crate::providers::openai::{classify_openai_error, OpenaiErrorClass};
 use crate::providers::{ModelInfo, ProviderError};
 use crate::routing::capability::EVAL_PROBE_SPACING_SECS;
+
+static FAMILY_MATCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static MODE_CHANGED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Process-wide candidate order for `model_family` walks; set from config on every router build
+/// and by `POST /api/family-match`. A real change stamps `MODE_CHANGED_AT` so entries resolved
+/// under the old order are re-walked instead of served from cache.
+pub(crate) fn set_family_match(mode: FamilyMatch) {
+    let raw = match mode {
+        FamilyMatch::Shortest => 0,
+        FamilyMatch::Newest => 1,
+    };
+    let previous = FAMILY_MATCH.swap(raw, std::sync::atomic::Ordering::Relaxed);
+    if previous != raw {
+        *MODE_CHANGED_AT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+}
+
+pub(crate) fn family_match() -> FamilyMatch {
+    match FAMILY_MATCH.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => FamilyMatch::Newest,
+        _ => FamilyMatch::Shortest,
+    }
+}
+
+fn resolved_before_mode_change(resolved_at: Instant) -> bool {
+    MODE_CHANGED_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|changed_at| resolved_at < changed_at)
+}
+
+/// For `Shortest`, stable-sort by id length so equal-length ids keep their newest-first order.
+/// Every candidate shares the family prefix, so length order is suffix-length order.
+fn apply_family_match(mut candidates: Vec<String>, mode: FamilyMatch) -> Vec<String> {
+    if mode == FamilyMatch::Shortest {
+        candidates.sort_by_key(String::len);
+    }
+    candidates
+}
 
 /// Keep only `models` whose id starts with `family`, preserving the order
 /// `/v1/models` returned them in. Ranking newest-first is a separate step —
@@ -555,7 +598,10 @@ where
     P: FnMut(String, Duration, Endpoint, TokenParamStyle) -> FutP,
     FutP: Future<Output = Result<Value, ProviderError>>,
 {
-    let candidates = resolve_candidates(fetch_models().await, family)?;
+    let candidates = apply_family_match(
+        resolve_candidates(fetch_models().await, family)?,
+        family_match(),
+    );
     let timeout = probe_timeout(request_timeout_secs, candidates.len());
 
     for (index, candidate) in candidates.iter().enumerate() {
@@ -829,7 +875,9 @@ where
     FutP: Future<Output = Result<Value, ProviderError>>,
 {
     if let Some(entry) = state.cache.get(family) {
-        if entry.resolved_at.elapsed() <= RESOLUTION_TTL {
+        if entry.resolved_at.elapsed() <= RESOLUTION_TTL
+            && !resolved_before_mode_change(entry.resolved_at)
+        {
             return Ok(entry.clone());
         }
         // Stale by TTL: fall through and re-walk rather than returning this
@@ -898,6 +946,36 @@ mod tests {
     // Synthetic ids (`family-vN`), not real OpenAI catalog names, per
     // pitfalls.md §5: a test asserting against today's real catalog snapshot
     // stops proving anything about the algorithm once that catalog moves on.
+    #[test]
+    fn apply_family_match_should_try_exact_family_before_longer_variants_when_shortest() {
+        let ranked = rank_candidates(
+            "gpt-6.1-sol",
+            &ids(&["gpt-6.1-sol-healthcare", "gpt-6.1-sol", "gpt-6.1-sol-mini"]),
+        );
+        assert_eq!(
+            apply_family_match(ranked, FamilyMatch::Shortest),
+            ids(&["gpt-6.1-sol", "gpt-6.1-sol-mini", "gpt-6.1-sol-healthcare"])
+        );
+    }
+
+    #[test]
+    fn apply_family_match_should_keep_newest_first_order_when_newest() {
+        let ranked = ids(&["gpt-6.1-sol-healthcare", "gpt-6.1-sol"]);
+        assert_eq!(
+            apply_family_match(ranked.clone(), FamilyMatch::Newest),
+            ranked
+        );
+    }
+
+    #[test]
+    fn apply_family_match_should_break_length_ties_by_newest_first() {
+        let ranked = rank_candidates("gpt-", &ids(&["gpt-5", "gpt-7", "gpt-6"]));
+        assert_eq!(
+            apply_family_match(ranked, FamilyMatch::Shortest),
+            ids(&["gpt-7", "gpt-6", "gpt-5"])
+        );
+    }
+
     #[test]
     fn filter_candidates_should_keep_only_ids_starting_with_family_prefix() {
         let models = vec![

@@ -115,6 +115,12 @@ net, a cache entry also expires after an internal `RESOLUTION_TTL` (currently
 this catches cases like a `WrongEndpoint` misclassification surviving into
 steady state, or a model silently un-deprecated or newly available.
 
+- **Match order** (`family_match`, default `shortest`): `shortest` tries the id with the fewest
+  characters beyond the prefix first, so `gpt-6.1-sol` prefers `gpt-6.1-sol` over a catalog-listed
+  `gpt-6.1-sol-healthcare` the account can't use; `newest` tries the highest version first. Set it
+  top-level in conf.d, or change it live from the dashboard's Config Editor (`GET`/`POST
+  /api/family-match`, persisted to `runtime-overrides.toml`). A candidate the gateway rejects as
+  "does not exist or you do not have access" is skipped like a deprecated one.
 - **Opt-in, additive**: `model_family` is unset by default, and existing
   `model`-pinned upstreams are unaffected.
 - **Mutually exclusive with `model`**: exactly one of `model`/`model_family`

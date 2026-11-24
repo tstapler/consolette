@@ -28,7 +28,7 @@ use crate::claude_code_session::transcript::{
     build_turns, parse_session_file, prune_session_file_with_policy, resolve_session_path,
     ToolNameMap,
 };
-use crate::config::schema::Route;
+use crate::config::schema::{FamilyMatch, Route};
 use crate::config::RuntimeOverrides;
 use crate::routing::router::{build_providers, Router as DispatchRouter};
 use crate::routing::session_overrides::SessionOverride;
@@ -137,9 +137,8 @@ pub async fn post_route(
 ) -> Result<Json<Route>, (StatusCode, Json<Value>)> {
     let mut candidate =
         crate::config::load(&state.config_dir).map_err(|e| config_load_error(&e))?;
-    let overrides = RuntimeOverrides {
-        route: Some(route.clone()),
-    };
+    let mut overrides = RuntimeOverrides::load(&state.config_dir).unwrap_or_default();
+    overrides.route = Some(route.clone());
     overrides.apply(&mut candidate);
     crate::config::validate_references(&candidate).map_err(|e| {
         (
@@ -190,6 +189,41 @@ pub async fn post_route(
     });
 
     Ok(Json(route))
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FamilyMatchBody {
+    pub family_match: FamilyMatch,
+}
+
+pub async fn get_family_match() -> Json<FamilyMatchBody> {
+    Json(FamilyMatchBody {
+        family_match: crate::providers::openai::family_match(),
+    })
+}
+
+/// Sets how `model_family` prefixes order their matching catalog ids, persists it to
+/// `runtime-overrides.toml`, and applies it live (cached resolutions made under the old order are
+/// re-walked on next use).
+///
+/// # Errors
+///
+/// Returns 500 if the existing overrides can't be read or the new ones can't be saved.
+pub async fn post_family_match(
+    State(state): State<EntrypointState>,
+    Json(body): Json<FamilyMatchBody>,
+) -> Result<Json<FamilyMatchBody>, (StatusCode, Json<Value>)> {
+    let internal = |e: anyhow::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to persist runtime overrides: {e}") })),
+        )
+    };
+    let mut overrides = RuntimeOverrides::load(&state.config_dir).map_err(internal)?;
+    overrides.family_match = Some(body.family_match);
+    overrides.save(&state.config_dir).map_err(internal)?;
+    crate::providers::openai::set_family_match(body.family_match);
+    Ok(Json(body))
 }
 
 /// Every session id seen in the last 100 requests (the same ring buffer
@@ -772,6 +806,48 @@ name = "anthropic"
         // The live router was hot-swapped, not just the on-disk config.
         let live = state.dispatch_router.load();
         assert_eq!(live.candidate_names(), vec!["bedrock".to_string()]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn post_family_match_persists_and_survives_a_later_route_post() {
+        // `Shortest` is the process default, so this never flips the shared global mid-suite.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path()).await;
+
+        let Json(applied) = post_family_match(
+            State(state.clone()),
+            Json(FamilyMatchBody {
+                family_match: FamilyMatch::Shortest,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied.family_match, FamilyMatch::Shortest);
+        assert_eq!(
+            RuntimeOverrides::load(dir.path()).unwrap().family_match,
+            Some(FamilyMatch::Shortest)
+        );
+
+        let route = Route {
+            name: "default".to_string(),
+            strategy: Strategy::Weighted,
+            upstreams: vec![RouteUpstreamRef {
+                name: "bedrock".to_string(),
+                weight: Some(1.0),
+                model: Some("pinned-model".to_string()),
+                model_family: None,
+            }],
+        };
+        let _ = post_route(State(state.clone()), Json(route)).await.unwrap();
+
+        assert_eq!(
+            RuntimeOverrides::load(dir.path()).unwrap().family_match,
+            Some(FamilyMatch::Shortest),
+            "saving a route must not drop the persisted family_match"
+        );
+        let Json(fetched) = get_family_match().await;
+        assert_eq!(fetched.family_match, FamilyMatch::Shortest);
     }
 
     fn create_test_session_file(dir: &std::path::Path, session_id: &str) -> std::path::PathBuf {

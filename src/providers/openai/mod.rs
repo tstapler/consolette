@@ -13,6 +13,7 @@
 //! duplicate it).
 
 mod resolution;
+pub(crate) use resolution::{family_match, set_family_match};
 mod responses;
 
 use std::collections::VecDeque;
@@ -634,6 +635,13 @@ const OPENAI_ERROR_CLASSIFICATION_TABLE: &[(u16, &str, OpenaiErrorClass)] = &[
     // Alternate phrasing observed for the same condition — demonstrates that
     // covering it is a table entry, not a logic change.
     (400, "no longer available", OpenaiErrorClass::Deprecated),
+    // Catalog-listed variants the account can't use (e.g. `gpt-6.1-sol-healthcare`
+    // matching a `gpt-6.1-sol` prefix): advance to the next candidate.
+    (
+        400,
+        "does not exist or you do not have access",
+        OpenaiErrorClass::Deprecated,
+    ),
     (404, "v1/responses", OpenaiErrorClass::WrongEndpoint),
     // Observed for a candidate that supports `/v1/chat/completions` for
     // plain requests but rejects function tools + `reasoning_effort` there
@@ -2003,6 +2011,16 @@ mod tests {
     #[test]
     fn classify_openai_error_should_return_deprecated_when_400_names_deprecation() {
         let body = r#"{"error":{"type":"invalid_request_error","message":"The model `gpt-5.1-codex-max` has been deprecated"}}"#;
+        assert_eq!(
+            classify_openai_error(400, body),
+            OpenaiErrorClass::Deprecated
+        );
+    }
+
+    #[test]
+    fn classify_openai_error_should_return_deprecated_when_400_model_not_found_for_inaccessible_model(
+    ) {
+        let body = r#"{"error":{"message":"The model `gpt-6.1-sol-healthcare` does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}"#;
         assert_eq!(
             classify_openai_error(400, body),
             OpenaiErrorClass::Deprecated

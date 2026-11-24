@@ -23,6 +23,7 @@ describe('ConfigEditorViewComponent (TC-UNIT-32)', () => {
   });
 
   afterEach(() => {
+    httpMock.match('/api/family-match').forEach((req) => req.flush({ family_match: 'shortest' }));
     httpMock.verify();
   });
 

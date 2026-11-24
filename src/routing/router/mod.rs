@@ -468,6 +468,7 @@ impl Router {
         // misconfigured route should be rejected before either happens, not
         // after.
         validate_openrouter_strategy_pairing(config)?;
+        crate::providers::openai::set_family_match(config.family_match);
 
         let (providers, openrouter_providers) =
             build_providers(config, Arc::clone(&metrics.counters)).await?;
